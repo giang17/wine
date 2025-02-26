@@ -756,6 +756,7 @@ extern BOOL is_net_supported( Atom atom );
 
 extern Window init_clip_window(void);
 extern void window_set_user_time( struct x11drv_win_data *data, Time time, BOOL init );
+extern void window_clear_padding( struct x11drv_win_data *data );
 extern UINT get_window_net_wm_state( Display *display, Window window );
 extern void make_window_embedded( struct x11drv_win_data *data );
 extern void window_flush_wm_state_update( HWND hwnd );
