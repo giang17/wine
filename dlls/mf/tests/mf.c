@@ -5895,7 +5895,6 @@ if (SUCCEEDED(hr))
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 
     hr = IMFMediaSink_SetPresentationClock(sink, present_clock);
-    todo_wine
     ok(hr == MF_E_CLOCK_NO_TIME_SOURCE, "Unexpected hr %#lx.\n", hr);
 
     hr = MFCreateSystemTimeSource(&time_source);
@@ -6527,9 +6526,7 @@ if (time_source)
 
     SET_EXPECT(presentation_clock_GetTimeSource);
     hr = IMFMediaSink_SetPresentationClock(sink, clock);
-    todo_wine
     ok(hr == MF_E_CLOCK_NO_TIME_SOURCE, "Unexpected hr %#lx.\n", hr);
-    todo_wine
     CHECK_CALLED(presentation_clock_GetTimeSource);
 
     IMFPresentationTimeSource_AddRef(presentation_clock->time_source = time_source);
@@ -6538,7 +6535,6 @@ if (time_source)
     SET_EXPECT(presentation_clock_AddClockStateSink);
     hr = IMFMediaSink_SetPresentationClock(sink, clock);
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
-    todo_wine
     CHECK_CALLED(presentation_clock_GetTimeSource);
     CHECK_CALLED(presentation_clock_AddClockStateSink);
 
