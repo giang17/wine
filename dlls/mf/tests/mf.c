@@ -6826,12 +6826,10 @@ if (time_source)
 
     /* Test scrubbing. Start by setting clock rate to zero. */
     hr = IMFClockStateSink_OnClockSetRate(state_sink1, 0, 0.0);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 
     /* Wait for the rate changed event */
     hr = gen_wait_media_event_until_blocking((IMFMediaEventGenerator*)stream, callback, MEStreamSinkRateChanged, 1000, &propvar);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     PropVariantClear(&propvar);
 
@@ -6846,10 +6844,12 @@ if (time_source)
 
     /* Then two samples are requested */
     hr = gen_wait_media_event_until_blocking((IMFMediaEventGenerator*)stream, callback, MEStreamSinkRequestSample, 1000, &propvar);
+    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     PropVariantClear(&propvar);
 
     hr = gen_wait_media_event_until_blocking((IMFMediaEventGenerator*)stream, callback, MEStreamSinkRequestSample, 1000, &propvar);
+    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     PropVariantClear(&propvar);
 
@@ -6903,11 +6903,9 @@ if (time_source)
 
     /* ... set rate back to 1 ... */
     hr = IMFClockStateSink_OnClockSetRate(state_sink1, 0, 1.0);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 
     hr = gen_wait_media_event_until_blocking((IMFMediaEventGenerator*)stream, callback, MEStreamSinkRateChanged, 1000, &propvar);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     PropVariantClear(&propvar);
 
@@ -6916,12 +6914,10 @@ if (time_source)
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 
     hr = gen_wait_media_event_until_blocking((IMFMediaEventGenerator*)stream, callback, MEStreamSinkRequestSample, 1000, &propvar);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     PropVariantClear(&propvar);
 
     hr = gen_wait_media_event_until_blocking((IMFMediaEventGenerator*)stream, callback, MEStreamSinkRequestSample, 1000, &propvar);
-    todo_wine
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
     PropVariantClear(&propvar);
 
