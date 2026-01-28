@@ -313,6 +313,10 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
     HDC draw_hdc = teb->glReserved1[0], read_hdc = teb->glReserved1[1];
     struct context *old_ctx = get_current_context( teb, NULL, NULL );
     const struct opengl_funcs *old_funcs = teb->glTable;
+    static const WCHAR staticW[] = {'s','t','a','t','i','c',0};
+    UNICODE_STRING static_us = RTL_CONSTANT_STRING( staticW );
+    HDC hdc = NULL;
+    HWND hwnd;
 
     if (dst == old_ctx)
     {
@@ -324,7 +328,17 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
     if (src->used == -1) FIXME( "Unsupported attributes on context %p/%p\n", src_handle, src );
     if (src != dst && dst->used == -1) FIXME( "Unsupported attributes on context %p/%p\n", dst_handle, dst );
 
-    funcs->p_wglMakeCurrent( dst->hdc, &dst->base );
+    if (!(hwnd = NtUserCreateWindowEx( 0, &static_us, NULL, &static_us, WS_POPUP, 0, 0, 0, 0,
+                                       NULL, NULL, NULL, NULL, 0, NULL, NULL, FALSE )) ||
+        !(hdc = NtUserGetWindowDC( hwnd )) || !funcs->p_wglSetPixelFormat( hdc, dst->base.format, NULL ))
+    {
+        WARN( "Failed to create dummy window to update context attributes\n" );
+        if (hdc) NtUserReleaseDC( hwnd, hdc );
+        if (hwnd) NtUserDestroyWindow( hwnd );
+        return FALSE;
+    }
+
+    funcs->p_wglMakeCurrent( hdc, &dst->base );
 
     if (mask & GL_COLOR_BUFFER_BIT)
     {
@@ -375,6 +389,9 @@ static BOOL copy_context_attributes( TEB *teb, const struct opengl_funcs *funcs,
     if (!old_ctx) funcs->p_wglMakeCurrent( NULL, NULL );
     else if (!old_funcs->p_wglMakeContextCurrentARB) old_funcs->p_wglMakeCurrent( draw_hdc, &old_ctx->base );
     else old_funcs->p_wglMakeContextCurrentARB( draw_hdc, read_hdc, &old_ctx->base );
+
+    NtUserReleaseDC( hwnd, hdc );
+    NtUserDestroyWindow( hwnd );
 
     return dst->used != -1 && src->used != -1;
 }
@@ -1020,13 +1037,10 @@ BOOL wrap_wglCopyContext( TEB *teb, HGLRC hglrcSrc, HGLRC hglrcDst, UINT mask )
 {
     const struct opengl_funcs *src_funcs, *dst_funcs;
     struct context *src, *dst;
-    BOOL ret = FALSE;
 
     if (!(src = opengl_context_from_handle( teb, hglrcSrc, &src_funcs ))) return FALSE;
     if (!(dst = opengl_context_from_handle( teb, hglrcDst, &dst_funcs ))) return FALSE;
-    else ret = copy_context_attributes( teb, dst_funcs, hglrcDst, dst, hglrcSrc, src, mask );
-
-    return ret;
+    return copy_context_attributes( teb, dst_funcs, hglrcDst, dst, hglrcSrc, src, mask );
 }
 
 static BOOL initialize_vk_device( TEB *teb, struct context *ctx )
