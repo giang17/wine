@@ -1746,129 +1746,185 @@ fail:
 
 static BOOL d2d_cdt_fixup(struct d2d_cdt *cdt, const struct d2d_cdt_edge_ref *base_edge)
 {
-    struct d2d_cdt_edge_ref candidate, next, new_base;
-    unsigned int count = 0;
+    struct d2d_cdt_edge_ref *stack = NULL;
+    size_t stack_count = 0, stack_capacity = 0;
+    BOOL result = TRUE;
 
-    d2d_cdt_edge_next_left(cdt, &next, base_edge);
-    if (next.idx == base_edge->idx)
+    if (!d2d_array_reserve((void **)&stack, &stack_capacity, 1, sizeof(*stack)))
     {
-        ERR("Degenerate face.\n");
+        ERR("Failed to allocate fixup stack.\n");
         return FALSE;
     }
+    stack[stack_count++] = *base_edge;
 
-    candidate = next;
-    while (d2d_cdt_edge_destination(cdt, &next) != d2d_cdt_edge_origin(cdt, base_edge))
+    while (stack_count > 0)
     {
-        if (d2d_cdt_incircle(cdt, d2d_cdt_edge_origin(cdt, base_edge), d2d_cdt_edge_destination(cdt, base_edge),
-                d2d_cdt_edge_destination(cdt, &candidate), d2d_cdt_edge_destination(cdt, &next)))
-            candidate = next;
-        d2d_cdt_edge_next_left(cdt, &next, &next);
-        ++count;
+        struct d2d_cdt_edge_ref current_base = stack[--stack_count];
+        struct d2d_cdt_edge_ref candidate, next, new_base;
+        unsigned int count = 0;
+
+        d2d_cdt_edge_next_left(cdt, &next, &current_base);
+        if (next.idx == current_base.idx)
+        {
+            ERR("Degenerate face.\n");
+            result = FALSE;
+            break;
+        }
+
+        candidate = next;
+        while (d2d_cdt_edge_destination(cdt, &next) != d2d_cdt_edge_origin(cdt, &current_base))
+        {
+            if (d2d_cdt_incircle(cdt, d2d_cdt_edge_origin(cdt, &current_base),
+                    d2d_cdt_edge_destination(cdt, &current_base),
+                    d2d_cdt_edge_destination(cdt, &candidate), d2d_cdt_edge_destination(cdt, &next)))
+                candidate = next;
+            d2d_cdt_edge_next_left(cdt, &next, &next);
+            ++count;
+        }
+
+        if (count > 1)
+        {
+            d2d_cdt_edge_next_left(cdt, &next, &candidate);
+            if (d2d_cdt_edge_destination(cdt, &next) == d2d_cdt_edge_origin(cdt, &current_base))
+                d2d_cdt_edge_next_left(cdt, &next, &current_base);
+            else
+                next = current_base;
+            if (!d2d_cdt_connect(cdt, &new_base, &candidate, &next))
+            {
+                result = FALSE;
+                break;
+            }
+            if (!d2d_array_reserve((void **)&stack, &stack_capacity,
+                    stack_count + 2, sizeof(*stack)))
+            {
+                ERR("Failed to grow fixup stack.\n");
+                result = FALSE;
+                break;
+            }
+            /* Push sym side first (processed second), then normal side (processed first). */
+            d2d_cdt_edge_sym(&new_base, &new_base);
+            stack[stack_count++] = new_base;
+            d2d_cdt_edge_sym(&new_base, &new_base);
+            stack[stack_count++] = new_base;
+        }
     }
 
-    if (count > 1)
-    {
-        d2d_cdt_edge_next_left(cdt, &next, &candidate);
-        if (d2d_cdt_edge_destination(cdt, &next) == d2d_cdt_edge_origin(cdt, base_edge))
-            d2d_cdt_edge_next_left(cdt, &next, base_edge);
-        else
-            next = *base_edge;
-        if (!d2d_cdt_connect(cdt, &new_base, &candidate, &next))
-            return FALSE;
-        if (!d2d_cdt_fixup(cdt, &new_base))
-            return FALSE;
-        d2d_cdt_edge_sym(&new_base, &new_base);
-        if (!d2d_cdt_fixup(cdt, &new_base))
-            return FALSE;
-    }
-
-    return TRUE;
+    free(stack);
+    return result;
 }
 
 static void d2d_cdt_cut_edges(struct d2d_cdt *cdt, struct d2d_cdt_edge_ref *end_edge,
         const struct d2d_cdt_edge_ref *base_edge, size_t start_vertex, size_t end_vertex)
 {
-    struct d2d_cdt_edge_ref next;
-    float ccw;
+    struct d2d_cdt_edge_ref *destroy_stack = NULL;
+    size_t destroy_count = 0, destroy_capacity = 0;
+    struct d2d_cdt_edge_ref current = *base_edge;
 
-    d2d_cdt_edge_next_left(cdt, &next, base_edge);
-    if (d2d_cdt_edge_destination(cdt, &next) == end_vertex)
+    for (;;)
     {
-        *end_edge = next;
-        return;
+        struct d2d_cdt_edge_ref next;
+        float ccw;
+
+        d2d_cdt_edge_next_left(cdt, &next, &current);
+        if (d2d_cdt_edge_destination(cdt, &next) == end_vertex)
+        {
+            *end_edge = next;
+            break;
+        }
+
+        ccw = d2d_cdt_ccw(cdt, d2d_cdt_edge_destination(cdt, &next), end_vertex, start_vertex);
+        if (ccw == 0.0f)
+        {
+            *end_edge = next;
+            break;
+        }
+
+        if (ccw > 0.0f)
+            d2d_cdt_edge_next_left(cdt, &next, &next);
+
+        d2d_cdt_edge_sym(&next, &next);
+
+        if (!d2d_array_reserve((void **)&destroy_stack, &destroy_capacity,
+                destroy_count + 1, sizeof(*destroy_stack)))
+        {
+            ERR("Failed to grow destroy stack.\n");
+            break;
+        }
+        destroy_stack[destroy_count++] = next;
+        current = next;
     }
 
-    ccw = d2d_cdt_ccw(cdt, d2d_cdt_edge_destination(cdt, &next), end_vertex, start_vertex);
-    if (ccw == 0.0f)
-    {
-        *end_edge = next;
-        return;
-    }
+    while (destroy_count > 0)
+        d2d_cdt_destroy_edge(cdt, &destroy_stack[--destroy_count]);
 
-    if (ccw > 0.0f)
-        d2d_cdt_edge_next_left(cdt, &next, &next);
-
-    d2d_cdt_edge_sym(&next, &next);
-    d2d_cdt_cut_edges(cdt, end_edge, &next, start_vertex, end_vertex);
-    d2d_cdt_destroy_edge(cdt, &next);
+    free(destroy_stack);
 }
 
 static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geometry,
         const struct d2d_cdt_edge_ref *origin, struct d2d_cdt_edge_ref *edge, size_t end_vertex)
 {
-    struct d2d_cdt_edge_ref base_edge, current, new_origin, next, target;
-    size_t current_destination, current_origin;
+    struct d2d_cdt_edge_ref current_origin = *origin;
 
-    for (current = *origin;; current = next)
+    for (;;)
     {
-        d2d_cdt_edge_next_origin(cdt, &next, &current);
+        struct d2d_cdt_edge_ref base_edge, current, new_origin, next, target;
+        size_t current_destination, current_origin_vtx;
 
-        current_destination = d2d_cdt_edge_destination(cdt, &current);
-        if (current_destination == end_vertex)
+        for (current = current_origin;; current = next)
         {
-            d2d_cdt_edge_sym(edge, &current);
-            return TRUE;
-        }
+            d2d_cdt_edge_next_origin(cdt, &next, &current);
 
-        current_origin = d2d_cdt_edge_origin(cdt, &current);
-        if (d2d_cdt_ccw(cdt, end_vertex, current_origin, current_destination) == 0.0f
-                && (cdt->vertices[current_destination].x > cdt->vertices[current_origin].x)
-                == (cdt->vertices[end_vertex].x > cdt->vertices[current_origin].x)
-                && (cdt->vertices[current_destination].y > cdt->vertices[current_origin].y)
-                == (cdt->vertices[end_vertex].y > cdt->vertices[current_origin].y))
-        {
-            d2d_cdt_edge_sym(&new_origin, &current);
-            return d2d_cdt_insert_segment(cdt, geometry, &new_origin, edge, end_vertex);
-        }
-
-        if (d2d_cdt_rightof(cdt, end_vertex, &next) && d2d_cdt_leftof(cdt, end_vertex, &current))
-        {
-            d2d_cdt_edge_next_left(cdt, &base_edge, &current);
-
-            d2d_cdt_edge_sym(&base_edge, &base_edge);
-            d2d_cdt_cut_edges(cdt, &target, &base_edge, d2d_cdt_edge_origin(cdt, origin), end_vertex);
-            d2d_cdt_destroy_edge(cdt, &base_edge);
-
-            if (!d2d_cdt_connect(cdt, &base_edge, &target, &current))
-                return FALSE;
-            *edge = base_edge;
-            if (!d2d_cdt_fixup(cdt, &base_edge))
-                return FALSE;
-            d2d_cdt_edge_sym(&base_edge, &base_edge);
-            if (!d2d_cdt_fixup(cdt, &base_edge))
-                return FALSE;
-
-            if (d2d_cdt_edge_origin(cdt, edge) == end_vertex)
+            current_destination = d2d_cdt_edge_destination(cdt, &current);
+            if (current_destination == end_vertex)
+            {
+                d2d_cdt_edge_sym(edge, &current);
                 return TRUE;
-            new_origin = *edge;
-            return d2d_cdt_insert_segment(cdt, geometry, &new_origin, edge, end_vertex);
-        }
+            }
 
-        if (next.idx == origin->idx)
-        {
-            ERR("Triangle not found.\n");
-            return FALSE;
+            current_origin_vtx = d2d_cdt_edge_origin(cdt, &current);
+            if (d2d_cdt_ccw(cdt, end_vertex, current_origin_vtx, current_destination) == 0.0f
+                    && (cdt->vertices[current_destination].x > cdt->vertices[current_origin_vtx].x)
+                    == (cdt->vertices[end_vertex].x > cdt->vertices[current_origin_vtx].x)
+                    && (cdt->vertices[current_destination].y > cdt->vertices[current_origin_vtx].y)
+                    == (cdt->vertices[end_vertex].y > cdt->vertices[current_origin_vtx].y))
+            {
+                d2d_cdt_edge_sym(&new_origin, &current);
+                current_origin = new_origin;
+                goto next_segment;
+            }
+
+            if (d2d_cdt_rightof(cdt, end_vertex, &next) && d2d_cdt_leftof(cdt, end_vertex, &current))
+            {
+                d2d_cdt_edge_next_left(cdt, &base_edge, &current);
+
+                d2d_cdt_edge_sym(&base_edge, &base_edge);
+                d2d_cdt_cut_edges(cdt, &target, &base_edge,
+                        d2d_cdt_edge_origin(cdt, &current_origin), end_vertex);
+                d2d_cdt_destroy_edge(cdt, &base_edge);
+
+                if (!d2d_cdt_connect(cdt, &base_edge, &target, &current))
+                    return FALSE;
+                *edge = base_edge;
+                if (!d2d_cdt_fixup(cdt, &base_edge))
+                    return FALSE;
+                d2d_cdt_edge_sym(&base_edge, &base_edge);
+                if (!d2d_cdt_fixup(cdt, &base_edge))
+                    return FALSE;
+
+                if (d2d_cdt_edge_origin(cdt, edge) == end_vertex)
+                    return TRUE;
+                current_origin = *edge;
+                goto next_segment;
+            }
+
+            if (next.idx == current_origin.idx)
+            {
+                ERR("Triangle not found.\n");
+                return FALSE;
+            }
         }
+    next_segment:
+        continue;
     }
 }
 
@@ -2387,6 +2443,18 @@ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
     if (vertex_count < 3)
     {
         WARN("Geometry has %lu vertices after eliminating duplicates.\n", (long)vertex_count);
+        free(vertices);
+        return S_OK;
+    }
+
+    /* Bail out if vertex count is still too high for the CDT algorithm.
+     * This prevents hangs with degenerate geometries (e.g. waveforms with
+     * hundreds of near-collinear vertices). The outline is still rendered
+     * correctly since it was computed separately in EndFigure. */
+    if (vertex_count > 512)
+    {
+        WARN("Geometry has %lu vertices after simplification, skipping triangulation.\n",
+                (long)vertex_count);
         free(vertices);
         return S_OK;
     }
@@ -3250,6 +3318,7 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
 {
     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
     HRESULT hr = E_FAIL;
+    size_t i;
 
     TRACE("iface %p.\n", iface);
 
@@ -3263,6 +3332,48 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
         return geometry->u.path.code;
 
     geometry->u.path.state = D2D_GEOMETRY_STATE_CLOSED;
+
+    /* Remove collinear LINE vertices from figures to reduce CDT complexity.
+     * This is safe because the outline data is already computed in EndFigure,
+     * and removing collinear points does not change the filled area. */
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        struct d2d_figure *figure = &geometry->u.path.figures[i];
+        size_t k;
+
+        if (figure->vertex_count < 3)
+            continue;
+
+        for (k = 1; k + 1 < figure->vertex_count;)
+        {
+            float cross;
+
+            if (figure->vertex_types[k] != D2D_VERTEX_TYPE_LINE)
+            {
+                ++k;
+                continue;
+            }
+
+            /* Check if vertex k is collinear with k-1 and k+1 using cross product. */
+            cross = (figure->vertices[k].x - figure->vertices[k - 1].x)
+                    * (figure->vertices[k + 1].y - figure->vertices[k - 1].y)
+                    - (figure->vertices[k].y - figure->vertices[k - 1].y)
+                    * (figure->vertices[k + 1].x - figure->vertices[k - 1].x);
+
+            if (cross >= -1e-6f && cross <= 1e-6f)
+            {
+                memmove(&figure->vertices[k], &figure->vertices[k + 1],
+                        (figure->vertex_count - k - 1) * sizeof(*figure->vertices));
+                memmove(&figure->vertex_types[k], &figure->vertex_types[k + 1],
+                        (figure->vertex_count - k - 1) * sizeof(*figure->vertex_types));
+                --figure->vertex_count;
+            }
+            else
+            {
+                ++k;
+            }
+        }
+    }
 
     if (!d2d_geometry_intersect_self(geometry))
         goto done;
@@ -3450,8 +3561,6 @@ static void d2d_arc_to_beziers(D2D1_POINT_2F start, const D2D1_ARC_SEGMENT *arc,
     cx = cos_phi * cxp - sin_phi * cyp + (x1 + x2) * 0.5f;
     cy = sin_phi * cxp + cos_phi * cyp + (y1 + y2) * 0.5f;
 
-    TRACE("Arc: start(%.2f,%.2f) end(%.2f,%.2f) large=%d sweep=%d x1p=%.2f y1p=%.2f sq=%.4f factor=%.2f cxp=%.2f cyp=%.2f center(%.2f,%.2f)\n",
-          x1, y1, x2, y2, large_arc, sweep, x1p, y1p, sq, factor, cxp, cyp, cx, cy);
 
     /* Step 4: Compute theta1 and dtheta (F.6.5.4, F.6.5.5, F.6.5.6) */
     {
