@@ -801,7 +801,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
 }
 
 static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
-        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width)
+        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit)
 {
     D3D11_MAPPED_SUBRESOURCE map_desc;
     ID3D11DeviceContext *d3d_context;
@@ -824,7 +824,7 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
     cb_data->transform_geometry._11 = geometry_transform->_11;
     cb_data->transform_geometry._21 = geometry_transform->_21;
     cb_data->transform_geometry._31 = geometry_transform->_31;
-    cb_data->transform_geometry.pad0 = 0.0f;
+    cb_data->transform_geometry.miter_limit = miter_limit;
     cb_data->transform_geometry._12 = geometry_transform->_12;
     cb_data->transform_geometry._22 = geometry_transform->_22;
     cb_data->transform_geometry._32 = geometry_transform->_32;
@@ -851,14 +851,14 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
 }
 
 static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
-        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width)
+        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width, float miter_limit)
 {
     D3D11_SUBRESOURCE_DATA buffer_data;
     D3D11_BUFFER_DESC buffer_desc;
     ID3D11Buffer *ib, *vb;
     HRESULT hr;
 
-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width)))
+    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width, miter_limit)))
     {
         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
         return;
@@ -1007,7 +1007,12 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
             stroke_width /= context->drawing_state.transform.m11;
     }
 
-    d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width);
+    {
+        float miter_limit = 10.0f;
+        if (stroke_style_impl)
+            miter_limit = stroke_style_impl->desc.miterLimit;
+        d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width, miter_limit);
+    }
 }
 
 static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
@@ -1025,7 +1030,7 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
     buffer_data.SysMemPitch = 0;
     buffer_data.SysMemSlicePitch = 0;
 
-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f)))
+    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f, 0.0f)))
     {
         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
         return;
@@ -1946,7 +1951,7 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
     vs_cb_data->transform_geometry._11 = 1.0f;
     vs_cb_data->transform_geometry._21 = 0.0f;
     vs_cb_data->transform_geometry._31 = 0.0f;
-    vs_cb_data->transform_geometry.pad0 = 0.0f;
+    vs_cb_data->transform_geometry.miter_limit = 0.0f;
     vs_cb_data->transform_geometry._12 = 0.0f;
     vs_cb_data->transform_geometry._22 = 1.0f;
     vs_cb_data->transform_geometry._32 = 0.0f;
@@ -3622,8 +3627,8 @@ static const D3D11_INPUT_ELEMENT_DESC shape_il_desc_curve[] =
     {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
 };
 static const char shape_vs_code_outline[] =
-    "float3x2 transform_geometry;\n"
-    "float stroke_width;\n"
+    "float4 transform_geometry_r0;\n"
+    "float4 transform_geometry_r1;\n"
     "float4 transform_rtx;\n"
     "float4 transform_rty;\n"
     "\n"
@@ -3650,9 +3655,9 @@ static const char shape_vs_code_outline[] =
     "    float2x2 geom;\n"
     "    float l;\n"
     "\n"
-    "    o.stroke_transform = float2x2(transform_rtx.xy, transform_rty.xy) * stroke_width * 0.5f;\n"
+    "    o.stroke_transform = float2x2(transform_rtx.xy, transform_rty.xy) * transform_geometry_r1.w * 0.5f;\n"
     "\n"
-    "    geom = float2x2(transform_geometry._11_21, transform_geometry._12_22);\n"
+    "    geom = float2x2(transform_geometry_r0.xy, transform_geometry_r1.xy);\n"
     "    q_prev = normalize(mul(geom, prev));\n"
     "    q_next = normalize(mul(geom, next));\n"
     "\n"
@@ -3661,10 +3666,12 @@ static const char shape_vs_code_outline[] =
     "    v_p = float2(-q_prev.y, q_prev.x);\n"
     "    l = -dot(v_p, q_next) / (1.0f + dot(q_prev, q_next));\n"
     "    q_i = l * q_prev + v_p;\n"
+    "    if (transform_geometry_r0.w > 0.0f && length(q_i) > transform_geometry_r0.w)\n"
+    "        q_i = normalize(q_i) * transform_geometry_r0.w;\n"
     "\n"
     "    o.b = float4(0.0, 0.0, 0.0, 0.0);\n"
     "\n"
-    "    o.p = mul(float3(position, 1.0f), transform_geometry) + stroke_width * 0.5f * q_i;\n"
+    "    o.p = float2(dot(float3(position, 1.0f), transform_geometry_r0.xyz), dot(float3(position, 1.0f), transform_geometry_r1.xyz)) + transform_geometry_r1.w * 0.5f * q_i;\n"
     "    position = mul(float2x3(transform_rtx.xyz, transform_rty.xyz), float3(o.p, 1.0f))\n"
     "            * float2(transform_rtx.w, transform_rty.w);\n"
     "    o.position = float4(position + float2(-1.0f, 1.0f), 0.0f, 1.0f);\n"
@@ -3687,8 +3694,8 @@ static const char shape_vs_code_outline[] =
  * T = A'⁻¹B'
  */
 static const char shape_vs_code_bezier_outline[] =
-    "float3x2 transform_geometry;\n"
-    "float stroke_width;\n"
+    "float4 transform_geometry_r0;\n"
+    "float4 transform_geometry_r1;\n"
     "float4 transform_rtx;\n"
     "float4 transform_rty;\n"
     "\n"
@@ -3707,9 +3714,9 @@ static const char shape_vs_code_bezier_outline[] =
     "    float2x2 geom, rt;\n"
     "    float l;\n"
     "\n"
-    "    geom = float2x2(transform_geometry._11_21, transform_geometry._12_22);\n"
+    "    geom = float2x2(transform_geometry_r0.xy, transform_geometry_r1.xy);\n"
     "    rt = float2x2(transform_rtx.xy, transform_rty.xy);\n"
-    "    o.stroke_transform = rt * stroke_width * 0.5f;\n"
+    "    o.stroke_transform = rt * transform_geometry_r1.w * 0.5f;\n"
     "\n"
     "    p = mul(geom, position);\n"
     "    p0 = mul(geom, p0);\n"
@@ -3726,7 +3733,9 @@ static const char shape_vs_code_bezier_outline[] =
     "    v_p = float2(-q_prev.y, q_prev.x);\n"
     "    l = -dot(v_p, q_next) / (1.0f + dot(q_prev, q_next));\n"
     "    q_i = l * q_prev + v_p;\n"
-    "    p += 0.5f * stroke_width * q_i;\n"
+    "    if (transform_geometry_r0.w > 0.0f && length(q_i) > transform_geometry_r0.w)\n"
+    "        q_i = normalize(q_i) * transform_geometry_r0.w;\n"
+    "    p += 0.5f * transform_geometry_r1.w * q_i;\n"
     "\n"
     "    v_p = mul(rt, p2);\n"
     "    v_p = normalize(float2(-v_p.y, v_p.x));\n"
@@ -3743,7 +3752,7 @@ static const char shape_vs_code_bezier_outline[] =
     "        o.b.y = dot(v_p, p1);\n"
     "    }\n"
     "\n"
-    "    o.p = mul(float3(position, 1.0f), transform_geometry) + 0.5f * stroke_width * q_i;\n"
+    "    o.p = float2(dot(float3(position, 1.0f), transform_geometry_r0.xyz), dot(float3(position, 1.0f), transform_geometry_r1.xyz)) + 0.5f * transform_geometry_r1.w * q_i;\n"
     "    position = mul(float2x3(transform_rtx.xyz, transform_rty.xyz), float3(o.p, 1.0f))\n"
     "            * float2(transform_rtx.w, transform_rty.w);\n"
     "    o.position = float4(position + float2(-1.0f, 1.0f), 0.0f, 1.0f);\n"
@@ -3766,8 +3775,8 @@ static const char shape_vs_code_bezier_outline[] =
  * T = A'⁻¹B' = (B'⁻¹A')⁻¹
  */
 static const char shape_vs_code_arc_outline[] =
-    "float3x2 transform_geometry;\n"
-    "float stroke_width;\n"
+    "float4 transform_geometry_r0;\n"
+    "float4 transform_geometry_r1;\n"
     "float4 transform_rtx;\n"
     "float4 transform_rty;\n"
     "\n"
@@ -3788,9 +3797,9 @@ static const char shape_vs_code_arc_outline[] =
     "    float a;\n"
     "    float2 bc;\n"
     "\n"
-    "    geom = float2x2(transform_geometry._11_21, transform_geometry._12_22);\n"
+    "    geom = float2x2(transform_geometry_r0.xy, transform_geometry_r1.xy);\n"
     "    rt = float2x2(transform_rtx.xy, transform_rty.xy);\n"
-    "    o.stroke_transform = rt * stroke_width * 0.5f;\n"
+    "    o.stroke_transform = rt * transform_geometry_r1.w * 0.5f;\n"
     "\n"
     "    p = mul(geom, position);\n"
     "    p0 = mul(geom, p0);\n"
@@ -3807,19 +3816,22 @@ static const char shape_vs_code_arc_outline[] =
     "    v_p = float2(-q_prev.y, q_prev.x);\n"
     "    l = -dot(v_p, q_next) / (1.0f + dot(q_prev, q_next));\n"
     "    q_i = l * q_prev + v_p;\n"
-    "    p += 0.5f * stroke_width * q_i;\n"
+    "    if (transform_geometry_r0.w > 0.0f && length(q_i) > transform_geometry_r0.w)\n"
+    "        q_i = normalize(q_i) * transform_geometry_r0.w;\n"
+    "    p += 0.5f * transform_geometry_r1.w * q_i;\n"
     "\n"
     "    p_inv = float2x2(p1.y, -p1.x, p2.y - p1.y, p1.x - p2.x) / (p1.x * p2.y - p2.x * p1.y);\n"
     "    o.b.xy = mul(p_inv, p) + float2(1.0f, 0.0f);\n"
     "    o.b.zw = 0.0f;\n"
     "\n"
-    "    o.p = mul(float3(position, 1.0f), transform_geometry) + 0.5f * stroke_width * q_i;\n"
+    "    o.p = float2(dot(float3(position, 1.0f), transform_geometry_r0.xyz), dot(float3(position, 1.0f), transform_geometry_r1.xyz)) + 0.5f * transform_geometry_r1.w * q_i;\n"
     "    position = mul(float2x3(transform_rtx.xyz, transform_rty.xyz), float3(o.p, 1.0f))\n"
     "            * float2(transform_rtx.w, transform_rty.w);\n"
     "    o.position = float4(position + float2(-1.0f, 1.0f), 0.0f, 1.0f);\n"
     "}\n";
 static const char shape_vs_code_triangle[] =
-    "float3x2 transform_geometry;\n"
+    "float4 transform_geometry_r0;\n"
+    "float4 transform_geometry_r1;\n"
     "float4 transform_rtx;\n"
     "float4 transform_rty;\n"
     "\n"
@@ -3833,7 +3845,7 @@ static const char shape_vs_code_triangle[] =
     "\n"
     "void main(float2 position : POSITION, out struct output o)\n"
     "{\n"
-    "    o.p = mul(float3(position, 1.0f), transform_geometry);\n"
+    "    o.p = float2(dot(float3(position, 1.0f), transform_geometry_r0.xyz), dot(float3(position, 1.0f), transform_geometry_r1.xyz));\n"
     "    o.b = float4(1.0, 0.0, 1.0, 1.0);\n"
     "    o.stroke_transform = float2x2(1.0, 0.0, 0.0, 1.0);\n"
     "    position = mul(float2x3(transform_rtx.xyz, transform_rty.xyz), float3(o.p, 1.0f))\n"
@@ -3841,7 +3853,8 @@ static const char shape_vs_code_triangle[] =
     "    o.position = float4(position + float2(-1.0f, 1.0f), 0.0f, 1.0f);\n"
     "}\n";
 static const char shape_vs_code_curve[] =
-    "float3x2 transform_geometry;\n"
+    "float4 transform_geometry_r0;\n"
+    "float4 transform_geometry_r1;\n"
     "float4 transform_rtx;\n"
     "float4 transform_rty;\n"
     "\n"
@@ -3855,7 +3868,7 @@ static const char shape_vs_code_curve[] =
     "\n"
     "void main(float2 position : POSITION, float3 texcoord : TEXCOORD0, out struct output o)\n"
     "{\n"
-    "    o.p = mul(float3(position, 1.0f), transform_geometry);\n"
+    "    o.p = float2(dot(float3(position, 1.0f), transform_geometry_r0.xyz), dot(float3(position, 1.0f), transform_geometry_r1.xyz));\n"
     "    o.b = float4(texcoord, 1.0);\n"
     "    o.stroke_transform = float2x2(1.0, 0.0, 0.0, 1.0);\n"
     "    position = mul(float2x3(transform_rtx.xyz, transform_rty.xyz), float3(o.p, 1.0f))\n"

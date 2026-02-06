@@ -1864,6 +1864,8 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
         const struct d2d_cdt_edge_ref *origin, struct d2d_cdt_edge_ref *edge, size_t end_vertex)
 {
     struct d2d_cdt_edge_ref current_origin = *origin;
+    size_t max_iterations = cdt->edge_count * 4;  /* Safety limit */
+    size_t iteration_count = 0;
 
     for (;;)
     {
@@ -1872,6 +1874,12 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
 
         for (current = current_origin;; current = next)
         {
+            if (++iteration_count > max_iterations)
+            {
+                ERR("insert_segment: exceeded max iterations (%lu), aborting.\\n",
+                    (unsigned long)max_iterations);
+                return FALSE;
+            }
             d2d_cdt_edge_next_origin(cdt, &next, &current);
 
             current_destination = d2d_cdt_edge_destination(cdt, &current);

@@ -134,7 +134,7 @@ struct d2d_vs_cb
 {
     struct
     {
-        float _11, _21, _31, pad0;
+        float _11, _21, _31, miter_limit;
         float _12, _22, _32, stroke_width;
     } transform_geometry;
     struct d2d_vec4 transform_rtx;
