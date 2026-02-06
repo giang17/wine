@@ -3359,11 +3359,196 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_AddQuadraticBeziers(ID2D1Geometr
     geometry->u.path.segment_count += bezier_count;
 }
 
+/* Convert an arc segment to cubic Bezier curves.
+ * Based on the SVG arc implementation algorithm (W3C SVG 1.1 spec, Appendix F.6).
+ * An arc is converted to one or more cubic Bezier segments. */
+static void d2d_arc_to_beziers(D2D1_POINT_2F start, const D2D1_ARC_SEGMENT *arc,
+        D2D1_BEZIER_SEGMENT *beziers, unsigned int *bezier_count)
+{
+    float rx, ry, x1, y1, x2, y2, phi, cos_phi, sin_phi;
+    float x1p, y1p, cxp, cyp, cx, cy;
+    float lambda, lambda_sqrt;
+    float theta1, dtheta, theta;
+    float x1p_sq, y1p_sq, rx_sq, ry_sq;
+    float factor, sq, coeff;
+    int large_arc, sweep;
+    int num_segments, i;
+    float delta;
+
+    *bezier_count = 0;
+
+    /* Get start and end points */
+    x1 = start.x;
+    y1 = start.y;
+    x2 = arc->point.x;
+    y2 = arc->point.y;
+
+    /* Get radii and rotation */
+    rx = fabsf(arc->size.width);
+    ry = fabsf(arc->size.height);
+    phi = arc->rotationAngle * M_PI / 180.0f;
+
+    /* Get arc flags */
+    large_arc = (arc->arcSize == D2D1_ARC_SIZE_LARGE) ? 1 : 0;
+    sweep = (arc->sweepDirection == D2D1_SWEEP_DIRECTION_CLOCKWISE) ? 1 : 0;
+
+    /* Handle degenerate cases */
+    if (rx < 1e-7f || ry < 1e-7f)
+        return;
+
+    /* If endpoints are the same, no arc to draw */
+    if (fabsf(x1 - x2) < 1e-7f && fabsf(y1 - y2) < 1e-7f)
+        return;
+
+    cos_phi = cosf(phi);
+    sin_phi = sinf(phi);
+
+    /* Step 1: Compute (x1', y1') - rotate to align ellipse axes (F.6.5.1) */
+    {
+        float dx = (x1 - x2) * 0.5f;
+        float dy = (y1 - y2) * 0.5f;
+        x1p = cos_phi * dx + sin_phi * dy;
+        y1p = -sin_phi * dx + cos_phi * dy;
+    }
+
+    /* Correct radii if they're too small (F.6.6) */
+    x1p_sq = x1p * x1p;
+    y1p_sq = y1p * y1p;
+    rx_sq = rx * rx;
+    ry_sq = ry * ry;
+
+    lambda = x1p_sq / rx_sq + y1p_sq / ry_sq;
+    if (lambda > 1.0f)
+    {
+        lambda_sqrt = sqrtf(lambda);
+        rx *= lambda_sqrt;
+        ry *= lambda_sqrt;
+        rx_sq = rx * rx;
+        ry_sq = ry * ry;
+    }
+
+    /* Step 2: Compute (cx', cy') - center in rotated space (F.6.5.2) */
+    {
+        float num = rx_sq * ry_sq - rx_sq * y1p_sq - ry_sq * x1p_sq;
+        float denom = rx_sq * y1p_sq + ry_sq * x1p_sq;
+
+        sq = num / denom;
+        if (sq < 0.0f) sq = 0.0f;
+        factor = sqrtf(sq);
+
+        /* Sign depends on large_arc and sweep flags (F.6.5.2)
+         * SVG spec: factor is negated if large_arc_flag == sweep_flag.
+         * This ensures the correct arc center is chosen. */
+        if (large_arc == sweep)
+            factor = -factor;
+
+        cxp = factor * rx * y1p / ry;
+        cyp = -factor * ry * x1p / rx;
+    }
+
+    /* Step 3: Compute (cx, cy) - center in original space (F.6.5.3) */
+    cx = cos_phi * cxp - sin_phi * cyp + (x1 + x2) * 0.5f;
+    cy = sin_phi * cxp + cos_phi * cyp + (y1 + y2) * 0.5f;
+
+    TRACE("Arc: start(%.2f,%.2f) end(%.2f,%.2f) large=%d sweep=%d x1p=%.2f y1p=%.2f sq=%.4f factor=%.2f cxp=%.2f cyp=%.2f center(%.2f,%.2f)\n",
+          x1, y1, x2, y2, large_arc, sweep, x1p, y1p, sq, factor, cxp, cyp, cx, cy);
+
+    /* Step 4: Compute theta1 and dtheta (F.6.5.4, F.6.5.5, F.6.5.6) */
+    {
+        float ux = (x1p - cxp) / rx;
+        float uy = (y1p - cyp) / ry;
+        float vx = (-x1p - cxp) / rx;
+        float vy = (-y1p - cyp) / ry;
+        float n, p;
+
+        /* theta1 = angle of vector (ux, uy) */
+        theta1 = atan2f(uy, ux);
+
+        /* dtheta = angle between (ux, uy) and (vx, vy) */
+        n = sqrtf(ux * ux + uy * uy) * sqrtf(vx * vx + vy * vy);
+        p = ux * vx + uy * vy;
+        if (n > 0.0f)
+            dtheta = acosf(fmaxf(-1.0f, fminf(1.0f, p / n)));
+        else
+            dtheta = 0.0f;
+
+        /* Adjust sign based on cross product */
+        if (ux * vy - uy * vx < 0.0f)
+            dtheta = -dtheta;
+
+        /* Adjust dtheta based on sweep direction (F.6.5.6) */
+        if (sweep && dtheta < 0.0f)
+            dtheta += 2.0f * M_PI;
+        else if (!sweep && dtheta > 0.0f)
+            dtheta -= 2.0f * M_PI;
+    }
+
+    /* Step 5: Convert arc to Bezier segments
+     * Use at most 90 degrees per Bezier segment for good approximation */
+    num_segments = (int)ceilf(fabsf(dtheta) / (M_PI * 0.5f));
+    if (num_segments < 1) num_segments = 1;
+    if (num_segments > 4) num_segments = 4;
+
+    delta = dtheta / num_segments;
+
+    /* Coefficient for control points: (4/3) * tan(delta/4) */
+    coeff = 4.0f / 3.0f * tanf(delta * 0.25f);
+
+    theta = theta1;
+    for (i = 0; i < num_segments; i++)
+    {
+        float cos_t1, sin_t1, cos_t2, sin_t2;
+        D2D1_POINT_2F p1, p3, cp1, cp2;
+        float t1x, t1y, t2x, t2y;
+
+        cos_t1 = cosf(theta);
+        sin_t1 = sinf(theta);
+        cos_t2 = cosf(theta + delta);
+        sin_t2 = sinf(theta + delta);
+
+        /* Point on ellipse at angle theta (before rotation) */
+        /* Then apply rotation by phi */
+        p1.x = cx + rx * cos_phi * cos_t1 - ry * sin_phi * sin_t1;
+        p1.y = cy + rx * sin_phi * cos_t1 + ry * cos_phi * sin_t1;
+
+        p3.x = cx + rx * cos_phi * cos_t2 - ry * sin_phi * sin_t2;
+        p3.y = cy + rx * sin_phi * cos_t2 + ry * cos_phi * sin_t2;
+
+        /* Tangent at angle theta: derivative of ellipse point
+         * dx/dt = -rx*sin(t), dy/dt = ry*cos(t)
+         * After rotation by phi */
+        t1x = -rx * cos_phi * sin_t1 - ry * sin_phi * cos_t1;
+        t1y = -rx * sin_phi * sin_t1 + ry * cos_phi * cos_t1;
+
+        t2x = -rx * cos_phi * sin_t2 - ry * sin_phi * cos_t2;
+        t2y = -rx * sin_phi * sin_t2 + ry * cos_phi * cos_t2;
+
+        /* Control points */
+        cp1.x = p1.x + coeff * t1x;
+        cp1.y = p1.y + coeff * t1y;
+
+        cp2.x = p3.x - coeff * t2x;
+        cp2.y = p3.y - coeff * t2y;
+
+        beziers[i].point1 = cp1;
+        beziers[i].point2 = cp2;
+        beziers[i].point3 = p3;
+
+        theta += delta;
+    }
+
+    *bezier_count = num_segments;
+}
+
 static void STDMETHODCALLTYPE d2d_geometry_sink_AddArc(ID2D1GeometrySink *iface, const D2D1_ARC_SEGMENT *arc)
 {
     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
+    struct d2d_figure *figure;
+    D2D1_BEZIER_SEGMENT beziers[4];
+    unsigned int bezier_count;
+    D2D1_POINT_2F start_point;
 
-    FIXME("iface %p, arc %p stub!\n", iface, arc);
+    TRACE("iface %p, arc %p.\n", iface, arc);
 
     if (geometry->u.path.state != D2D_GEOMETRY_STATE_FIGURE)
     {
@@ -3371,13 +3556,42 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_AddArc(ID2D1GeometrySink *iface,
         return;
     }
 
-    if (!d2d_figure_add_vertex(&geometry->u.path.figures[geometry->u.path.figure_count - 1], arc->point))
+    figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
+
+    /* Get the current point (start of arc) */
+    if (figure->vertex_count == 0)
     {
-        ERR("Failed to add vertex.\n");
+        ERR("No start point for arc.\n");
+        d2d_geometry_set_error(geometry, D2DERR_WRONG_STATE);
+        return;
+    }
+    start_point = figure->vertices[figure->vertex_count - 1];
+
+    /* Convert arc to Bezier curves */
+    d2d_arc_to_beziers(start_point, arc, beziers, &bezier_count);
+
+    if (bezier_count == 0)
+    {
+        /* Degenerate arc - just add endpoint as line */
+        if (!d2d_figure_add_vertex(figure, arc->point))
+        {
+            ERR("Failed to add vertex.\n");
+            d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
+            return;
+        }
+        ++geometry->u.path.segment_count;
         return;
     }
 
-    ++geometry->u.path.segment_count;
+    /* Add Bezier curves */
+    if (!d2d_figure_add_beziers(figure, beziers, bezier_count))
+    {
+        ERR("Failed to add Bezier curves for arc.\n");
+        d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
+        return;
+    }
+
+    geometry->u.path.segment_count += bezier_count;
 }
 
 static const struct ID2D1GeometrySinkVtbl d2d_geometry_sink_vtbl =
