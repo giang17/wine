@@ -120,7 +120,8 @@ struct d2d_ps_cb
 {
     BOOL outline;
     BOOL is_arc;
-    BOOL pad[2];
+    BOOL aa_mode;
+    BOOL pad[1];
     struct d2d_brush_cb colour_brush;
     struct d2d_brush_cb opacity_brush;
 };
