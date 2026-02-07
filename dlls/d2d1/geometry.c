@@ -5735,6 +5735,36 @@ static const struct ID2D1EllipseGeometryVtbl d2d_ellipse_geometry_vtbl =
 static void d2d_ellipse_geometry_stream(struct d2d_geometry *geometry, const D2D_MATRIX_3X2_F *transform,
         ID2D1GeometrySink *sink)
 {
+    const D2D1_ELLIPSE *e = &geometry->u.ellipse.ellipse;
+    D2D1_POINT_2F start_point;
+    D2D1_ARC_SEGMENT arcs[4];
+
+    arcs[0].size.width = e->radiusX;
+    arcs[0].size.height = e->radiusY;
+    arcs[0].rotationAngle = 0.0f;
+    arcs[0].sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
+    arcs[0].arcSize = D2D1_ARC_SIZE_SMALL;
+    arcs[1] = arcs[2] = arcs[3] = arcs[0];
+
+    d2d_point_set(&start_point, e->point.x - e->radiusX, e->point.y);
+    d2d_point_set(&arcs[0].point, e->point.x, e->point.y - e->radiusY);
+    d2d_point_set(&arcs[1].point, e->point.x + e->radiusX, e->point.y);
+    d2d_point_set(&arcs[2].point, e->point.x, e->point.y + e->radiusY);
+    d2d_point_set(&arcs[3].point, start_point.x, start_point.y);
+
+    if (transform)
+    {
+        d2d_point_transform(&start_point, transform, start_point.x, start_point.y);
+        for (int i = 0; i < ARRAYSIZE(arcs); ++i)
+            d2d_arc_transform(&arcs[i], transform);
+    }
+
+    ID2D1GeometrySink_BeginFigure(sink, start_point, D2D1_FIGURE_BEGIN_FILLED);
+
+    for (int i = 0; i < ARRAYSIZE(arcs); ++i)
+        ID2D1GeometrySink_AddArc(sink, &arcs[i]);
+
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
 }
 
 static const struct d2d_geometry_ops d2d_ellipse_geometry_ops =
