@@ -1350,8 +1350,9 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawTextLayout(ID2D1DeviceConte
 static D2D1_ANTIALIAS_MODE d2d_device_context_set_aa_mode_from_text_aa_mode(struct d2d_device_context *rt)
 {
     D2D1_ANTIALIAS_MODE prev_antialias_mode = rt->drawing_state.antialiasMode;
-    rt->drawing_state.antialiasMode = rt->drawing_state.textAntialiasMode == D2D1_TEXT_ANTIALIAS_MODE_ALIASED ?
-            D2D1_ANTIALIAS_MODE_ALIASED : D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+    /* Force ALIASED for text so shader-based geometry AA does not affect glyph bitmaps.
+     * Text has its own alpha texture from DWrite - geometry AA would degrade quality. */
+    rt->drawing_state.antialiasMode = D2D1_ANTIALIAS_MODE_ALIASED;
     return prev_antialias_mode;
 }
 
@@ -1627,7 +1628,7 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
                 measuring_mode, rendering_params, &rendering_mode)))
         {
             ERR("Failed to get recommended rendering mode, hr %#lx.\n", hr);
-            rendering_mode = DWRITE_RENDERING_MODE_OUTLINE;
+            rendering_mode = DWRITE_RENDERING_MODE_NATURAL;
         }
     }
 
