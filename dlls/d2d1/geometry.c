@@ -1864,8 +1864,8 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
         const struct d2d_cdt_edge_ref *origin, struct d2d_cdt_edge_ref *edge, size_t end_vertex)
 {
     struct d2d_cdt_edge_ref current_origin = *origin;
-    size_t max_iterations = cdt->edge_count * 4;  /* Safety limit */
-    size_t iteration_count = 0;
+    size_t last_origin_vtx = ~(size_t)0;
+    size_t collinear_steps = 0;
 
     for (;;)
     {
@@ -1874,12 +1874,6 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
 
         for (current = current_origin;; current = next)
         {
-            if (++iteration_count > max_iterations)
-            {
-                ERR("insert_segment: exceeded max iterations (%lu), aborting.\\n",
-                    (unsigned long)max_iterations);
-                return FALSE;
-            }
             d2d_cdt_edge_next_origin(cdt, &next, &current);
 
             current_destination = d2d_cdt_edge_destination(cdt, &current);
@@ -1896,6 +1890,20 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
                     && (cdt->vertices[current_destination].y > cdt->vertices[current_origin_vtx].y)
                     == (cdt->vertices[end_vertex].y > cdt->vertices[current_origin_vtx].y))
             {
+                /* Cycle detection: if we revisit the same origin vertex via
+                 * collinear edges, we are stuck in a loop. */
+                if (current_destination == last_origin_vtx)
+                {
+                    ERR("Collinear cycle detected, aborting.\n");
+                    return FALSE;
+                }
+                last_origin_vtx = current_origin_vtx;
+                if (++collinear_steps > cdt->edge_count)
+                {
+                    ERR("Too many collinear steps (%lu), aborting.\n",
+                        (unsigned long)collinear_steps);
+                    return FALSE;
+                }
                 d2d_cdt_edge_sym(&new_origin, &current);
                 current_origin = new_origin;
                 goto next_segment;
@@ -3383,6 +3391,7 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
         }
     }
 
+    ERR("=== CDT FIX v1 ACTIVE === figures=%lu\n", (unsigned long)geometry->u.path.figure_count);
     if (!d2d_geometry_intersect_self(geometry))
         goto done;
     if (FAILED(hr = d2d_geometry_resolve_beziers(geometry)))
