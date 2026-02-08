@@ -2562,12 +2562,31 @@ static BOOL d2d_geometry_outline_add_join(struct d2d_geometry *geometry,
     ccw = d2d_point_ccw(&origin, prev, next);
     if (ccw == 0.0f)
     {
-        d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
-        d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
-        d2d_outline_vertex_set(&v[2], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
-                 prev->x,  prev->y,  prev->x,  prev->y);
-        d2d_outline_vertex_set(&v[3], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
-                -prev->x, -prev->y, -prev->x, -prev->y);
+        /* Collinear case: prev and next are parallel. Check if same direction
+         * (straight through) or opposite direction (U-turn/hairpin).
+         * In both cases, keep all vertices at p0 — the vertex shader computes
+         * the actual stroke-width offset. The previous code offset v[2]/v[3]
+         * by a hardcoded 25.0f in geometry space, creating visible spikes. */
+        float dot = prev->x * next->x + prev->y * next->y;
+        if (dot >= 0.0f)
+        {
+            /* Same direction: the two segments continue straight.
+             * Create a degenerate join (zero area) since no visible join is needed. */
+            d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
+            d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
+            d2d_outline_vertex_set(&v[2], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
+            d2d_outline_vertex_set(&v[3], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
+        }
+        else
+        {
+            /* U-turn (hairpin): segments go in opposite directions.
+             * Create a flat end cap by using perpendicular directions. */
+            float perp_x = -prev->y, perp_y = prev->x;
+            d2d_outline_vertex_set(&v[0], p0->x, p0->y,  perp_x,  perp_y, -prev->x, -prev->y);
+            d2d_outline_vertex_set(&v[1], p0->x, p0->y, -perp_x, -perp_y, -perp_x, -perp_y);
+            d2d_outline_vertex_set(&v[2], p0->x, p0->y, -perp_x, -perp_y,  prev->x,  prev->y);
+            d2d_outline_vertex_set(&v[3], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
+        }
     }
     else if (ccw < 0.0f)
     {
