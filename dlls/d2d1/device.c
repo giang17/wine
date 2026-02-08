@@ -1626,6 +1626,14 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
         }
     }
 
+    /* Force NATURAL rendering mode for better font quality with FreeType.
+     * ALIASED and OUTLINE modes produce poor results with Wine's FreeType backend. */
+    if (rendering_mode == DWRITE_RENDERING_MODE_ALIASED ||
+        rendering_mode == DWRITE_RENDERING_MODE_OUTLINE)
+    {
+        rendering_mode = DWRITE_RENDERING_MODE_NATURAL;
+    }
+
     if (rendering_mode == DWRITE_RENDERING_MODE_OUTLINE)
         d2d_device_context_draw_glyph_run_outline(context, baseline_origin, glyph_run, brush);
     else
