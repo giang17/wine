@@ -1894,14 +1894,18 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
                  * collinear edges, we are stuck in a loop. */
                 if (current_destination == last_origin_vtx)
                 {
-                    ERR("Collinear cycle detected, aborting.\n");
+                    static int once;
+                    if (!once++)
+                        FIXME("Collinear cycle detected, aborting.\n");
                     return FALSE;
                 }
                 last_origin_vtx = current_origin_vtx;
                 if (++collinear_steps > cdt->edge_count)
                 {
-                    ERR("Too many collinear steps (%lu), aborting.\n",
-                        (unsigned long)collinear_steps);
+                    static int once2;
+                    if (!once2++)
+                        FIXME("Too many collinear steps (%lu), aborting.\n",
+                            (unsigned long)collinear_steps);
                     return FALSE;
                 }
                 d2d_cdt_edge_sym(&new_origin, &current);
