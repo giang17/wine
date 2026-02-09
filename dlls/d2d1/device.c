@@ -999,7 +999,11 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
     }
 
     if (stroke_style)
-        FIXME("Ignoring stroke style %p.\n", stroke_style);
+    {
+        static int once;
+        if (!once++)
+            FIXME("Ignoring stroke style %p.\n", stroke_style);
+    }
 
     if (stroke_style_impl)
     {
