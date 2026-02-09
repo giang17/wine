@@ -1935,7 +1935,9 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
 
             if (next.idx == current_origin.idx)
             {
-                ERR("Triangle not found.\n");
+                static int once;
+                if (!once++)
+                    FIXME("Triangle not found.\n");
                 return FALSE;
             }
         }
@@ -2004,7 +2006,33 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
                 continue;
 
             if (!d2d_cdt_insert_segment(cdt, geometry, &edge, &new_edge, end_vertex))
-                return FALSE;
+            {
+                /* Skip this constraint edge rather than aborting the entire
+                 * triangulation. Find an edge starting at end_vertex so we
+                 * can continue with the next segment. */
+                BOOL refound = FALSE;
+                for (k = 0; k < cdt->edge_count; ++k)
+                {
+                    if (cdt->edges[k].flags & D2D_CDT_EDGE_FLAG_FREED)
+                        continue;
+                    edge.idx = k;
+                    edge.r = 0;
+                    if (d2d_cdt_edge_origin(cdt, &edge) == end_vertex)
+                    {
+                        refound = TRUE;
+                        break;
+                    }
+                    d2d_cdt_edge_sym(&edge, &edge);
+                    if (d2d_cdt_edge_origin(cdt, &edge) == end_vertex)
+                    {
+                        refound = TRUE;
+                        break;
+                    }
+                }
+                if (!refound)
+                    return FALSE;
+                continue;
+            }
             edge = new_edge;
         }
     }
