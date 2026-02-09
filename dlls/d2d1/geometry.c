@@ -2463,18 +2463,6 @@ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
         return S_OK;
     }
 
-    /* Bail out if vertex count is still too high for the CDT algorithm.
-     * This prevents hangs with degenerate geometries (e.g. waveforms with
-     * hundreds of near-collinear vertices). The outline is still rendered
-     * correctly since it was computed separately in EndFigure. */
-    if (vertex_count > 512)
-    {
-        WARN("Geometry has %lu vertices after simplification, skipping triangulation.\n",
-                (long)vertex_count);
-        free(vertices);
-        return S_OK;
-    }
-
     geometry->fill.vertices = vertices;
     geometry->fill.vertex_count = vertex_count;
 
