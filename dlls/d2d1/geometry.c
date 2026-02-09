@@ -3410,7 +3410,6 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
         }
     }
 
-    ERR("=== CDT FIX v1 ACTIVE === figures=%lu\n", (unsigned long)geometry->u.path.figure_count);
     if (!d2d_geometry_intersect_self(geometry))
         goto done;
     if (FAILED(hr = d2d_geometry_resolve_beziers(geometry)))
