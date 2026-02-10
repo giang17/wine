@@ -2660,9 +2660,9 @@ static BOOL d2d_geometry_outline_add_line_segment(struct d2d_geometry *geometry,
     d2d_point_normalise(&q_next);
 
     d2d_outline_vertex_set(&v[0], p0->x, p0->y,  q_next.x,  q_next.y,  q_next.x,  q_next.y);
-    d2d_outline_vertex_set(&v[1], p0->x, p0->y, -q_next.x, -q_next.y, -q_next.x, -q_next.y);
+    d2d_outline_vertex_set(&v[1], p0->x, p0->y, -2.0f * q_next.x, -2.0f * q_next.y, -2.0f * q_next.x, -2.0f * q_next.y);
     d2d_outline_vertex_set(&v[2], next->x, next->y,  q_next.x,  q_next.y,  q_next.x,  q_next.y);
-    d2d_outline_vertex_set(&v[3], next->x, next->y, -q_next.x, -q_next.y, -q_next.x, -q_next.y);
+    d2d_outline_vertex_set(&v[3], next->x, next->y, -2.0f * q_next.x, -2.0f * q_next.y, -2.0f * q_next.x, -2.0f * q_next.y);
     geometry->outline.vertex_count += 4;
 
     d2d_face_set(&f[0], base_idx + 0, base_idx + 1, base_idx + 2);
