@@ -149,11 +149,12 @@ HRESULT d2d_gradient_create(ID2D1Factory *factory, ID3D11Device1 *device, const 
 
     for (i = 0; i < stop_count; ++i)
     {
+        float a = stops[i].color.a;
         data[i * 2].x = stops[i].position;
-        data[i * 2 + 1].x = stops[i].color.r;
-        data[i * 2 + 1].y = stops[i].color.g;
-        data[i * 2 + 1].z = stops[i].color.b;
-        data[i * 2 + 1].w = stops[i].color.a;
+        data[i * 2 + 1].x = stops[i].color.r * a;
+        data[i * 2 + 1].y = stops[i].color.g * a;
+        data[i * 2 + 1].z = stops[i].color.b * a;
+        data[i * 2 + 1].w = a;
     }
 
     buffer_desc.ByteWidth = 2 * stop_count * sizeof(*data);
