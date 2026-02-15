@@ -1148,7 +1148,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
     TRACE("Presenting DC %p.\n", context_gl->dc);
 
-    pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format];
+    pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format - 1];
 
     /* PREFER_GL_PRESENT overrides FLIP_SEQUENTIAL/SEQUENTIAL/partial checks
      * for top-level popup windows with a GL-capable X11 drawable.  The GL
