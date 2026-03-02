@@ -30,13 +30,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
 
-enum stream_state
-{
-    STREAM_STATE_STOPPED = 0,
-    STREAM_STATE_RUNNING,
-    STREAM_STATE_PAUSED,
-};
-
 enum audio_renderer_flags
 {
     SAR_SHUT_DOWN = 0x1,
@@ -104,10 +97,11 @@ struct audio_renderer
     unsigned int queued_frames;
     unsigned int max_frames;
     struct list queue;
-    enum stream_state state;
     float rate;
     unsigned int flags;
     CRITICAL_SECTION cs;
+
+    MFCLOCK_STATE clock_state;
 };
 
 static void release_pending_object(struct queued_object *object)
@@ -637,11 +631,11 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockStart(IMFClockStateSink *
     EnterCriticalSection(&renderer->cs);
     if (renderer->audio_client)
     {
-        if (renderer->state != STREAM_STATE_RUNNING)
+        if (renderer->clock_state != MFCLOCK_STATE_RUNNING)
         {
             if (FAILED(hr = IAudioClient_Start(renderer->audio_client)))
                 WARN("Failed to start audio client, hr %#lx.\n", hr);
-            renderer->state = STREAM_STATE_RUNNING;
+            renderer->clock_state = MFCLOCK_STATE_RUNNING;
         }
     }
     else
@@ -672,7 +666,7 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockStop(IMFClockStateSink *i
     EnterCriticalSection(&renderer->cs);
     if (renderer->audio_client)
     {
-        if (renderer->state != STREAM_STATE_STOPPED)
+        if (renderer->clock_state != MFCLOCK_STATE_STOPPED)
         {
             if (SUCCEEDED(hr = IAudioClient_Stop(renderer->audio_client)))
             {
@@ -681,7 +675,7 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockStop(IMFClockStateSink *i
             }
             else
                 WARN("Failed to stop audio client, hr %#lx.\n", hr);
-            renderer->state = STREAM_STATE_STOPPED;
+            renderer->clock_state = MFCLOCK_STATE_STOPPED;
             renderer->flags &= ~SAR_PREROLLED;
         }
     }
@@ -702,13 +696,13 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockPause(IMFClockStateSink *
     TRACE("%p, %s.\n", iface, debugstr_time(systime));
 
     EnterCriticalSection(&renderer->cs);
-    if (renderer->state == STREAM_STATE_RUNNING)
+    if (renderer->clock_state == MFCLOCK_STATE_RUNNING)
     {
         if (renderer->audio_client)
         {
             if (FAILED(hr = IAudioClient_Stop(renderer->audio_client)))
                 WARN("Failed to stop audio client, hr %#lx.\n", hr);
-            renderer->state = STREAM_STATE_PAUSED;
+            renderer->clock_state = MFCLOCK_STATE_PAUSED;
         }
         else
             hr = MF_E_NOT_INITIALIZED;
@@ -733,11 +727,11 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockRestart(IMFClockStateSink
     EnterCriticalSection(&renderer->cs);
     if (renderer->audio_client)
     {
-        if ((preroll = (renderer->state != STREAM_STATE_RUNNING)))
+        if ((preroll = (renderer->clock_state != MFCLOCK_STATE_RUNNING)))
         {
             if (FAILED(hr = IAudioClient_Start(renderer->audio_client)))
                 WARN("Failed to start audio client, hr %#lx.\n", hr);
-            renderer->state = STREAM_STATE_RUNNING;
+            renderer->clock_state = MFCLOCK_STATE_RUNNING;
         }
     }
     else
@@ -766,7 +760,7 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockSetRate(IMFClockStateSink
 
     /* Nothing was requested while the rate was zero, so the render loop has no
      * outstanding request to piggyback on.  Ask for one sample here. */
-    if (resumed && renderer->state == STREAM_STATE_RUNNING && !(renderer->flags & SAR_SAMPLE_REQUESTED)
+    if (resumed && renderer->clock_state == MFCLOCK_STATE_RUNNING && !(renderer->flags & SAR_SAMPLE_REQUESTED)
             && renderer->queued_frames < renderer->max_frames)
     {
         IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkRequestSample,
@@ -1403,11 +1397,11 @@ static HRESULT WINAPI audio_renderer_stream_ProcessSample(IMFStreamSink *iface, 
         hr = MF_E_STREAMSINK_REMOVED;
     else
     {
-        if (renderer->state == STREAM_STATE_RUNNING)
+        if (renderer->clock_state == MFCLOCK_STATE_RUNNING)
             hr = stream_queue_sample(renderer, sample);
         renderer->flags &= ~SAR_SAMPLE_REQUESTED;
 
-        if (renderer->queued_frames < renderer->max_frames && renderer->state == STREAM_STATE_RUNNING
+        if (renderer->queued_frames < renderer->max_frames && renderer->clock_state == MFCLOCK_STATE_RUNNING
                 && renderer->rate != 0.0f)
         {
             IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkRequestSample,
