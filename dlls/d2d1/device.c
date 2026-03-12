@@ -2418,7 +2418,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
 
         memcpy(&parameters, layer_parameters, sizeof(*layer_parameters));
         parameters.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
-        d2d_command_list_push_layer(context->target.command_list, context, &parameters, layer);
+        d2d_command_list_push_layer(context->target.command_list, context, &parameters);
     }
 
     if (context->target.type == D2D_TARGET_BITMAP)
@@ -3908,7 +3908,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
     }
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
-        d2d_command_list_push_layer(context->target.command_list, context, layer_parameters, layer);
+        d2d_command_list_push_layer(context->target.command_list, context, layer_parameters);
 
     if (context->target.type == D2D_TARGET_BITMAP)
     {
