@@ -1376,6 +1376,8 @@ static void test_communication(void)
     ok(status == SEC_E_INCOMPLETE_MESSAGE, "Expected SEC_E_INCOMPLETE_MESSAGE, got %08lx\n", status);
     ok(buffers[0].pBuffers[0].BufferType == SECBUFFER_MISSING, "Expected first buffer to be SECBUFFER_MISSING\n");
     ok(buffers[0].pBuffers[0].cbBuffer == 5, "Expected first buffer to be a five bytes\n");
+    ok(buffers[0].pBuffers[1].BufferType == SECBUFFER_MISSING, "Unexpected buffer type\n");
+    ok(buffers[0].pBuffers[1].cbBuffer == 5, "Unexpected buffer size\n");
 
     /* Renegotiate */
     buffers[0].pBuffers[0].BufferType = SECBUFFER_DATA;
