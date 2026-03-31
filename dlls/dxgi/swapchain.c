@@ -234,6 +234,8 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
     if (!refcount)
     {
         IWineDXGIDevice *device = swapchain->device;
+        if (swapchain->frame_latency_event)
+            CloseHandle(swapchain->frame_latency_event);
         if (swapchain->target)
         {
             WARN("Releasing fullscreen swapchain.\n");
@@ -324,7 +326,16 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
     }
 
     if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, NULL, sync_interval, 0)))
+    {
+        /* Back-buffer copy for FLIP_SEQUENTIAL/FLIP_DISCARD is now handled
+         * inside the wined3d CS present handler (wined3d_cs_exec_present)
+         * to avoid a race with frame_latency_event. */
+
         InterlockedIncrement(&swapchain->present_count);
+
+        if (swapchain->frame_latency_event)
+            SetEvent(swapchain->frame_latency_event);
+    }
     return hr;
 }
 
@@ -626,7 +637,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetDesc1(IDXGISwapChain4 *iface
     wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &wined3d_desc);
     wined3d_mutex_unlock();
 
-    FIXME("Ignoring Stereo, Scaling and AlphaMode.\n");
+    FIXME("Ignoring Stereo and Scaling.\n");
 
     desc->Width = wined3d_desc.backbuffer_width;
     desc->Height = wined3d_desc.backbuffer_height;
@@ -638,7 +649,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetDesc1(IDXGISwapChain4 *iface
     desc->BufferCount = wined3d_desc.backbuffer_count;
     desc->Scaling = DXGI_SCALING_STRETCH;
     desc->SwapEffect = dxgi_swap_effect_from_wined3d(wined3d_desc.swap_effect);
-    desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    desc->AlphaMode = swapchain->alpha_mode;
     desc->Flags = dxgi_swapchain_flags_from_wined3d(wined3d_desc.flags);
 
     return S_OK;
@@ -708,8 +719,27 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_Present1(IDXGISwapChain4 *iface
     TRACE("iface %p, sync_interval %u, flags %#x, present_parameters %p.\n",
             iface, sync_interval, flags, present_parameters);
 
-    if (present_parameters)
-        FIXME("Ignored present parameters %p.\n", present_parameters);
+    /* Pass dirty rects to wined3d for partial GDI blit (DComp composition). */
+    if (present_parameters && present_parameters->DirtyRectsCount > 0
+            && present_parameters->pDirtyRects)
+    {
+        wined3d_swapchain_set_dirty_rects(swapchain->wined3d_swapchain,
+                present_parameters->pDirtyRects, present_parameters->DirtyRectsCount);
+
+        /* Signal the DComp timer handler that the app rendered new content.
+         * The timer will perform a micro-resize to force JUCE's
+         * CachedComponentImage to repaint (stale-UI workaround). */
+        if (swapchain->alpha_mode == DXGI_ALPHA_MODE_PREMULTIPLIED)
+        {
+            HWND hwnd = d3d11_swapchain_get_hwnd(swapchain);
+            if (hwnd)
+                SetPropW(hwnd, L"__wine_dcomp_content_changed", (HANDLE)1);
+        }
+    }
+    else
+    {
+        wined3d_swapchain_set_dirty_rects(swapchain->wined3d_swapchain, NULL, 0);
+    }
 
     return d3d11_swapchain_present(swapchain, sync_interval, flags);
 }
@@ -795,9 +825,18 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetMaximumFrameLatency(IDXGISwa
 
 static HANDLE STDMETHODCALLTYPE d3d11_swapchain_GetFrameLatencyWaitableObject(IDXGISwapChain4 *iface)
 {
-    FIXME("iface %p stub!\n", iface);
+    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
 
-    return NULL;
+    TRACE("iface %p.\n", iface);
+
+    if (!swapchain->frame_latency_event)
+    {
+        swapchain->frame_latency_event = CreateEventW(NULL, FALSE, TRUE, NULL);
+        FIXME("Created frame latency event %p for swapchain %p.\n",
+                swapchain->frame_latency_event, swapchain);
+    }
+
+    return swapchain->frame_latency_event;
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_swapchain_SetMatrixTransform(IDXGISwapChain4 *iface,
