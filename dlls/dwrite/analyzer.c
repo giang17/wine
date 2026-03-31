@@ -426,6 +426,12 @@ static void text_source_get_u32_char(struct text_source_context *context)
     available = context->chunk_length - context->cursor;
     text = context->text + context->cursor;
 
+    if (!text || !available)
+    {
+        context->ch = 0;
+        return;
+    }
+
     if (available > 1 && IS_HIGH_SURROGATE(*text) && IS_LOW_SURROGATE(*(text + 1)))
     {
         context->cursor += 2;
@@ -434,6 +440,11 @@ static void text_source_get_u32_char(struct text_source_context *context)
         return;
     }
 
+    if (!text)
+    {
+        context->ch = 0;
+        return;
+    }
     context->cursor++;
     context->consumed++;
     context->ch = *text;
