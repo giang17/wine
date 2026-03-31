@@ -1494,6 +1494,25 @@ BOOL d2d_brush_fill_cb(const struct d2d_brush *brush, struct d2d_brush_cb *cb)
 
             cb->u.bitmap.ignore_alpha = bitmap->format.alphaMode == D2D1_ALPHA_MODE_IGNORE;
 
+            /* Set source_rect as UV coordinates (0..1 range).
+             * For bitmap brushes: full texture (0,0)-(1,1).
+             * For image brushes: map source_rect pixels to UV. */
+            if (brush->type == D2D_BRUSH_TYPE_IMAGE
+                    && bitmap->pixel_size.width > 0 && bitmap->pixel_size.height > 0)
+            {
+                cb->u.bitmap.source_left = brush->u.image.source_rect.left / (float)bitmap->pixel_size.width;
+                cb->u.bitmap.source_top = brush->u.image.source_rect.top / (float)bitmap->pixel_size.height;
+                cb->u.bitmap.source_right = brush->u.image.source_rect.right / (float)bitmap->pixel_size.width;
+                cb->u.bitmap.source_bottom = brush->u.image.source_rect.bottom / (float)bitmap->pixel_size.height;
+            }
+            else
+            {
+                cb->u.bitmap.source_left = 0.0f;
+                cb->u.bitmap.source_top = 0.0f;
+                cb->u.bitmap.source_right = 1.0f;
+                cb->u.bitmap.source_bottom = 1.0f;
+            }
+
             if (image_bitmap)
                 ID2D1Bitmap_Release(image_bitmap);
 

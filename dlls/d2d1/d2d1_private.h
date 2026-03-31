@@ -69,6 +69,27 @@ struct d2d_clip_stack
     size_t count;
 };
 
+struct d2d_layer_info
+{
+    float opacity;
+    struct d2d_bitmap *prev_target;     /* saved original render target */
+    struct d2d_bitmap *layer_bitmap;    /* temporary render surface */
+    ID3D11BlendState *prev_bs;          /* saved blend state */
+    D2D1_SIZE_U prev_pixel_size;        /* saved pixel size */
+    ID2D1Geometry *mask_geometry;       /* geometric mask for compositing */
+    D2D1_MATRIX_3X2_F mask_transform;  /* transform applied to mask */
+    ID2D1Brush *opacity_brush;          /* per-pixel opacity mask brush */
+    BOOL clear_called;                  /* Clear() was called inside this layer */
+    BOOL bypass_layer;                  /* clip-only bypass: render directly on backbuffer */
+};
+
+struct d2d_layer_stack
+{
+    struct d2d_layer_info *stack;
+    size_t size;
+    size_t count;
+};
+
 struct d2d_error_state
 {
     HRESULT code;
@@ -112,6 +133,7 @@ struct d2d_brush_cb
             float _11, _21, _31, pad;
             float _12, _22, _32;
             BOOL ignore_alpha;
+            float source_left, source_top, source_right, source_bottom;
         } bitmap;
     } u;
 };
@@ -171,6 +193,12 @@ struct d2d_indexed_objects
     size_t count;
 };
 
+struct d2d_scratch_buffer
+{
+    ID3D11Buffer *buffer;
+    unsigned int size;
+};
+
 struct d2d_device_context
 {
     ID2D1DeviceContext6 ID2D1DeviceContext6_iface;
@@ -202,11 +230,17 @@ struct d2d_device_context
     ID3D11Buffer *vs_cb;
     ID3D11PixelShader *ps;
     ID3D11Buffer *ps_cb;
+    struct d2d_vs_cb vs_cb_cache;
+    BOOL vs_cb_cache_valid;
+    struct d2d_ps_cb ps_cb_cache;
+    BOOL ps_cb_cache_valid;
     ID3D11Buffer *ib;
     unsigned int vb_stride;
     ID3D11Buffer *vb;
     ID3D11RasterizerState *rs;
     ID3D11BlendState *bs;
+    struct d2d_scratch_buffer scratch_vb[D2D_SHAPE_TYPE_COUNT];
+    struct d2d_scratch_buffer scratch_ib[D2D_SHAPE_TYPE_COUNT];
     ID3D11SamplerState *sampler_states
             [D2D_SAMPLER_INTERPOLATION_MODE_COUNT]
             [D2D_SAMPLER_EXTEND_MODE_COUNT]
@@ -220,8 +254,19 @@ struct d2d_device_context
     D2D1_RENDER_TARGET_PROPERTIES desc;
     D2D1_SIZE_U pixel_size;
     struct d2d_clip_stack clip_stack;
+    struct d2d_layer_stack layer_stack;
 
     struct d2d_indexed_objects vertex_buffers;
+    BOOL has_element_layers;            /* context has had PushLayer with mask=NULL */
+
+    /* Stencil-based clipping for PushLayer bypass (Option D). */
+    ID3D11Texture2D *stencil_texture;
+    ID3D11DepthStencilView *stencil_dsv;
+    ID3D11DepthStencilState *stencil_write_state;   /* ALWAYS/REPLACE: write ref to stencil */
+    ID3D11DepthStencilState *stencil_test_state;    /* EQUAL/KEEP: pass where stencil==ref */
+    D2D1_SIZE_U stencil_size;                       /* current stencil buffer dimensions */
+    BOOL stencil_active;                            /* stencil test currently enabled */
+    BOOL stencil_writing;                           /* stencil write pass active */
 };
 
 HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,

@@ -2353,9 +2353,178 @@ static BOOL d2d_geometry_apply_intersections(struct d2d_geometry *geometry,
     return TRUE;
 }
 
-/* Intersect the geometry's segments with themselves. This uses the
- * straightforward approach of testing everything against everything, but
- * there certainly exist more scalable algorithms for this. */
+
+/* ---- Grid-accelerated self-intersection infrastructure (Phase 1) ---- */
+
+struct d2d_segment_desc
+{
+    struct d2d_segment_idx idx;
+    enum d2d_vertex_type type;
+    D2D_RECT_F bounds;
+    size_t flat_idx;  /* global segment index across all figures */
+};
+
+struct d2d_grid_entry
+{
+    size_t segment_idx;  /* index into segment_descs[] */
+    size_t next;         /* next entry in this cell, SIZE_MAX = end */
+};
+
+struct d2d_grid
+{
+    size_t *cells;                    /* cells[row * cols + col] = first grid_entry index */
+    struct d2d_grid_entry *entries;
+    size_t entry_count;
+    size_t entry_capacity;
+    size_t cols, rows;
+    float cell_w, cell_h;
+    float origin_x, origin_y;
+};
+
+static void d2d_segment_get_line_bounds(D2D_RECT_F *bounds,
+        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1)
+{
+    bounds->left   = min(p0->x, p1->x);
+    bounds->top    = min(p0->y, p1->y);
+    bounds->right  = max(p0->x, p1->x);
+    bounds->bottom = max(p0->y, p1->y);
+}
+
+static BOOL d2d_grid_init(struct d2d_grid *grid, const D2D_RECT_F *total_bounds,
+        size_t segment_count)
+{
+    float width, height, aspect;
+    size_t grid_size, i;
+
+    width  = total_bounds->right - total_bounds->left;
+    height = total_bounds->bottom - total_bounds->top;
+
+    if (width < 1e-6f) width = 1.0f;
+    if (height < 1e-6f) height = 1.0f;
+
+    /* Target ~4 segments per cell on average.
+     * cell_count ≈ segment_count / 4, distributed by aspect ratio. */
+    if (segment_count < 16)
+    {
+        grid->cols = 1;
+        grid->rows = 1;
+    }
+    else
+    {
+        float target_cells = (float)segment_count / 4.0f;
+        aspect = width / height;
+        grid->cols = (size_t)(sqrtf(target_cells * aspect) + 0.5f);
+        grid->rows = (size_t)(sqrtf(target_cells / aspect) + 0.5f);
+        if (grid->cols < 1) grid->cols = 1;
+        if (grid->rows < 1) grid->rows = 1;
+        if (grid->cols > 256) grid->cols = 256;
+        if (grid->rows > 256) grid->rows = 256;
+    }
+
+    grid->cell_w = width / (float)grid->cols;
+    grid->cell_h = height / (float)grid->rows;
+    grid->origin_x = total_bounds->left;
+    grid->origin_y = total_bounds->top;
+
+    grid_size = grid->cols * grid->rows;
+    grid->cells = calloc(grid_size, sizeof(*grid->cells));
+    if (!grid->cells)
+        return FALSE;
+    for (i = 0; i < grid_size; ++i)
+        grid->cells[i] = SIZE_MAX;
+
+    /* Allocate entry pool: each segment typically spans 1-4 cells.
+     * We use 8x as generous upper bound and grow if needed. */
+    grid->entry_capacity = segment_count * 8;
+    if (grid->entry_capacity < 64)
+        grid->entry_capacity = 64;
+    grid->entries = calloc(grid->entry_capacity, sizeof(*grid->entries));
+    if (!grid->entries)
+    {
+        free(grid->cells);
+        grid->cells = NULL;
+        return FALSE;
+    }
+    grid->entry_count = 0;
+
+    return TRUE;
+}
+
+static BOOL d2d_grid_insert(struct d2d_grid *grid, size_t segment_idx,
+        const D2D_RECT_F *bounds)
+{
+    size_t cx0, cy0, cx1, cy1, cx, cy, cell_idx;
+    struct d2d_grid_entry *entry;
+
+    /* Map AABB to grid cell range */
+    cx0 = (size_t)((bounds->left   - grid->origin_x) / grid->cell_w);
+    cy0 = (size_t)((bounds->top    - grid->origin_y) / grid->cell_h);
+    cx1 = (size_t)((bounds->right  - grid->origin_x) / grid->cell_w);
+    cy1 = (size_t)((bounds->bottom - grid->origin_y) / grid->cell_h);
+
+    /* Clamp to grid bounds (handles floating-point edge cases) */
+    if (cx0 >= grid->cols) cx0 = grid->cols - 1;
+    if (cy0 >= grid->rows) cy0 = grid->rows - 1;
+    if (cx1 >= grid->cols) cx1 = grid->cols - 1;
+    if (cy1 >= grid->rows) cy1 = grid->rows - 1;
+
+    for (cy = cy0; cy <= cy1; ++cy)
+    {
+        for (cx = cx0; cx <= cx1; ++cx)
+        {
+            /* Grow entry pool if needed */
+            if (grid->entry_count >= grid->entry_capacity)
+            {
+                size_t new_cap = grid->entry_capacity * 2;
+                struct d2d_grid_entry *new_entries = realloc(grid->entries,
+                        new_cap * sizeof(*new_entries));
+                if (!new_entries)
+                    return FALSE;
+                grid->entries = new_entries;
+                grid->entry_capacity = new_cap;
+            }
+
+            entry = &grid->entries[grid->entry_count];
+            entry->segment_idx = segment_idx;
+            cell_idx = cy * grid->cols + cx;
+            entry->next = grid->cells[cell_idx];
+            grid->cells[cell_idx] = grid->entry_count;
+            ++grid->entry_count;
+        }
+    }
+
+    return TRUE;
+}
+
+static void d2d_grid_destroy(struct d2d_grid *grid)
+{
+    free(grid->cells);
+    free(grid->entries);
+    memset(grid, 0, sizeof(*grid));
+}
+
+static BOOL d2d_segments_adjacent(const struct d2d_segment_desc *a,
+        const struct d2d_segment_desc *b, const struct d2d_geometry *geometry)
+{
+    size_t diff, n;
+
+    if (a->idx.figure_idx != b->idx.figure_idx)
+        return FALSE;
+
+    n = geometry->u.path.figures[a->idx.figure_idx].vertex_count;
+    if (a->idx.vertex_idx > b->idx.vertex_idx)
+        diff = a->idx.vertex_idx - b->idx.vertex_idx;
+    else
+        diff = b->idx.vertex_idx - a->idx.vertex_idx;
+
+    return (diff == 1 || diff == n - 1);
+}
+
+
+/* Intersect the geometry's segments with themselves. For small segment
+ * counts (< 16), use the straightforward O(n^2) approach. For larger
+ * geometries, build a uniform spatial grid and only test segment pairs
+ * that share at least one grid cell. */
 static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
 {
     struct d2d_geometry_intersections intersections = {0};
@@ -2365,70 +2534,283 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
     BOOL ret = FALSE;
     size_t max_q;
 
+    struct d2d_segment_desc *segment_descs = NULL;
+    size_t segment_count = 0, segment_capacity = 0;
+    struct d2d_grid grid = {0};
+    D2D_RECT_F total_bounds;
+    BOOL use_grid = FALSE;
+    BOOL *tested = NULL;
+
     if (!geometry->u.path.figure_count)
         return TRUE;
 
-    for (idx_p.figure_idx = 0; idx_p.figure_idx < geometry->u.path.figure_count; ++idx_p.figure_idx)
+    /* --- Step 1: Count segments and decide whether to use grid --- */
     {
-        figure_p = &geometry->u.path.figures[idx_p.figure_idx];
-        idx_p.control_idx = 0;
-        for (idx_p.vertex_idx = 0; idx_p.vertex_idx < figure_p->vertex_count; ++idx_p.vertex_idx)
+        size_t fi, vi;
+        for (fi = 0; fi < geometry->u.path.figure_count; ++fi)
         {
-            if ((type_p = figure_p->vertex_types[idx_p.vertex_idx]) == D2D_VERTEX_TYPE_END)
-                continue;
-
-            for (idx_q.figure_idx = 0; idx_q.figure_idx <= idx_p.figure_idx; ++idx_q.figure_idx)
+            const struct d2d_figure *fig = &geometry->u.path.figures[fi];
+            for (vi = 0; vi < fig->vertex_count; ++vi)
             {
-                figure_q = &geometry->u.path.figures[idx_q.figure_idx];
-                if (idx_q.figure_idx != idx_p.figure_idx)
-                {
-                    if (!d2d_rect_check_overlap(&figure_p->bounds, &figure_q->bounds))
-                        continue;
-                    if ((max_q = figure_q->vertex_count)
-                            && figure_q->vertex_types[max_q - 1] == D2D_VERTEX_TYPE_END)
-                        --max_q;
-                }
-                else
-                {
-                    max_q = idx_p.vertex_idx;
-                }
+                if (fig->vertex_types[vi] != D2D_VERTEX_TYPE_END)
+                    ++segment_capacity;
+            }
+        }
+    }
 
-                idx_q.control_idx = 0;
-                for (idx_q.vertex_idx = 0; idx_q.vertex_idx < max_q; ++idx_q.vertex_idx)
+    if (segment_capacity >= 16)
+    {
+        /* --- Step 2: Build segment descriptors with per-segment AABBs --- */
+        segment_descs = calloc(segment_capacity, sizeof(*segment_descs));
+        if (segment_descs)
+        {
+            size_t fi, vi, ci;
+
+            total_bounds.left = FLT_MAX;
+            total_bounds.top = FLT_MAX;
+            total_bounds.right = -FLT_MAX;
+            total_bounds.bottom = -FLT_MAX;
+
+            for (fi = 0; fi < geometry->u.path.figure_count; ++fi)
+            {
+                const struct d2d_figure *fig = &geometry->u.path.figures[fi];
+                ci = 0;
+                for (vi = 0; vi < fig->vertex_count; ++vi)
                 {
-                    type_q = figure_q->vertex_types[idx_q.vertex_idx];
-                    if (d2d_vertex_type_is_bezier(type_q))
+                    enum d2d_vertex_type vtype = fig->vertex_types[vi];
+                    if (vtype == D2D_VERTEX_TYPE_END)
+                        continue;
+
+                    if (segment_count < segment_capacity)
                     {
-                        if (d2d_vertex_type_is_bezier(type_p))
+                        struct d2d_segment_desc *desc = &segment_descs[segment_count];
+                        size_t next_vi = vi + 1;
+
+                        desc->idx.figure_idx = fi;
+                        desc->idx.vertex_idx = vi;
+                        desc->idx.control_idx = ci;
+                        desc->type = vtype;
+                        desc->flat_idx = segment_count;
+
+                        if (d2d_vertex_type_is_bezier(vtype))
                         {
-                            if (!d2d_geometry_intersect_bezier_bezier(geometry, &intersections,
-                                    &idx_p, 0.0f, 1.0f, &idx_q, 0.0f, 1.0f))
-                                goto done;
+                            d2d_rect_get_bezier_bounds(&desc->bounds,
+                                    &fig->vertices[vi],
+                                    &fig->bezier_controls[ci],
+                                    &fig->vertices[next_vi]);
                         }
                         else
                         {
-                            if (!d2d_geometry_intersect_bezier_line(geometry, &intersections, &idx_q, &idx_p))
-                                goto done;
+                            if (next_vi >= fig->vertex_count)
+                                next_vi = 0;
+                            d2d_segment_get_line_bounds(&desc->bounds,
+                                    &fig->vertices[vi],
+                                    &fig->vertices[next_vi]);
                         }
-                        ++idx_q.control_idx;
+
+                        d2d_rect_union(&total_bounds, &desc->bounds);
+                        ++segment_count;
                     }
-                    else
+
+                    if (d2d_vertex_type_is_bezier(vtype))
+                        ++ci;
+                }
+            }
+
+            /* --- Step 3: Build spatial grid --- */
+            if (segment_count >= 16 && d2d_grid_init(&grid, &total_bounds, segment_count))
+            {
+                size_t si;
+                use_grid = TRUE;
+                for (si = 0; si < segment_count; ++si)
+                {
+                    if (!d2d_grid_insert(&grid, si, &segment_descs[si].bounds))
                     {
-                        if (d2d_vertex_type_is_bezier(type_p))
+                        use_grid = FALSE;
+                        break;
+                    }
+                }
+            }
+
+            /* Allocate tested-array for duplicate avoidance */
+            if (use_grid)
+            {
+                tested = calloc(segment_count, sizeof(*tested));
+                if (!tested)
+                    use_grid = FALSE;
+            }
+        }
+    }
+
+    if (use_grid)
+    {
+        /* --- Grid-accelerated intersection loop --- */
+        size_t i, j;
+
+        for (i = 0; i < segment_count; ++i)
+        {
+            const struct d2d_segment_desc *desc_i = &segment_descs[i];
+            size_t cx0, cy0, cx1, cy1, cx, cy;
+
+            /* Clear tested flags for this outer iteration.
+             * Only clear entries that were actually set in previous iteration
+             * would be faster, but memset on segment_count bytes is cheap. */
+            memset(tested, 0, segment_count * sizeof(*tested));
+
+            /* Compute grid cell range for segment i */
+            cx0 = (size_t)((desc_i->bounds.left   - grid.origin_x) / grid.cell_w);
+            cy0 = (size_t)((desc_i->bounds.top    - grid.origin_y) / grid.cell_h);
+            cx1 = (size_t)((desc_i->bounds.right  - grid.origin_x) / grid.cell_w);
+            cy1 = (size_t)((desc_i->bounds.bottom - grid.origin_y) / grid.cell_h);
+            if (cx0 >= grid.cols) cx0 = grid.cols - 1;
+            if (cy0 >= grid.rows) cy0 = grid.rows - 1;
+            if (cx1 >= grid.cols) cx1 = grid.cols - 1;
+            if (cy1 >= grid.rows) cy1 = grid.rows - 1;
+
+            for (cy = cy0; cy <= cy1; ++cy)
+            {
+                for (cx = cx0; cx <= cx1; ++cx)
+                {
+                    size_t ei = grid.cells[cy * grid.cols + cx];
+
+                    while (ei != SIZE_MAX)
+                    {
+                        const struct d2d_grid_entry *entry = &grid.entries[ei];
+                        j = entry->segment_idx;
+                        ei = entry->next;
+
+                        /* Only test j < i to avoid duplicates (like original) */
+                        if (j >= i)
+                            continue;
+
+                        /* Skip if already tested via another shared cell */
+                        if (tested[j])
+                            continue;
+                        tested[j] = TRUE;
+
+                        /* Skip adjacent segments (share a vertex — endpoint
+                         * intersections are filtered by s/t strictly in (0,1)) */
+                        if (d2d_segments_adjacent(desc_i, &segment_descs[j], geometry))
+                            continue;
+
+                        /* Fine-grained AABB overlap check */
+                        if (!d2d_rect_check_overlap(&desc_i->bounds,
+                                &segment_descs[j].bounds))
+                            continue;
+
+                        /* Perform actual intersection test */
                         {
-                            if (!d2d_geometry_intersect_bezier_line(geometry, &intersections, &idx_p, &idx_q))
-                                goto done;
-                        }
-                        else
-                        {
-                            if (!d2d_geometry_intersect_line_line(geometry, &intersections, &idx_p, &idx_q))
-                                goto done;
+                            const struct d2d_segment_desc *desc_j = &segment_descs[j];
+
+                            if (d2d_vertex_type_is_bezier(desc_j->type))
+                            {
+                                if (d2d_vertex_type_is_bezier(desc_i->type))
+                                {
+                                    if (!d2d_geometry_intersect_bezier_bezier(geometry,
+                                            &intersections, &desc_i->idx, 0.0f, 1.0f,
+                                            &desc_j->idx, 0.0f, 1.0f))
+                                        goto done;
+                                }
+                                else
+                                {
+                                    if (!d2d_geometry_intersect_bezier_line(geometry,
+                                            &intersections, &desc_j->idx, &desc_i->idx))
+                                        goto done;
+                                }
+                            }
+                            else
+                            {
+                                if (d2d_vertex_type_is_bezier(desc_i->type))
+                                {
+                                    if (!d2d_geometry_intersect_bezier_line(geometry,
+                                            &intersections, &desc_i->idx, &desc_j->idx))
+                                        goto done;
+                                }
+                                else
+                                {
+                                    if (!d2d_geometry_intersect_line_line(geometry,
+                                            &intersections, &desc_i->idx, &desc_j->idx))
+                                        goto done;
+                                }
+                            }
                         }
                     }
                 }
             }
-            if (d2d_vertex_type_is_bezier(type_p))
-                ++idx_p.control_idx;
+        }
+    }
+    else
+    {
+        /* --- Original brute-force loop for small geometries --- */
+        for (idx_p.figure_idx = 0; idx_p.figure_idx < geometry->u.path.figure_count;
+                ++idx_p.figure_idx)
+        {
+            figure_p = &geometry->u.path.figures[idx_p.figure_idx];
+            idx_p.control_idx = 0;
+            for (idx_p.vertex_idx = 0; idx_p.vertex_idx < figure_p->vertex_count;
+                    ++idx_p.vertex_idx)
+            {
+                if ((type_p = figure_p->vertex_types[idx_p.vertex_idx]) == D2D_VERTEX_TYPE_END)
+                    continue;
+
+                for (idx_q.figure_idx = 0; idx_q.figure_idx <= idx_p.figure_idx;
+                        ++idx_q.figure_idx)
+                {
+                    figure_q = &geometry->u.path.figures[idx_q.figure_idx];
+                    if (idx_q.figure_idx != idx_p.figure_idx)
+                    {
+                        if (!d2d_rect_check_overlap(&figure_p->bounds, &figure_q->bounds))
+                            continue;
+                        if ((max_q = figure_q->vertex_count)
+                                && figure_q->vertex_types[max_q - 1] == D2D_VERTEX_TYPE_END)
+                            --max_q;
+                    }
+                    else
+                    {
+                        max_q = idx_p.vertex_idx;
+                    }
+
+                    idx_q.control_idx = 0;
+                    for (idx_q.vertex_idx = 0; idx_q.vertex_idx < max_q; ++idx_q.vertex_idx)
+                    {
+                        type_q = figure_q->vertex_types[idx_q.vertex_idx];
+                        if (d2d_vertex_type_is_bezier(type_q))
+                        {
+                            if (d2d_vertex_type_is_bezier(type_p))
+                            {
+                                if (!d2d_geometry_intersect_bezier_bezier(geometry,
+                                        &intersections, &idx_p, 0.0f, 1.0f,
+                                        &idx_q, 0.0f, 1.0f))
+                                    goto done;
+                            }
+                            else
+                            {
+                                if (!d2d_geometry_intersect_bezier_line(geometry,
+                                        &intersections, &idx_q, &idx_p))
+                                    goto done;
+                            }
+                            ++idx_q.control_idx;
+                        }
+                        else
+                        {
+                            if (d2d_vertex_type_is_bezier(type_p))
+                            {
+                                if (!d2d_geometry_intersect_bezier_line(geometry,
+                                        &intersections, &idx_p, &idx_q))
+                                    goto done;
+                            }
+                            else
+                            {
+                                if (!d2d_geometry_intersect_line_line(geometry,
+                                        &intersections, &idx_p, &idx_q))
+                                    goto done;
+                            }
+                        }
+                    }
+                }
+                if (d2d_vertex_type_is_bezier(type_p))
+                    ++idx_p.control_idx;
+            }
         }
     }
 
@@ -2437,6 +2819,9 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
     ret = d2d_geometry_apply_intersections(geometry, &intersections);
 
 done:
+    free(tested);
+    d2d_grid_destroy(&grid);
+    free(segment_descs);
     free(intersections.intersections);
     return ret;
 }
