@@ -311,6 +311,9 @@ system_fallback_config[] =
     /* Dingbats - 2700-27BF */
     { "2700-27BF",              L"Noto Sans Symbols2, Noto Sans Symbols 2" },
 
+    /* Miscellaneous Symbols and Arrows - 2B00-2BFF (includes U+2B50 star) */
+    { "2B00-2BFF",              L"Noto Sans Symbols2, Noto Sans Symbols 2, Symbola, FreeSans" },
+
     { "2C80-2CFF",              L"Noto Sans Coptic" },
     { "2D30-2D7F",              L"Noto Sans Tifinagh" },
 
