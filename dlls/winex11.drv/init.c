@@ -278,6 +278,11 @@ struct x11drv_client_surface
     HDC hdc_dst;
 };
 
+/* DComp micro-resize skip property (shared with window.c) */
+static const WCHAR dcomp_skip_config_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','s','k','i','p','_','x','1','1','_','c','o','n','f','i','g',0};
+static const WCHAR *dcomp_skip_config_prop = dcomp_skip_config_propW;
+
 static struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client )
 {
     return CONTAINING_RECORD( client, struct x11drv_client_surface, client );
@@ -320,6 +325,17 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     struct x11drv_win_data *data;
     int mask = 0;
     RECT rect;
+
+    /* DComp micro-resize optimisation: when the DComp code in dxgi performs
+     * a synthetic shrink+restore cycle to trigger JUCE's handleResize(),
+     * it sets this property to suppress the intermediate X11 resize.
+     * Skip the XConfigureWindow AND the surface->changes update so the
+     * restore SetWindowPos finds mask==0 and is a no-op too. */
+    if (NtUserGetProp( hwnd, dcomp_skip_config_prop ))
+    {
+        TRACE( "client_surface skip XConfigureWindow for DComp micro-resize, hwnd %p\n", hwnd );
+        return;
+    }
 
     if (NtUserGetPresentRect( hwnd, &rect, dpi )) OffsetRect( &rect, -rect.left, -rect.top );
     else if (!NtUserGetClientRect( hwnd, &rect, dpi )) return;

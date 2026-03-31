@@ -105,6 +105,15 @@ static const WCHAR clip_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
 static const WCHAR focus_time_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','f','o','c','u','s','_','t','i','m','e',0};
+static const WCHAR dcomp_skip_config_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','s','k','i','p','_','x','1','1','_','c','o','n','f','i','g',0};
+static const WCHAR *dcomp_skip_config_prop = dcomp_skip_config_propW;
+static const WCHAR dcomp_swapchain_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','s','w','a','p','c','h','a','i','n',0};
+static const WCHAR *dcomp_swapchain_prop = dcomp_swapchain_propW;
+static const WCHAR dcomp_deferred_map_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','d','e','f','e','r','r','e','d','_','m','a','p',0};
+static const WCHAR *dcomp_deferred_map_prop = dcomp_deferred_map_propW;
 
 static const char *debugstr_mwm_hints( const MwmHints *hints )
 {
@@ -526,13 +535,33 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
     attr->bit_gravity       = NorthWestGravity;
     attr->backing_store     = NotUseful;
     attr->border_pixel      = 0;
-    attr->background_pixel  = 0;
     attr->event_mask        = (ExposureMask | KeyPressMask | KeyReleaseMask |
                                FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask);
     /* for transparent windows, exclude mouse events to allow mouse pass-through */
     if (!(ex_style & WS_EX_TRANSPARENT)) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
                                                               ButtonReleaseMask | EnterWindowMask);
 
+    /* DComp windows: use None background_pixmap to avoid black flash on map.
+     * Without this, XMapWindow shows background_pixel=0 (black) for 1 frame
+     * before the first surface_flush writes content. With None, the X server
+     * does not paint any background, so the parent content shows through.
+     *
+     * Also enable backing_store = Always so the X server saves window content
+     * written via surface_flush (XPutImage).  When a popup/tooltip above this
+     * window is unmapped, the X server uses the saved backing store to repaint
+     * the exposed area immediately, avoiding a 1-frame flash of undefined
+     * content (garbage, terminal, white) that occurs with NotUseful because
+     * the client has not yet processed the Expose event. */
+    if (NtUserGetProp( data->hwnd, dcomp_swapchain_prop ))
+    {
+        TRACE( "using None background_pixmap + Always backing_store for DComp window %p\n", data->hwnd );
+        attr->background_pixmap = None;
+        attr->backing_store = Always;
+        return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixmap |
+                CWEventMask | CWBitGravity | CWBackingStore);
+    }
+
+    attr->background_pixel  = 0;
     return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
             CWEventMask | CWBitGravity | CWBackingStore);
 }
@@ -1632,7 +1661,19 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     case MAKELONG(NormalState, WithdrawnState):
     case MAKELONG(IconicState, WithdrawnState):
         if (data->embedded) set_xembed_flags( data, 0 );
-        else if (!data->managed) XUnmapWindow( data->display, data->whole_window );
+        else if (!data->managed)
+        {
+            /* Sync gdi_display before unmapping so any pending surface flush
+             * (XPutImage on gdi_display) from sibling DComp windows is
+             * completed by the X server before it processes the unmap.
+             * Without this, the X server may show stale backing-store content
+             * for the exposed area beneath the unmapped window, producing a
+             * 1-frame flash visible as popup/tooltip close flicker.
+             * (Same pattern as destroy_whole_window which does XSync before
+             * XDestroyWindow.) */
+            XSync( gdi_display, False );
+            XUnmapWindow( data->display, data->whole_window );
+        }
         else XWithdrawWindow( data->display, data->whole_window, data->vis.screen );
         break;
     case MAKELONG(NormalState, IconicState):
@@ -2129,6 +2170,14 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
     RECT new_rect, window_rect;
     BOOL above = FALSE;
 
+    /* DComp micro-resize optimisation: when the DComp code performs a
+     * synthetic shrink+restore cycle to trigger JUCE's handleResize(),
+     * it sets this property to suppress the intermediate X11
+     * ConfigureWindow request.  The window stays at its current X11
+     * size while the Win32 side sees the temporary size change. */
+    if (NtUserGetProp( data->hwnd, dcomp_skip_config_prop ))
+        return;
+
     if (data->managed && ((style & WS_MINIMIZE) || data->desired_state.wm_state == IconicState)) return;
 
     if (!(swp_flags & SWP_NOZORDER) || (swp_flags & SWP_SHOWWINDOW))
@@ -2147,6 +2196,18 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
     update_net_wm_states( data );
 
     new_rect = data->rects.visible;
+
+    /* For WS_CHILD windows with forced whole_window (non-desktop parent),
+     * data->rects.visible is parent-relative but window_set_config passes
+     * it through virtual_screen_to_root which expects screen coordinates.
+     * Convert to screen coords so the X11 window position is correct. */
+    if ((style & WS_CHILD) && data->whole_window)
+    {
+        HWND parent = NtUserGetAncestor( data->hwnd, GA_PARENT );
+        if (parent && parent != NtUserGetDesktopWindow())
+            NtUserMapWindowPoints( parent, 0, (POINT *)&new_rect, 2,
+                    NtUserGetWinMonitorDpi( data->hwnd, MDT_RAW_DPI ) );
+    }
 
     /* if the window has been moved offscreen by the window manager, we didn't tell the Win32 side about it */
     window_rect = window_rect_from_visible( old_rects, data->desired_state.rect );
@@ -3544,6 +3605,73 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         return 0;
     case WM_X11DRV_ADD_TAB:
         taskbar_add_tab( hwnd );
+        return 0;
+    case WM_X11DRV_CREATE_WHOLE_WINDOW:
+        if ((data = get_win_data( hwnd )))
+        {
+            if (!data->whole_window)
+            {
+                Window old_client = data->client_window;
+                HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+
+                FIXME( "Creating whole_window for hwnd %p visible=(%ld,%ld)-(%ld,%ld)"
+                        " %ldx%ld client_window=%lx.\n", hwnd,
+                        data->rects.visible.left, data->rects.visible.top,
+                        data->rects.visible.right, data->rects.visible.bottom,
+                        data->rects.visible.right - data->rects.visible.left,
+                        data->rects.visible.bottom - data->rects.visible.top,
+                        old_client );
+                create_whole_window( data );
+                if (data->whole_window)
+                {
+                    FIXME( "whole_window %lx created, pending=(%ld,%ld)-(%ld,%ld).\n",
+                            data->whole_window,
+                            data->pending_state.rect.left, data->pending_state.rect.top,
+                            data->pending_state.rect.right, data->pending_state.rect.bottom );
+
+                    /* Fix X11 position and background for forced WS_CHILD whole_window.
+                     * 1) data->rects.visible is parent-relative for children but
+                     *    virtual_screen_to_root expects screen coords. Map and reposition.
+                     * 2) create_whole_window sets background_pixel=0 (black). Clear
+                     *    the background so the GL client_window content shows through. */
+                    if (parent && parent != NtUserGetDesktopWindow())
+                    {
+                        RECT screen_rect = data->rects.visible;
+                        UINT dpi = NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI );
+                        XSetWindowAttributes attrs;
+                        POINT pos;
+
+                        NtUserMapWindowPoints( parent, 0, (POINT *)&screen_rect, 2, dpi );
+                        pos = virtual_screen_to_root( screen_rect.left, screen_rect.top );
+                        XMoveWindow( gdi_display, data->whole_window, pos.x, pos.y );
+
+                        /* Remove black background — let GL client_window show through */
+                        attrs.background_pixmap = None;
+                        XChangeWindowAttributes( gdi_display, data->whole_window,
+                                CWBackPixmap, &attrs );
+
+                        FIXME( "Fixed child: screen=(%ld,%ld) x11=(%d,%d) bg=None.\n",
+                                screen_rect.left, screen_rect.top, pos.x, pos.y );
+                    }
+
+                    /* Reparent existing GL client window from dummy_parent
+                     * into the new whole_window. Without this, the GL drawable
+                     * stays inside the 1x1 dummy parent and all content is clipped. */
+                    if (old_client)
+                    {
+                        int x = data->rects.client.left - data->rects.visible.left;
+                        int y = data->rects.client.top - data->rects.visible.top;
+                        FIXME( "Reparenting client_window %lx into whole_window %lx at %d,%d.\n",
+                                old_client, data->whole_window, x, y );
+                        XReparentWindow( gdi_display, old_client, data->whole_window, x, y );
+                        XMapWindow( gdi_display, old_client );
+                        client_window_events_enable( data, old_client );
+                        XFlush( gdi_display );
+                    }
+                }
+            }
+            release_win_data( data );
+        }
         return 0;
     default:
         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );

@@ -1548,6 +1548,18 @@ BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *xev )
     input.mi.time        = EVENT_x11_time_to_win32_time( event->time );
     input.mi.dwExtraInfo = 0;
 
+    if (!hwnd)
+    {
+        /* Fallback for windows without an X11 window (e.g. reparented child).
+         * Use root coordinates and let Win32 hit-testing find the target. */
+        POINT pt = root_to_virtual_screen( event->x_root, event->y_root );
+        input.type = INPUT_MOUSE;
+        input.mi.dx = pt.x;
+        input.mi.dy = pt.y;
+        NtUserSendHardwareInput( 0, 0, &input, 0 );
+        return TRUE;
+    }
+
     if ((data = get_win_data( hwnd )))
     {
         window_set_user_time( data, event->time, FALSE );
@@ -1579,6 +1591,16 @@ BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *xev )
     input.mi.dwFlags     = button_up_flags[buttonNum] | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
     input.mi.time        = EVENT_x11_time_to_win32_time( event->time );
     input.mi.dwExtraInfo = 0;
+
+    if (!hwnd)
+    {
+        POINT pt = root_to_virtual_screen( event->x_root, event->y_root );
+        input.type = INPUT_MOUSE;
+        input.mi.dx = pt.x;
+        input.mi.dy = pt.y;
+        NtUserSendHardwareInput( 0, 0, &input, 0 );
+        return TRUE;
+    }
 
     map_event_coords( hwnd, event->window, event->root, event->x_root, event->y_root, &input );
     send_mouse_input( hwnd, event->window, event->state, &input );
