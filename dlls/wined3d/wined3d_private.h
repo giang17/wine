@@ -3104,6 +3104,13 @@ struct wined3d_device
     UINT context_count;
 
     CRITICAL_SECTION bo_map_lock;
+
+    /* Pool of freed wined3d_bo_gl structs for recycling.
+     * Reduces malloc/free churn from Map(WRITE_DISCARD).
+     * Protected by bo_map_lock. */
+    struct wined3d_bo *bo_gl_free_pool;
+    SIZE_T bo_gl_free_pool_count;
+#define WINED3D_BO_GL_FREE_POOL_MAX 256
 };
 
 void wined3d_device_cleanup(struct wined3d_device *device);
@@ -4122,6 +4129,31 @@ struct wined3d_swapchain
     struct wined3d_swapchain_state state;
     HWND win_handle;
     HDC dc;
+
+    /* DComp dirty rect tracking for Present1 */
+    RECT present_dirty_rects[16];
+    unsigned int present_dirty_rect_count;
+    HWND last_blit_window;
+
+    /* DComp composition buffer (persistent, for dirty-rect accumulation) */
+    HDC comp_dc;
+    HBITMAP comp_bitmap;
+    HGDIOBJ comp_old_bitmap;
+    DWORD *comp_bits;
+    unsigned int comp_width;
+    unsigned int comp_height;
+
+    /* Per-visual surface buffer (persistent, separate from comp_buffer) */
+    DWORD *surface_bits;
+    unsigned int surface_width;
+    unsigned int surface_height;
+    BOOL surface_valid;
+
+    /* Set TRUE after a real Present1 with dirty rects updates comp_dc.
+     * Cleared after the no-dirty-rect path reads back the buffer.
+     * When FALSE, the no-dirty-rect path skips the expensive GPU readback
+     * + StretchBlt and just re-blits the existing comp_dc to the window. */
+    BOOL comp_buffer_dirty;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);
