@@ -73,6 +73,18 @@ Everything in `d2d1-v6` plus:
 | Korg Prophecy (VST3 in Reaper) | Fully functional |
 | WineSynth (custom VSTGUI plugin) | 18k+ partial redraws without crash |
 
+## Font Setup
+
+The DWrite patches fix font rendering in VSTGUI-based plugins, but some applications
+also require system fonts to be configured correctly (Unicode symbols, GDI menus).
+
+See **[documentation/wine-font-setup-guide.md](documentation/wine-font-setup-guide.md)**
+for a step-by-step guide covering:
+
+- Installing `NotoSansSymbols2` and `DejaVuSans` into the Wine prefix
+- Setting GDI `FontLink` registry entries for correct menu symbol rendering
+- Working around the missing `BitPDisp-10` tooltip font in Serum2
+
 ## Related
 
 - Discussion: [yabridge#413](https://github.com/robbert-vdh/yabridge/issues/413)
