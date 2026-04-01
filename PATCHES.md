@@ -53,7 +53,9 @@ Everything in `d2d1-v6` plus:
 
 - **DComp**: IDCompositionDesktopDevice implementation with D2D1 bitmap rendering path,
   dirty-rect clipping, DIB+BitBlt presentation (9 phases)
-- **DWrite**: Rendering mode 5 fix, IDWriteFontSet::GetMatchingFonts implementation
+- **DWrite**: Rendering mode 5 fix, IDWriteFontSet::GetMatchingFonts implementation,
+  font fallback mapping for Miscellaneous Symbols and Arrows (U+2B00-2BFF, fixes star
+  rating display in Serum2)
 - **DXGI**: Composition swapchain, FLIP_SEQUENTIAL preservation, DComp popup handling,
   micro-resize for stale UI
 - **WineD3D**: Composition buffer with dirty rect accumulation, GL buffer recycling pool
