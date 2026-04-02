@@ -11,45 +11,12 @@ Korg Trinity, Korg Prophecy) running in DAWs (Reaper) via Wine.
 
 | Branch | Description |
 |--------|-------------|
-| `d2d1-v6` | 15 D2D1 rendering patches (standalone, upstream-suitable) |
-| `d2d1-dcomp-11.0` | Full stack: D2D1 + DComp + DWrite + WineD3D performance + winex11 |
-
-## D2D1 Patches (Branch: `d2d1-v6`)
-
-15 patches fixing core D2D1 rendering issues:
-
-1. **AddArc implementation** -- path geometry arc segments
-2. **Font rendering** -- force NATURAL rendering mode for better quality
-3. **CDT iterative conversion** -- convert recursive constrained Delaunay triangulation to iterative
-4. **Miter limit clamping** -- stroke outline miter limit support
-5. **Shader-based antialiasing** -- smooth edges for geometry rendering (fill + outline)
-6. **Text rendering fix** -- fix interaction between shader AA and text rendering
-7. **CDT cycle detection** -- replace blind iteration guard with proper cycle detection
-8. **Stroke outline join fix** -- fix spike artifacts from collinear/hairpin joins
-9. **Debug marker cleanup** -- remove debug markers from geometry sink
-10. **Stroke style rate-limit** -- rate-limit stroke style FIXME messages
-11. **CDT bailout removal** -- remove 512-vertex CDT bailout (protected by cycle detection)
-12. **CDT segment skip** -- skip failed constraints instead of aborting triangulation
-13. **CDT diagnostic rate-limit** -- rate-limit collinear cycle detection diagnostics
-14. **Outline edge AA** -- anti-aliasing for straight line outline edges
-15. **Gradient premultiply** -- premultiply alpha in gradient stop colors for correct blending
-
-These patches are self-contained and applicable to vanilla Wine 11.0 with `git am` or `patch -p1`.
-
-### Applying
-
-```bash
-git clone https://github.com/giang17/wine.git
-cd wine
-git checkout d2d1-v6
-./configure --prefix=/usr/local --enable-win64
-make -j$(nproc)
-sudo make install
-```
+| `d2d1-dcomp-11.0` | **Recommended.** Full stack: D2D1 + DComp + DWrite + WineD3D performance + winex11 |
+| `d2d1-v6` | 15 D2D1 rendering patches only (upstream reference, see below) |
 
 ## Full Stack (Branch: `d2d1-dcomp-11.0`)
 
-Everything in `d2d1-v6` plus:
+This is the recommended branch. It includes all 15 D2D1 patches plus:
 
 - **DComp**: IDCompositionDesktopDevice implementation with D2D1 bitmap rendering path,
   dirty-rect clipping, DIB+BitBlt presentation (9 phases)
@@ -79,7 +46,7 @@ sudo make install
 64-bit DLLs (including d2d1) will be missing. Use a separate `--prefix` to avoid overwriting
 your distro's Wine installation.
 
-Run Serum2 with WineD3D (not DXVK) for best D2D1 performance:
+Run plugins with WineD3D (not DXVK) for best D2D1 performance:
 
 ```bash
 WINEDLLOVERRIDES="d3d11,dxgi,d3d10core,d3d9=b" /opt/wine-d2d1/bin/wine reaper.exe
@@ -111,6 +78,32 @@ for a step-by-step guide covering:
 - Installing `NotoSansSymbols2` and `DejaVuSans` into the Wine prefix
 - Setting GDI `FontLink` registry entries for correct menu symbol rendering
 - Working around the missing `BitPDisp-10` tooltip font in Serum2
+
+## D2D1 Patches Only (Branch: `d2d1-v6`)
+
+This branch contains only the 15 D2D1 rendering patches without DComp, DWrite, or
+performance fixes. It is maintained as a clean upstream reference for potential
+submission to Wine upstream. **For normal use, prefer `d2d1-dcomp-11.0` above.**
+
+15 patches fixing core D2D1 rendering issues:
+
+1. **AddArc implementation** -- path geometry arc segments
+2. **Font rendering** -- force NATURAL rendering mode for better quality
+3. **CDT iterative conversion** -- convert recursive constrained Delaunay triangulation to iterative
+4. **Miter limit clamping** -- stroke outline miter limit support
+5. **Shader-based antialiasing** -- smooth edges for geometry rendering (fill + outline)
+6. **Text rendering fix** -- fix interaction between shader AA and text rendering
+7. **CDT cycle detection** -- replace blind iteration guard with proper cycle detection
+8. **Stroke outline join fix** -- fix spike artifacts from collinear/hairpin joins
+9. **Debug marker cleanup** -- remove debug markers from geometry sink
+10. **Stroke style rate-limit** -- rate-limit stroke style FIXME messages
+11. **CDT bailout removal** -- remove 512-vertex CDT bailout (protected by cycle detection)
+12. **CDT segment skip** -- skip failed constraints instead of aborting triangulation
+13. **CDT diagnostic rate-limit** -- rate-limit collinear cycle detection diagnostics
+14. **Outline edge AA** -- anti-aliasing for straight line outline edges
+15. **Gradient premultiply** -- premultiply alpha in gradient stop colors for correct blending
+
+These patches are self-contained and applicable to vanilla Wine 11.0 with `git am` or `patch -p1`.
 
 ## Related
 
