@@ -64,6 +64,33 @@ Everything in `d2d1-v6` plus:
 - **winex11**: DComp window support, backing store, micro-resize suppression
 - **shell32**: VirtualDesktopManager COM stub
 
+### Building
+
+```bash
+git clone https://github.com/giang17/wine.git
+cd wine
+git checkout d2d1-dcomp-11.0
+./configure --prefix=/opt/wine-d2d1 --enable-win64
+make -j$(nproc)
+sudo make install
+```
+
+**Important**: The `--enable-win64` flag is required — without it only 32-bit is built and
+64-bit DLLs (including d2d1) will be missing. Use a separate `--prefix` to avoid overwriting
+your distro's Wine installation.
+
+Run Serum2 with WineD3D (not DXVK) for best D2D1 performance:
+
+```bash
+WINEDLLOVERRIDES="d3d11,dxgi,d3d10core,d3d9=b" /opt/wine-d2d1/bin/wine reaper.exe
+```
+
+To verify the patches are working, start with fallback settings in Serum2:
+- `"Disable DirectComposition": true`
+- `"Disable Partial Redraw": true`
+
+Once confirmed working, switch to the full DComp path (`false` / `false`) for better performance.
+
 ## Tested Applications
 
 | Application | Status |
