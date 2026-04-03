@@ -1,18 +1,94 @@
 # Wine Font Setup Guide (Container + Host)
 
 Guide for setting up fonts for correct Unicode symbol rendering in Wine
-(Serum2 rating stars, menu arrows, etc.).
+(Serum2 rating stars, menu arrows, etc.) and for preventing plugin crashes
+caused by missing system fonts.
 
 ## Prerequisites
 
 Required font files (available on the host):
 - `DejaVuSans.ttf` — `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`
 - `NotoSansSymbols2-Regular.ttf` — `/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf`
+- **MS Core Fonts** (Arial, Verdana, Times New Roman, etc.) — `/usr/share/fonts/truetype/msttcorefonts/`
 
 If not present:
 ```bash
-sudo apt install fonts-dejavu-core fonts-noto-core
+sudo apt install fonts-dejavu-core fonts-noto-core ttf-mscorefonts-installer
 ```
+
+## 0. MS Core Fonts (Arial, Verdana, etc.) — CRITICAL for Plugin Stability
+
+**Problem (discovered 2026-04-03):** Some plugins ship their own D3D9/OpenGL rendering
+engine (`engine_x64.dll`) that loads fonts directly by file path from
+`C:\windows\Fonts\` during DLL initialization. If the expected font file is missing,
+the engine returns a NULL font object and crashes immediately with an Access Violation
+(`c0000005`) before any rendering occurs. The plugin reports as "failed to initialize"
+with no useful error message.
+
+**Known affected plugin:** FL Studio "Fruity Delay 3" — `engine_x64.dll` requires
+`Arialbd.ttf` (Arial Bold) and `Verdana.ttf`. Without these fonts, the plugin crashes
+on load.
+
+**Root cause:** The engine uses `PathFileExistsW("C:/windows/Fonts/Arialbd.ttf")` and
+`CreateFileW("C:\\windows\\Fonts\\Verdana.ttf")` — direct file system access, not
+GDI/DWrite font enumeration. The font files must physically exist in the Wine Fonts
+directory.
+
+**Important:** Wine does NOT auto-register fonts from the Fonts directory into the
+registry. `wineboot -u` does not pick them up either. Manual registry entries are needed
+for programs using GDI font APIs.
+
+### Fix (Host)
+
+```bash
+# 1. Copy all MS Core Fonts to Wine prefix:
+cp /usr/share/fonts/truetype/msttcorefonts/*.ttf ~/.wine/drive_c/windows/Fonts/
+
+# 2. Register in Windows Font registry (for GDI/DWrite access):
+for f in /usr/share/fonts/truetype/msttcorefonts/*.ttf; do
+  name=$(basename "$f" .ttf)
+  wine reg add "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" \
+    /v "$name (TrueType)" /t REG_SZ /d "$(basename "$f")" /f 2>/dev/null
+done
+```
+
+### Fix (Container)
+
+```bash
+# 1. Copy fonts into container:
+for f in /usr/share/fonts/truetype/msttcorefonts/*.ttf; do
+  docker cp "$f" wine-test-11.0-container:/home/wine/.wine/drive_c/windows/Fonts/
+done
+
+# 2. Register in registry:
+docker exec wine-test-11.0-container bash -c '
+  for f in /home/wine/.wine/drive_c/windows/Fonts/[Aa]rial*.ttf \
+           /home/wine/.wine/drive_c/windows/Fonts/[Vv]erdana*.ttf \
+           /home/wine/.wine/drive_c/windows/Fonts/[Tt]imes*.ttf \
+           /home/wine/.wine/drive_c/windows/Fonts/[Cc]our*.ttf; do
+    name=$(basename "$f" .ttf)
+    wine reg add "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" \
+      /v "$name (TrueType)" /t REG_SZ /d "$(basename "$f")" /f 2>/dev/null
+  done
+'
+```
+
+### Debugging font-related plugin crashes
+
+If a plugin fails to initialize with no error message, check for missing fonts:
+
+```bash
+# Run with relay trace, filter for the plugin's thread:
+WINEDEBUG=+relay,+loaddll,+seh wine "/path/to/DAW.exe" 2>&1 | tee /tmp/debug.log
+
+# After crash, look for PathFileExistsW/CreateFileW calls to Fonts/:
+grep "PathFileExistsW\|CreateFileW.*Fonts" /tmp/debug.log | grep "retval=00000000\|retval=fffff"
+```
+
+Signs of a font-related crash:
+- `PathFileExistsW(... L"C:/windows/Fonts/SomeFont.ttf")` returning 0
+- `CreateFileW(... L"C:\\windows\\Fonts\\SomeFont.ttf")` returning `ffffffffffffffff`
+- Followed immediately by `EXCEPTION_ACCESS_VIOLATION` with `info[1]` near 0x00 (NULL+offset)
 
 ## 1. Installing Fonts into the Test Container
 
@@ -163,10 +239,11 @@ docker exec wine-test-11.0-container bash -c '
 ```
 
 
-**Summary:** Two separate rendering paths, two separate fixes:
+**Summary:** Three separate rendering paths, three separate fixes:
 
 | Path | Font | Fix |
 |------|------|-----|
+| Direct file access (plugin engines) | Arial, Verdana, etc. | Copy MS Core Fonts to `Fonts/` + registry |
 | DWrite/D2D1 (VSTGUI GUI) | BarlowSemiCondensed | `analyzer.c` fallback mapping 2B00–2BFF |
 | GDI (native Win32 menus) | Tahoma → DejaVu Sans | FontLink registry → Noto Sans Symbols2 |
 | Serum2 tooltips | BitPDisp-10 (proprietary) | DejaVu Sans Mono with renamed family name |
