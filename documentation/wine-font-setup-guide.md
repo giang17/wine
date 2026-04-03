@@ -155,13 +155,26 @@ docker exec wine-test-11.0-container bash -c '
 
 ## 2. Setting GDI FontLink Registry Entries
 
+> **WARNING: `wineboot -u` overwrites FontLink entries!**
+> Wine's `wineboot -u` resets the Tahoma FontLink to Windows defaults (CJK fallbacks
+> only), removing our DejaVu Sans / Noto Sans Symbols2 entries. This causes Serum2
+> rating stars to revert to tofu boxes. **Re-run the commands below after every
+> `wineboot -u`** (discovered 2026-04-03 on the host after MS Core Font registration
+> triggered a wineboot).
+
+The commands below place our custom entries **before** the standard CJK fallbacks,
+so they are tried first for symbol glyphs (stars, arrows).
+
+### Container
+
 ```bash
 docker exec wine-test-11.0-container bash -c '
   # Tahoma (system menu font) → DejaVu Sans (arrows) + Noto Sans Symbols2 (stars)
+  # followed by standard CJK fallbacks
   wine reg add \
     "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" \
     /v "Tahoma" /t REG_MULTI_SZ \
-    /d "DejaVuSans.ttf,DejaVu Sans\0NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f
+    /d "DejaVuSans.ttf,DejaVu Sans\0NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2\0MSGOTHIC.TTC,MS UI Gothic\0MINGLIU.TTC,PMingLiU\0SIMSUN.TTC,SimSun\0GULIM.TTC,Gulim\0YUGOTHM.TTC,Yu Gothic UI\0MSJH.TTC,Microsoft JhengHei UI\0MSYH.TTC,Microsoft YaHei UI\0MALGUN.TTF,Malgun Gothic\0SEGUISYM.TTF,Segoe UI Symbol" /f
 
   # DejaVu Sans itself → Noto Sans Symbols2 (for missing symbols)
   wine reg add \
@@ -169,6 +182,20 @@ docker exec wine-test-11.0-container bash -c '
     /v "DejaVu Sans" /t REG_MULTI_SZ \
     /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f
 '
+```
+
+### Host
+
+```bash
+wine reg add \
+  "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" \
+  /v "Tahoma" /t REG_MULTI_SZ \
+  /d "DejaVuSans.ttf,DejaVu Sans\0NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2\0MSGOTHIC.TTC,MS UI Gothic\0MINGLIU.TTC,PMingLiU\0SIMSUN.TTC,SimSun\0GULIM.TTC,Gulim\0YUGOTHM.TTC,Yu Gothic UI\0MSJH.TTC,Microsoft JhengHei UI\0MSYH.TTC,Microsoft YaHei UI\0MALGUN.TTF,Malgun Gothic\0SEGUISYM.TTF,Segoe UI Symbol" /f
+
+wine reg add \
+  "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" \
+  /v "DejaVu Sans" /t REG_MULTI_SZ \
+  /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f
 ```
 
 ## 3. Verification
@@ -207,20 +234,8 @@ On the host, fonts are typically already installed. Only the DWrite patch
 (`dlls/dwrite/analyzer.c`, commit `31a8676`) needs to be included in the Wine
 installation.
 
-FontLink entries for the host (custom Wine under `/usr/local/`):
-
-```bash
-# If necessary — host Wine uses the user's WINEPREFIX:
-WINEPREFIX=/home/$USER/.wine wine reg add \
-  "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" \
-  /v "Tahoma" /t REG_MULTI_SZ \
-  /d "DejaVuSans.ttf,DejaVu Sans\0NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f
-
-WINEPREFIX=/home/$USER/.wine wine reg add \
-  "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" \
-  /v "DejaVu Sans" /t REG_MULTI_SZ \
-  /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f
-```
+FontLink entries for the host: see Section 2 above (Host subsection).
+The same `wineboot -u` caveat applies — re-run after any wineboot.
 
 ## Rollback (in Case of Problems)
 
