@@ -2011,7 +2011,8 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
         {
             static int once;
             if (!once++)
-                FIXME("Geometric mask not implemented (old PushLayer).\n");
+                TRACE("Geometric mask in old PushLayer (mask=%p, maskAA=%u).\n",
+                        layer_parameters->geometricMask, layer_parameters->maskAntialiasMode);
         }
 
         /* Transform contentBounds to device coordinates for scissor clip. */
@@ -2044,7 +2045,8 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
          * temporary layer_bitmap, so Clear() and drawPopupMenuBackground both go
          * directly to the backbuffer — fixing the hover persistence + black bg. */
         if (layer_parameters->geometricMask && !context->has_element_layers
-                && layer_parameters->opacity >= 1.0f && !layer_parameters->opacityBrush)
+                && layer_parameters->opacity >= 1.0f && !layer_parameters->opacityBrush
+                && layer_parameters->maskAntialiasMode != D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
         {
             D2D1_RECT_F mask_clip;
             const struct d2d_geometry *mask_geo;
@@ -2158,6 +2160,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
             /* Save current state. */
             memset(&info, 0, sizeof(info));
             info.opacity = layer_parameters->opacity;
+            info.mask_aa_mode = layer_parameters->maskAntialiasMode;
             info.prev_target = context->target.bitmap;
             ID2D1Bitmap1_AddRef(&info.prev_target->ID2D1Bitmap1_iface);
             info.prev_pixel_size = context->pixel_size;
@@ -2312,10 +2315,19 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                     d2d_matrix_multiply(&context->drawing_state.transform,
                             &info.mask_transform);
 
-                    d2d_device_context_FillGeometry(
-                            &context->ID2D1DeviceContext6_iface,
-                            info.mask_geometry,
-                            &mask_brush->ID2D1Brush_iface, NULL);
+                    /* Use the stored maskAntialiasMode for compositing so
+                     * the mask geometry edges are properly antialiased. */
+                    {
+                        D2D1_ANTIALIAS_MODE prev_aa = context->drawing_state.antialiasMode;
+                        context->drawing_state.antialiasMode = info.mask_aa_mode;
+
+                        d2d_device_context_FillGeometry(
+                                &context->ID2D1DeviceContext6_iface,
+                                info.mask_geometry,
+                                &mask_brush->ID2D1Brush_iface, NULL);
+
+                        context->drawing_state.antialiasMode = prev_aa;
+                    }
 
                     context->drawing_state.transform = saved_transform;
                     ID2D1Brush_Release(&mask_brush->ID2D1Brush_iface);
@@ -3449,7 +3461,8 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
         /* Clip-only bypass for non-element-layer contexts (e.g. popup menus).
          * Render directly on backbuffer with stencil-based geometry clipping. */
         if (layer_parameters->geometricMask && !context->has_element_layers
-                && layer_parameters->opacity >= 1.0f && !layer_parameters->opacityBrush)
+                && layer_parameters->opacity >= 1.0f && !layer_parameters->opacityBrush
+                && layer_parameters->maskAntialiasMode != D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
         {
             D2D1_RECT_F mask_clip;
             const struct d2d_geometry *mask_geo;
@@ -3552,6 +3565,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
             /* Save current state. */
             memset(&info, 0, sizeof(info));
             info.opacity = layer_parameters->opacity;
+            info.mask_aa_mode = layer_parameters->maskAntialiasMode;
             info.prev_target = context->target.bitmap;
             ID2D1Bitmap1_AddRef(&info.prev_target->ID2D1Bitmap1_iface);
             info.prev_pixel_size = context->pixel_size;

@@ -81,6 +81,7 @@ struct d2d_layer_info
     ID2D1Brush *opacity_brush;          /* per-pixel opacity mask brush */
     BOOL clear_called;                  /* Clear() was called inside this layer */
     BOOL bypass_layer;                  /* clip-only bypass: render directly on backbuffer */
+    D2D1_ANTIALIAS_MODE mask_aa_mode;   /* maskAntialiasMode for PopLayer compositing */
 };
 
 struct d2d_layer_stack
