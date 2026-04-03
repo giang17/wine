@@ -761,7 +761,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
             swapchain->comp_dc = CreateCompatibleDC(swapchain->dc);
             swapchain->comp_bitmap = CreateDIBSection(swapchain->comp_dc, &bmi,
-                    DIB_RGB_COLORS, &swapchain->comp_bits, NULL, 0);
+                    DIB_RGB_COLORS, (void **)&swapchain->comp_bits, NULL, 0);
             swapchain->comp_old_bitmap = SelectObject(swapchain->comp_dc, swapchain->comp_bitmap);
             swapchain->comp_width = dst_w;
             swapchain->comp_height = dst_h;
