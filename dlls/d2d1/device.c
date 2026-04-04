@@ -1236,10 +1236,239 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
     }
 }
 
-static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+/* Draw filled triangles without anti-aliasing (plain index+vertex buffer path). */
+static void d2d_device_context_fill_triangles(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
 {
     ID3D11Buffer *ib, *vb;
+    HRESULT hr;
+
+    if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
+            D3D11_BIND_INDEX_BUFFER,
+            geometry->fill.face_count * sizeof(*geometry->fill.faces),
+            &render_target->scratch_ib[D2D_SHAPE_TYPE_TRIANGLE],
+            geometry->fill.faces, &ib)))
+    {
+        WARN("Failed to create index buffer, hr %#lx.\n", hr);
+        return;
+    }
+
+    if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
+            D3D11_BIND_VERTEX_BUFFER,
+            geometry->fill.vertex_count * sizeof(*geometry->fill.vertices),
+            &render_target->scratch_vb[D2D_SHAPE_TYPE_TRIANGLE],
+            geometry->fill.vertices, &vb)))
+    {
+        ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
+        return;
+    }
+
+    d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * geometry->fill.face_count, vb,
+            sizeof(*geometry->fill.vertices), brush, opacity_brush);
+}
+
+/* Build and draw fill-AA geometry. Returns TRUE on success, FALSE if caller should fall back. */
+static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+{
+    /* Fill-edge AA: per-face vertices with boundary edge weights + skirt expansion.
+     * Inner triangles: bary coords identify boundary edges.
+     * Skirt quads: extend boundary edges ~0.75px outward for full AA transition. */
+    struct d2d_fill_aa_vertex { D2D1_POINT_2F pos; float u, v, s; float ex, ey; };
+    struct d2d_fill_aa_vertex *expanded;
+    size_t fc = geometry->fill.face_count;
+    size_t boundary_count = 0;
+    size_t expanded_count, map_size, i, vi;
+    UINT32 *edge_keys;
+    BYTE *edge_cnt, *edge_processed;
+    ID3D11Buffer *vb;
+    HRESULT hr;
+
+    /* Use 6x multiplier to keep load factor ≤ 50%, preventing open-addressing loops
+     * from running unbounded even in worst-case all-boundary-edge meshes. */
+    map_size = fc * 6 + 16;
+    edge_keys      = calloc(map_size, sizeof(*edge_keys));
+    edge_cnt       = calloc(map_size, sizeof(*edge_cnt));
+    edge_processed = calloc(map_size, sizeof(*edge_processed));
+    if (!edge_keys || !edge_cnt || !edge_processed)
+    {
+        free(edge_keys); free(edge_cnt); free(edge_processed);
+        return FALSE;
+    }
+
+    /* Pass 1: count edge occurrences via open-addressing hash. */
+    for (i = 0; i < fc; i++)
+    {
+        const struct d2d_face *f = &geometry->fill.faces[i];
+        int e;
+        for (e = 0; e < 3; e++)
+        {
+            UINT16 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
+            UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
+            UINT32 key = lo * 65536u + hi + 1u;
+            UINT32 slot = key % map_size;
+            size_t probe = 0;
+            while (probe < map_size && edge_keys[slot] && edge_keys[slot] != key)
+            {
+                slot = (slot + 1) % map_size;
+                probe++;
+            }
+            if (probe == map_size)
+            {
+                free(edge_keys); free(edge_cnt); free(edge_processed);
+                return FALSE;
+            }
+            edge_keys[slot] = key;
+            edge_cnt[slot]++;
+        }
+    }
+
+    /* Count boundary edges for skirt allocation. */
+    for (i = 0; i < map_size; i++)
+        if (edge_keys[i] && edge_cnt[i] == 1) boundary_count++;
+
+    /* Allocate: inner triangles (3 per face) + skirt quads (6 per boundary edge). */
+    expanded_count = fc * 3 + boundary_count * 6;
+    expanded = malloc(expanded_count * sizeof(*expanded));
+    if (!expanded)
+    {
+        free(edge_keys); free(edge_cnt); free(edge_processed);
+        return FALSE;
+    }
+
+    /* Pass 2: build inner triangle vertices with edge weights. */
+    for (i = 0; i < fc; i++)
+    {
+        const struct d2d_face *f = &geometry->fill.faces[i];
+        int j;
+        for (j = 0; j < 3; j++)
+        {
+            int e;
+            vi = i * 3 + j;
+            expanded[vi].pos = geometry->fill.vertices[f->v[j]];
+            expanded[vi].ex = 0.0f;
+            expanded[vi].ey = 0.0f;
+            for (e = 0; e < 3; e++)
+            {
+                UINT16 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
+                UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
+                UINT32 key = lo * 65536u + hi + 1u;
+                UINT32 slot = key % map_size;
+                float w;
+                while (edge_keys[slot] != key)
+                    slot = (slot + 1) % map_size;
+                /* Interior edge weight: large value (>> 1.0) ensures it never limits
+                 * min_edge_px, so only true boundary edges drive the AA fade. */
+                w = (edge_cnt[slot] == 1) ? (j == e ? 1.0f : 0.0f) : 10.0f;
+                if (e == 0) expanded[vi].u = w;
+                else if (e == 1) expanded[vi].v = w;
+                else expanded[vi].s = w;
+            }
+        }
+    }
+
+    /* Pass 3: build skirt quads along boundary edges. */
+    vi = fc * 3;
+    for (i = 0; i < fc; i++)
+    {
+        const struct d2d_face *f = &geometry->fill.faces[i];
+        int e;
+        for (e = 0; e < 3; e++)
+        {
+            UINT16 ai = f->v[(e + 1) % 3], bi = f->v[(e + 2) % 3];
+            UINT32 lo = ai < bi ? ai : bi, hi = ai < bi ? bi : ai;
+            UINT32 key = lo * 65536u + hi + 1u;
+            UINT32 slot = key % map_size;
+            D2D1_POINT_2F pa, pb, pc, edge_dir, outward;
+            float dot_test, edge_len;
+
+            while (edge_keys[slot] != key)
+                slot = (slot + 1) % map_size;
+            /* Skip interior edges and already-processed boundary edges. */
+            if (edge_cnt[slot] != 1 || edge_processed[slot]) continue;
+
+            /* Compute outward normal (away from opposite vertex). */
+            pa = geometry->fill.vertices[ai];
+            pb = geometry->fill.vertices[bi];
+            pc = geometry->fill.vertices[f->v[e]]; /* opposite vertex */
+            edge_dir.x = pb.x - pa.x;
+            edge_dir.y = pb.y - pa.y;
+            edge_len = sqrtf(edge_dir.x * edge_dir.x + edge_dir.y * edge_dir.y);
+            if (edge_len < 0.0001f)
+            {
+                /* Degenerate edge: mark processed and skip without writing vertices. */
+                edge_processed[slot] = 1;
+                continue;
+            }
+            /* Perpendicular: (-dy, dx) */
+            outward.x = -edge_dir.y / edge_len;
+            outward.y =  edge_dir.x / edge_len;
+            /* Ensure it points away from opposite vertex c. */
+            dot_test = outward.x * (pa.x - pc.x) + outward.y * (pa.y - pc.y);
+            if (dot_test < 0.0f) { outward.x = -outward.x; outward.y = -outward.y; }
+
+            /* Safety: ensure we never write past the allocated buffer. */
+            if (vi + 6 > expanded_count) continue;
+
+            /* Skirt quad: 2 triangles (A, B, A_out) + (B, B_out, A_out).
+             * Inner verts (A, B): bary=0 for boundary component, ex/ey=0.
+             * Outer verts (A_out, B_out): bary=-1 for boundary component, ex/ey=outward. */
+            /* Triangle 1: A, B, A_out */
+            expanded[vi].pos = pa;
+            expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
+            expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
+            vi++;
+            expanded[vi].pos = pb;
+            expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
+            expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
+            vi++;
+            expanded[vi].pos = pa;
+            expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
+            expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
+            vi++;
+            /* Triangle 2: B, B_out, A_out */
+            expanded[vi].pos = pb;
+            expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
+            expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
+            vi++;
+            expanded[vi].pos = pb;
+            expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
+            expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
+            vi++;
+            expanded[vi].pos = pa;
+            expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
+            expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
+            vi++;
+
+            /* Mark this edge as processed to avoid a duplicate skirt from the adjacent face. */
+            edge_processed[slot] = 1;
+        }
+    }
+    expanded_count = vi; /* actual count (may be less if degenerate edges skipped) */
+    free(edge_keys);
+    free(edge_cnt);
+    free(edge_processed);
+
+    if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
+            D3D11_BIND_VERTEX_BUFFER,
+            expanded_count * sizeof(*expanded),
+            &render_target->scratch_vb[D2D_SHAPE_TYPE_FILL_AA],
+            expanded, &vb)))
+    {
+        free(expanded);
+        return FALSE;
+    }
+    free(expanded);
+
+    d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_FILL_AA, NULL, expanded_count, vb,
+            sizeof(*expanded), brush, opacity_brush);
+    return TRUE;
+}
+
+static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+{
+    ID3D11Buffer *vb;
     HRESULT hr;
 
     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f, 0.0f)))
@@ -1259,198 +1488,12 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
             && !geometry->fill.bezier_vertex_count
             && !geometry->fill.arc_vertex_count)
     {
-        /* Fill-edge AA: per-face vertices with boundary edge weights + skirt expansion.
-         * Inner triangles: bary coords identify boundary edges.
-         * Skirt quads: extend boundary edges ~0.75px outward for full AA transition. */
-        struct d2d_fill_aa_vertex { D2D1_POINT_2F pos; float u, v, s; float ex, ey; };
-        struct d2d_fill_aa_vertex *expanded;
-        size_t fc = geometry->fill.face_count;
-        size_t boundary_count = 0;
-        size_t expanded_count, map_size, i, vi;
-        UINT32 *edge_keys;
-        BYTE *edge_cnt;
-
-        map_size = fc * 4;
-        if (map_size < 16) map_size = 16;
-        edge_keys = calloc(map_size, sizeof(*edge_keys));
-        edge_cnt  = calloc(map_size, sizeof(*edge_cnt));
-        if (!edge_keys || !edge_cnt)
-        {
-            free(edge_keys); free(edge_cnt);
-            goto fill_aa_fallback;
-        }
-
-        /* Pass 1: count edge occurrences via open-addressing hash. */
-        for (i = 0; i < fc; i++)
-        {
-            const struct d2d_face *f = &geometry->fill.faces[i];
-            int e;
-            for (e = 0; e < 3; e++)
-            {
-                UINT16 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
-                UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
-                UINT32 key = lo * 65536u + hi + 1u;
-                UINT32 slot = key % map_size;
-                while (edge_keys[slot] && edge_keys[slot] != key)
-                    slot = (slot + 1) % map_size;
-                edge_keys[slot] = key;
-                edge_cnt[slot]++;
-            }
-        }
-
-        /* Count boundary edges for skirt allocation. */
-        for (i = 0; i < map_size; i++)
-            if (edge_keys[i] && edge_cnt[i] == 1) boundary_count++;
-
-        /* Allocate: inner triangles (3 per face) + skirt quads (6 per boundary edge). */
-        expanded_count = fc * 3 + boundary_count * 6;
-        expanded = malloc(expanded_count * sizeof(*expanded));
-        if (!expanded)
-        {
-            free(edge_keys); free(edge_cnt);
-            goto fill_aa_fallback;
-        }
-
-        /* Pass 2: build inner triangle vertices with edge weights. */
-        for (i = 0; i < fc; i++)
-        {
-            const struct d2d_face *f = &geometry->fill.faces[i];
-            int j;
-            for (j = 0; j < 3; j++)
-            {
-                vi = i * 3 + j;
-                int e;
-                expanded[vi].pos = geometry->fill.vertices[f->v[j]];
-                expanded[vi].ex = 0.0f;
-                expanded[vi].ey = 0.0f;
-                for (e = 0; e < 3; e++)
-                {
-                    UINT16 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
-                    UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
-                    UINT32 key = lo * 65536u + hi + 1u;
-                    UINT32 slot = key % map_size;
-                    float w;
-                    while (edge_keys[slot] != key)
-                        slot = (slot + 1) % map_size;
-                    w = (edge_cnt[slot] == 1) ? (j == e ? 1.0f : 0.0f) : 10.0f;
-                    if (e == 0) expanded[vi].u = w;
-                    else if (e == 1) expanded[vi].v = w;
-                    else expanded[vi].s = w;
-                }
-            }
-        }
-
-        /* Pass 3: build skirt quads along boundary edges. */
-        vi = fc * 3;
-        for (i = 0; i < fc; i++)
-        {
-            const struct d2d_face *f = &geometry->fill.faces[i];
-            int e;
-            for (e = 0; e < 3; e++)
-            {
-                UINT16 ai = f->v[(e + 1) % 3], bi = f->v[(e + 2) % 3];
-                UINT32 lo = ai < bi ? ai : bi, hi = ai < bi ? bi : ai;
-                UINT32 key = lo * 65536u + hi + 1u;
-                UINT32 slot = key % map_size;
-                D2D1_POINT_2F pa, pb, pc, edge_dir, outward;
-                float dot_test, edge_len;
-
-                while (edge_keys[slot] != key)
-                    slot = (slot + 1) % map_size;
-                if (edge_cnt[slot] != 1) continue;
-
-                /* Compute outward normal (away from opposite vertex). */
-                pa = geometry->fill.vertices[ai];
-                pb = geometry->fill.vertices[bi];
-                pc = geometry->fill.vertices[f->v[e]]; /* opposite vertex */
-                edge_dir.x = pb.x - pa.x;
-                edge_dir.y = pb.y - pa.y;
-                edge_len = sqrtf(edge_dir.x * edge_dir.x + edge_dir.y * edge_dir.y);
-                if (edge_len < 0.0001f) continue;
-                /* Perpendicular: (-dy, dx) */
-                outward.x = -edge_dir.y / edge_len;
-                outward.y =  edge_dir.x / edge_len;
-                /* Ensure it points away from opposite vertex c. */
-                dot_test = outward.x * (pa.x - pc.x) + outward.y * (pa.y - pc.y);
-                if (dot_test < 0.0f) { outward.x = -outward.x; outward.y = -outward.y; }
-
-                /* Skirt quad: 2 triangles (A, B, A_out) + (B, B_out, A_out).
-                 * Inner verts (A, B): bary=0 for boundary component, ex/ey=0.
-                 * Outer verts (A_out, B_out): bary=-1 for boundary component, ex/ey=outward. */
-                /* Triangle 1: A, B, A_out */
-                expanded[vi].pos = pa;
-                expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-                expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
-                vi++;
-                expanded[vi].pos = pb;
-                expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-                expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
-                vi++;
-                expanded[vi].pos = pa;
-                expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-                expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
-                vi++;
-                /* Triangle 2: B, B_out, A_out */
-                expanded[vi].pos = pb;
-                expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-                expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
-                vi++;
-                expanded[vi].pos = pb;
-                expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-                expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
-                vi++;
-                expanded[vi].pos = pa;
-                expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-                expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
-                vi++;
-
-                /* Mark this edge as processed (avoid double skirt from 2nd triangle). */
-                edge_cnt[slot] = 0;
-            }
-        }
-        expanded_count = vi; /* actual count (may be less if degenerate edges skipped) */
-        free(edge_keys);
-        free(edge_cnt);
-
-        if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
-                D3D11_BIND_VERTEX_BUFFER,
-                expanded_count * sizeof(*expanded),
-                &render_target->scratch_vb[D2D_SHAPE_TYPE_FILL_AA],
-                expanded, &vb)))
-        {
-            free(expanded);
-            goto fill_aa_fallback;
-        }
-        free(expanded);
-
-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_FILL_AA, NULL, expanded_count, vb,
-                sizeof(*expanded), brush, opacity_brush);
+        if (!d2d_device_context_fill_triangles_aa(render_target, geometry, brush, opacity_brush))
+            d2d_device_context_fill_triangles(render_target, geometry, brush, opacity_brush);
     }
     else if (geometry->fill.face_count)
     {
-    fill_aa_fallback:
-        if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
-                D3D11_BIND_INDEX_BUFFER,
-                geometry->fill.face_count * sizeof(*geometry->fill.faces),
-                &render_target->scratch_ib[D2D_SHAPE_TYPE_TRIANGLE],
-                geometry->fill.faces, &ib)))
-        {
-            WARN("Failed to create index buffer, hr %#lx.\n", hr);
-            return;
-        }
-
-        if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
-                D3D11_BIND_VERTEX_BUFFER,
-                geometry->fill.vertex_count * sizeof(*geometry->fill.vertices),
-                &render_target->scratch_vb[D2D_SHAPE_TYPE_TRIANGLE],
-                geometry->fill.vertices, &vb)))
-        {
-            ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
-            return;
-        }
-
-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * geometry->fill.face_count, vb,
-                sizeof(*geometry->fill.vertices), brush, opacity_brush);
+        d2d_device_context_fill_triangles(render_target, geometry, brush, opacity_brush);
     }
 
     if (geometry->fill.bezier_vertex_count)
@@ -5010,7 +5053,8 @@ static const char shape_vs_code_fill_aa[] =
     "        if (screen_px > 0.001f)\n"
     "            o.p += exp_world * (0.75f / screen_px);\n"
     "    }\n"
-    "    o.b = float4(texcoord, 0.0);\n"
+    /* Use b.w=2.0 as an explicit fill-AA marker (distinct from curve b.w=1.0 and arc b.w=1.0). */
+    "    o.b = float4(texcoord, 2.0);\n"
     "    o.stroke_transform = float2x2(1.0, 0.0, 0.0, 1.0);\n"
     "    position = mul(float2x3(transform_rtx.xyz, transform_rty.xyz), float3(o.p, 1.0f))\n"
     "            * float2(transform_rtx.w, transform_rty.w);\n"
@@ -5293,10 +5337,10 @@ static const char shape_ps_code[] =
     "    }\n"
     "    else\n"
     "    {\n"
-    "        /* Fill-edge AA: b.w==0 marks fill triangles with edge weights.\n"
+    "        /* Fill-edge AA: b.w==2.0 is an explicit marker for fill triangles with edge weights.\n"
     "         * b.xyz encode barycentric proximity to each triangle edge.\n"
     "         * min(b.xyz/gradient) = pixel distance to nearest boundary edge. */\n"
-    "        if (i.b.w < 0.5f && aa_mode)\n"
+    "        if (i.b.w > 1.5f && aa_mode)\n"
     "        {\n"
     "            float3 edges = i.b.xyz;\n"
     "            float3 grad_e = float3(\n"
