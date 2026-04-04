@@ -82,6 +82,7 @@ struct d2d_layer_info
     ID2D1Brush *opacity_brush;          /* per-pixel opacity mask brush */
     BOOL clear_called;                  /* Clear() was called inside this layer */
     BOOL bypass_layer;                  /* clip-only bypass: render directly on backbuffer */
+    ID2D1Geometry *stencil_geometry;    /* saved mask geometry for stencil DECR on PopLayer */
     D2D1_ANTIALIAS_MODE mask_aa_mode;   /* maskAntialiasMode for PopLayer compositing */
 };
 
@@ -264,11 +265,13 @@ struct d2d_device_context
     /* Stencil-based clipping for PushLayer bypass (Option D). */
     ID3D11Texture2D *stencil_texture;
     ID3D11DepthStencilView *stencil_dsv;
-    ID3D11DepthStencilState *stencil_write_state;   /* ALWAYS/REPLACE: write ref to stencil */
+    ID3D11DepthStencilState *stencil_write_state;   /* ALWAYS/INCR_SAT: increment stencil */
     ID3D11DepthStencilState *stencil_test_state;    /* EQUAL/KEEP: pass where stencil==ref */
+    ID3D11DepthStencilState *stencil_decr_state;    /* ALWAYS/DECR_SAT: decrement stencil */
     D2D1_SIZE_U stencil_size;                       /* current stencil buffer dimensions */
-    BOOL stencil_active;                            /* stencil test currently enabled */
-    BOOL stencil_writing;                           /* stencil write pass active */
+    unsigned int stencil_depth;                     /* nested stencil layer count (0=off) */
+    BOOL stencil_writing;                           /* stencil INCR pass active */
+    BOOL stencil_decrementing;                      /* stencil DECR pass active */
 };
 
 HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,

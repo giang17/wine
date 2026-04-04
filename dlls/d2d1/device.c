@@ -222,7 +222,7 @@ static HRESULT d2d_device_context_ensure_stencil(struct d2d_device_context *cont
         ds_desc.StencilReadMask = 0xff;
         ds_desc.StencilWriteMask = 0xff;
         ds_desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
-        ds_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+        ds_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_INCR_SAT;
         ds_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
         ds_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
         ds_desc.BackFace = ds_desc.FrontFace;
@@ -233,6 +233,17 @@ static HRESULT d2d_device_context_ensure_stencil(struct d2d_device_context *cont
             return hr;
         }
 
+        /* DECR_SAT state for PopLayer: decrement stencil where mask geometry covers. */
+        ds_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_DECR_SAT;
+        ds_desc.BackFace = ds_desc.FrontFace;
+
+        if (FAILED(hr = ID3D11Device1_CreateDepthStencilState(device, &ds_desc, &context->stencil_decr_state)))
+        {
+            WARN("Failed to create stencil decrement state, hr %#lx.\n", hr);
+            return hr;
+        }
+
+        /* Test state: pass only where stencil == ref (current depth). */
         ds_desc.StencilWriteMask = 0x00;
         ds_desc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
         ds_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
@@ -319,17 +330,25 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
     ID3D11DeviceContext1_RSSetState(context, render_target->rs);
     if (render_target->stencil_writing)
     {
-        /* Stencil write pass: bind ONLY the DSV, no render target.
-         * This writes to the stencil buffer without affecting the backbuffer color. */
+        /* Stencil INCR pass: bind ONLY the DSV, no render target.
+         * This increments the stencil buffer without affecting the backbuffer color. */
         ID3D11DeviceContext1_OMSetRenderTargets(context, 0, NULL, render_target->stencil_dsv);
-        ID3D11DeviceContext1_OMSetDepthStencilState(context, render_target->stencil_write_state, 1);
+        ID3D11DeviceContext1_OMSetDepthStencilState(context, render_target->stencil_write_state, 0);
     }
-    else if (render_target->stencil_active)
+    else if (render_target->stencil_decrementing)
     {
-        /* Stencil test pass: bind both RTV and DSV. Only pixels where stencil==1 pass. */
+        /* Stencil DECR pass: bind ONLY the DSV, no render target.
+         * This decrements the stencil buffer (restoring previous layer's values). */
+        ID3D11DeviceContext1_OMSetRenderTargets(context, 0, NULL, render_target->stencil_dsv);
+        ID3D11DeviceContext1_OMSetDepthStencilState(context, render_target->stencil_decr_state, 0);
+    }
+    else if (render_target->stencil_depth > 0)
+    {
+        /* Stencil test pass: bind both RTV and DSV. Only pixels where stencil==depth pass. */
         ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv,
                 render_target->stencil_dsv);
-        ID3D11DeviceContext1_OMSetDepthStencilState(context, render_target->stencil_test_state, 1);
+        ID3D11DeviceContext1_OMSetDepthStencilState(context, render_target->stencil_test_state,
+                render_target->stencil_depth);
     }
     else
     {
@@ -447,6 +466,8 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
             ID3D11DepthStencilState_Release(context->stencil_write_state);
         if (context->stencil_test_state)
             ID3D11DepthStencilState_Release(context->stencil_test_state);
+        if (context->stencil_decr_state)
+            ID3D11DepthStencilState_Release(context->stencil_decr_state);
         ID3D11RasterizerState_Release(context->rs);
         ID3D11Buffer_Release(context->vb);
         ID3D11Buffer_Release(context->ib);
@@ -2275,7 +2296,8 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
 
             /* Stencil-based clipping: render mask geometry to stencil buffer,
              * then enable stencil test so all subsequent rendering (Clear, draw)
-             * only affects pixels within the actual dirty rects — not the entire BBox. */
+             * only affects pixels within the mask geometry.
+             * Supports nesting: each layer increments stencil, test == depth. */
             if (SUCCEEDED(d2d_device_context_ensure_stencil(context)))
             {
                 ID3D11DeviceContext *d3d_context;
@@ -2283,12 +2305,13 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
 
                 ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
 
-                /* Clear stencil to 0. */
-                ID3D11DeviceContext_ClearDepthStencilView(d3d_context,
-                        context->stencil_dsv, D3D11_CLEAR_STENCIL, 1.0f, 0);
+                /* Clear stencil to 0 only on first stencil layer. */
+                if (context->stencil_depth == 0)
+                    ID3D11DeviceContext_ClearDepthStencilView(d3d_context,
+                            context->stencil_dsv, D3D11_CLEAR_STENCIL, 1.0f, 0);
 
-                /* Write 1 to stencil where mask geometry covers. */
-                context->stencil_active = TRUE;
+                /* Increment stencil where mask geometry covers. */
+                context->stencil_depth++;
                 context->stencil_writing = TRUE;
 
                 /* Render mask geometry triangles to stencil.
@@ -2300,9 +2323,6 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
                     D3D11_BUFFER_DESC buf_desc;
                     ID3D11Buffer *geo_ib, *geo_vb;
 
-                    /* Set up constant buffers for identity transform + solid color.
-                     * The color output doesn't matter (stencil write is the goal),
-                     * but we need valid shader state for rasterization. */
                     saved_transform = context->drawing_state.transform;
                     context->drawing_state.transform._11 = 1.0f;
                     context->drawing_state.transform._12 = 0.0f;
@@ -2320,13 +2340,11 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
                     buf_data.SysMemPitch = 0;
                     buf_data.SysMemSlicePitch = 0;
 
-                    /* Create index buffer from geometry faces. */
                     buf_desc.ByteWidth = mask_geo->fill.face_count * sizeof(*mask_geo->fill.faces);
                     buf_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
                     buf_data.pSysMem = mask_geo->fill.faces;
                     if (SUCCEEDED(ID3D11Device1_CreateBuffer(context->d3d_device, &buf_desc, &buf_data, &geo_ib)))
                     {
-                        /* Create vertex buffer from geometry vertices. */
                         buf_desc.ByteWidth = mask_geo->fill.vertex_count * sizeof(*mask_geo->fill.vertices);
                         buf_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
                         buf_data.pSysMem = mask_geo->fill.vertices;
@@ -2343,15 +2361,16 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
                     context->drawing_state.transform = saved_transform;
                 }
 
-                /* Switch from write to test mode. */
                 context->stencil_writing = FALSE;
-
                 ID3D11DeviceContext_Release(d3d_context);
             }
 
             memset(&info, 0, sizeof(info));
             info.opacity = layer_parameters->opacity;
             info.bypass_layer = TRUE;
+            /* Save mask geometry for stencil DECR in PopLayer. */
+            info.stencil_geometry = layer_parameters->geometricMask;
+            ID2D1Geometry_AddRef(info.stencil_geometry);
 
             if (!d2d_layer_stack_push(&context->layer_stack, &info))
                 WARN("Failed to push layer.\n");
@@ -2457,20 +2476,89 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
 
         d2d_clip_stack_pop(&context->clip_stack);
 
-        /* Bypass layer: pop mask clip and disable stencil test.
-         * Rendering was done directly on the backbuffer. */
+        /* Bypass layer: pop mask clip, decrement stencil, restore previous layer. */
         if (info.bypass_layer)
         {
             d2d_clip_stack_pop(&context->clip_stack); /* pop mask BBox clip */
 
-            /* Disable stencil clipping. */
-            if (context->stencil_active)
+            /* Decrement stencil where this layer's mask covered, restoring
+             * the previous layer's stencil values for correct nesting. */
+            if (context->stencil_depth > 0 && info.stencil_geometry)
             {
                 ID3D11DeviceContext *d3d_context;
+                D2D1_MATRIX_3X2_F saved_transform;
+                const struct d2d_geometry *mask_geo;
+
                 ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
-                ID3D11DeviceContext_OMSetDepthStencilState(d3d_context, NULL, 0);
+
+                context->stencil_decrementing = TRUE;
+
+                mask_geo = unsafe_impl_from_ID2D1Geometry(info.stencil_geometry);
+                if (mask_geo->fill.face_count)
+                {
+                    D3D11_SUBRESOURCE_DATA buf_data;
+                    D3D11_BUFFER_DESC buf_desc;
+                    ID3D11Buffer *geo_ib, *geo_vb;
+
+                    saved_transform = context->drawing_state.transform;
+                    context->drawing_state.transform._11 = 1.0f;
+                    context->drawing_state.transform._12 = 0.0f;
+                    context->drawing_state.transform._21 = 0.0f;
+                    context->drawing_state.transform._22 = 1.0f;
+                    context->drawing_state.transform._31 = 0.0f;
+                    context->drawing_state.transform._32 = 0.0f;
+
+                    d2d_device_context_update_vs_cb(context, &mask_geo->transform, 0.0f, 0.0f);
+                    d2d_device_context_update_ps_cb(context, NULL, NULL, FALSE, FALSE);
+
+                    buf_desc.Usage = D3D11_USAGE_DEFAULT;
+                    buf_desc.CPUAccessFlags = 0;
+                    buf_desc.MiscFlags = 0;
+                    buf_data.SysMemPitch = 0;
+                    buf_data.SysMemSlicePitch = 0;
+
+                    buf_desc.ByteWidth = mask_geo->fill.face_count * sizeof(*mask_geo->fill.faces);
+                    buf_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+                    buf_data.pSysMem = mask_geo->fill.faces;
+                    if (SUCCEEDED(ID3D11Device1_CreateBuffer(context->d3d_device, &buf_desc, &buf_data, &geo_ib)))
+                    {
+                        buf_desc.ByteWidth = mask_geo->fill.vertex_count * sizeof(*mask_geo->fill.vertices);
+                        buf_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                        buf_data.pSysMem = mask_geo->fill.vertices;
+                        if (SUCCEEDED(ID3D11Device1_CreateBuffer(context->d3d_device, &buf_desc, &buf_data, &geo_vb)))
+                        {
+                            d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, geo_ib,
+                                    3 * mask_geo->fill.face_count, geo_vb,
+                                    sizeof(*mask_geo->fill.vertices), NULL, NULL);
+                            ID3D11Buffer_Release(geo_vb);
+                        }
+                        ID3D11Buffer_Release(geo_ib);
+                    }
+
+                    context->drawing_state.transform = saved_transform;
+                }
+
+                context->stencil_decrementing = FALSE;
+                context->stencil_depth--;
+
+                /* If no more stencil layers, disable stencil test entirely. */
+                if (context->stencil_depth == 0)
+                    ID3D11DeviceContext_OMSetDepthStencilState(d3d_context, NULL, 0);
+
                 ID3D11DeviceContext_Release(d3d_context);
-                context->stencil_active = FALSE;
+                ID2D1Geometry_Release(info.stencil_geometry);
+            }
+            else if (context->stencil_depth > 0)
+            {
+                /* No geometry saved (shouldn't happen), just decrement depth. */
+                context->stencil_depth--;
+                if (context->stencil_depth == 0)
+                {
+                    ID3D11DeviceContext *d3d_context;
+                    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+                    ID3D11DeviceContext_OMSetDepthStencilState(d3d_context, NULL, 0);
+                    ID3D11DeviceContext_Release(d3d_context);
+                }
             }
             return;
         }
@@ -3688,7 +3776,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
             if (!d2d_clip_stack_push(&context->clip_stack, &mask_clip))
                 WARN("Failed to push mask clip rect.\n");
 
-            /* Stencil-based clipping (same as PushLayer path above). */
+            /* Stencil-based clipping with nesting support (same as PushLayer path above). */
             if (SUCCEEDED(d2d_device_context_ensure_stencil(context)))
             {
                 ID3D11DeviceContext *d3d_context;
@@ -3696,9 +3784,11 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
 
                 ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
 
-                ID3D11DeviceContext_ClearDepthStencilView(d3d_context,
-                        context->stencil_dsv, D3D11_CLEAR_STENCIL, 1.0f, 0);
-                context->stencil_active = TRUE;
+                if (context->stencil_depth == 0)
+                    ID3D11DeviceContext_ClearDepthStencilView(d3d_context,
+                            context->stencil_dsv, D3D11_CLEAR_STENCIL, 1.0f, 0);
+
+                context->stencil_depth++;
                 context->stencil_writing = TRUE;
 
                 mask_geo = unsafe_impl_from_ID2D1Geometry(layer_parameters->geometricMask);
@@ -3708,9 +3798,6 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
                     D3D11_BUFFER_DESC buf_desc;
                     ID3D11Buffer *geo_ib, *geo_vb;
 
-                    /* Set up constant buffers for identity transform + solid color.
-                     * The color output doesn't matter (stencil write is the goal),
-                     * but we need valid shader state for rasterization. */
                     saved_transform = context->drawing_state.transform;
                     context->drawing_state.transform._11 = 1.0f;
                     context->drawing_state.transform._12 = 0.0f;
@@ -3728,13 +3815,11 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
                     buf_data.SysMemPitch = 0;
                     buf_data.SysMemSlicePitch = 0;
 
-                    /* Create index buffer from geometry faces. */
                     buf_desc.ByteWidth = mask_geo->fill.face_count * sizeof(*mask_geo->fill.faces);
                     buf_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
                     buf_data.pSysMem = mask_geo->fill.faces;
                     if (SUCCEEDED(ID3D11Device1_CreateBuffer(context->d3d_device, &buf_desc, &buf_data, &geo_ib)))
                     {
-                        /* Create vertex buffer from geometry vertices. */
                         buf_desc.ByteWidth = mask_geo->fill.vertex_count * sizeof(*mask_geo->fill.vertices);
                         buf_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
                         buf_data.pSysMem = mask_geo->fill.vertices;
@@ -3758,6 +3843,8 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
             memset(&info, 0, sizeof(info));
             info.opacity = layer_parameters->opacity;
             info.bypass_layer = TRUE;
+            info.stencil_geometry = layer_parameters->geometricMask;
+            ID2D1Geometry_AddRef(info.stencil_geometry);
 
             if (!d2d_layer_stack_push(&context->layer_stack, &info))
                 WARN("Failed to push layer.\n");
