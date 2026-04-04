@@ -3604,7 +3604,8 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
         return;
     }
 
-    if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER)
+    if (composite_mode != D2D1_COMPOSITE_MODE_SOURCE_OVER
+            && composite_mode != D2D1_COMPOSITE_MODE_SOURCE_COPY)
         FIXME("Unhandled composite mode %#x.\n", composite_mode);
 
     if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Bitmap, (void **)&bitmap)))
@@ -3613,6 +3614,59 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
 
         ID2D1Bitmap_Release(bitmap);
         return;
+    }
+
+    /* If the image is an effect output, extract its input bitmap and apply
+     * basic effect processing. For the D2D1 Opacity effect, read the opacity
+     * property and use it when drawing. For SOURCE_COPY composite mode with
+     * opacity=0, this effectively clears the area to transparent — which is
+     * how JUCE's multiplyAllAlphasInArea() erases component content. */
+    {
+        ID2D1Effect *effect;
+
+        if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Effect, (void **)&effect)))
+        {
+            ID2D1Image *input = NULL;
+            float opacity = 1.0f;
+
+            /* Read the first custom property (index 0 = Opacity for D2D1Opacity effect). */
+            ID2D1Effect_GetValue(effect, 0, D2D1_PROPERTY_TYPE_FLOAT,
+                    (BYTE *)&opacity, sizeof(opacity));
+
+            ID2D1Effect_GetInput(effect, 0, &input);
+            if (input)
+            {
+                if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
+                {
+                    if (composite_mode == D2D1_COMPOSITE_MODE_SOURCE_COPY)
+                    {
+                        /* SOURCE_COPY: replace destination with source.
+                         * The opacity effect multiplies alpha, then SOURCE_COPY writes it back.
+                         * We implement this by drawing with blend disabled (NULL blend state)
+                         * which makes the pixel shader output replace the render target directly.
+                         * The opacity is baked into the brush/color via draw_bitmap's opacity param. */
+                        ID3D11BlendState *prev_bs = context->bs;
+                        if (prev_bs)
+                            ID3D11BlendState_AddRef(prev_bs);
+                        context->bs = NULL;
+
+                        d2d_device_context_draw_bitmap(context, bitmap, NULL, opacity,
+                                interpolation_mode, image_rect, target_offset, NULL);
+
+                        context->bs = prev_bs;
+                    }
+                    else
+                    {
+                        d2d_device_context_draw_bitmap(context, bitmap, NULL, opacity,
+                                interpolation_mode, image_rect, target_offset, NULL);
+                    }
+                    ID2D1Bitmap_Release(bitmap);
+                }
+                ID2D1Image_Release(input);
+            }
+            ID2D1Effect_Release(effect);
+            return;
+        }
     }
 
     FIXME("Unhandled image %p.\n", image);

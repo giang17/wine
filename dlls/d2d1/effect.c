@@ -20,6 +20,9 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 
+/* CLSID_D2D1Opacity — not yet in Wine's dxguid library. */
+const GUID CLSID_D2D1Opacity = {0x811d79a4,0xde28,0x4454,{0x80,0x94,0xc6,0x46,0x85,0xf8,0xbd,0x4c}};
+
 static inline struct d2d_transform *impl_from_ID2D1OffsetTransform(ID2D1OffsetTransform *iface)
 {
     return CONTAINING_RECORD(iface, struct d2d_transform, ID2D1TransformNode_iface);
@@ -1718,6 +1721,40 @@ static HRESULT __stdcall hue_rotation_factory(IUnknown **effect)
     return d2d_effect_create_impl(effect, &properties, sizeof(properties));
 }
 
+static const WCHAR opacity_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Opacity'/>          \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Opacity'/>          \
+    <Inputs>                                                              \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='Opacity' type='float' />                              \
+  </Effect>";
+
+struct opacity_properties
+{
+    float opacity;
+};
+
+EFFECT_PROPERTY_RW(opacity, opacity, FLOAT)
+
+static const D2D1_PROPERTY_BINDING opacity_bindings[] =
+{
+    { L"Opacity", BINDING_RW(opacity, opacity) },
+};
+
+static HRESULT __stdcall opacity_factory(IUnknown **effect)
+{
+    static const struct opacity_properties properties =
+    {
+        .opacity = 1.0f,
+    };
+    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+}
+
 static const WCHAR saturation_description[] =
 L"<?xml version='1.0'?>                                                   \
   <Effect>                                                                \
@@ -1833,6 +1870,7 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
         { &CLSID_D2D1Brightness, X2(brightness) },
         { &CLSID_D2D1DirectionalBlur, X2(directional_blur) },
         { &CLSID_D2D1HueRotation, X2(hue_rotation) },
+        { &CLSID_D2D1Opacity, X2(opacity) },
         { &CLSID_D2D1Saturation, X2(saturation) },
         { &CLSID_D2D1Scale, X2(scale) },
 #undef X2
