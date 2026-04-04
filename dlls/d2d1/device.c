@@ -368,7 +368,13 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
     }
     if (brush)
     {
-        ID3D11DeviceContext1_OMSetBlendState(context, render_target->bs, NULL, D3D11_DEFAULT_SAMPLE_MASK);
+        /* D2D1_PRIMITIVE_BLEND_COPY disables alpha blending — the pixel shader
+         * output replaces the destination directly. Used by JUCE 8 for
+         * multiplyAllAlphasInArea() and component alpha compositing. */
+        if (render_target->drawing_state.primitiveBlend == D2D1_PRIMITIVE_BLEND_COPY)
+            ID3D11DeviceContext1_OMSetBlendState(context, NULL, NULL, D3D11_DEFAULT_SAMPLE_MASK);
+        else
+            ID3D11DeviceContext1_OMSetBlendState(context, render_target->bs, NULL, D3D11_DEFAULT_SAMPLE_MASK);
         d2d_brush_bind_resources(brush, render_target, 0);
     }
     else
