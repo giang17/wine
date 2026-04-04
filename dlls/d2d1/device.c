@@ -300,12 +300,21 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
     if (render_target->clip_stack.count)
     {
         const D2D1_RECT_F *clip_rect;
+        float l, t, r, b;
 
         clip_rect = &render_target->clip_stack.stack[render_target->clip_stack.count - 1];
-        scissor_rect.left = ceilf(clip_rect->left - 0.5f);
-        scissor_rect.top = ceilf(clip_rect->top - 0.5f);
-        scissor_rect.right = ceilf(clip_rect->right - 0.5f);
-        scissor_rect.bottom = ceilf(clip_rect->bottom - 0.5f);
+        l = ceilf(clip_rect->left - 0.5f);
+        t = ceilf(clip_rect->top - 0.5f);
+        r = ceilf(clip_rect->right - 0.5f);
+        b = ceilf(clip_rect->bottom - 0.5f);
+        /* Clamp to LONG range before cast to prevent integer overflow.
+         * Apps like JUCE push full-range clip rects {-FLT_MAX, -FLT_MAX,
+         * FLT_MAX, FLT_MAX} which overflow LONG and produce inverted
+         * scissor rects, causing GL_INVALID_VALUE in glScissor. */
+        scissor_rect.left   = l < -2.0e9f ? (LONG)-2000000000 : l > 2.0e9f ? (LONG)2000000000 : (LONG)l;
+        scissor_rect.top    = t < -2.0e9f ? (LONG)-2000000000 : t > 2.0e9f ? (LONG)2000000000 : (LONG)t;
+        scissor_rect.right  = r < -2.0e9f ? (LONG)-2000000000 : r > 2.0e9f ? (LONG)2000000000 : (LONG)r;
+        scissor_rect.bottom = b < -2.0e9f ? (LONG)-2000000000 : b > 2.0e9f ? (LONG)2000000000 : (LONG)b;
     }
     else
     {
