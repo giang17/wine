@@ -84,6 +84,7 @@ struct d2d_layer_info
     BOOL bypass_layer;                  /* clip-only bypass: render directly on backbuffer */
     ID2D1Geometry *stencil_geometry;    /* saved mask geometry for stencil DECR on PopLayer */
     D2D1_ANTIALIAS_MODE mask_aa_mode;   /* maskAntialiasMode for PopLayer compositing */
+    BOOL ignore_alpha;                  /* D2D1_LAYER_OPTIONS1_IGNORE_ALPHA */
 };
 
 struct d2d_layer_stack

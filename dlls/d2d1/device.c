@@ -2452,6 +2452,9 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
             ID3D11DeviceContext_ClearRenderTargetView(d3d_context, layer_bitmap->rtv, transparent);
             ID3D11DeviceContext_Release(d3d_context);
 
+            if (layer_parameters->layerOptions & D2D1_LAYER_OPTIONS1_IGNORE_ALPHA)
+                info.ignore_alpha = TRUE;
+
             /* Switch render target to the layer bitmap. */
             context->target.bitmap = layer_bitmap;
         }
@@ -2579,6 +2582,10 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                         &bitmap_brush_desc, &brush_desc, &mask_brush);
                 if (SUCCEEDED(hr))
                 {
+                    D2D1_ALPHA_MODE saved_alpha = info.layer_bitmap->format.alphaMode;
+                    if (info.ignore_alpha)
+                        info.layer_bitmap->format.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+
                     /* Apply maskTransform to world transform so the mask
                      * geometry is positioned correctly in device space. */
                     saved_transform = context->drawing_state.transform;
@@ -2600,6 +2607,8 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                     }
 
                     context->drawing_state.transform = saved_transform;
+                    if (info.ignore_alpha)
+                        info.layer_bitmap->format.alphaMode = saved_alpha;
                     ID2D1Brush_Release(&mask_brush->ID2D1Brush_iface);
                 }
                 else
@@ -2647,6 +2656,10 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                         &bitmap_brush_desc, &brush_desc, &layer_brush);
                 if (SUCCEEDED(hr))
                 {
+                    D2D1_ALPHA_MODE saved_alpha = info.layer_bitmap->format.alphaMode;
+                    if (info.ignore_alpha)
+                        info.layer_bitmap->format.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+
                     size = ID2D1Bitmap1_GetSize(&info.layer_bitmap->ID2D1Bitmap1_iface);
                     d2d_rect_set(&dst_rect, 0.0f, 0.0f, size.width, size.height);
 
@@ -2669,6 +2682,8 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                         context->drawing_state.transform = saved_transform;
                         ID2D1RectangleGeometry_Release(rect_geo);
                     }
+                    if (info.ignore_alpha)
+                        info.layer_bitmap->format.alphaMode = saved_alpha;
                     ID2D1Brush_Release(&layer_brush->ID2D1Brush_iface);
                 }
                 else
@@ -2686,6 +2701,10 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
             else
             {
                 /* No geometric mask, no opacity brush — composite full layer bitmap. */
+                D2D1_ALPHA_MODE saved_alpha = info.layer_bitmap->format.alphaMode;
+                if (info.ignore_alpha)
+                    info.layer_bitmap->format.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+
                 size = ID2D1Bitmap1_GetSize(&info.layer_bitmap->ID2D1Bitmap1_iface);
                 d2d_rect_set(&dst_rect, 0.0f, 0.0f, size.width, size.height);
                 d2d_device_context_draw_bitmap(context,
@@ -2693,6 +2712,9 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                         &dst_rect, info.opacity,
                         D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
                         NULL, NULL, NULL);
+
+                if (info.ignore_alpha)
+                    info.layer_bitmap->format.alphaMode = saved_alpha;
             }
 
             /* Release the layer bitmap (prev_target ref released below). */
@@ -3847,6 +3869,9 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
                 ID3D11DeviceContext_ClearRenderTargetView(d3d_context, layer_bitmap->rtv, transparent);
             }
             ID3D11DeviceContext_Release(d3d_context);
+
+            if (layer_parameters->layerOptions & D2D1_LAYER_OPTIONS1_IGNORE_ALPHA)
+                info.ignore_alpha = TRUE;
 
             /* Switch render target to the layer bitmap. */
             context->target.bitmap = layer_bitmap;
