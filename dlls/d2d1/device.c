@@ -3781,9 +3781,19 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
                 ID2D1Brush_AddRef(info.opacity_brush);
             }
 
-            /* Clear temporary surface to transparent. */
+            /* Initialize layer bitmap: copy background or clear to transparent. */
             ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
-            ID3D11DeviceContext_ClearRenderTargetView(d3d_context, layer_bitmap->rtv, transparent);
+            if (layer_parameters->layerOptions & D2D1_LAYER_OPTIONS1_INITIALIZE_FROM_BACKGROUND)
+            {
+                TRACE("Layer initialized from background (options %#x).\n",
+                        layer_parameters->layerOptions);
+                ID3D11DeviceContext_CopyResource(d3d_context,
+                        layer_bitmap->resource, context->target.bitmap->resource);
+            }
+            else
+            {
+                ID3D11DeviceContext_ClearRenderTargetView(d3d_context, layer_bitmap->rtv, transparent);
+            }
             ID3D11DeviceContext_Release(d3d_context);
 
             /* Switch render target to the layer bitmap. */
