@@ -20,9 +20,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 
-/* CLSID_D2D1Opacity — not yet in Wine's dxguid library. */
-const GUID CLSID_D2D1Opacity = {0x811d79a4,0xde28,0x4454,{0x80,0x94,0xc6,0x46,0x85,0xf8,0xbd,0x4c}};
-
 static inline struct d2d_transform *impl_from_ID2D1OffsetTransform(ID2D1OffsetTransform *iface)
 {
     return CONTAINING_RECORD(iface, struct d2d_transform, ID2D1TransformNode_iface);
