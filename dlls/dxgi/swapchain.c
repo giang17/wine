@@ -725,16 +725,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_Present1(IDXGISwapChain4 *iface
     {
         wined3d_swapchain_set_dirty_rects(swapchain->wined3d_swapchain,
                 present_parameters->pDirtyRects, present_parameters->DirtyRectsCount);
-
-        /* Signal the DComp timer handler that the app rendered new content.
-         * The timer will perform a micro-resize to force JUCE's
-         * CachedComponentImage to repaint (stale-UI workaround). */
-        if (swapchain->alpha_mode == DXGI_ALPHA_MODE_PREMULTIPLIED)
-        {
-            HWND hwnd = d3d11_swapchain_get_hwnd(swapchain);
-            if (hwnd)
-                SetPropW(hwnd, L"__wine_dcomp_content_changed", (HANDLE)1);
-        }
     }
     else
     {

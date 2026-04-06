@@ -423,92 +423,16 @@ static void dcomp_reblit_comp_buffer(HWND hwnd, const char *reason)
     }
 }
 
-/* ── DComp micro-resize: popup detection via EnumThreadWindows ──
- *
- * JUCE popup menus are separate top-level windows with WS_POPUP style
- * (class "JUCE_*", title "menu" or empty for shadow/border windows).
- * A micro-resize on the parent would trigger handleMovedOrResized()
- * which dismisses these popups.  We enumerate the current thread's
- * windows before each micro-resize and skip it when any visible
- * popup-style window exists (excluding DComp infrastructure windows
- * excluding the micro-resize target itself via skip_hwnd). */
-
-struct dcomp_popup_check
-{
-    HWND skip_hwnd;
-    BOOL found;
-};
-
-static BOOL CALLBACK dcomp_check_popup_cb(HWND wnd, LPARAM lp)
-{
-    struct dcomp_popup_check *pc = (struct dcomp_popup_check *)lp;
-    RECT r;
-    LONG style;
-    int w, h;
-
-    if (wnd == pc->skip_hwnd || !IsWindowVisible(wnd))
-        return TRUE;
-
-    style = GetWindowLongW(wnd, GWL_STYLE);
-    if (!(style & WS_POPUP))
-        return TRUE;
-
-    /* Skip windows with title bars (WS_CAPTION = WS_BORDER | WS_DLGFRAME).
-     * These are regular application windows (e.g. Reaper FX editor), not
-     * popup menus.  JUCE popup menus use bare WS_POPUP without WS_CAPTION. */
-    if ((style & WS_CAPTION) == WS_CAPTION)
-        return TRUE;
-
-    /* NOTE: We previously skipped DComp windows here (checking
-     * __wine_dcomp_swapchain), but Prophecy popup menus are also DComp
-     * targets, so they were never detected as popups.  The other filters
-     * (WS_POPUP, no WS_CAPTION, size, skip_hwnd) are sufficient — the
-     * micro-resize target itself is excluded via skip_hwnd, and other
-     * embedded DComp targets are WS_CHILD (not WS_POPUP). */
-
-    if (!GetWindowRect(wnd, &r))
-        return TRUE;
-
-    w = r.right - r.left;
-    h = r.bottom - r.top;
-
-    /* JUCE popup menus are at least ~50x20; shadow/border windows are
-     * narrow strips (12xN or Nx12) but still > 50 in one dimension.
-     * Infrastructure helper windows are tiny (1x1 or 113x2). */
-    if (w > 50 && h > 20)
-    {
-        pc->found = TRUE;
-        return FALSE; /* stop enumeration */
-    }
-
-    return TRUE;
-}
-
-/* Check if another DComp-subclassed target already exists in this thread.
- * Used to distinguish primary targets (main plugin window) from secondary
- * targets (popup menus, tooltips) that should use lightweight mode. */
-struct dcomp_existing_target_check
-{
-    HWND skip_hwnd;
-    BOOL found;
-};
-
-static BOOL CALLBACK dcomp_check_existing_target_cb(HWND wnd, LPARAM lp)
-{
-    struct dcomp_existing_target_check *ec = (struct dcomp_existing_target_check *)lp;
-    if (wnd == ec->skip_hwnd)
-        return TRUE;
-    if (GetPropW(wnd, L"__wine_dcomp_swapchain"))
-    {
-        ec->found = TRUE;
-        return FALSE;
-    }
-    return TRUE;
-}
+/* Count of currently subclassed DComp target windows.  Used to distinguish
+ * the first (primary) target from secondary targets (popups, tooltips).
+ * Primary target gets full mode (timer + periodic Present), secondary targets
+ * get lightweight popup mode.  Incremented after subclassing, decremented
+ * in WM_NCDESTROY of both wndprocs.  Thread-safe via Interlocked ops. */
+static LONG dcomp_subclassed_target_count;
 
 /* Lightweight subclass for DComp popup windows (menus, tooltips).
  * Only blocks WM_ERASEBKGND and re-blits composition content on WM_PAINT.
- * NO timer, NO micro-resize, NO periodic Present â avoids dual-swapchain
+ * NO timer, NO periodic Present â avoids dual-swapchain
  * interference that causes main plugin window to flicker. */
 static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
@@ -552,6 +476,7 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
         case WM_NCDESTROY:
         {
             LRESULT result;
+            InterlockedDecrement(&dcomp_subclassed_target_count);
             KillTimer(hwnd, DCOMP_POPUP_REBLIT_TIMER_ID);
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -616,11 +541,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         case WM_TIMER:
             if (wparam == DCOMP_REBLIT_TIMER_ID)
             {
-                static unsigned int dcomp_resize_cooldown;
                 IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
-
-                if (dcomp_resize_cooldown > 0)
-                    --dcomp_resize_cooldown;
 
                 if (sc)
                 {
@@ -632,78 +553,6 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                      * frame-ready signal — without it, input events stall. */
                     IDXGISwapChain4_Present(sc, 0, 0);
 
-                    /* DComp stale-UI workaround (event-driven):  When the app
-                     * rendered new content (Present1 with dirty rects set the
-                     * __wine_dcomp_content_changed property), perform a micro-
-                     * resize (shrink 1px then restore) on the target window.
-                     * This triggers JUCE's handleResize() which marks all cached
-                     * component images dirty and forces a full repaint — exactly
-                     * what happens naturally at non-100% view sizes.
-                     *
-                     * Uses GetWindowRect (not GetClientRect) so that the 1px
-                     * delta applies to the window frame, not client area — this
-                     * prevents cumulative shrinkage on standalone windows that
-                     * have title bars and borders.
-                     *
-                     * A cooldown (3 ticks = 600ms) prevents excessive repaints
-                     * when the app renders continuously. */
-                    if (GetPropW(hwnd, L"__wine_dcomp_content_changed")
-                            && dcomp_resize_cooldown == 0)
-                    {
-                        /* Skip micro-resize for standalone (top-level) windows.
-                         * The stale-UI bug only manifests in VST3 plugins
-                         * embedded in hosts (Reaper) at 100% view size.
-                         * Standalone windows have no view-size scaling and
-                         * the micro-resize causes a brief visual flash. */
-                        HWND parent = GetParent(hwnd);
-                        if (!parent || parent == GetDesktopWindow())
-                        {
-                            RemovePropW(hwnd, L"__wine_dcomp_content_changed");
-                        }
-                        else
-                        {
-                        struct dcomp_popup_check pc;
-                        pc.skip_hwnd = hwnd;
-                        pc.found = FALSE;
-                        EnumThreadWindows(GetCurrentThreadId(), dcomp_check_popup_cb, (LPARAM)&pc);
-
-                        if (pc.found)
-                        {
-                            /* A popup menu is open — skip micro-resize to avoid
-                             * dismissing it.  The property stays set and will be
-                             * consumed on the next timer tick after the popup
-                             * closes.  See dcomp_check_popup_cb for details. */
-                            TRACE("DComp micro-resize deferred: popup window active.\n");
-                        }
-                        else
-                        {
-                            RECT wr;
-                            RemovePropW(hwnd, L"__wine_dcomp_content_changed");
-                            if (GetWindowRect(hwnd, &wr))
-                            {
-                                int w = wr.right - wr.left;
-                                int h = wr.bottom - wr.top;
-                                if (w > 1 && h > 1)
-                                {
-                                    /* Suppress X11 ConfigureWindow for the shrink call.
-                                     * The property tells the X11 driver to skip the
-                                     * XReconfigureWMWindow so the 1px shrink is never
-                                     * visible.  Win32 state (wineserver) still updates,
-                                     * so JUCE sees the size change via GetWindowRect. */
-                                    SetPropW(hwnd, L"__wine_dcomp_skip_x11_config", (HANDLE)1);
-                                    SetWindowPos(hwnd, NULL, 0, 0, w - 1, h,
-                                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-                                    RemovePropW(hwnd, L"__wine_dcomp_skip_x11_config");
-                                    SetWindowPos(hwnd, NULL, 0, 0, w, h,
-                                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-                                    dcomp_resize_cooldown = 3;
-                                    TRACE("DComp micro-resize pulse: hwnd %p %dx%d (cooldown 3).\n",
-                                            hwnd, w, h);
-                                }
-                            }
-                        }
-                        } /* else (embedded child window) */
-                    }
                 }
                 else
                 {
@@ -746,6 +595,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         case WM_NCDESTROY:
         {
             LRESULT result;
+            InterlockedDecrement(&dcomp_subclassed_target_count);
             KillTimer(hwnd, DCOMP_REBLIT_TIMER_ID);
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -822,31 +672,21 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
 
                 ShowWindow(hwnd, SW_HIDE);
 
-                /* Detect popup mode: any DComp target where another window
-                 * with __wine_dcomp_swapchain already exists in this thread.
-                 * This catches ALL secondary targets (popups, tooltips, dialogs
-                 * with WS_CAPTION like Pianoteq Options) because the composition
-                 * infrastructure window (from CreateSwapChainForComposition) gets
-                 * __wine_dcomp_swapchain before the real target is subclassed.
-                 * Popup mode = lightweight wndproc (no timer, no micro-resize)
-                 * to avoid dual-swapchain interference that causes flicker. */
+                /* Detect popup mode via subclassed target count.
+                 * First target (count == 0) gets full mode with timer +
+                 * Present.  Subsequent targets get lightweight popup
+                 * mode to avoid dual-swapchain interference. */
                 {
                     BOOL is_popup_mode = FALSE;
                     LONG target_style = GetWindowLongW(target_hwnd, GWL_STYLE);
                     HWND target_parent = GetParent(target_hwnd);
 
-                    FIXME("DComp popup-detect: target %p style=0x%08lx parent=%p.\n",
-                            target_hwnd, (unsigned long)target_style, target_parent);
+                    FIXME("DComp popup-detect: target %p style=0x%08lx parent=%p count=%ld.\n",
+                            target_hwnd, (unsigned long)target_style, target_parent,
+                            dcomp_subclassed_target_count);
 
-                    {
-                        struct dcomp_existing_target_check ec;
-                        ec.skip_hwnd = target_hwnd;
-                        ec.found = FALSE;
-                        EnumThreadWindows(GetCurrentThreadId(),
-                                dcomp_check_existing_target_cb, (LPARAM)&ec);
-                        if (ec.found)
-                            is_popup_mode = TRUE;
-                    }
+                    if (dcomp_subclassed_target_count > 0)
+                        is_popup_mode = TRUE;
 
                     if (is_popup_mode)
                     {
@@ -859,6 +699,7 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                             SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
                             SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
                             SetTimer(target_hwnd, DCOMP_POPUP_REBLIT_TIMER_ID, 200, NULL);
+                            InterlockedIncrement(&dcomp_subclassed_target_count);
                             FIXME("DComp POPUP mode: target %p, orig wndproc %p, sc=%p (reblit timer 200ms).\n",
                                     target_hwnd, orig, iface);
                         }
@@ -870,7 +711,7 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                     }
                     else
                     {
-                        /* Full mode: subclass + timer + micro-resize for main window */
+                        /* Full mode: subclass + timer + periodic Present for main window */
                         WNDPROC orig = (WNDPROC)SetWindowLongPtrW(target_hwnd, GWLP_WNDPROC,
                                 (LONG_PTR)dcomp_target_wndproc);
                         if (orig)
@@ -878,6 +719,7 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                             SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
                             SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
                             SetTimer(target_hwnd, DCOMP_REBLIT_TIMER_ID, 200, NULL);
+                            InterlockedIncrement(&dcomp_subclassed_target_count);
                             FIXME("DComp: subclassed target %p, orig wndproc %p, timer started, sc=%p.\n",
                                     target_hwnd, orig, iface);
                         }
