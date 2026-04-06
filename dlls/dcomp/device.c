@@ -61,6 +61,8 @@ static void dcomp_send_child_mode(IUnknown *content)
     }
 }
 
+static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface);
+
 /* =====================================================================
  * IDCompositionSurface
  * ===================================================================== */
@@ -88,6 +90,7 @@ struct dcomp_surface
     BOOL drawing;
     ID2D1DeviceContext *active_context; /* D2D1 context from BeginDraw (for EndDraw clip pop) */
     BOOL has_clip;                     /* TRUE if PushAxisAlignedClip active */
+    IDCompositionDevice *device_iface; /* back-pointer for auto-commit in EndDraw */
 };
 
 static inline struct dcomp_surface *impl_from_IDCompositionSurface(IDCompositionSurface *iface)
@@ -406,12 +409,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_EndDraw(IDCompositionSurface *ifa
         {
             FIXME("ID2D1Bitmap1_Map failed: %#lx.\n", hr);
         }
-
-        return S_OK;
     }
-
-    /* D3D11 path: GPU texture → staging → CPU readback */
-    if (surface->staging && surface->texture && surface->bits)
+    else if (surface->staging && surface->texture && surface->bits)
     {
         ID3D11DeviceContext *d3d_context;
         D3D11_MAPPED_SUBRESOURCE mapped;
@@ -442,6 +441,33 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_EndDraw(IDCompositionSurface *ifa
         }
 
         ID3D11DeviceContext_Release(d3d_context);
+    }
+
+    /* Auto-commit: present the updated surface immediately so that apps
+     * that don't call Commit() after every EndDraw (or call it too late)
+     * still get timely screen updates.  This mirrors Windows behavior where
+     * DWM presents composition changes at the next vsync boundary.
+     * Guard against reentrancy: Commit → BitBlt → WM_PAINT → BeginDraw/EndDraw.
+     * If reentrant EndDraw happens, set dirty flag so we re-commit after. */
+    if (surface->device_iface)
+    {
+        static BOOL in_auto_commit;
+        static BOOL commit_pending;
+        if (!in_auto_commit)
+        {
+            in_auto_commit = TRUE;
+            dcomp_device_Commit(surface->device_iface);
+            while (commit_pending)
+            {
+                commit_pending = FALSE;
+                dcomp_device_Commit(surface->device_iface);
+            }
+            in_auto_commit = FALSE;
+        }
+        else
+        {
+            commit_pending = TRUE;
+        }
     }
 
     return S_OK;
@@ -1951,6 +1977,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateSurface(IDCompositionDevice 
     if (FAILED(hr))
         return hr;
 
+    object->device_iface = &device->IDCompositionDevice_iface;
     *surface = &object->IDCompositionSurface_iface;
     return S_OK;
 }
@@ -1989,6 +2016,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateVirtualSurface(IDComposition
     if (FAILED(hr))
         return hr;
 
+    object->device_iface = &device->IDCompositionDevice_iface;
     *surface = (IDCompositionVirtualSurface *)&object->IDCompositionSurface_iface;
     return S_OK;
 }
