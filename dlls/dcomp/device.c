@@ -484,8 +484,115 @@ static const IDCompositionSurfaceVtbl dcomp_surface_vtbl =
 static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtualSurface *iface,
         UINT width, UINT height)
 {
-    FIXME("iface %p, %ux%u stub!\n", iface, width, height);
-    /* TODO: Reallocate texture + staging + bits with new dimensions */
+    struct dcomp_surface *surface = CONTAINING_RECORD(iface, struct dcomp_surface, IDCompositionSurface_iface);
+    DWORD *new_bits;
+
+    TRACE("iface %p, %ux%u (old %ux%u).\n", iface, width, height, surface->width, surface->height);
+
+    if (width == surface->width && height == surface->height)
+        return S_OK;
+
+    if (surface->drawing)
+    {
+        WARN("Resize called during active BeginDraw — ignoring.\n");
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    /* Reallocate system memory for composition. */
+    new_bits = calloc(width * height, sizeof(DWORD));
+    if (!new_bits)
+        return E_OUTOFMEMORY;
+    free(surface->bits);
+    surface->bits = new_bits;
+
+    /* Release D2D1 bitmaps — they will be recreated lazily in BeginDraw
+     * via dcomp_surface_ensure_d2d1_resources() with the new dimensions. */
+    if (surface->readback_bitmap)
+    {
+        ID2D1Bitmap1_Release(surface->readback_bitmap);
+        surface->readback_bitmap = NULL;
+    }
+    if (surface->target_bitmap)
+    {
+        ID2D1Bitmap1_Release(surface->target_bitmap);
+        surface->target_bitmap = NULL;
+    }
+    if (surface->persistent_context)
+    {
+        ID2D1DeviceContext_Release(surface->persistent_context);
+        surface->persistent_context = NULL;
+    }
+
+    /* Recreate D3D11 textures at the new size (no lazy-init in this path). */
+    if (surface->d3d11_device)
+    {
+        D3D11_TEXTURE2D_DESC tex_desc;
+        HRESULT hr;
+
+        if (surface->dxgi_surface)
+        {
+            IDXGISurface_Release(surface->dxgi_surface);
+            surface->dxgi_surface = NULL;
+        }
+        if (surface->staging)
+        {
+            ID3D11Texture2D_Release(surface->staging);
+            surface->staging = NULL;
+        }
+        if (surface->texture)
+        {
+            ID3D11Texture2D_Release(surface->texture);
+            surface->texture = NULL;
+        }
+
+        memset(&tex_desc, 0, sizeof(tex_desc));
+        tex_desc.Width = width;
+        tex_desc.Height = height;
+        tex_desc.MipLevels = 1;
+        tex_desc.ArraySize = 1;
+        tex_desc.Format = surface->format;
+        tex_desc.SampleDesc.Count = 1;
+        tex_desc.Usage = D3D11_USAGE_DEFAULT;
+        tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &tex_desc, NULL, &surface->texture);
+        if (FAILED(hr))
+        {
+            WARN("Failed to create resized render target texture: %#lx.\n", hr);
+            surface->width = width;
+            surface->height = height;
+            return hr;
+        }
+
+        tex_desc.Usage = D3D11_USAGE_STAGING;
+        tex_desc.BindFlags = 0;
+        tex_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &tex_desc, NULL, &surface->staging);
+        if (FAILED(hr))
+        {
+            WARN("Failed to create resized staging texture: %#lx.\n", hr);
+            ID3D11Texture2D_Release(surface->texture);
+            surface->texture = NULL;
+            surface->width = width;
+            surface->height = height;
+            return hr;
+        }
+
+        hr = ID3D11Texture2D_QueryInterface(surface->texture,
+                &IID_IDXGISurface, (void **)&surface->dxgi_surface);
+        if (FAILED(hr))
+        {
+            WARN("Failed to get IDXGISurface from resized texture: %#lx.\n", hr);
+            surface->width = width;
+            surface->height = height;
+            return hr;
+        }
+    }
+
+    surface->width = width;
+    surface->height = height;
+
     return S_OK;
 }
 
