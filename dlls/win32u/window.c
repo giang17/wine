@@ -3930,6 +3930,18 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     }
     if (surface) window_surface_release( surface );
 
+    /* After apply_window_pos, the window's content may have been BitBlt'd from the
+     * old position. During batch processing (EndDeferWindowPos), sibling expose_window
+     * calls can set update regions that cause DCX_EXCLUDERGN to skip parts of the
+     * BitBlt, leaving stale content. Force a full invalidation so WM_PAINT repaints
+     * everything correctly on top of the BitBlt'd content. */
+    if (!(winpos->flags & (SWP_NOREDRAW | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) &&
+        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOGEOMETRYCHANGE)
+    {
+        TRACE( "hwnd %p: post-move invalidation (flags %08x)\n", winpos->hwnd, (int)winpos->flags );
+        NtUserRedrawWindow( winpos->hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
+    }
+
     if (winpos->flags & SWP_HIDEWINDOW)
     {
         NtUserNotifyWinEvent( EVENT_OBJECT_HIDE, winpos->hwnd, 0, 0 );
