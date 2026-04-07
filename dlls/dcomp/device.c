@@ -1748,6 +1748,66 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
         memcpy(target->comp_bits, surface->bits,
                 surface->width * surface->height * sizeof(DWORD));
 
+        /* Composite child visual surfaces on top (premultiplied alpha over) */
+        {
+            struct dcomp_visual *child;
+            static unsigned int child_comp_log;
+
+            for (child = target->root_visual->children; child; child = child->next_sibling)
+            {
+                struct dcomp_surface *child_surf = child->surface_content;
+                int ox, oy, src_x, src_y, dst_x, dst_y, copy_w, copy_h, y, x;
+                DWORD *dst_row, *src_row;
+
+                if (!child_surf || !child_surf->bits || !child_surf->width || !child_surf->height)
+                    continue;
+
+                ox = (int)child->offset_x;
+                oy = (int)child->offset_y;
+
+                /* Clip to destination bounds */
+                src_x = (ox < 0) ? -ox : 0;
+                src_y = (oy < 0) ? -oy : 0;
+                dst_x = (ox < 0) ? 0 : ox;
+                dst_y = (oy < 0) ? 0 : oy;
+                copy_w = min((int)child_surf->width - src_x, (int)surface->width - dst_x);
+                copy_h = min((int)child_surf->height - src_y, (int)surface->height - dst_y);
+
+                if (copy_w <= 0 || copy_h <= 0)
+                    continue;
+
+                if (++child_comp_log <= 5)
+                    FIXME("Compositing child visual %ux%u at (%d,%d) onto %ux%u root.\n",
+                            child_surf->width, child_surf->height, ox, oy,
+                            surface->width, surface->height);
+
+                for (y = 0; y < copy_h; y++)
+                {
+                    dst_row = (DWORD *)target->comp_bits + (dst_y + y) * surface->width + dst_x;
+                    src_row = (DWORD *)child_surf->bits + (src_y + y) * child_surf->width + src_x;
+                    for (x = 0; x < copy_w; x++)
+                    {
+                        DWORD s = src_row[x];
+                        BYTE sa = (s >> 24);
+                        if (sa == 0xff)
+                        {
+                            dst_row[x] = s;
+                        }
+                        else if (sa > 0)
+                        {
+                            /* Premultiplied alpha: out = src + dst * (1 - sa/255) */
+                            DWORD d = dst_row[x];
+                            BYTE ia = 255 - sa;
+                            dst_row[x] = ((min(sa + (((d >> 24) * ia + 127) / 255), 255u)) << 24)
+                                       | ((((s >> 16) & 0xff) + ((((d >> 16) & 0xff) * ia + 127) / 255)) << 16)
+                                       | ((((s >> 8) & 0xff) + ((((d >> 8) & 0xff) * ia + 127) / 255)) << 8)
+                                       | (((s & 0xff) + (((d & 0xff) * ia + 127) / 255)));
+                        }
+                    }
+                }
+            }
+        }
+
         /* BitBlt to the target window */
         hdc = GetDC(target->hwnd);
         if (hdc)
