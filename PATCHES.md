@@ -46,6 +46,10 @@ sudo make install
 64-bit DLLs (including d2d1) will be missing. Use a separate `--prefix` to avoid overwriting
 your distro's Wine installation.
 
+**Bottles users**: If you need 32-bit support (e.g. for Bottles), use
+`--enable-archs=i386,x86_64` instead of `--enable-win64` (thanks to @jibeape for
+figuring this out).
+
 Run plugins with WineD3D (not DXVK) for best D2D1 performance:
 
 ```bash
