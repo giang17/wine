@@ -228,8 +228,18 @@ static BOOL needs_client_window_clipping( HWND hwnd )
 
 BOOL needs_offscreen_rendering( HWND hwnd )
 {
+    static const WCHAR dcomp_target_propW[] =
+        {'_','_','w','i','n','e','_','d','c','o','m','p','_','t','a','r','g','e','t',0};
+
     if (NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
-    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return TRUE; /* child window, needs compositing */
+    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow())
+    {
+        /* DComp target windows render via their own BitBlt path (comp_dc → GetDC),
+         * not through the GL client_surface.  Offscreen XComposite compositing is
+         * unnecessary and causes flicker when popups open/close over the plugin. */
+        if (NtUserGetProp( hwnd, dcomp_target_propW )) return FALSE;
+        return TRUE; /* child window, needs compositing */
+    }
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
     return FALSE;
 }
@@ -446,6 +456,7 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     client_surface_update_offscreen( hwnd, surface );
 
     if (!hdc) return;
+    if (!surface->hdc_dst) return; /* non-offscreen, GL presents directly */
     window = X11DRV_get_whole_window( toplevel );
 
     if (NtUserGetPresentRect( toplevel, &rect_dst, -1 /* raw dpi */ ))
