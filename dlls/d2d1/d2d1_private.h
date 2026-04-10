@@ -29,6 +29,37 @@
 #include <math.h>
 #define COBJMACROS
 #include "d2d1_3.h"
+
+/* Private heap for d2d1 — isolates high-frequency alloc/free churn
+ * (geometry objects, path builders, brush data) from the process heap
+ * to prevent RSS growth from ntdll heap fragmentation. */
+extern HANDLE d2d1_heap;
+
+static inline void *d2d1_private_alloc(size_t size)
+{
+    return HeapAlloc(d2d1_heap, 0, size);
+}
+
+static inline void *d2d1_private_calloc(size_t count, size_t size)
+{
+    return HeapAlloc(d2d1_heap, HEAP_ZERO_MEMORY, count * size);
+}
+
+static inline void *d2d1_private_realloc(void *ptr, size_t size)
+{
+    if (!ptr) return HeapAlloc(d2d1_heap, 0, size);
+    return HeapReAlloc(d2d1_heap, 0, ptr, size);
+}
+
+static inline void d2d1_private_free(void *ptr)
+{
+    if (ptr) HeapFree(d2d1_heap, 0, ptr);
+}
+
+#define malloc(s)       d2d1_private_alloc(s)
+#define calloc(c, s)    d2d1_private_calloc(c, s)
+#define realloc(p, s)   d2d1_private_realloc(p, s)
+#define free(p)         d2d1_private_free(p)
 #include "d2d1effectauthor.h"
 #include "d3d11_1.h"
 #ifdef D2D1_INIT_GUID

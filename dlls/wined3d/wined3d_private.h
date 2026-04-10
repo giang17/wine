@@ -52,6 +52,38 @@
 #include "wine/list.h"
 #include "wine/rbtree.h"
 
+/* Private heap for wined3d — isolates high-frequency alloc/free churn from
+ * the process heap to prevent RSS growth from ntdll heap fragmentation.
+ * HeapDestroy at DLL_PROCESS_DETACH returns all memory to the OS at once. */
+extern HANDLE wined3d_heap;
+
+static inline void *wined3d_private_alloc(size_t size)
+{
+    return HeapAlloc(wined3d_heap, 0, size);
+}
+
+static inline void *wined3d_private_calloc(size_t count, size_t size)
+{
+    return HeapAlloc(wined3d_heap, HEAP_ZERO_MEMORY, count * size);
+}
+
+static inline void *wined3d_private_realloc(void *ptr, size_t size)
+{
+    if (!ptr) return HeapAlloc(wined3d_heap, 0, size);
+    return HeapReAlloc(wined3d_heap, 0, ptr, size);
+}
+
+static inline void wined3d_private_free(void *ptr)
+{
+    if (ptr) HeapFree(wined3d_heap, 0, ptr);
+}
+
+/* Redirect standard C allocators to wined3d private heap */
+#define malloc(s)       wined3d_private_alloc(s)
+#define calloc(c, s)    wined3d_private_calloc(c, s)
+#define realloc(p, s)   wined3d_private_realloc(p, s)
+#define free(p)         wined3d_private_free(p)
+
 static inline size_t align(size_t addr, size_t alignment)
 {
     return (addr + (alignment - 1)) & ~(alignment - 1);

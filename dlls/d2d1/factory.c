@@ -1693,9 +1693,24 @@ static void d2d_settings_init(void)
         RegCloseKey(default_key);
 }
 
+HANDLE d2d1_heap;
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
 {
-    if (reason == DLL_PROCESS_ATTACH)
+    switch (reason)
+    {
+    case DLL_PROCESS_ATTACH:
+        d2d1_heap = HeapCreate(0, 0, 0);
+        if (!d2d1_heap) return FALSE;
         d2d_settings_init();
+        break;
+    case DLL_PROCESS_DETACH:
+        if (!reserved && d2d1_heap)
+        {
+            HeapDestroy(d2d1_heap);
+            d2d1_heap = NULL;
+        }
+        break;
+    }
     return TRUE;
 }
