@@ -1145,6 +1145,24 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
         owner_win = X11DRV_get_whole_window( owner );
     }
 
+    /* For ownerless WS_POPUP|WS_EX_TOOLWINDOW windows (e.g. JUCE popup menus in
+     * embedded VST3 plugins), use the active window as implicit transient parent.
+     * Without transient_for, the window manager has no stacking context and may
+     * place the popup behind the application window. */
+    if (!owner_win && (style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW))
+    {
+        HWND active = get_active_window();
+        if (active && active != data->hwnd)
+        {
+            Window active_win = X11DRV_get_whole_window( NtUserGetAncestor( active, GA_ROOT ) );
+            if (active_win)
+            {
+                owner_win = active_win;
+                group_leader = active_win;
+            }
+        }
+    }
+
     if (owner_win)
     {
         XSetTransientForHint( data->display, data->whole_window, owner_win );
@@ -1157,6 +1175,8 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
      */
     if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
+    else if ((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW) && !owner)
+        window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );
     else
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
 
