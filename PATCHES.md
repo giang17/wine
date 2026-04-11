@@ -1,9 +1,15 @@
 # Wine D2D1 / DComp Patches
 
 This fork contains patches for Wine's Direct2D (d2d1), DirectComposition (dcomp),
-DirectWrite (dwrite), and related subsystems. The patches fix rendering issues in
-Windows applications that rely heavily on D2D1, such as audio plugins (Serum2,
-Korg Trinity, Korg Prophecy) running in DAWs (Reaper) via Wine.
+DirectWrite (dwrite), and related subsystems. The patches fix rendering and
+performance issues that prevented modern JUCE 8 and VSTGUI-based Windows
+applications from running correctly under Wine — particularly audio plugins
+(Serum2, Korg Trinity, Korg Prophecy, Pianoteq 9) in DAWs like Reaper.
+
+These newer plugin frameworks rely on DirectComposition for window management
+and D2D1 for GPU-accelerated 2D rendering — APIs that were largely unimplemented
+in Wine. With these patches, plugins using DComp + D2D1 now render correctly
+and run stable in production use.
 
 **Base**: Wine 11.0 stable (`wine-11.0` tag)
 
@@ -27,7 +33,9 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   micro-resize for stale UI
 - **WineD3D**: Composition buffer with dirty rect accumulation, GL buffer recycling pool
   (70% RSS reduction), scratch buffer reuse (98.6% fewer allocs), constant buffer
-  dirty-check (23% fewer DISCARDs)
+  dirty-check (23% fewer DISCARDs), private heap to isolate alloc churn
+- **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behavior)
+- **D2D1 private heap**: Isolates high-frequency geometry alloc/free from process heap
 - **winex11**: DComp window support, backing store, micro-resize suppression
 - **shell32**: VirtualDesktopManager COM stub
 
@@ -46,30 +54,36 @@ sudo make install
 64-bit DLLs (including d2d1) will be missing. Use a separate `--prefix` to avoid overwriting
 your distro's Wine installation.
 
+**ntsync** (recommended): If your kernel has the `ntsync` module (Linux 6.12+), make sure
+`/usr/include/linux/ntsync.h` exists before running `./configure`. This enables kernel-level
+NT synchronization primitives, significantly reducing audio latency (stable at 64 samples /
+48 kHz). Check with `grep HAVE_LINUX_NTSYNC_H include/config.h` after configure.
+
 **Bottles users**: If you need 32-bit support (e.g. for Bottles), use
 `--enable-archs=i386,x86_64` instead of `--enable-win64` (thanks to @jibeape for
 figuring this out).
 
-Run plugins with WineD3D (not DXVK) for best D2D1 performance:
-
-```bash
-WINEDLLOVERRIDES="d3d11,dxgi,d3d10core,d3d9=b" /opt/wine-d2d1/bin/wine reaper.exe
-```
+With the DComp rendering path active, DXVK and WineD3D perform equally well for
+D2D1 plugins — D2D1 draws go through a bitmap+BitBlt path, not the DXGI swapchain.
+DXVK can stay enabled globally.
 
 To verify the patches are working, start with fallback settings in Serum2:
 - `"Disable DirectComposition": true`
 - `"Disable Partial Redraw": true`
 
-Once confirmed working, switch to the full DComp path (`false` / `false`) for better performance.
+Once confirmed working, switch to the full DComp path (`false` / `false`) for best
+performance (dirty-rect clipping, persistent bitmap, faster GUI redraws).
 
 ## Tested Applications
 
-| Application | Status |
-|-------------|--------|
-| Serum2 (VST3 in Reaper) | Fully functional, all waveform views + envelopes + presets |
-| Korg Trinity (VST3 in Reaper) | Fully functional, DComp rendering path |
-| Korg Prophecy (VST3 in Reaper) | Fully functional |
-| WineSynth (custom VSTGUI plugin) | 18k+ partial redraws without crash |
+| Application | Framework | Status |
+|-------------|-----------|--------|
+| Serum2 (VST3 in Reaper) | VSTGUI + DComp | Fully functional, all waveform views + envelopes + presets |
+| Korg Trinity (VST3 in Reaper) | JUCE 8 + DComp | Fully functional, DComp rendering path |
+| Korg Prophecy (VST3 in Reaper) | JUCE 8 + DComp | Fully functional |
+| Pianoteq 9 (standalone + VST3) | JUCE 8 + DComp | Fully functional |
+| FL Studio (Wine + ntsync) | Custom | Runs without xruns at 64 samples / 48 kHz |
+| WineSynth (custom VSTGUI plugin) | VSTGUI + DComp | 18k+ partial redraws without crash |
 
 ## Font Setup
 
