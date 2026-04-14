@@ -63,9 +63,14 @@ NT synchronization primitives, significantly reducing audio latency (stable at 6
 `--enable-archs=i386,x86_64` instead of `--enable-win64` (thanks to @jibeape for
 figuring this out).
 
-With the DComp rendering path active, DXVK and WineD3D perform equally well for
-D2D1 plugins — D2D1 draws go through a bitmap+BitBlt path, not the DXGI swapchain.
-DXVK can stay enabled globally.
+**DXVK compatibility**: Do **not** install DXVK alongside this patch set. The DXGI
+patches (DComp popup handling, GL SwapBuffers) modify Wine's builtin `dxgi.dll`.
+DXVK replaces `dxgi.dll` with its own implementation, which discards these patches.
+Furthermore, DXVK's `d3d11.dll` and Wine's `dxgi.dll` are **not interchangeable** —
+they use different internal COM interfaces (`DxgiSwap*` / `D3D11DXGI*` vs
+`IWineDXGI*`) and mixing them causes crashes. With the DComp rendering path active,
+DXVK offers no benefit anyway — D2D1 draws go through a bitmap+BitBlt path, not the
+DXGI swapchain, so WineD3D performs equally well.
 
 To verify the patches are working, start with fallback settings in Serum2:
 - `"Disable DirectComposition": true`
