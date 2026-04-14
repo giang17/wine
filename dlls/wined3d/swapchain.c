@@ -249,6 +249,16 @@ void CDECL wined3d_swapchain_set_force_gdi_present(struct wined3d_swapchain *swa
         swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT;
 }
 
+void CDECL wined3d_swapchain_set_prefer_gl_present(struct wined3d_swapchain *swapchain, BOOL prefer)
+{
+    TRACE("swapchain %p, prefer %d.\n", swapchain, prefer);
+
+    if (prefer)
+        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
+    else
+        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
+}
+
 void CDECL wined3d_swapchain_set_premultiplied_alpha(struct wined3d_swapchain *swapchain, BOOL premultiplied)
 {
     TRACE("swapchain %p, premultiplied %d.\n", swapchain, premultiplied);
@@ -1139,7 +1149,29 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     TRACE("Presenting DC %p.\n", context_gl->dc);
 
     pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format];
-    if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
+
+    /* PREFER_GL_PRESENT overrides FLIP_SEQUENTIAL/SEQUENTIAL/partial checks
+     * for top-level popup windows with a GL-capable X11 drawable.  The GL
+     * context must have successfully bound (not backup_dc) and FORCE_GDI
+     * must not be set.  This eliminates the GPU readback + CPU copies that
+     * the GDI present path requires (~5-10ms per frame). */
+    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
+            && !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+            && context_gl->dc != wined3d_device_gl(swapchain->device)->backup_dc)
+    {
+        static unsigned int gl_present_count;
+        gl_info = context_gl->gl_info;
+
+        if (!(gl_present_count++ % 60))
+            FIXME("GL popup present #%u: dc %p, win %p.\n",
+                    gl_present_count, context_gl->dc, swapchain->win_handle);
+
+        swapchain_gl_set_swap_interval(swapchain, context_gl, swap_interval);
+        wined3d_texture_load_location(back_buffer, 0, context, back_buffer->resource.draw_binding);
+        swapchain_blit(swapchain, context, src_rect, dst_rect);
+        gl_info->gl_ops.wgl.p_wglSwapBuffers(context_gl->dc);
+    }
+    else if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
             || (swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
             || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
             && swapchain_present_is_partial_copy(swapchain, dst_rect))

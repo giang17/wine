@@ -922,6 +922,7 @@ enum wined3d_memory_segment_group
 #define WINED3D_SWAPCHAIN_REGISTER_TOPMOST_TIMER                0x00100000u
 #define WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT                     0x00200000u
 #define WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA                   0x00400000u
+#define WINED3D_SWAPCHAIN_PREFER_GL_PRESENT                     0x00800000u
 
 #define WINED3DDP_MAXTEXCOORD                                   8
 
@@ -2925,6 +2926,7 @@ void __cdecl wined3d_swapchain_set_palette(struct wined3d_swapchain *swapchain, 
 void __cdecl wined3d_swapchain_set_window(struct wined3d_swapchain *swapchain, HWND window);
 void __cdecl wined3d_swapchain_set_device_window(struct wined3d_swapchain *swapchain, HWND window);
 void __cdecl wined3d_swapchain_set_force_gdi_present(struct wined3d_swapchain *swapchain, BOOL force);
+void __cdecl wined3d_swapchain_set_prefer_gl_present(struct wined3d_swapchain *swapchain, BOOL prefer);
 void __cdecl wined3d_swapchain_set_dirty_rects(struct wined3d_swapchain *swapchain,
         const RECT *rects, unsigned int count);
 void __cdecl wined3d_swapchain_set_premultiplied_alpha(struct wined3d_swapchain *swapchain, BOOL premultiplied);

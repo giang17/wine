@@ -476,11 +476,45 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
         case WM_NCDESTROY:
         {
             LRESULT result;
+            IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+
             InterlockedDecrement(&dcomp_subclassed_target_count);
             KillTimer(hwnd, DCOMP_POPUP_REBLIT_TIMER_ID);
+
+            /* Before the popup window is destroyed, switch the swapchain back
+             * to its composition window.  This drains the CS queue (no more
+             * presents to the dead popup), releases the popup's DC, and
+             * rebinds to a valid window.  Without this, the GL context stays
+             * bound to the destroyed popup's drawable → page fault. */
+            if (sc)
+            {
+                struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(sc);
+                WCHAR prop_name[64];
+                HWND comp_wnd;
+
+                swprintf(prop_name, ARRAY_SIZE(prop_name),
+                        L"__wine_dcomp_wnd_%I64x", (UINT_PTR)sc);
+                comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
+
+                wined3d_swapchain_set_prefer_gl_present(swapchain->wined3d_swapchain, FALSE);
+                wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, TRUE);
+
+                if (comp_wnd && IsWindow(comp_wnd))
+                {
+                    wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, comp_wnd);
+                    FIXME("DComp popup %p destroyed, switched back to comp_wnd %p.\n",
+                            hwnd, comp_wnd);
+                }
+                else
+                {
+                    FIXME("DComp popup %p destroyed, comp_wnd not found.\n", hwnd);
+                }
+            }
+
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
             RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
+            RemovePropW(hwnd, L"__wine_dcomp_swapchain");
             RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
             RemovePropW(hwnd, L"__wine_dcomp_comp_size");
             return result;
@@ -658,11 +692,35 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
 
                 /* Switch swapchain device window from comp_wnd to target_hwnd.
                  * The GL context rebinds lazily via context_gl_update_window.
-                 * Force GDI blit for present: target_hwnd has no X11 whole_window,
-                 * so GL swap would write to an invisible drawable. GDI blit writes
-                 * to the window surface, which persists through parent repaints. */
-                wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, target_hwnd);
-                wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, TRUE);
+                 *
+                 * Top-level popup windows (WS_POPUP, parent == Desktop) have an
+                 * X11 whole_window, so GL can create a client_window drawable and
+                 * use glXSwapBuffers directly — no GPU readback or CPU copies.
+                 * win32u's get_window_unused_drawable() calls p_surface_create
+                 * on-demand when wglMakeCurrent needs a drawable for the popup.
+                 *
+                 * Child windows (embedded plugins) have no whole_window, so GL
+                 * swap would write to an invisible drawable.  Force GDI blit for
+                 * those — it writes to the window surface via comp_dc. */
+                {
+                    HWND target_parent_toplevel = GetAncestor(target_hwnd, GA_PARENT);
+                    BOOL is_toplevel = !target_parent_toplevel
+                            || target_parent_toplevel == GetDesktopWindow();
+
+                    wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, target_hwnd);
+
+                    if (is_toplevel)
+                    {
+                        wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, FALSE);
+                        wined3d_swapchain_set_prefer_gl_present(swapchain->wined3d_swapchain, TRUE);
+                        FIXME("DComp: target %p is top-level, using GL present (no GDI readback).\n",
+                                target_hwnd);
+                    }
+                    else
+                    {
+                        wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, TRUE);
+                    }
+                }
 
                 /* Set premultiplied alpha blending if the swapchain uses it.
                  * This makes GDI blit use AlphaBlend instead of StretchBlt,
