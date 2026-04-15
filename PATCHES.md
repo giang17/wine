@@ -72,12 +72,13 @@ they use different internal COM interfaces (`DxgiSwap*` / `D3D11DXGI*` vs
 DXVK offers no benefit anyway — D2D1 draws go through a bitmap+BitBlt path, not the
 DXGI swapchain, so WineD3D performs equally well.
 
-To verify the patches are working, start with fallback settings in Serum2:
-- `"Disable DirectComposition": true`
-- `"Disable Partial Redraw": true`
+**Serum2 settings** (required — the DComp rendering path must be active):
+- `"Disable DirectComposition": false`
+- `"Disable Partial Redraw": false`
 
-Once confirmed working, switch to the full DComp path (`false` / `false`) for best
-performance (dirty-rect clipping, persistent bitmap, faster GUI redraws).
+Do **not** set `"Disable DirectComposition"` to `true` — Wine's GDI fallback path
+does not work correctly with VSTGUI's offscreen bitmap caching, resulting in a
+black window or frozen UI elements.
 
 ## Tested Applications
 
