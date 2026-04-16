@@ -949,5 +949,16 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
         return hr;
     }
 
+    /* Mark this HWND so winex11.drv's needs_offscreen_rendering() returns FALSE.
+     * Otherwise the plugin's X11 child window stays in offscreen XComposite mode
+     * and the GDI present path (swapchain_blit_gdi → BitBlt to HWND DC) never
+     * reaches the toplevel, leaving the plugin window black until an external
+     * event triggers a repaint.  Then force a SetWindowPos no-op to retrigger
+     * client_surface_update_offscreen so the X11 child gets re-attached. */
+    SetPropW(hwnd_rt_desc->hwnd, L"__wine_d3d_hwnd_target", (HANDLE)1);
+    SetWindowPos(hwnd_rt_desc->hwnd, NULL, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+            | SWP_NOREDRAW | SWP_FRAMECHANGED);
+
     return S_OK;
 }

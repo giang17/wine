@@ -230,6 +230,8 @@ BOOL needs_offscreen_rendering( HWND hwnd )
 {
     static const WCHAR dcomp_target_propW[] =
         {'_','_','w','i','n','e','_','d','c','o','m','p','_','t','a','r','g','e','t',0};
+    static const WCHAR d3d_hwnd_target_propW[] =
+        {'_','_','w','i','n','e','_','d','3','d','_','h','w','n','d','_','t','a','r','g','e','t',0};
 
     if (NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
     if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow())
@@ -238,6 +240,16 @@ BOOL needs_offscreen_rendering( HWND hwnd )
          * not through the GL client_surface.  Offscreen XComposite compositing is
          * unnecessary and causes flicker when popups open/close over the plugin. */
         if (NtUserGetProp( hwnd, dcomp_target_propW )) return FALSE;
+        /* ID2D1HwndRenderTarget windows (e.g. VSTGUI plugins with DComp disabled)
+         * render via wined3d's swapchain_blit_gdi to the HWND DC, but the GDI
+         * present path never triggers client_surface_present.  When the window
+         * is offscreen-redirected the rendered pixels are stuck in an X11
+         * pixmap that nothing blits to the toplevel — result is a black plugin
+         * window until external events (window move, mouse hover) kick a
+         * repaint.  Skip offscreen for these windows so the plugin's X11 child
+         * is attached directly to the parent and visible without a composite
+         * trigger. */
+        if (NtUserGetProp( hwnd, d3d_hwnd_target_propW )) return FALSE;
         return TRUE; /* child window, needs compositing */
     }
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
