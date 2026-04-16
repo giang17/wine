@@ -72,13 +72,18 @@ they use different internal COM interfaces (`DxgiSwap*` / `D3D11DXGI*` vs
 DXVK offers no benefit anyway — D2D1 draws go through a bitmap+BitBlt path, not the
 DXGI swapchain, so WineD3D performs equally well.
 
-**Serum2 settings** (required — the DComp rendering path must be active):
+**Serum2 settings** (recommended — DComp gives the best performance):
 - `"Disable DirectComposition": false`
 - `"Disable Partial Redraw": false`
 
-Do **not** set `"Disable DirectComposition"` to `true` — Wine's GDI fallback path
-does not work correctly with VSTGUI's offscreen bitmap caching, resulting in a
-black window or frozen UI elements.
+The GDI fallback path (`"Disable DirectComposition": true`) is also supported
+since commit `e04e6dfd` (`d2d1/winex11.drv: Skip offscreen XComposite for
+ID2D1HwndRenderTarget windows`). Earlier versions of this branch left the
+plugin window black until the user moved it or hovered the mouse over it,
+because `wined3d`'s GDI present path never triggered the X11 client surface
+composite for offscreen-redirected child windows. The fix marks the HWND so
+`needs_offscreen_rendering()` returns FALSE, attaching the plugin's X11 child
+directly to the host's toplevel.
 
 ## Tested Applications
 
