@@ -56,10 +56,22 @@ static inline void d2d1_private_free(void *ptr)
     if (ptr) HeapFree(d2d1_heap, 0, ptr);
 }
 
+static inline WCHAR *d2d1_private_wcsdup(const WCHAR *src)
+{
+    size_t bytes;
+    WCHAR *dst;
+    if (!src) return NULL;
+    bytes = (wcslen(src) + 1) * sizeof(WCHAR);
+    if (!(dst = HeapAlloc(d2d1_heap, 0, bytes))) return NULL;
+    memcpy(dst, src, bytes);
+    return dst;
+}
+
 #define malloc(s)       d2d1_private_alloc(s)
 #define calloc(c, s)    d2d1_private_calloc(c, s)
 #define realloc(p, s)   d2d1_private_realloc(p, s)
 #define free(p)         d2d1_private_free(p)
+#define wcsdup(s)       d2d1_private_wcsdup(s)
 #include "d2d1effectauthor.h"
 #include "d3d11_1.h"
 #ifdef D2D1_INIT_GUID
