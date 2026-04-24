@@ -35,6 +35,37 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
+/* Private heap for dcomp — isolates surface/visual/target lifecycle
+ * allocations (BeginDraw/EndDraw cycles, dirty-rect tracking, persistent
+ * context wrappers) from the process heap. */
+static HANDLE dcomp_heap;
+
+static inline void *dcomp_private_alloc(size_t size)
+{
+    return HeapAlloc(dcomp_heap, 0, size);
+}
+
+static inline void *dcomp_private_calloc(size_t count, size_t size)
+{
+    return HeapAlloc(dcomp_heap, HEAP_ZERO_MEMORY, count * size);
+}
+
+static inline void *dcomp_private_realloc(void *ptr, size_t size)
+{
+    if (!ptr) return HeapAlloc(dcomp_heap, 0, size);
+    return HeapReAlloc(dcomp_heap, 0, ptr, size);
+}
+
+static inline void dcomp_private_free(void *ptr)
+{
+    if (ptr) HeapFree(dcomp_heap, 0, ptr);
+}
+
+#define malloc(s)       dcomp_private_alloc(s)
+#define calloc(c, s)    dcomp_private_calloc(c, s)
+#define realloc(p, s)   dcomp_private_realloc(p, s)
+#define free(p)         dcomp_private_free(p)
+
 #define WM_WINE_DCOMP_SET_CHILD_MODE (WM_USER + 0x101)
 
 /* Forward declarations for target back-pointer and list management */
@@ -2567,4 +2598,25 @@ HRESULT WINAPI DCompositionCreateDevice3(IUnknown *rendering_device, REFIID iid,
     TRACE("rendering_device %p, iid %s, device %p.\n", rendering_device, debugstr_guid(iid), device);
 
     return dcomp_device_create(rendering_device, iid, device);
+}
+
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
+{
+    switch (reason)
+    {
+    case DLL_PROCESS_ATTACH:
+        dcomp_heap = HeapCreate(0, 0, 0);
+        if (!dcomp_heap) return FALSE;
+        DisableThreadLibraryCalls(inst);
+        break;
+    case DLL_PROCESS_DETACH:
+        if (reserved) break;
+        if (dcomp_heap)
+        {
+            HeapDestroy(dcomp_heap);
+            dcomp_heap = NULL;
+        }
+        break;
+    }
+    return TRUE;
 }
