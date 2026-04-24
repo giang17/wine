@@ -499,6 +499,14 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
             if (context->scratch_ib[i].buffer)
                 ID3D11Buffer_Release(context->scratch_ib[i].buffer);
         }
+        /* Session 6 (C1): free cached rectangle geometry. The geometry object
+         * was never registered with the COM factory (we bypassed the refcount
+         * path), so direct cleanup + free is correct. */
+        if (context->rect_geometry_cache)
+        {
+            d2d_geometry_cleanup(context->rect_geometry_cache);
+            free(context->rect_geometry_cache);
+        }
         for (i = 0; i < D2D_SHAPE_TYPE_COUNT; ++i)
         {
             ID3D11VertexShader_Release(context->shape_resources[i].vs);
@@ -866,12 +874,15 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawRectangle(ID2D1DeviceContex
     ID2D1RectangleGeometry_Release(geometry);
 }
 
+/* Forward declaration for Session 6 (C1) rect-geometry cache in FillRectangle. */
+static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush);
+
 static void STDMETHODCALLTYPE d2d_device_context_FillRectangle(ID2D1DeviceContext6 *iface,
         const D2D1_RECT_F *rect, ID2D1Brush *brush)
 {
     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
-    ID2D1RectangleGeometry *geometry;
-    HRESULT hr;
+    struct d2d_geometry *geometry;
 
     TRACE("iface %p, rect %s, brush %p.\n", iface, debug_d2d_rect_f(rect), brush);
 
@@ -884,14 +895,51 @@ static void STDMETHODCALLTYPE d2d_device_context_FillRectangle(ID2D1DeviceContex
         return;
     }
 
-    if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, rect, &geometry)))
+    /* Session 6 (C1): Reuse a single cached rectangle geometry across
+     * FillRectangle calls. Serum2 GUI hits ~22k FillRectangle/s, each of
+     * which was calloc'ing a ~1600-byte struct d2d_geometry plus ancillary
+     * arrays and freeing them immediately. We bypass the COM factory path
+     * and call d2d_device_context_fill_geometry() directly — FillGeometry
+     * does not hold a reference past the call, so the cached object is
+     * safe to reuse.
+     *
+     * Thread-safety: InterlockedExchangePointer claims the cached geometry
+     * atomically so two concurrent FillRectangle calls on the same context
+     * (MULTI_THREADED factory) each get their own object. On put-back, if
+     * the cache was refilled in the meantime we destroy the one we displaced.
+     */
+    geometry = InterlockedExchangePointer((void **)&context->rect_geometry_cache, NULL);
+    if (geometry)
     {
-        ERR("Failed to create geometry, hr %#lx.\n", hr);
-        return;
+        d2d_rectangle_geometry_reinit(geometry, rect);
+    }
+    else
+    {
+        if (!(geometry = calloc(1, sizeof(*geometry))))
+        {
+            ERR("Failed to allocate rectangle geometry.\n");
+            return;
+        }
+        if (FAILED(d2d_rectangle_geometry_init(geometry, context->factory, rect)))
+        {
+            free(geometry);
+            return;
+        }
     }
 
-    ID2D1DeviceContext6_FillGeometry(iface, (ID2D1Geometry *)geometry, brush, NULL);
-    ID2D1RectangleGeometry_Release(geometry);
+    d2d_device_context_fill_geometry(context, geometry, unsafe_impl_from_ID2D1Brush(brush), NULL);
+
+    /* Return to cache. If another thread already put one back, destroy the
+     * displaced object (cache size stays bounded at 1). */
+    {
+        struct d2d_geometry *displaced = InterlockedExchangePointer(
+                (void **)&context->rect_geometry_cache, geometry);
+        if (displaced)
+        {
+            d2d_geometry_cleanup(displaced);
+            free(displaced);
+        }
+    }
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_DrawRoundedRectangle(ID2D1DeviceContext6 *iface,

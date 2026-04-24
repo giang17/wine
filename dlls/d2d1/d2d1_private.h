@@ -276,6 +276,11 @@ struct d2d_device_context
     ID3D11BlendState *bs;
     struct d2d_scratch_buffer scratch_vb[D2D_SHAPE_TYPE_COUNT];
     struct d2d_scratch_buffer scratch_ib[D2D_SHAPE_TYPE_COUNT];
+    /* Session 6 (C1): persistent scratch rectangle geometry for FillRectangle.
+     * Eliminates per-call calloc(struct d2d_geometry) + Release churn (~1.5M
+     * allocs/min in Serum2 GUI workload). Reused across FillRectangle calls;
+     * freed only in device_context destructor. */
+    struct d2d_geometry *rect_geometry_cache;
     ID3D11SamplerState *sampler_states
             [D2D_SAMPLER_INTERPOLATION_MODE_COUNT]
             [D2D_SAMPLER_EXTEND_MODE_COUNT]
@@ -696,6 +701,8 @@ HRESULT d2d_ellipse_geometry_init(struct d2d_geometry *geometry,
 void d2d_path_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *factory);
 HRESULT d2d_rectangle_geometry_init(struct d2d_geometry *geometry,
         ID2D1Factory *factory, const D2D1_RECT_F *rect);
+void d2d_rectangle_geometry_reinit(struct d2d_geometry *geometry, const D2D1_RECT_F *rect);
+void d2d_geometry_cleanup(struct d2d_geometry *geometry);
 HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
         ID2D1Factory *factory, const D2D1_ROUNDED_RECT *rounded_rect);
 void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *factory,

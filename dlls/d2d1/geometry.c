@@ -3282,7 +3282,7 @@ static BOOL d2d_geometry_fill_add_arc_triangle(struct d2d_geometry *geometry,
     return TRUE;
 }
 
-static void d2d_geometry_cleanup(struct d2d_geometry *geometry)
+void d2d_geometry_cleanup(struct d2d_geometry *geometry)
 {
     free(geometry->outline.arc_faces);
     free(geometry->outline.arcs);
@@ -5661,6 +5661,78 @@ HRESULT d2d_rectangle_geometry_init(struct d2d_geometry *geometry, ID2D1Factory 
 fail:
     d2d_geometry_cleanup(geometry);
     return E_OUTOFMEMORY;
+}
+
+/* Session 6 (C1): Re-initialize a rectangle geometry for a new rect, reusing
+ * the existing fill/outline arrays instead of freeing + reallocating. The
+ * arrays are already sized for 4 vertices + 8 outline verts + 8 joins after
+ * the first FillRectangle call, so d2d_array_reserve becomes a no-op on every
+ * subsequent call. Caller must ensure the geometry was previously initialised
+ * as a rectangle geometry (so vtable, factory, transform, and arrays match). */
+void d2d_rectangle_geometry_reinit(struct d2d_geometry *geometry, const D2D1_RECT_F *rect)
+{
+    static const D2D1_POINT_2F prev[] =
+    {
+        { 1.0f,  0.0f},
+        { 0.0f, -1.0f},
+        {-1.0f,  0.0f},
+        { 0.0f,  1.0f},
+    };
+    static const D2D1_POINT_2F next[] =
+    {
+        { 0.0f,  1.0f},
+        { 1.0f,  0.0f},
+        { 0.0f, -1.0f},
+        {-1.0f,  0.0f},
+    };
+    D2D1_POINT_2F *v;
+    struct d2d_face *f;
+    float l, r, t, b;
+
+    /* Reset counts — arrays stay allocated. */
+    geometry->fill.vertex_count = 0;
+    geometry->fill.face_count = 0;
+    geometry->fill.bezier_vertex_count = 0;
+    geometry->fill.arc_vertex_count = 0;
+    geometry->outline.vertex_count = 0;
+    geometry->outline.face_count = 0;
+    geometry->outline.bezier_count = 0;
+    geometry->outline.bezier_face_count = 0;
+    geometry->outline.arc_count = 0;
+    geometry->outline.arc_face_count = 0;
+
+    geometry->u.rectangle.rect = *rect;
+
+    l = min(rect->left, rect->right);
+    r = max(rect->left, rect->right);
+    t = min(rect->top, rect->bottom);
+    b = max(rect->top, rect->bottom);
+
+    /* fill.vertices already allocated (4 slots) on first init — reuse. */
+    v = geometry->fill.vertices;
+    d2d_point_set(&v[0], l, t);
+    d2d_point_set(&v[1], l, b);
+    d2d_point_set(&v[2], r, b);
+    d2d_point_set(&v[3], r, t);
+    geometry->fill.vertex_count = 4;
+
+    f = geometry->fill.faces;
+    d2d_face_set(&f[0], 1, 2, 0);
+    d2d_face_set(&f[1], 0, 2, 3);
+    geometry->fill.face_count = 2;
+
+    /* Outline tessellation — d2d_array_reserve is a no-op because arrays are
+     * already sized from the first init (or a previous reinit with larger
+     * rect). These calls just write into the existing buffers. */
+    d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1]);
+    d2d_geometry_outline_add_line_segment(geometry, &v[1], &v[2]);
+    d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3]);
+    d2d_geometry_outline_add_line_segment(geometry, &v[3], &v[0]);
+
+    d2d_geometry_outline_add_join(geometry, &prev[0], &v[0], &next[0]);
+    d2d_geometry_outline_add_join(geometry, &prev[1], &v[1], &next[1]);
+    d2d_geometry_outline_add_join(geometry, &prev[2], &v[2], &next[2]);
+    d2d_geometry_outline_add_join(geometry, &prev[3], &v[3], &next[3]);
 }
 
 static inline struct d2d_geometry *impl_from_ID2D1RoundedRectangleGeometry(ID2D1RoundedRectangleGeometry *iface)
