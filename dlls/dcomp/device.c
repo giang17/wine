@@ -122,6 +122,12 @@ struct dcomp_surface
     ID2D1DeviceContext *active_context; /* D2D1 context from BeginDraw (for EndDraw clip pop) */
     BOOL has_clip;                     /* TRUE if PushAxisAlignedClip active */
     IDCompositionDevice *device_iface; /* back-pointer for auto-commit in EndDraw */
+    /* Dirty-rect tracking — avoids full-surface GPU readback per frame.
+     * Without this, EndDraw copies width*height pixels GPU→CPU even when
+     * the app only redrew a small area (e.g. one knob). */
+    BOOL has_dirty_rect;               /* TRUE if BeginDraw got a valid sub-rect */
+    RECT dirty_rect;                   /* clamped to surface bounds */
+    BOOL needs_full_init_copy;         /* TRUE before first readback — must copy full surface once */
 };
 
 static inline struct dcomp_surface *impl_from_IDCompositionSurface(IDCompositionSurface *iface)
@@ -284,6 +290,24 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_BeginDraw(IDCompositionSurface *i
         return E_FAIL;
     }
 
+    /* Remember the dirty rect (clamped) so EndDraw can avoid a full-surface readback. */
+    if (rect && (rect->right > rect->left) && (rect->bottom > rect->top))
+    {
+        surface->dirty_rect = *rect;
+        if (surface->dirty_rect.left < 0) surface->dirty_rect.left = 0;
+        if (surface->dirty_rect.top  < 0) surface->dirty_rect.top  = 0;
+        if (surface->dirty_rect.right  > (LONG)surface->width)
+            surface->dirty_rect.right  = (LONG)surface->width;
+        if (surface->dirty_rect.bottom > (LONG)surface->height)
+            surface->dirty_rect.bottom = (LONG)surface->height;
+        surface->has_dirty_rect = (surface->dirty_rect.right > surface->dirty_rect.left
+                                && surface->dirty_rect.bottom > surface->dirty_rect.top);
+    }
+    else
+    {
+        surface->has_dirty_rect = FALSE;
+    }
+
     if (IsEqualGUID(iid, &IID_ID2D1DeviceContext))
     {
         /* D2D1Device path: use VSTGUI's device so resources are compatible. */
@@ -320,18 +344,19 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_BeginDraw(IDCompositionSurface *i
 
         /* Push a clip rect so that Clear() only affects the dirty area,
          * preserving the rest of the surface (VSTGUI partial redraw pattern). */
-        if (rect && (rect->right > rect->left) && (rect->bottom > rect->top))
+        if (surface->has_dirty_rect)
         {
             D2D1_RECT_F clip_rect;
-            clip_rect.left = (float)rect->left;
-            clip_rect.top = (float)rect->top;
-            clip_rect.right = (float)rect->right;
-            clip_rect.bottom = (float)rect->bottom;
+            clip_rect.left = (float)surface->dirty_rect.left;
+            clip_rect.top = (float)surface->dirty_rect.top;
+            clip_rect.right = (float)surface->dirty_rect.right;
+            clip_rect.bottom = (float)surface->dirty_rect.bottom;
             ID2D1DeviceContext_PushAxisAlignedClip(context, &clip_rect,
                     D2D1_ANTIALIAS_MODE_ALIASED);
             surface->has_clip = TRUE;
             TRACE("Pushed dirty-rect clip (%ld,%ld)-(%ld,%ld) on context %p.\n",
-                    rect->left, rect->top, rect->right, rect->bottom, context);
+                    surface->dirty_rect.left, surface->dirty_rect.top,
+                    surface->dirty_rect.right, surface->dirty_rect.bottom, context);
         }
         else
         {
@@ -399,79 +424,110 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_EndDraw(IDCompositionSurface *ifa
 
     surface->drawing = FALSE;
 
-    /* D2D1 bitmap path: EndDraw on context, copy target → readback, Map, copy to bits */
-    if (surface->d2d1_device && surface->persistent_context)
+    /* Determine the readback region:
+     *   - first frame after surface (re)creation: full surface — CPU bits are uninitialized
+     *   - subsequent frames with a clamped dirty rect: only the dirty sub-rect
+     *   - no dirty rect (full redraw or unsupported): full surface
+     * surface->bits and the readback/staging bitmaps are persistent across frames,
+     * so the non-dirty pixels remain valid from the previous readback. */
     {
-        D2D1_MAPPED_RECT d2d_mapped;
-        D2D1_POINT_2U dest_point = { 0, 0 };
-        D2D1_RECT_U src_rect;
+        BOOL use_dirty = surface->has_dirty_rect && !surface->needs_full_init_copy;
+        LONG copy_left   = use_dirty ? surface->dirty_rect.left   : 0;
+        LONG copy_top    = use_dirty ? surface->dirty_rect.top    : 0;
+        LONG copy_right  = use_dirty ? surface->dirty_rect.right  : (LONG)surface->width;
+        LONG copy_bottom = use_dirty ? surface->dirty_rect.bottom : (LONG)surface->height;
+        unsigned int copy_w = (unsigned int)(copy_right - copy_left);
 
-        src_rect.left = 0;
-        src_rect.top = 0;
-        src_rect.right = surface->width;
-        src_rect.bottom = surface->height;
-
-        hr = ID2D1DeviceContext_EndDraw(surface->persistent_context, NULL, NULL);
-        if (FAILED(hr))
-            FIXME("ID2D1DeviceContext_EndDraw failed: %#lx.\n", hr);
-
-        /* Copy render target → CPU-readable bitmap */
-        hr = ID2D1Bitmap1_CopyFromBitmap(surface->readback_bitmap, &dest_point,
-                (ID2D1Bitmap *)surface->target_bitmap, &src_rect);
-        if (FAILED(hr))
+        if (surface->d2d1_device && surface->persistent_context)
         {
-            FIXME("CopyFromBitmap failed: %#lx.\n", hr);
-            return hr;
-        }
+            D2D1_MAPPED_RECT d2d_mapped;
+            D2D1_POINT_2U dest_point;
+            D2D1_RECT_U src_rect;
 
-        /* Map the readback bitmap and copy to system memory */
-        hr = ID2D1Bitmap1_Map(surface->readback_bitmap, D2D1_MAP_OPTIONS_READ, &d2d_mapped);
-        if (SUCCEEDED(hr))
-        {
-            for (y = 0; y < surface->height; ++y)
+            dest_point.x = (UINT32)copy_left;
+            dest_point.y = (UINT32)copy_top;
+            src_rect.left   = (UINT32)copy_left;
+            src_rect.top    = (UINT32)copy_top;
+            src_rect.right  = (UINT32)copy_right;
+            src_rect.bottom = (UINT32)copy_bottom;
+
+            hr = ID2D1DeviceContext_EndDraw(surface->persistent_context, NULL, NULL);
+            if (FAILED(hr))
+                FIXME("ID2D1DeviceContext_EndDraw failed: %#lx.\n", hr);
+
+            /* Copy render target → CPU-readable bitmap (dirty sub-rect only when possible). */
+            hr = ID2D1Bitmap1_CopyFromBitmap(surface->readback_bitmap, &dest_point,
+                    (ID2D1Bitmap *)surface->target_bitmap, &src_rect);
+            if (FAILED(hr))
             {
-                memcpy(surface->bits + y * surface->width,
-                        (const BYTE *)d2d_mapped.bits + y * d2d_mapped.pitch,
-                        surface->width * sizeof(DWORD));
+                FIXME("CopyFromBitmap failed: %#lx.\n", hr);
+                return hr;
             }
-            ID2D1Bitmap1_Unmap(surface->readback_bitmap);
-        }
-        else
-        {
-            FIXME("ID2D1Bitmap1_Map failed: %#lx.\n", hr);
-        }
-    }
-    else if (surface->staging && surface->texture && surface->bits)
-    {
-        ID3D11DeviceContext *d3d_context;
-        D3D11_MAPPED_SUBRESOURCE mapped;
 
-        ID3D11Device_GetImmediateContext(surface->d3d11_device, &d3d_context);
-
-        ID3D11DeviceContext_CopyResource(d3d_context,
-                (ID3D11Resource *)surface->staging,
-                (ID3D11Resource *)surface->texture);
-
-        hr = ID3D11DeviceContext_Map(d3d_context,
-                (ID3D11Resource *)surface->staging, 0,
-                D3D11_MAP_READ, 0, &mapped);
-        if (SUCCEEDED(hr))
-        {
-            for (y = 0; y < surface->height; ++y)
+            /* Map the readback bitmap and copy the dirty rows into system memory. */
+            hr = ID2D1Bitmap1_Map(surface->readback_bitmap, D2D1_MAP_OPTIONS_READ, &d2d_mapped);
+            if (SUCCEEDED(hr))
             {
-                memcpy(surface->bits + y * surface->width,
-                        (const BYTE *)mapped.pData + y * mapped.RowPitch,
-                        surface->width * sizeof(DWORD));
+                for (y = (unsigned int)copy_top; y < (unsigned int)copy_bottom; ++y)
+                {
+                    memcpy(surface->bits + y * surface->width + copy_left,
+                            (const BYTE *)d2d_mapped.bits + y * d2d_mapped.pitch
+                                    + copy_left * sizeof(DWORD),
+                            copy_w * sizeof(DWORD));
+                }
+                ID2D1Bitmap1_Unmap(surface->readback_bitmap);
+                surface->needs_full_init_copy = FALSE;
             }
-            ID3D11DeviceContext_Unmap(d3d_context,
-                    (ID3D11Resource *)surface->staging, 0);
+            else
+            {
+                FIXME("ID2D1Bitmap1_Map failed: %#lx.\n", hr);
+            }
         }
-        else
+        else if (surface->staging && surface->texture && surface->bits)
         {
-            FIXME("Failed to map staging texture: %#lx.\n", hr);
-        }
+            ID3D11DeviceContext *d3d_context;
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            D3D11_BOX src_box;
 
-        ID3D11DeviceContext_Release(d3d_context);
+            ID3D11Device_GetImmediateContext(surface->d3d11_device, &d3d_context);
+
+            src_box.left   = (UINT)copy_left;
+            src_box.top    = (UINT)copy_top;
+            src_box.right  = (UINT)copy_right;
+            src_box.bottom = (UINT)copy_bottom;
+            src_box.front = 0;
+            src_box.back  = 1;
+
+            /* CopySubresourceRegion with the dirty box; if not using dirty,
+             * pass the full box (equivalent to the previous CopyResource). */
+            ID3D11DeviceContext_CopySubresourceRegion(d3d_context,
+                    (ID3D11Resource *)surface->staging, 0,
+                    (UINT)copy_left, (UINT)copy_top, 0,
+                    (ID3D11Resource *)surface->texture, 0, &src_box);
+
+            hr = ID3D11DeviceContext_Map(d3d_context,
+                    (ID3D11Resource *)surface->staging, 0,
+                    D3D11_MAP_READ, 0, &mapped);
+            if (SUCCEEDED(hr))
+            {
+                for (y = (unsigned int)copy_top; y < (unsigned int)copy_bottom; ++y)
+                {
+                    memcpy(surface->bits + y * surface->width + copy_left,
+                            (const BYTE *)mapped.pData + y * mapped.RowPitch
+                                    + copy_left * sizeof(DWORD),
+                            copy_w * sizeof(DWORD));
+                }
+                ID3D11DeviceContext_Unmap(d3d_context,
+                        (ID3D11Resource *)surface->staging, 0);
+                surface->needs_full_init_copy = FALSE;
+            }
+            else
+            {
+                FIXME("Failed to map staging texture: %#lx.\n", hr);
+            }
+
+            ID3D11DeviceContext_Release(d3d_context);
+        }
     }
 
     /* Auto-commit: present the updated surface immediately so that apps
@@ -649,6 +705,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
 
     surface->width = width;
     surface->height = height;
+    surface->needs_full_init_copy = TRUE;
 
     return S_OK;
 }
@@ -696,6 +753,7 @@ static HRESULT dcomp_surface_create(ID3D11Device *d3d11_device, ID2D1Device *d2d
     surface->format = pixel_format;
     surface->alpha_mode = alpha_mode;
     surface->is_virtual = is_virtual;
+    surface->needs_full_init_copy = TRUE;
 
     if (d2d1_device)
     {
