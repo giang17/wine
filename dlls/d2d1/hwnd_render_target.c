@@ -874,6 +874,14 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
     if (render_target->desc.type == D2D1_RENDER_TARGET_TYPE_DEFAULT)
         render_target->desc.type = D2D1_RENDER_TARGET_TYPE_HARDWARE;
 
+    /* Mark this HWND so winex11.drv's needs_offscreen_rendering() returns FALSE
+     * BEFORE the swapchain is created.  Otherwise the swapchain wires itself
+     * up to an X11 XComposite pixmap that nothing ever blits to the toplevel —
+     * toggling the property afterwards leaves the swapchain dangling.  This
+     * covers both embedded plugins (VSTGUI in Reaper) and standalone D2D apps
+     * (Garritan CFX/ARIA), so no owner_pid heuristic is needed. */
+    SetPropW(hwnd_rt_desc->hwnd, L"__wine_d3d_hwnd_target", (HANDLE)1);
+
     swapchain_desc.BufferDesc.Width = hwnd_rt_desc->pixelSize.width;
     swapchain_desc.BufferDesc.Height = hwnd_rt_desc->pixelSize.height;
     swapchain_desc.BufferDesc.RefreshRate.Numerator = 60;
@@ -957,30 +965,13 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
         return hr;
     }
 
-    /* Mark this HWND so winex11.drv's needs_offscreen_rendering() returns FALSE.
-     * Otherwise the plugin's X11 child window stays in offscreen XComposite mode
-     * and the GDI present path (swapchain_blit_gdi → BitBlt to HWND DC) never
-     * reaches the toplevel, leaving the plugin window black until an external
-     * event triggers a repaint.  Then force a SetWindowPos no-op to retrigger
-     * client_surface_update_offscreen so the X11 child gets re-attached. */
-    /* The offscreen-XComposite skip is only needed for plugins embedded in a
-     * foreign host (e.g. VSTGUI in Reaper).  Standalone applications like
-     * Garritan CFX Concert Grand have their own toplevel and the skip breaks
-     * their D2D rendering because the DXGI swapchain is already set up for
-     * offscreen redirect at this point — toggling the mode afterwards leaves
-     * the swapchain rendering into a pixmap that the toplevel never blits. */
-    {
-        HWND root = GetAncestor(hwnd_rt_desc->hwnd, GA_ROOT);
-        DWORD owner_pid = 0;
-        if (root) GetWindowThreadProcessId(root, &owner_pid);
-        if (owner_pid && owner_pid != GetCurrentProcessId())
-        {
-            SetPropW(hwnd_rt_desc->hwnd, L"__wine_d3d_hwnd_target", (HANDLE)1);
-            SetWindowPos(hwnd_rt_desc->hwnd, NULL, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
-                    | SWP_NOREDRAW | SWP_FRAMECHANGED);
-        }
-    }
+    /* Force update_client_surfaces() so the X11 child is re-attached to the
+     * toplevel immediately rather than at the next geometry change.  Must
+     * happen AFTER the swapchain has wired up the X11 child — otherwise the
+     * re-attach has nothing to attach. */
+    SetWindowPos(hwnd_rt_desc->hwnd, NULL, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+            | SWP_NOREDRAW | SWP_FRAMECHANGED);
 
     return S_OK;
 }
