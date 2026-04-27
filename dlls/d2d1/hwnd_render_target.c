@@ -955,10 +955,24 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
      * reaches the toplevel, leaving the plugin window black until an external
      * event triggers a repaint.  Then force a SetWindowPos no-op to retrigger
      * client_surface_update_offscreen so the X11 child gets re-attached. */
-    SetPropW(hwnd_rt_desc->hwnd, L"__wine_d3d_hwnd_target", (HANDLE)1);
-    SetWindowPos(hwnd_rt_desc->hwnd, NULL, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
-            | SWP_NOREDRAW | SWP_FRAMECHANGED);
+    /* The offscreen-XComposite skip is only needed for plugins embedded in a
+     * foreign host (e.g. VSTGUI in Reaper).  Standalone applications like
+     * Garritan CFX Concert Grand have their own toplevel and the skip breaks
+     * their D2D rendering because the DXGI swapchain is already set up for
+     * offscreen redirect at this point — toggling the mode afterwards leaves
+     * the swapchain rendering into a pixmap that the toplevel never blits. */
+    {
+        HWND root = GetAncestor(hwnd_rt_desc->hwnd, GA_ROOT);
+        DWORD owner_pid = 0;
+        if (root) GetWindowThreadProcessId(root, &owner_pid);
+        if (owner_pid && owner_pid != GetCurrentProcessId())
+        {
+            SetPropW(hwnd_rt_desc->hwnd, L"__wine_d3d_hwnd_target", (HANDLE)1);
+            SetWindowPos(hwnd_rt_desc->hwnd, NULL, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                    | SWP_NOREDRAW | SWP_FRAMECHANGED);
+        }
+    }
 
     return S_OK;
 }
