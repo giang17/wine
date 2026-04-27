@@ -887,8 +887,16 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
     swapchain_desc.BufferCount = 1;
     swapchain_desc.OutputWindow = hwnd_rt_desc->hwnd;
     swapchain_desc.Windowed = TRUE;
-    swapchain_desc.SwapEffect = hwnd_rt_desc->presentOptions & D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS ?
-        DXGI_SWAP_EFFECT_SEQUENTIAL : DXGI_SWAP_EFFECT_DISCARD;
+    /* Always use SEQUENTIAL so the backbuffer contents survive Present.  VSTGUI-
+     * based plugins (Garritan CFX/ARIA, etc.) rely on partial-repaint between
+     * frames: tab switches and small UI updates only redraw the dirty sub-rect
+     * via PushAxisAlignedClip, leaving the rest of the backbuffer untouched.
+     * On Windows DISCARD often happens to preserve those pixels (driver
+     * behaviour); Wine implements DISCARD strictly, so unmodified regions
+     * become stale/garbage on the next Present.  D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS
+     * is observed by promoting to FLIP_SEQUENTIAL would-be a stricter mode, but
+     * SEQUENTIAL alone is enough to fix the stale-tab regression. */
+    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
     swapchain_desc.Flags = 0;
     if (desc->usage & D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE)
         swapchain_desc.Flags = DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE;
