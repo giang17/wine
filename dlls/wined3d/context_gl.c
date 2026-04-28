@@ -2924,11 +2924,11 @@ static void *wined3d_bo_gl_map(struct wined3d_bo_gl *bo, struct wined3d_context_
             bo_user->valid = false;
         list_init(&bo->b.users);
 
-        /* Push old BO to free list instead of destroying it. */
-        if (!wined3d_context_gl_push_free_bo(context_gl, bo))
-            wined3d_context_gl_destroy_bo(context_gl, bo);
-        else
-            bo->id = 0;
+        /* destroy_bo unmaps before recycling via push_free_bo internally.
+         * Calling push_free_bo directly would skip glUnmapBuffer and a later
+         * map after pop_free_bo would fail with "Buffer must be bound and
+         * not mapped" (Kontakt 7 crash). */
+        wined3d_context_gl_destroy_bo(context_gl, bo);
         *bo = tmp;
         list_init(&bo->b.users);
 
