@@ -4351,10 +4351,6 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_AddQuadraticBeziers(ID2D1Geometr
 static void STDMETHODCALLTYPE d2d_geometry_sink_AddArc(ID2D1GeometrySink *iface, const D2D1_ARC_SEGMENT *arc)
 {
     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
-    struct d2d_figure *figure;
-    D2D1_BEZIER_SEGMENT beziers[4];
-    unsigned int bezier_count;
-    D2D1_POINT_2F start_point;
 
     TRACE("iface %p, arc %p.\n", iface, arc);
 
@@ -4369,6 +4365,8 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_AddArc(ID2D1GeometrySink *iface,
         d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
         return;
     }
+
+    ++geometry->u.path.segment_count;
 }
 
 static const struct ID2D1GeometrySinkVtbl d2d_geometry_sink_vtbl =
