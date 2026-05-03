@@ -618,7 +618,8 @@ enum x11drv_window_messages
     WM_X11DRV_UPDATE_CLIPBOARD = WM_WINE_FIRST_DRIVER_MSG,
     WM_X11DRV_SET_WIN_REGION,
     WM_X11DRV_DELETE_TAB,
-    WM_X11DRV_ADD_TAB
+    WM_X11DRV_ADD_TAB,
+    WM_X11DRV_CREATE_WHOLE_WINDOW
 };
 
 /* _NET_WM_STATE properties that we keep track of */

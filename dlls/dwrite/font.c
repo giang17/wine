@@ -6166,10 +6166,18 @@ HRESULT create_glyphrunanalysis(const struct glyphrunanalysis_desc *desc, IDWrit
     *ret = NULL;
 
     /* Check rendering, antialiasing, measuring, and grid fitting modes. */
-    if ((UINT32)desc->rendering_mode >= DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED ||
+    if ((UINT32)desc->rendering_mode > DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED ||
             desc->rendering_mode == DWRITE_RENDERING_MODE1_OUTLINE ||
             desc->rendering_mode == DWRITE_RENDERING_MODE1_DEFAULT)
         return E_INVALIDARG;
+
+    /* NATURAL_SYMMETRIC_DOWNSAMPLED is not fully supported, treat as NATURAL_SYMMETRIC. */
+    if (desc->rendering_mode == DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC_DOWNSAMPLED)
+    {
+        struct glyphrunanalysis_desc modified = *desc;
+        modified.rendering_mode = DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC;
+        return create_glyphrunanalysis(&modified, ret);
+    }
 
     if ((UINT32)desc->aa_mode > DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE)
         return E_INVALIDARG;
@@ -7641,9 +7649,59 @@ static BOOL fontset_entry_is_matching(struct dwrite_fontset_entry *entry, DWRITE
 static HRESULT WINAPI dwritefontset_GetMatchingFonts_(IDWriteFontSet3 *iface, WCHAR const *family, DWRITE_FONT_WEIGHT weight,
         DWRITE_FONT_STRETCH stretch,  DWRITE_FONT_STYLE style, IDWriteFontSet **fontset)
 {
-    FIXME("%p, %s, %d, %d, %d, %p.\n", iface, debugstr_w(family), weight, stretch, style, fontset);
+    struct dwrite_fontset *set = impl_from_IDWriteFontSet3(iface);
+    struct dwrite_fontset_entry **entries;
+    unsigned int i, matched_count = 0;
+    struct dwrite_fontset *object;
 
-    return E_NOTIMPL;
+    TRACE("%p, %s, %d, %d, %d, %p.\n", iface, debugstr_w(family), weight, stretch, style, fontset);
+
+    if (!family || !fontset)
+        return E_INVALIDARG;
+
+    *fontset = NULL;
+
+    if (!(object = calloc(1, sizeof(*object))))
+        return E_OUTOFMEMORY;
+
+    if (!(entries = calloc(set->count, sizeof(*entries))))
+    {
+        free(object);
+        return E_OUTOFMEMORY;
+    }
+
+    for (i = 0; i < set->count; ++i)
+    {
+        IDWriteLocalizedStrings *name;
+
+        /* Match family name first. */
+        name = fontset_entry_get_property(set->entries[i], DWRITE_FONT_PROPERTY_ID_WIN32_FAMILY_NAME);
+        if (!name)
+            continue;
+        if (!localizedstrings_contains(name, family))
+        {
+            IDWriteLocalizedStrings_Release(name);
+            continue;
+        }
+        IDWriteLocalizedStrings_Release(name);
+
+        /* Include all entries matching the family name. The weight, stretch,
+         * and style parameters are used by the caller for prioritization,
+         * not for strict filtering. */
+        entries[matched_count++] = addref_fontset_entry(set->entries[i]);
+    }
+
+    if (!matched_count)
+    {
+        free(entries);
+        entries = NULL;
+    }
+
+    init_fontset(object, set->factory, entries, matched_count, FALSE);
+
+    *fontset = (IDWriteFontSet *)&object->IDWriteFontSet3_iface;
+
+    return S_OK;
 }
 
 static HRESULT WINAPI dwritefontset_GetMatchingFonts(IDWriteFontSet3 *iface, DWRITE_FONT_PROPERTY const *props, UINT32 count,
