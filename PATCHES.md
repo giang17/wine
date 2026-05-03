@@ -11,13 +11,14 @@ and D2D1 for GPU-accelerated 2D rendering — APIs that were largely unimplement
 in Wine. With these patches, plugins using DComp + D2D1 now render correctly
 and run stable in production use.
 
-**Base**: Wine 11.0 stable (`wine-11.0` tag)
+**Base**: Wine 11.8 devel (`wine-11.8` tag) — this branch.
 
 ## Branches
 
 | Branch | Description |
 |--------|-------------|
-| `d2d1-dcomp-11.0` | **Recommended.** Full stack: D2D1 + DComp + DWrite + WineD3D performance + winex11 |
+| `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable. Actively maintained. |
+| `d2d1-dcomp-11.8` | **Frozen.** Snapshot port of the full stack onto Wine 11.8 devel, for `wine-tkg-dev` users. **No backports** of bug fixes. Use until `d2d1-dcomp-12.0` lands (~mid-May 2026). Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
 | `d2d1-v6` | 15 D2D1 rendering patches only (upstream reference, see below) |
 
 ## Full Stack (Branch: `d2d1-dcomp-11.0`)
