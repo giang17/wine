@@ -19,7 +19,7 @@ and run stable in production use.
 |--------|-------------|
 | `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable. Actively maintained. |
 | `d2d1-dcomp-11.8` | **Frozen.** Snapshot port of the full stack onto Wine 11.8 devel, for `wine-tkg-dev` users. **No backports** of bug fixes. Use until `d2d1-dcomp-12.0` lands (~mid-May 2026). Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
-| `d2d1-v6` | 15 D2D1 rendering patches only (upstream reference, see below) |
+| `d2d1-v6` | **Deprecated** (last update 2026-02-14). Was the upstream-targeted D2D1-only patch series; superseded by 41+ later commits in `d2d1-dcomp-11.0`. A new clean D2D1-only series will be extracted from `d2d1-dcomp-12.0` after the 12.0 rebase, on top of Sivov's Stream-Path. Kept for historical reference. |
 
 ## Full Stack (Branch: `d2d1-dcomp-11.0`)
 
@@ -109,15 +109,30 @@ for a step-by-step guide covering:
 - Setting GDI `FontLink` registry entries for correct menu symbol rendering
 - Working around the missing `BitPDisp-10` tooltip font in Serum2
 
-## D2D1 Patches Only (Branch: `d2d1-v6`)
+## D2D1 Patches Only (Branch: `d2d1-v6`) — DEPRECATED
+
+> **Status (2026-05-03)**: This branch is **deprecated**. Last update was 2026-02-14
+> (15 patches against vanilla Wine 11.0). Since then, 41+ further D2D1 commits have
+> landed in `d2d1-dcomp-11.0` (PushLayer stencil clipping, ImageBrush UV fix, scratch
+> buffers, intersect_self grid, FillRectangle cache, Sivov's Stream-Path + Bezier-Arc,
+> and 15 misc upstream bug fixes pre-baked from 11.x devel). `d2d1-v6` no longer
+> reflects the current state of the D2D1 work.
+>
+> **Replacement plan**: After the Wine 12.0 stable rebase (~mid-May 2026), a new
+> clean D2D1-only series (working name `d2d1-v7`) will be extracted from
+> `d2d1-dcomp-12.0`. That series will be the upstream-submission candidate, sitting
+> on top of Sivov's Stream-Path architecture and incorporating all current fixes.
+>
+> The `d2d1-v6` branch is kept on the fork for historical reference only. The
+> patch ZIPs in `patches/v6-full/` and `patches/v6-full-11.0/` are similarly frozen.
 
 This branch contains only the 15 D2D1 rendering patches without DComp, DWrite, or
-performance fixes. It is maintained as a clean upstream reference for potential
-submission to Wine upstream. **For normal use, prefer `d2d1-dcomp-11.0` above.**
+performance fixes. It was originally maintained as a clean upstream reference.
+**For normal use, prefer `d2d1-dcomp-11.0` above.**
 
-15 patches fixing core D2D1 rendering issues:
+The 15 D2D1 patches in this branch:
 
-1. **AddArc implementation** -- path geometry arc segments
+1. **AddArc implementation** -- path geometry arc segments (later replaced upstream by Sivov's Bezier-Arc, see `d2d1-dcomp-11.0`)
 2. **Font rendering** -- force NATURAL rendering mode for better quality
 3. **CDT iterative conversion** -- convert recursive constrained Delaunay triangulation to iterative
 4. **Miter limit clamping** -- stroke outline miter limit support
