@@ -183,6 +183,8 @@ struct d3d11_swapchain
     IDXGIOutput *target;
     LONG present_count;
     LONG in_set_fullscreen_state;
+    HANDLE frame_latency_event;
+    DXGI_ALPHA_MODE alpha_mode;
 };
 
 HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,

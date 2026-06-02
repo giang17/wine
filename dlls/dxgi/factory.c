@@ -378,13 +378,533 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
     FIXME("iface %p, cookie %#lx stub!\n", iface, cookie);
 }
 
+#define WM_WINE_DCOMP_SET_TARGET (WM_USER + 0x100)
+#define WM_WINE_DCOMP_SET_CHILD_MODE (WM_USER + 0x101)
+
+static inline struct d3d11_swapchain *d3d11_swapchain_from_IDXGISwapChain4(IDXGISwapChain4 *iface)
+{
+    return CONTAINING_RECORD(iface, struct d3d11_swapchain, IDXGISwapChain4_iface);
+}
+
+#define DCOMP_REBLIT_TIMER_ID 0xDC01
+#define DCOMP_POPUP_REBLIT_TIMER_ID 0xDC02
+
+/* Re-blit composition content from persistent buffer to window.
+ * Called on WM_PAINT, focus changes, timer tick, and other events
+ * that may cause the window surface to be overwritten. */
+static void dcomp_reblit_comp_buffer(HWND hwnd, const char *reason)
+{
+    HDC comp_dc = (HDC)GetPropW(hwnd, L"__wine_dcomp_comp_dc");
+    LPARAM dims = (LPARAM)GetPropW(hwnd, L"__wine_dcomp_comp_size");
+
+    if (comp_dc && dims)
+    {
+        unsigned int w = LOWORD(dims);
+        unsigned int h = HIWORD(dims);
+        HDC hdc = GetDC(hwnd);
+        if (hdc)
+        {
+            static unsigned int reblit_count;
+            ++reblit_count;
+            if (reblit_count <= 5 || !(reblit_count % 200))
+                FIXME("Re-blit #%u: hwnd %p %ux%u reason=%s.\n",
+                        reblit_count, hwnd, w, h, reason);
+            BitBlt(hdc, 0, 0, w, h, comp_dc, 0, 0, SRCCOPY);
+            ReleaseDC(hwnd, hdc);
+        }
+    }
+    else
+    {
+        static unsigned int null_count;
+        ++null_count;
+        if (null_count <= 3)
+            FIXME("Re-blit skipped: hwnd %p comp_dc=%p dims=%#Ix reason=%s.\n",
+                    hwnd, comp_dc, (ULONG_PTR)dims, reason);
+    }
+}
+
+/* Count of currently subclassed DComp target windows.  Used to distinguish
+ * the first (primary) target from secondary targets (popups, tooltips).
+ * Primary target gets full mode (timer + periodic Present), secondary targets
+ * get lightweight popup mode.  Incremented after subclassing, decremented
+ * in WM_NCDESTROY of both wndprocs.  Thread-safe via Interlocked ops. */
+static LONG dcomp_subclassed_target_count;
+
+/* Lightweight subclass for DComp popup windows (menus, tooltips).
+ * Only blocks WM_ERASEBKGND and re-blits composition content on WM_PAINT.
+ * NO timer, NO periodic Present â avoids dual-swapchain
+ * interference that causes main plugin window to flicker. */
+static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+
+    switch (msg)
+    {
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC comp_dc = (HDC)GetPropW(hwnd, L"__wine_dcomp_comp_dc");
+            LPARAM dims = (LPARAM)GetPropW(hwnd, L"__wine_dcomp_comp_size");
+
+            BeginPaint(hwnd, &ps);
+            if (comp_dc && dims)
+            {
+                unsigned int w = LOWORD(dims);
+                unsigned int h = HIWORD(dims);
+                BitBlt(ps.hdc, 0, 0, w, h, comp_dc, 0, 0, SRCCOPY);
+            }
+            EndPaint(hwnd, &ps);
+            ValidateRect(hwnd, NULL);
+            return 0;
+        }
+
+        case WM_TIMER:
+            if (wparam == DCOMP_POPUP_REBLIT_TIMER_ID)
+            {
+                /* Lightweight reblit: just BitBlt from comp_dc, no Present,
+                 * no swapchain interaction.  Keeps the window surface fresh
+                 * so Expose events (e.g. tooltip close) show current content
+                 * instead of stale frames. */
+                dcomp_reblit_comp_buffer(hwnd, "popup-timer");
+                return 0;
+            }
+            break;
+
+        case WM_NCDESTROY:
+        {
+            LRESULT result;
+            IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+
+            InterlockedDecrement(&dcomp_subclassed_target_count);
+            KillTimer(hwnd, DCOMP_POPUP_REBLIT_TIMER_ID);
+
+            /* Before the popup window is destroyed, switch the swapchain back
+             * to its composition window.  This drains the CS queue (no more
+             * presents to the dead popup), releases the popup's DC, and
+             * rebinds to a valid window.  Without this, the GL context stays
+             * bound to the destroyed popup's drawable → page fault. */
+            if (sc)
+            {
+                struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(sc);
+                WCHAR prop_name[64];
+                HWND comp_wnd;
+
+                swprintf(prop_name, ARRAY_SIZE(prop_name),
+                        L"__wine_dcomp_wnd_%I64x", (UINT_PTR)sc);
+                comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
+
+                wined3d_swapchain_set_prefer_gl_present(swapchain->wined3d_swapchain, FALSE);
+                wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, TRUE);
+
+                if (comp_wnd && IsWindow(comp_wnd))
+                {
+                    wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, comp_wnd);
+                    FIXME("DComp popup %p destroyed, switched back to comp_wnd %p.\n",
+                            hwnd, comp_wnd);
+                }
+                else
+                {
+                    FIXME("DComp popup %p destroyed, comp_wnd not found.\n", hwnd);
+                }
+            }
+
+            result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+                         : DefWindowProcW(hwnd, msg, wparam, lparam);
+            RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
+            RemovePropW(hwnd, L"__wine_dcomp_swapchain");
+            RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
+            RemovePropW(hwnd, L"__wine_dcomp_comp_size");
+            return result;
+        }
+    }
+
+    return orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+                : DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+/* Subclass WndProc for composition target windows (plugin's HWND).
+ * Blocks WM_ERASEBKGND and re-blits composition content on events
+ * that can overwrite the window surface (paint, focus, expose).
+ * Uses a periodic timer as fallback since WM_ACTIVATE does not
+ * reach child windows when the top-level parent loses focus. */
+static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+
+    switch (msg)
+    {
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC comp_dc = (HDC)GetPropW(hwnd, L"__wine_dcomp_comp_dc");
+            LPARAM dims = (LPARAM)GetPropW(hwnd, L"__wine_dcomp_comp_size");
+
+            BeginPaint(hwnd, &ps);
+            if (comp_dc && dims)
+            {
+                unsigned int w = LOWORD(dims);
+                unsigned int h = HIWORD(dims);
+                BitBlt(ps.hdc, 0, 0, w, h, comp_dc, 0, 0, SRCCOPY);
+                {
+                    static unsigned int paint_count;
+                    ++paint_count;
+                    if (paint_count <= 5 || !(paint_count % 200))
+                        FIXME("WM_PAINT #%u: hwnd %p %ux%u, comp_dc=%p.\n",
+                                paint_count, hwnd, w, h, comp_dc);
+                }
+            }
+            else
+            {
+                static unsigned int paint_null;
+                ++paint_null;
+                if (paint_null <= 3)
+                    FIXME("WM_PAINT: no comp buffer for hwnd %p (dc=%p dims=%#Ix).\n",
+                            hwnd, comp_dc, (ULONG_PTR)dims);
+            }
+            EndPaint(hwnd, &ps);
+            ValidateRect(hwnd, NULL);
+            return 0;
+        }
+
+        case WM_TIMER:
+            if (wparam == DCOMP_REBLIT_TIMER_ID)
+            {
+                IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+
+                if (sc)
+                {
+                    /* Present(0,0) without dirty rects.  The expensive GPU
+                     * readback + StretchBlt is skipped in swapchain_blit_gdi
+                     * when the composition buffer is already up-to-date
+                     * (no new rendering since the last Present1).  We still
+                     * call Present so JUCE's SwapChain event loop gets its
+                     * frame-ready signal — without it, input events stall. */
+                    IDXGISwapChain4_Present(sc, 0, 0);
+
+                }
+                else
+                {
+                    dcomp_reblit_comp_buffer(hwnd, "timer");
+                }
+                return 0;
+            }
+            break;
+
+        case WM_WINDOWPOSCHANGED:
+        {
+            const WINDOWPOS *wp = (const WINDOWPOS *)lparam;
+            LRESULT result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+                                  : DefWindowProcW(hwnd, msg, wparam, lparam);
+            /* Only reblit when the window was actually moved, resized, or shown.
+             * Pure Z-order changes (e.g. popup menu appearing above) do not
+             * require a reblit and would compete with Timer Present, causing
+             * visible flickering (Prophecy hamburger menu hover). */
+            if (wp && (!(wp->flags & SWP_NOMOVE) || !(wp->flags & SWP_NOSIZE)
+                    || (wp->flags & SWP_SHOWWINDOW)))
+            {
+                dcomp_reblit_comp_buffer(hwnd, "windowposchanged");
+            }
+            return result;
+        }
+
+        case WM_SHOWWINDOW:
+        case WM_ACTIVATE:
+        case WM_CHILDACTIVATE:
+        case WM_MOUSEACTIVATE:
+        {
+            LRESULT result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+                                  : DefWindowProcW(hwnd, msg, wparam, lparam);
+            dcomp_reblit_comp_buffer(hwnd, msg == WM_ACTIVATE ? "activate" :
+                    msg == WM_SHOWWINDOW ? "showwindow" :
+                    msg == WM_CHILDACTIVATE ? "childactivate" : "mouseactivate");
+            return result;
+        }
+
+        case WM_NCDESTROY:
+        {
+            LRESULT result;
+            InterlockedDecrement(&dcomp_subclassed_target_count);
+            KillTimer(hwnd, DCOMP_REBLIT_TIMER_ID);
+            result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+                         : DefWindowProcW(hwnd, msg, wparam, lparam);
+            RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
+            RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
+            RemovePropW(hwnd, L"__wine_dcomp_comp_size");
+            return result;
+        }
+    }
+
+    return orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
+                : DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    switch (msg)
+    {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_WINE_DCOMP_SET_TARGET:
+        {
+            HWND target_hwnd = (HWND)lparam;
+            IDXGISwapChain4 *iface = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+            if (iface && target_hwnd)
+            {
+                struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
+                struct wined3d_swapchain_desc wined3d_desc;
+                RECT rc;
+
+                wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &wined3d_desc);
+                {
+                    RECT wr;
+                    HWND phwnd = GetParent(target_hwnd);
+                    GetClientRect(target_hwnd, &rc);
+                    GetWindowRect(target_hwnd, &wr);
+                    FIXME("DComp: target %p client=%ldx%ld screen=(%ld,%ld)-(%ld,%ld)"
+                            " parent=%p sc=%ux%u.\n",
+                            target_hwnd, rc.right, rc.bottom,
+                            wr.left, wr.top, wr.right, wr.bottom,
+                            phwnd, wined3d_desc.backbuffer_width,
+                            wined3d_desc.backbuffer_height);
+                    if (phwnd)
+                    {
+                        RECT pr;
+                        GetWindowRect(phwnd, &pr);
+                        FIXME("DComp: parent %p screen=(%ld,%ld)-(%ld,%ld).\n",
+                                phwnd, pr.left, pr.top, pr.right, pr.bottom);
+                    }
+                }
+
+                /* Switch swapchain device window from comp_wnd to target_hwnd.
+                 * The GL context rebinds lazily via context_gl_update_window.
+                 *
+                 * Top-level popup windows (WS_POPUP, parent == Desktop) have an
+                 * X11 whole_window, so GL can create a client_window drawable and
+                 * use glXSwapBuffers directly — no GPU readback or CPU copies.
+                 * win32u's get_window_unused_drawable() calls p_surface_create
+                 * on-demand when wglMakeCurrent needs a drawable for the popup.
+                 *
+                 * Child windows (embedded plugins) have no whole_window, so GL
+                 * swap would write to an invisible drawable.  Force GDI blit for
+                 * those — it writes to the window surface via comp_dc. */
+                {
+                    HWND target_parent_toplevel = GetAncestor(target_hwnd, GA_PARENT);
+                    BOOL is_toplevel = !target_parent_toplevel
+                            || target_parent_toplevel == GetDesktopWindow();
+
+                    wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, target_hwnd);
+
+                    if (is_toplevel)
+                    {
+                        wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, FALSE);
+                        wined3d_swapchain_set_prefer_gl_present(swapchain->wined3d_swapchain, TRUE);
+                        FIXME("DComp: target %p is top-level, using GL present (no GDI readback).\n",
+                                target_hwnd);
+                    }
+                    else
+                    {
+                        wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, TRUE);
+                    }
+                }
+
+                /* Set premultiplied alpha blending if the swapchain uses it.
+                 * This makes GDI blit use AlphaBlend instead of StretchBlt,
+                 * allowing proper compositing of transparent areas. */
+                if (swapchain->alpha_mode == DXGI_ALPHA_MODE_PREMULTIPLIED)
+                    wined3d_swapchain_set_premultiplied_alpha(swapchain->wined3d_swapchain, TRUE);
+
+                ShowWindow(hwnd, SW_HIDE);
+
+                /* Detect popup mode via subclassed target count.
+                 * First target (count == 0) gets full mode with timer +
+                 * Present.  Subsequent targets get lightweight popup
+                 * mode to avoid dual-swapchain interference. */
+                {
+                    BOOL is_popup_mode = FALSE;
+                    LONG target_style = GetWindowLongW(target_hwnd, GWL_STYLE);
+                    HWND target_parent = GetParent(target_hwnd);
+
+                    FIXME("DComp popup-detect: target %p style=0x%08lx parent=%p count=%ld.\n",
+                            target_hwnd, (unsigned long)target_style, target_parent,
+                            dcomp_subclassed_target_count);
+
+                    if (dcomp_subclassed_target_count > 0)
+                        is_popup_mode = TRUE;
+
+                    if (is_popup_mode)
+                    {
+                        /* Lightweight popup mode: subclass with minimal wndproc
+                         * (WM_ERASEBKGND + WM_PAINT only), no timer. */
+                        WNDPROC orig = (WNDPROC)SetWindowLongPtrW(target_hwnd, GWLP_WNDPROC,
+                                (LONG_PTR)dcomp_popup_wndproc);
+                        if (orig)
+                        {
+                            SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
+                            SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
+                            SetTimer(target_hwnd, DCOMP_POPUP_REBLIT_TIMER_ID, 200, NULL);
+                            InterlockedIncrement(&dcomp_subclassed_target_count);
+                            FIXME("DComp POPUP mode: target %p, orig wndproc %p, sc=%p (reblit timer 200ms).\n",
+                                    target_hwnd, orig, iface);
+                        }
+                        else
+                        {
+                            FIXME("DComp popup: SetWindowLongPtrW FAILED for target %p, err %lu.\n",
+                                    target_hwnd, GetLastError());
+                        }
+                    }
+                    else
+                    {
+                        /* Full mode: subclass + timer + periodic Present for main window */
+                        WNDPROC orig = (WNDPROC)SetWindowLongPtrW(target_hwnd, GWLP_WNDPROC,
+                                (LONG_PTR)dcomp_target_wndproc);
+                        if (orig)
+                        {
+                            SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
+                            SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
+                            SetTimer(target_hwnd, DCOMP_REBLIT_TIMER_ID, 200, NULL);
+                            InterlockedIncrement(&dcomp_subclassed_target_count);
+                            FIXME("DComp: subclassed target %p, orig wndproc %p, timer started, sc=%p.\n",
+                                    target_hwnd, orig, iface);
+                        }
+                        else
+                        {
+                            FIXME("DComp: SetWindowLongPtrW FAILED for target %p, err %lu.\n",
+                                    target_hwnd, GetLastError());
+                        }
+                    }
+                }
+
+                /* Prevent black flickering between GL presents */
+                SetClassLongPtrW(target_hwnd, GCLP_HBRBACKGROUND, 0);
+                {
+                    HWND phwnd = GetParent(target_hwnd);
+                    if (phwnd)
+                        SetWindowLongW(phwnd, GWL_STYLE,
+                                GetWindowLongW(phwnd, GWL_STYLE) | WS_CLIPCHILDREN);
+                }
+                ValidateRect(target_hwnd, NULL);
+
+                GetClientRect(target_hwnd, &rc);
+                FIXME("DComp: target %p now %ldx%ld, swapchain switched.\n",
+                        target_hwnd, rc.right, rc.bottom);
+            }
+            return 0;
+        }
+
+        case WM_WINE_DCOMP_SET_CHILD_MODE:
+        {
+            IDXGISwapChain4 *iface = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+            if (iface)
+            {
+                struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
+
+                /* Enable GDI present so child renders into a comp buffer
+                 * (CreateDIBSection) instead of GL-swapping to the hidden window.
+                 * The root visual reads the child's comp_bits for compositing. */
+                wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, TRUE);
+
+                if (swapchain->alpha_mode == DXGI_ALPHA_MODE_PREMULTIPLIED)
+                    wined3d_swapchain_set_premultiplied_alpha(swapchain->wined3d_swapchain, TRUE);
+
+                /* Mark this window as a child visual's comp window */
+                SetPropW(hwnd, L"__wine_dcomp_is_child", (HANDLE)(ULONG_PTR)1);
+
+                FIXME("DComp child mode: hwnd %p, sc %p, alpha_mode %u.\n",
+                        hwnd, iface, swapchain->alpha_mode);
+            }
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+static BOOL dcomp_register_window_class(void)
+{
+    static BOOL registered;
+    WNDCLASSW wc;
+
+    if (registered)
+        return TRUE;
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = dcomp_swapchain_wndproc;
+    wc.style = CS_OWNDC;
+    wc.lpszClassName = L"WineDCompSwapchain";
+    wc.hInstance = GetModuleHandleW(NULL);
+
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        ERR("Failed to register WineDCompSwapchain class, error %lu.\n", GetLastError());
+        return FALSE;
+    }
+
+    registered = TRUE;
+    return TRUE;
+}
+
 static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
 {
-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
+    WCHAR prop_name[64];
+    HWND window;
+    HRESULT hr;
+
+    TRACE("iface %p, device %p, desc %p, output %p, swapchain %p.\n",
             iface, device, desc, output, swapchain);
 
-    return E_NOTIMPL;
+    if (!device || !desc || !swapchain)
+    {
+        WARN("Invalid pointer.\n");
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (!dcomp_register_window_class())
+        return E_FAIL;
+
+    window = CreateWindowExW(WS_EX_NOPARENTNOTIFY,
+            L"WineDCompSwapchain", L"DComp Swapchain",
+            WS_CHILD, 0, 0, desc->Width, desc->Height,
+            GetDesktopWindow(), NULL, GetModuleHandleW(NULL), NULL);
+    if (!window)
+    {
+        ERR("Failed to create composition window, error %lu.\n", GetLastError());
+        return E_FAIL;
+    }
+
+    hr = dxgi_factory_CreateSwapChainForHwnd(iface, device, window,
+            desc, NULL, output, swapchain);
+    if (SUCCEEDED(hr))
+    {
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_wnd_%I64x", (UINT_PTR)*swapchain);
+        SetPropW(GetDesktopWindow(), prop_name, (HANDLE)window);
+        /* Store back-reference for WM_WINE_DCOMP_SET_TARGET handler */
+        SetPropW(window, L"__wine_dcomp_swapchain", (HANDLE)*swapchain);
+        FIXME("Created composition window %p (%ux%u) for swapchain %p.\n",
+                window, desc->Width, desc->Height, *swapchain);
+    }
+    else
+    {
+        ERR("CreateSwapChainForHwnd failed, hr %#lx.\n", hr);
+        DestroyWindow(window);
+    }
+
+    return hr;
 }
 
 static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)

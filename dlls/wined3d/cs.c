@@ -717,6 +717,24 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
 
     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
 
+    /* FLIP_SEQUENTIAL: copy the just-presented content back into back_buffer[0]
+     * so the app can do incremental rendering (DirtyRects). After rotation,
+     * back_buffers[N-1] has the presented frame; copy it to back_buffers[0].
+     * This MUST happen in the CS thread (not from DXGI) to avoid a race with
+     * the frame latency event that wakes the app. */
+    if ((desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
+            || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
+            && desc->backbuffer_count >= 2)
+    {
+        struct wined3d_texture *copy_src = swapchain->back_buffers[desc->backbuffer_count - 1];
+        struct wined3d_texture *copy_dst = swapchain->back_buffers[0];
+        RECT copy_rect;
+
+        SetRect(&copy_rect, 0, 0, copy_dst->resource.width, copy_dst->resource.height);
+        wined3d_device_context_blt(&cs->c, copy_dst, 0, &copy_rect,
+                copy_src, 0, &copy_rect, 0, NULL, WINED3D_TEXF_POINT);
+    }
+
     /* Discard buffers if the swap effect allows it. */
     back_buffer = swapchain->back_buffers[desc->backbuffer_count - 1];
     if (desc->swap_effect == WINED3D_SWAP_EFFECT_DISCARD || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
@@ -2791,7 +2809,8 @@ void wined3d_device_context_emit_update_sub_resource(struct wined3d_device_conte
     if (resource->type == WINED3D_RTYPE_BUFFER && box->right - box->left == resource->size)
         invalidate_client_address(resource);
 
-    if (context->ops->map_upload_bo(context, resource, sub_resource_idx, &map_desc, box, WINED3D_MAP_WRITE))
+    if (context->ops->map_upload_bo(context, resource, sub_resource_idx, &map_desc, box,
+            WINED3D_MAP_WRITE | ((resource->type == WINED3D_RTYPE_BUFFER) ? WINED3D_MAP_DISCARD : 0)))
     {
         const struct wined3d_format *format = resource->format;
 
@@ -4695,8 +4714,24 @@ static void wined3d_command_list_destroy_object(void *object)
         {
             if (!--bo->refcount)
             {
+                struct wined3d_device *device = list->device;
+
                 wined3d_context_destroy_bo(context, bo);
-                free(bo);
+
+                /* Recycle the bo struct instead of freeing it. */
+                wined3d_device_bo_map_lock(device);
+                if (device->bo_gl_free_pool_count < WINED3D_BO_GL_FREE_POOL_MAX)
+                {
+                    bo->map_ptr = device->bo_gl_free_pool;
+                    device->bo_gl_free_pool = bo;
+                    ++device->bo_gl_free_pool_count;
+                    wined3d_device_bo_map_unlock(device);
+                }
+                else
+                {
+                    wined3d_device_bo_map_unlock(device);
+                    free(bo);
+                }
             }
         }
         else

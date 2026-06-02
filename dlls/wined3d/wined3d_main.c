@@ -101,6 +101,11 @@ static CRITICAL_SECTION_DEBUG wined3d_wndproc_cs_debug =
 };
 static CRITICAL_SECTION wined3d_wndproc_cs = {&wined3d_wndproc_cs_debug, -1, 0, 0, 0, 0};
 
+/* Private heap for wined3d — avoids ntdll process heap fragmentation from
+ * high-frequency alloc/free cycles (GL buffer structs, staging buffers).
+ * Created at DLL_PROCESS_ATTACH, destroyed at DLL_PROCESS_DETACH. */
+HANDLE wined3d_heap;
+
 CRITICAL_SECTION wined3d_command_cs;
 static CRITICAL_SECTION_DEBUG wined3d_command_cs_debug =
 {
@@ -281,11 +286,19 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
     unsigned int tmpvalue;
     WNDCLASSA wc;
 
+    wined3d_heap = HeapCreate(0, 0, 0);
+    if (!wined3d_heap)
+    {
+        ERR("Failed to create wined3d private heap.\n");
+        return FALSE;
+    }
+
     wined3d_context_tls_idx = TlsAlloc();
     if (wined3d_context_tls_idx == TLS_OUT_OF_INDEXES)
     {
         unsigned int err = GetLastError();
         ERR("Failed to allocate context TLS index, err %#x.\n", err);
+        HeapDestroy(wined3d_heap);
         return FALSE;
     }
     context_set_tls_idx(wined3d_context_tls_idx);
@@ -533,6 +546,16 @@ static BOOL wined3d_dll_destroy(HINSTANCE hInstDLL)
 
     DeleteCriticalSection(&wined3d_wndproc_cs);
     DeleteCriticalSection(&wined3d_cs);
+
+    /* Destroy private heap — returns ALL wined3d memory to the OS at once,
+     * regardless of fragmentation state. This is the key benefit: the process
+     * heap's RSS is not polluted by wined3d's high-frequency alloc/free churn. */
+    if (wined3d_heap)
+    {
+        HeapDestroy(wined3d_heap);
+        wined3d_heap = NULL;
+    }
+
     return TRUE;
 }
 

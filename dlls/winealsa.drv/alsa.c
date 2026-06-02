@@ -710,6 +710,14 @@ static HRESULT map_channels(EDataFlow flow, const WAVEFORMATEX *fmt, int *alsa_c
 {
     BOOL need_remap;
 
+    if(fmt->nChannels > 32){
+        WARN("Channel count %u exceeds map size, clamping to stereo.\n", fmt->nChannels);
+        *alsa_channels = 2;
+        map[0] = 0;
+        map[1] = 1;
+        return S_OK;
+    }
+
     if(flow != eCapture && (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE || fmt->nChannels > 2) ){
         WAVEFORMATEXTENSIBLE *fmtex = (void*)fmt;
         UINT mask, flag = SPEAKER_FRONT_LEFT;
@@ -1910,6 +1918,11 @@ static NTSTATUS alsa_is_format_supported(void *args)
         params->result = S_FALSE;
     else if(params->fmt_in->nChannels < min)
         params->result = S_FALSE;
+    else if(params->fmt_in->nChannels > 32){
+        WARN("Channel count %u exceeds supported limit.\n", params->fmt_in->nChannels);
+        params->result = S_FALSE;
+        goto exit;
+    }
 
     map_channels(params->flow, params->fmt_in, &alsa_channels, alsa_channel_map);
 

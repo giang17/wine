@@ -2578,8 +2578,48 @@ static void wined3d_context_gl_cleanup_resources(struct wined3d_context_gl *cont
         wined3d_device_gl_free_memory(device_gl, r->block);
         if (i != --count)
             *r = blocks[count];
+
     }
     device_gl->retired_block_count = count;
+
+    /* Clean up BO free list: delete BOs that have been idle for a while.
+     * Keep at most half the max capacity of completed (recyclable) BOs. */
+    {
+        SIZE_T free_count = device_gl->bo_free_list_count;
+        SIZE_T completed = 0, j = 0;
+
+        for (j = 0; j < free_count; ++j)
+        {
+            if (device_gl->bo_free_list[j].fence_id <= id)
+                ++completed;
+        }
+
+        if (completed > WINED3D_BO_FREE_LIST_MAX / 2)
+        {
+            const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+            SIZE_T to_evict = completed - WINED3D_BO_FREE_LIST_MAX / 2;
+            SIZE_T evicted = 0;
+
+            j = 0;
+            while (j < device_gl->bo_free_list_count && evicted < to_evict)
+            {
+                struct wined3d_retired_bo_gl *r = &device_gl->bo_free_list[j];
+
+                if (r->fence_id <= id)
+                {
+                    GL_EXTCALL(glDeleteBuffers(1, &r->id));
+                    if (j != device_gl->bo_free_list_count - 1)
+                        *r = device_gl->bo_free_list[device_gl->bo_free_list_count - 1];
+                    --device_gl->bo_free_list_count;
+                    ++evicted;
+                }
+                else
+                {
+                    ++j;
+                }
+            }
+        }
+    }
 }
 
 void wined3d_context_gl_wait_command_fence(struct wined3d_context_gl *context_gl, uint64_t id)
@@ -2657,6 +2697,8 @@ static void wined3d_context_gl_destroy_allocator_block(struct wined3d_context_gl
     r = &device_gl->retired_blocks[device_gl->retired_block_count++];
     r->block = block;
     r->fence_id = fence_id;
+
+
 }
 
 /* We always have buffer storage here. */
@@ -2685,8 +2727,6 @@ GLuint wined3d_context_gl_allocate_vram_chunk_buffer(struct wined3d_context_gl *
     GL_EXTCALL(glBufferStorage(binding, size, NULL, flags));
 
     checkGLcall("buffer object creation");
-
-    TRACE("Created buffer object %u.\n", id);
 
     return id;
 }
@@ -2754,6 +2794,109 @@ static void wined3d_allocator_chunk_gl_unmap(struct wined3d_allocator_chunk_gl *
     wined3d_allocator_chunk_gl_unlock(chunk_gl);
 }
 
+/* Push a non-suballocated BO to the device free list for later recycling.
+ * The BO must already be unmapped. Returns TRUE if recycled, FALSE if the
+ * free list is full and the caller should glDeleteBuffers instead. */
+BOOL wined3d_context_gl_push_free_bo(struct wined3d_context_gl *context_gl,
+        const struct wined3d_bo_gl *bo)
+{
+    struct wined3d_device_gl *device_gl = wined3d_device_gl(context_gl->c.device);
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    struct wined3d_retired_bo_gl *r;
+
+    if (device_gl->bo_free_list_count >= WINED3D_BO_FREE_LIST_MAX)
+    {
+        /* Free list full — evict oldest entry to make room. */
+        r = &device_gl->bo_free_list[0];
+        TRACE("Evicting GL buffer %u (size %Iu) from free list.\n", r->id, r->size);
+        GL_EXTCALL(glDeleteBuffers(1, &r->id));
+        /* Move last entry into slot 0. */
+        if (device_gl->bo_free_list_count > 1)
+            *r = device_gl->bo_free_list[device_gl->bo_free_list_count - 1];
+        --device_gl->bo_free_list_count;
+    }
+
+    if (!wined3d_array_reserve((void **)&device_gl->bo_free_list,
+            &device_gl->bo_free_list_size, device_gl->bo_free_list_count + 1,
+            sizeof(*device_gl->bo_free_list)))
+    {
+        ERR("Failed to grow BO free list.\n");
+        return FALSE;
+    }
+
+    r = &device_gl->bo_free_list[device_gl->bo_free_list_count++];
+    r->id = bo->id;
+    r->size = bo->size;
+    r->binding = bo->binding;
+    r->usage = bo->usage;
+    r->flags = bo->flags;
+    r->coherent = bo->b.coherent;
+    r->fence_id = bo->command_fence_id;
+
+    TRACE("Pushed GL buffer %u (size %Iu, binding %#x) to free list (%Iu entries).\n",
+            bo->id, bo->size, bo->binding, device_gl->bo_free_list_count);
+    return TRUE;
+}
+
+/* Try to pop a matching BO from the device free list. The BO must have
+ * completed its fence (GPU done), and match binding and flags exactly.
+ * Size must be >= requested and <= 2x requested to limit waste. */
+BOOL wined3d_context_gl_pop_free_bo(struct wined3d_context_gl *context_gl,
+        GLsizeiptr size, GLenum binding, GLenum usage, bool coherent, GLbitfield flags,
+        struct wined3d_bo_gl *bo)
+{
+    struct wined3d_device_gl *device_gl = wined3d_device_gl(context_gl->c.device);
+    struct wined3d_retired_bo_gl *r;
+    SIZE_T i;
+
+
+    for (i = 0; i < device_gl->bo_free_list_count; ++i)
+    {
+        r = &device_gl->bo_free_list[i];
+
+        if (r->fence_id > device_gl->completed_fence_id)
+        {
+            continue;
+        }
+        if (r->binding != binding || r->flags != flags)
+        {
+            continue;
+        }
+        if (r->size < size || r->size > size * 2)
+        {
+            continue;
+        }
+
+        /* Found a match — recycle this BO. */
+        bo->id = r->id;
+        bo->memory = NULL;
+        bo->size = r->size;
+        bo->binding = r->binding;
+        bo->usage = r->usage;
+        bo->flags = r->flags;
+        bo->b.coherent = r->coherent;
+        list_init(&bo->b.users);
+        bo->command_fence_id = 0;
+        bo->b.buffer_offset = 0;
+        bo->b.memory_offset = 0;
+        bo->b.map_ptr = NULL;
+        bo->b.client_map_count = 0;
+        bo->b.refcount = 1;
+
+        TRACE("Recycled GL buffer %u (size %Iu) from free list for request size %Iu.\n",
+                bo->id, bo->size, size);
+
+        /* Remove from free list by swapping with last. */
+        if (i != device_gl->bo_free_list_count - 1)
+            *r = device_gl->bo_free_list[device_gl->bo_free_list_count - 1];
+        --device_gl->bo_free_list_count;
+
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 static void *wined3d_bo_gl_map(struct wined3d_bo_gl *bo, struct wined3d_context_gl *context_gl, uint32_t flags)
 {
     struct wined3d_device_gl *device_gl = wined3d_device_gl(context_gl->c.device);
@@ -2766,22 +2909,34 @@ static void *wined3d_bo_gl_map(struct wined3d_bo_gl *bo, struct wined3d_context_
 
     if ((flags & WINED3D_MAP_DISCARD) && bo->command_fence_id > device_gl->completed_fence_id)
     {
-        if (wined3d_device_gl_create_bo(device_gl, context_gl, bo->size,
+        /* Try to get a recycled BO from the free list first. */
+        if (wined3d_context_gl_pop_free_bo(context_gl, bo->size,
                 bo->binding, bo->usage, bo->b.coherent, bo->flags, &tmp))
         {
-            LIST_FOR_EACH_ENTRY(bo_user, &bo->b.users, struct wined3d_bo_user, entry)
-                bo_user->valid = false;
-            list_init(&bo->b.users);
-
-            wined3d_context_gl_destroy_bo(context_gl, bo);
-            *bo = tmp;
-            list_init(&bo->b.users);
-
-            goto map;
+        }
+        else if (!wined3d_device_gl_create_bo(device_gl, context_gl, bo->size,
+                bo->binding, bo->usage, bo->b.coherent, bo->flags, &tmp))
+        {
+            ERR("Failed to create new buffer object.\n");
+            goto wait;
         }
 
-        ERR("Failed to create new buffer object.\n");
+        LIST_FOR_EACH_ENTRY(bo_user, &bo->b.users, struct wined3d_bo_user, entry)
+            bo_user->valid = false;
+        list_init(&bo->b.users);
+
+        /* destroy_bo unmaps before recycling via push_free_bo internally.
+         * Calling push_free_bo directly would skip glUnmapBuffer and a later
+         * map after pop_free_bo would fail with "Buffer must be bound and
+         * not mapped" (Kontakt 7 crash). */
+        wined3d_context_gl_destroy_bo(context_gl, bo);
+        *bo = tmp;
+        list_init(&bo->b.users);
+
+        goto map;
     }
+
+wait:
 
     if (context_gl->c.d3d_info->fences)
     {
@@ -3089,10 +3244,12 @@ void wined3d_context_gl_destroy_bo(struct wined3d_context_gl *context_gl, struct
         adapter_adjust_mapped_memory(context_gl->c.device->adapter, -bo->size);
     }
 
-    TRACE("Destroying GL buffer %u.\n", bo->id);
-
-    GL_EXTCALL(glDeleteBuffers(1, &bo->id));
-    checkGLcall("buffer object destruction");
+    /* Try to recycle the GL buffer instead of deleting it. */
+    if (!wined3d_context_gl_push_free_bo(context_gl, bo))
+    {
+        GL_EXTCALL(glDeleteBuffers(1, &bo->id));
+        checkGLcall("buffer object destruction");
+    }
     bo->id = 0;
 }
 
