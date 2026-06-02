@@ -17,9 +17,15 @@ and run stable in production use.
 
 | Branch | Description |
 |--------|-------------|
-| `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable: D2D1 + DComp + DWrite + WineD3D performance + winex11. Actively maintained. |
-| `d2d1-dcomp-11.8` | **Frozen** snapshot port onto Wine 11.8 devel for `wine-tkg-dev` users. **No backports** of bug fixes. Use until `d2d1-dcomp-12.0` lands (~mid-May 2026). Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
-| `d2d1-v6` | **Deprecated** (last update 2026-02-14). Was the upstream-targeted D2D1-only patch series; superseded by 41+ later commits in `d2d1-dcomp-11.0`. A new clean D2D1-only series will be extracted from `d2d1-dcomp-12.0` after the 12.0 rebase, on top of Sivov's Stream-Path. Kept for historical reference. |
+| `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable: D2D1 + DComp + DWrite + WineD3D performance + winex11. Actively maintained. This branch. |
+| `d2d1-dcomp-11.10` | **Recommended for devel / rolling-release users** (e.g. `wine-tkg-dev`). Same full stack rebased onto Wine 11.10 devel. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineASIO). The rolling base for future devel rebases. |
+| `d2d1-dcomp-11.8` | **Frozen** snapshot port onto Wine 11.8 devel. **Superseded by `d2d1-dcomp-11.10`** — kept for historical reference. Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
+| `d2d1-v6` | **Deprecated** (last update 2026-02-14). Was the upstream-targeted D2D1-only patch series; superseded by 41+ later commits in `d2d1-dcomp-11.0`. Kept for historical reference. |
+
+> **Note on Wine versioning**: WineHQ devel releases run `11.8 → 11.9 → 11.10 → …`
+> every two weeks; `.10` is the tenth devel iteration, not `1.0`. Stable `12.0`
+> arrives on the yearly cadence (≈ January 2027), not mid-2026. This fork tracks
+> devel releases on a rolling basis (currently 11.10) rather than waiting for 12.0.
 
 ## Full Stack (Branch: `d2d1-dcomp-11.0`)
 
@@ -118,10 +124,12 @@ for a step-by-step guide covering:
 > and 15 misc upstream bug fixes pre-baked from 11.x devel). `d2d1-v6` no longer
 > reflects the current state of the D2D1 work.
 >
-> **Replacement plan**: After the Wine 12.0 stable rebase (~mid-May 2026), a new
-> clean D2D1-only series (working name `d2d1-v7`) will be extracted from
-> `d2d1-dcomp-12.0`. That series will be the upstream-submission candidate, sitting
-> on top of Sivov's Stream-Path architecture and incorporating all current fixes.
+> **Replacement plan**: No new bundled upstream-submission series (`d2d1-v7`) is
+> planned. WineHQ's Clean-Room Guidelines disallow LLM-generated code, so large
+> AI-assisted patch series are out of scope for upstream. Instead, small targeted
+> bug fixes go upstream opportunistically via a Codeweavers maintainer sign-off
+> (precedent: Wine bug 59718 — three arc fixes merged with Sivov's `Signed-off-by`).
+> The fork itself stays as a rolling devel-tracking distribution.
 >
 > The `d2d1-v6` branch is kept on the fork for historical reference only. The
 > patch ZIPs in `patches/v6-full/` and `patches/v6-full-11.0/` are similarly frozen.
