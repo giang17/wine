@@ -200,6 +200,9 @@ static ULONG STDMETHODCALLTYPE dcomp_surface_Release(IDCompositionSurface *iface
             ID3D11Texture2D_Release(surface->texture);
         if (surface->d3d11_device)
             ID3D11Device_Release(surface->d3d11_device);
+        /* Drop the back-reference taken in dcomp_device_Create[Virtual]Surface. */
+        if (surface->device_iface)
+            IDCompositionDevice_Release(surface->device_iface);
         free(surface->bits);
         free(surface);
     }
@@ -2129,6 +2132,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateSurface(IDCompositionDevice 
         return hr;
 
     object->device_iface = &device->IDCompositionDevice_iface;
+    IDCompositionDevice_AddRef(object->device_iface);
     *surface = &object->IDCompositionSurface_iface;
     return S_OK;
 }
@@ -2168,6 +2172,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateVirtualSurface(IDComposition
         return hr;
 
     object->device_iface = &device->IDCompositionDevice_iface;
+    IDCompositionDevice_AddRef(object->device_iface);
     *surface = (IDCompositionVirtualSurface *)&object->IDCompositionSurface_iface;
     return S_OK;
 }
