@@ -241,6 +241,48 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
             WARN("Releasing fullscreen swapchain.\n");
             IDXGIOutput_Release(swapchain->target);
         }
+        /* Tear down DComp composition-window subclassing/props before the
+         * swapchain is freed.  A reblit timer on a *surviving* plugin window
+         * would otherwise fire and dereference this freed swapchain pointer
+         * (use-after-free).  Window properties are server-side and safe to
+         * remove cross-thread, so the swapchain back-reference is always
+         * broken; the window-owning operations (KillTimer, WndProc restore,
+         * DestroyWindow) only run when Release happens on the window's own UI
+         * thread, where they are valid. */
+        if (swapchain->target_hwnd)
+        {
+            HWND t = swapchain->target_hwnd;
+
+            RemovePropW(t, L"__wine_dcomp_swapchain");
+            if (IsWindow(t) && GetWindowThreadProcessId(t, NULL) == GetCurrentThreadId())
+            {
+                WNDPROC orig = (WNDPROC)GetPropW(t, L"__wine_dcomp_orig_wndproc");
+
+                KillTimer(t, DCOMP_REBLIT_TIMER_ID);
+                KillTimer(t, DCOMP_POPUP_REBLIT_TIMER_ID);
+                if (orig)
+                    SetWindowLongPtrW(t, GWLP_WNDPROC, (LONG_PTR)orig);
+                RemovePropW(t, L"__wine_dcomp_orig_wndproc");
+                RemovePropW(t, L"__wine_dcomp_comp_dc");
+                RemovePropW(t, L"__wine_dcomp_comp_size");
+                RemovePropW(t, L"__wine_dcomp_comp_bits");
+                InterlockedDecrement(&dcomp_subclassed_target_count);
+            }
+            swapchain->target_hwnd = NULL;
+        }
+        if (swapchain->comp_wnd)
+        {
+            WCHAR prop_name[64];
+
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    L"__wine_dcomp_wnd_%I64x", (UINT_PTR)iface);
+            RemovePropW(GetDesktopWindow(), prop_name);
+            RemovePropW(swapchain->comp_wnd, L"__wine_dcomp_swapchain");
+            if (IsWindow(swapchain->comp_wnd)
+                    && GetWindowThreadProcessId(swapchain->comp_wnd, NULL) == GetCurrentThreadId())
+                DestroyWindow(swapchain->comp_wnd);
+            swapchain->comp_wnd = NULL;
+        }
         IWineDXGIFactory_Release(swapchain->factory);
         wined3d_swapchain_decref(swapchain->wined3d_swapchain);
         IWineDXGIDevice_Release(device);

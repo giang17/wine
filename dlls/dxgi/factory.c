@@ -386,8 +386,8 @@ static inline struct d3d11_swapchain *d3d11_swapchain_from_IDXGISwapChain4(IDXGI
     return CONTAINING_RECORD(iface, struct d3d11_swapchain, IDXGISwapChain4_iface);
 }
 
-#define DCOMP_REBLIT_TIMER_ID 0xDC01
-#define DCOMP_POPUP_REBLIT_TIMER_ID 0xDC02
+/* DCOMP_REBLIT_TIMER_ID / DCOMP_POPUP_REBLIT_TIMER_ID moved to dxgi_private.h
+ * so d3d11_swapchain_Release() can KillTimer them on teardown. */
 
 /* Re-blit composition content from persistent buffer to window.
  * Called on WM_PAINT, focus changes, timer tick, and other events
@@ -428,7 +428,7 @@ static void dcomp_reblit_comp_buffer(HWND hwnd, const char *reason)
  * Primary target gets full mode (timer + periodic Present), secondary targets
  * get lightweight popup mode.  Incremented after subclassing, decremented
  * in WM_NCDESTROY of both wndprocs.  Thread-safe via Interlocked ops. */
-static LONG dcomp_subclassed_target_count;
+LONG dcomp_subclassed_target_count;
 
 /* Lightweight subclass for DComp popup windows (menus, tooltips).
  * Only blocks WM_ERASEBKGND and re-blits composition content on WM_PAINT.
@@ -491,6 +491,10 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
                 struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(sc);
                 WCHAR prop_name[64];
                 HWND comp_wnd;
+
+                /* Window dies first: clear the back-pointer so a later
+                 * d3d11_swapchain_Release won't touch this (recycled) HWND. */
+                swapchain->target_hwnd = NULL;
 
                 swprintf(prop_name, ARRAY_SIZE(prop_name),
                         L"__wine_dcomp_wnd_%I64x", (UINT_PTR)sc);
@@ -629,11 +633,17 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         case WM_NCDESTROY:
         {
             LRESULT result;
+            IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
             InterlockedDecrement(&dcomp_subclassed_target_count);
             KillTimer(hwnd, DCOMP_REBLIT_TIMER_ID);
+            /* Window dies first: clear the back-pointer so a later
+             * d3d11_swapchain_Release won't touch this (recycled) HWND. */
+            if (sc)
+                d3d11_swapchain_from_IDXGISwapChain4(sc)->target_hwnd = NULL;
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
             RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
+            RemovePropW(hwnd, L"__wine_dcomp_swapchain");
             RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
             RemovePropW(hwnd, L"__wine_dcomp_comp_size");
             return result;
@@ -708,6 +718,8 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                             || target_parent_toplevel == GetDesktopWindow();
 
                     wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, target_hwnd);
+                    /* Remember the subclassed target for teardown in d3d11_swapchain_Release. */
+                    swapchain->target_hwnd = target_hwnd;
 
                     if (is_toplevel)
                     {
@@ -895,6 +907,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWin
         SetPropW(GetDesktopWindow(), prop_name, (HANDLE)window);
         /* Store back-reference for WM_WINE_DCOMP_SET_TARGET handler */
         SetPropW(window, L"__wine_dcomp_swapchain", (HANDLE)*swapchain);
+        /* Remember the composition window for teardown in d3d11_swapchain_Release. */
+        d3d11_swapchain_from_IDXGISwapChain4((IDXGISwapChain4 *)*swapchain)->comp_wnd = window;
         FIXME("Created composition window %p (%ux%u) for swapchain %p.\n",
                 window, desc->Width, desc->Height, *swapchain);
     }
