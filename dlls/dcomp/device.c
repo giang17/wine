@@ -281,7 +281,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_BeginDraw(IDCompositionSurface *i
     ID2D1DeviceContext *context;
     HRESULT hr;
 
-    FIXME("iface %p, rect %s, iid %s, object %p, offset %p semi-stub.\n",
+    TRACE("iface %p, rect %s, iid %s, object %p, offset %p.\n",
             iface, wine_dbgstr_rect(rect), debugstr_guid(iid), object, offset);
 
     if (!object || !offset)
@@ -405,7 +405,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_EndDraw(IDCompositionSurface *ifa
     HRESULT hr;
     unsigned int y;
 
-    FIXME("iface %p.\n", iface);
+    TRACE("iface %p.\n", iface);
 
     if (!surface->drawing)
     {
@@ -1384,6 +1384,52 @@ static const IDCompositionVisualVtbl dcomp_visual_vtbl =
     dcomp_visual_RemoveVisual,
     dcomp_visual_RemoveAllVisuals,
     dcomp_visual_SetCompositeMode,
+};
+
+/* IDCompositionVisual2 extends IDCompositionVisual with two setters. Provide a
+ * real v2 vtable so objects returned through IDCompositionVisual2* dispatch
+ * those methods correctly instead of running past the 20-slot v1 vtable
+ * (crash). The first 20 slots are layout-identical to the v1 vtable and reuse
+ * its methods (the IDCompositionVisual2* and IDCompositionVisual* this-pointers
+ * are binary-identical), so they are cast in. */
+static HRESULT STDMETHODCALLTYPE dcomp_visual2_SetOpacityMode(IDCompositionVisual2 *iface,
+        enum DCOMPOSITION_OPACITY_MODE opacity_mode)
+{
+    FIXME("iface %p, opacity_mode %d - stub.\n", iface, opacity_mode);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual2_SetBackFaceVisibility(IDCompositionVisual2 *iface,
+        enum DCOMPOSITION_BACKFACE_VISIBILITY visibility)
+{
+    FIXME("iface %p, visibility %d - stub.\n", iface, visibility);
+    return S_OK;
+}
+
+static const IDCompositionVisual2Vtbl dcomp_visual2_vtbl =
+{
+    (void *)dcomp_visual_QueryInterface,
+    (void *)dcomp_visual_AddRef,
+    (void *)dcomp_visual_Release,
+    (void *)dcomp_visual_SetOffsetXAnimation,
+    (void *)dcomp_visual_SetOffsetX,
+    (void *)dcomp_visual_SetOffsetYAnimation,
+    (void *)dcomp_visual_SetOffsetY,
+    (void *)dcomp_visual_SetTransformObject,
+    (void *)dcomp_visual_SetTransform,
+    (void *)dcomp_visual_SetTransformParent,
+    (void *)dcomp_visual_SetEffect,
+    (void *)dcomp_visual_SetBitmapInterpolationMode,
+    (void *)dcomp_visual_SetBorderMode,
+    (void *)dcomp_visual_SetClipObject,
+    (void *)dcomp_visual_SetClip,
+    (void *)dcomp_visual_SetContent,
+    (void *)dcomp_visual_AddVisual,
+    (void *)dcomp_visual_RemoveVisual,
+    (void *)dcomp_visual_RemoveAllVisuals,
+    (void *)dcomp_visual_SetCompositeMode,
+    dcomp_visual2_SetOpacityMode,
+    dcomp_visual2_SetBackFaceVisibility,
 };
 
 #define WM_WINE_DCOMP_SET_TARGET (WM_USER + 0x100)
@@ -2385,14 +2431,24 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateVisual(
         IDCompositionDesktopDevice *iface, IDCompositionVisual2 **visual)
 {
     struct dcomp_device *device = impl_from_IDCompositionDesktopDevice(iface);
+    IDCompositionVisual *v1 = NULL;
+    HRESULT hr;
 
-    FIXME("iface %p, visual %p — delegating to v1 CreateVisual.\n", iface, visual);
+    TRACE("iface %p, visual %p.\n", iface, visual);
 
-    /* IDCompositionVisual2 extends IDCompositionVisual with SetOpacityMode
-     * and SetBackFaceVisibility. Our visual implements the v1 vtable which
-     * is layout-compatible for all methods VSTGUI actually calls. */
-    return dcomp_device_CreateVisual(&device->IDCompositionDevice_iface,
-            (IDCompositionVisual **)visual);
+    if (!visual)
+        return E_INVALIDARG;
+
+    if (FAILED(hr = dcomp_device_CreateVisual(&device->IDCompositionDevice_iface, &v1)))
+        return hr;
+
+    /* The v1 path creates the object with the v1 vtable; swap it for the real
+     * IDCompositionVisual2 vtable so the Visual2-only methods dispatch
+     * correctly instead of running past the 20-slot v1 vtable. */
+    impl_from_IDCompositionVisual(v1)->IDCompositionVisual_iface.lpVtbl =
+            (const IDCompositionVisualVtbl *)&dcomp_visual2_vtbl;
+    *visual = (IDCompositionVisual2 *)v1;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateSurfaceFactory(
