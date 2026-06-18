@@ -56,6 +56,19 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
         swapchain->comp_bits = NULL;
     }
 
+    /* Remove the composition props this swapchain set on its window during
+     * Present (see SetPropW of __wine_dcomp_comp_dc/_size/_bits). The comp_dc
+     * and bits they reference are freed above; leaving the props behind lets
+     * the child-compositing path read a stale HDC/bits pointer after the
+     * swapchain is gone. Only our own props are touched — __wine_dcomp_child_*
+     * and __wine_dcomp_is_child are owned by dcomp/dxgi and removed there. */
+    if (swapchain->win_handle)
+    {
+        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_dc");
+        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_size");
+        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_bits");
+    }
+
     if (swapchain->surface_bits)
     {
         HeapFree(GetProcessHeap(), 0, swapchain->surface_bits);
