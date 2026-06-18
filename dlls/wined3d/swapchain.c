@@ -848,14 +848,38 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
                 if (use_alpha_copy)
                 {
-                    /* Write to per-visual surface_bits if available. */
-                    {
-                        DWORD *target = swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits;
-                        unsigned int stride = swapchain->surface_bits ? swapchain->surface_width * 4 : swapchain->comp_width * 4;
+                    /* Write to per-visual surface_bits if available. Clamp the
+                     * dirty rect to both the source (backbuffer) and the target
+                     * buffer bounds before comp_buffer_alpha_copy's raw memcpy:
+                     * present_dirty_rects come from the app via Present1 and are
+                     * only count-clamped upstream (wined3d_swapchain_set_dirty_rects),
+                     * never coordinate-clamped, so a rect larger than the surface
+                     * or with a negative origin would read past the backbuffer and
+                     * write past the comp/surface buffer. */
+                    DWORD *target = swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits;
+                    unsigned int stride = swapchain->surface_bits ? swapchain->surface_width * 4 : swapchain->comp_width * 4;
+                    int tgt_w = swapchain->surface_bits ? (int)swapchain->surface_width : (int)swapchain->comp_width;
+                    int tgt_h = swapchain->surface_bits ? (int)swapchain->surface_height : (int)swapchain->comp_height;
+                    int csx = sx, csy = sy, cdx = dx, cdy = dy, cw = dw, ch = dh;
+
+                    /* Trim negative origins, advancing the paired origin by the
+                     * overshoot so src/dst columns stay aligned. */
+                    if (csx < 0) { cw += csx; cdx -= csx; csx = 0; }
+                    if (cdx < 0) { cw += cdx; csx -= cdx; cdx = 0; }
+                    if (csy < 0) { ch += csy; cdy -= csy; csy = 0; }
+                    if (cdy < 0) { ch += cdy; csy -= cdy; cdy = 0; }
+
+                    /* Trim extent against source (src_w/src_h) and target bounds. */
+                    if (csx + cw > (int)src_w) cw = (int)src_w - csx;
+                    if (cdx + cw > tgt_w)      cw = tgt_w - cdx;
+                    if (csy + ch > (int)src_h) ch = (int)src_h - csy;
+                    if (cdy + ch > tgt_h)      ch = tgt_h - cdy;
+
+                    /* Skip degenerate rects (fully clipped or inverted). */
+                    if (cw > 0 && ch > 0)
                         comp_buffer_alpha_copy(target, stride,
                                 back_buffer->resource.heap_memory, row_pitch,
-                                dx, dy, sx, sy, dw, dh);
-                    }
+                                cdx, cdy, csx, csy, cw, ch);
                 }
                 else
                 {
