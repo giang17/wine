@@ -2508,6 +2508,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
             memset(&info, 0, sizeof(info));
             info.opacity = layer_parameters->opacity;
             info.bypass_layer = TRUE;
+            info.clip_push_count = 2; /* transformed_rect + mask BBox clip */
             /* Save mask geometry for stencil DECR in PopLayer. */
             info.stencil_geometry = layer_parameters->geometricMask;
             if (info.stencil_geometry)
@@ -2544,6 +2545,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
             if (context->bs)
                 ID3D11BlendState_AddRef(context->bs);
             info.layer_bitmap = layer_bitmap;
+            info.clip_push_count = 1; /* transformed_rect clip */
 
             /* Save geometric mask for compositing in PopLayer. */
             if (layer_parameters->geometricMask)
@@ -2593,6 +2595,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
             WARN("Failed to create layer bitmap, hr %#lx. Rendering without layer.\n", hr);
             memset(&info, 0, sizeof(info));
             info.opacity = layer_parameters->opacity;
+            info.clip_push_count = 1; /* transformed_rect clip pushed before bitmap creation */
         }
 
         if (!d2d_layer_stack_push(&context->layer_stack, &info))
@@ -2618,13 +2621,19 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
             return;
         }
 
-        d2d_clip_stack_pop(&context->clip_stack);
+        /* Pop exactly the clips this layer pushed (0 for element-layer bypass,
+         * 1 for a normal layer, 2 for a stencil/clip-only bypass). Using the
+         * per-layer count avoids the old over-pop where the shared bypass_layer
+         * flag popped 2 clips even for the element-layer bypass that pushed none. */
+        {
+            unsigned int i;
+            for (i = 0; i < info.clip_push_count; ++i)
+                d2d_clip_stack_pop(&context->clip_stack);
+        }
 
-        /* Bypass layer: pop mask clip, decrement stencil, restore previous layer. */
+        /* Bypass layer: decrement stencil, restore previous layer. */
         if (info.bypass_layer)
         {
-            d2d_clip_stack_pop(&context->clip_stack); /* pop mask BBox clip */
-
             /* Decrement stencil where this layer's mask covered, restoring
              * the previous layer's stencil values for correct nesting. */
             if (context->stencil_depth > 0 && info.stencil_geometry)
@@ -3937,6 +3946,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
             memset(&info, 0, sizeof(info));
             info.opacity = 1.0f;
             info.bypass_layer = TRUE;
+            info.clip_push_count = 0; /* element-layer bypass pushes no clip */
 
             if (!d2d_layer_stack_push(&context->layer_stack, &info))
                 WARN("Failed to push layer.\n");
@@ -4017,6 +4027,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
             memset(&info, 0, sizeof(info));
             info.opacity = layer_parameters->opacity;
             info.bypass_layer = TRUE;
+            info.clip_push_count = 2; /* transformed_rect + mask BBox clip */
             info.stencil_geometry = layer_parameters->geometricMask;
             if (info.stencil_geometry)
                 ID2D1Geometry_AddRef(info.stencil_geometry);
@@ -4051,6 +4062,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
             if (context->bs)
                 ID3D11BlendState_AddRef(context->bs);
             info.layer_bitmap = layer_bitmap;
+            info.clip_push_count = 1; /* transformed_rect clip */
 
             /* Save geometric mask for compositing in PopLayer.
              * Skip only simple full-frame rectangles (face_count <= 2).
@@ -4112,6 +4124,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
             WARN("Failed to create layer bitmap, hr %#lx. Rendering without layer.\n", hr);
             memset(&info, 0, sizeof(info));
             info.opacity = layer_parameters->opacity;
+            info.clip_push_count = 1; /* transformed_rect clip pushed before bitmap creation */
         }
 
         if (!d2d_layer_stack_push(&context->layer_stack, &info))

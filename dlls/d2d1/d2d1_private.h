@@ -127,6 +127,7 @@ struct d2d_layer_info
     ID2D1Brush *opacity_brush;          /* per-pixel opacity mask brush */
     BOOL clear_called;                  /* Clear() was called inside this layer */
     BOOL bypass_layer;                  /* clip-only bypass: render directly on backbuffer */
+    unsigned int clip_push_count;       /* number of clips pushed by this layer; PopLayer pops exactly this many */
     ID2D1Geometry *stencil_geometry;    /* saved mask geometry for stencil DECR on PopLayer */
     D2D1_ANTIALIAS_MODE mask_aa_mode;   /* maskAntialiasMode for PopLayer compositing */
     BOOL ignore_alpha;                  /* D2D1_LAYER_OPTIONS1_IGNORE_ALPHA */
