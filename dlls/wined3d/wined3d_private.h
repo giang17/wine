@@ -64,6 +64,8 @@ static inline void *wined3d_private_alloc(size_t size)
 
 static inline void *wined3d_private_calloc(size_t count, size_t size)
 {
+    if (size && count > (~(size_t)0) / size)
+        return NULL;
     return HeapAlloc(wined3d_heap, HEAP_ZERO_MEMORY, count * size);
 }
 
