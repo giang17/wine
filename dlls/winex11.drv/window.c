@@ -111,6 +111,13 @@ static const WCHAR *dcomp_swapchain_prop = dcomp_swapchain_propW;
 static const WCHAR dcomp_popup_parent_propW[] =
     {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','o','p','u','p','_','p','a','r','e','n','t',0};
 static const WCHAR *dcomp_popup_parent_prop = dcomp_popup_parent_propW;
+/* Set on the desktop window by dxgi while a DComp plugin GUI is hosted in this
+ * session.  Used to mark embedded ownerless TOOLWINDOW popups as DROPDOWN_MENU
+ * (see set_style_hints) — they anchor to the host window, so the per-window
+ * dcomp discriminators below cannot see they belong to a DComp plugin. */
+static const WCHAR dcomp_active_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','a','c','t','i','v','e',0};
+static const WCHAR *dcomp_active_prop = dcomp_active_propW;
 
 static const char *debugstr_mwm_hints( const MwmHints *hints )
 {
@@ -1217,8 +1224,19 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
          * pull each popup into the focus/stacking rotation → _NET_ACTIVE_WINDOW
          * conflicts → front/back restack loop (the dropdown "blink"). DROPDOWN_MENU
          * stays managed (no override_redirect → embedded-safe) but is excluded
-         * from focus rotation. */
-        if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ) || anchor_is_dcomp)
+         * from focus rotation.
+         *
+         * Third discriminator (embedded, broad): a DComp plugin GUI is hosted in
+         * this session (dxgi published __wine_dcomp_active on the desktop). In the
+         * embedded case (plugin in a Windows host under Wine) the in-plugin popups
+         * anchor to the host window, not to a DComp swapchain — so neither the
+         * popup-parent property nor anchor_is_dcomp fires, and they stayed UTILITY
+         * → the same focus war among themselves (Trinity IFX list flicker). This
+         * flag catches them. It is deliberately broad (any TOOLWINDOW popup while
+         * a DComp GUI is open) — validated against Serum2 (embedded dropdowns must
+         * not regress). */
+        if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ) || anchor_is_dcomp
+                || NtUserGetProp( NtUserGetDesktopWindow(), dcomp_active_prop ))
             window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
         else
             window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );

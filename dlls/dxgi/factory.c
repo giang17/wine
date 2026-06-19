@@ -430,6 +430,26 @@ static void dcomp_reblit_comp_buffer(HWND hwnd, const char *reason)
  * in WM_NCDESTROY of both wndprocs.  Thread-safe via Interlocked ops. */
 LONG dcomp_subclassed_target_count;
 
+/* Process-wide signal that a DComp plugin GUI is currently hosted, published as
+ * a property on the desktop window so winex11's set_style_hints can read it
+ * (cross-module: dxgi is PE, winex11 is the Unix driver — a shared window
+ * property is the idiomatic channel, same convention as __wine_dcomp_wnd_*).
+ * Embedded in-plugin popups (ownerless WS_POPUP|WS_EX_TOOLWINDOW) anchor to the
+ * host window, not to a DComp swapchain target, so the standalone discriminators
+ * (popup_parent prop / anchor_is_dcomp) miss them and they stay UTILITY
+ * (activatable) → focus war with the plugin's other popups → flicker (Trinity
+ * IFX list, embedded).  This flag lets winex11 mark them DROPDOWN_MENU instead.
+ * Set while count > 0, removed at 0 (SetProp with value 0 is not distinguishable
+ * from "unset" — see the SetPropW (HANDLE)1/2 lesson). */
+static void dcomp_update_active_prop(void)
+{
+    LONG count = dcomp_subclassed_target_count;
+    if (count > 0)
+        SetPropW(GetDesktopWindow(), L"__wine_dcomp_active", (HANDLE)(LONG_PTR)count);
+    else
+        RemovePropW(GetDesktopWindow(), L"__wine_dcomp_active");
+}
+
 /* Popup transient-parent stack: the open DComp targets in open order
  * [main, settings, dropdown, ...]. A new popup's transient_for anchor is the
  * current top (the previously-opened target) — yielding the correct nested
@@ -539,6 +559,7 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
             IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
 
             InterlockedDecrement(&dcomp_subclassed_target_count);
+            dcomp_update_active_prop();
             dcomp_popup_stack_remove(hwnd);
             KillTimer(hwnd, DCOMP_POPUP_REBLIT_TIMER_ID);
 
@@ -697,6 +718,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             LRESULT result;
             IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
             InterlockedDecrement(&dcomp_subclassed_target_count);
+            dcomp_update_active_prop();
             dcomp_popup_stack_remove(hwnd);
             KillTimer(hwnd, DCOMP_REBLIT_TIMER_ID);
             /* Window dies first: clear the back-pointer so a later
@@ -854,6 +876,7 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                             SetPropW(target_hwnd, L"__wine_dcomp_popup_parent", (HANDLE)popup_parent);
                             SetTimer(target_hwnd, DCOMP_POPUP_REBLIT_TIMER_ID, 200, NULL);
                             InterlockedIncrement(&dcomp_subclassed_target_count);
+                            dcomp_update_active_prop();
                             dcomp_popup_stack_push(target_hwnd);
                             FIXME("DComp POPUP mode: target %p, orig wndproc %p, sc=%p, transient->%p (reblit timer 200ms).\n",
                                     target_hwnd, orig, iface, popup_parent);
@@ -875,6 +898,7 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                             SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
                             SetTimer(target_hwnd, DCOMP_REBLIT_TIMER_ID, 200, NULL);
                             InterlockedIncrement(&dcomp_subclassed_target_count);
+                            dcomp_update_active_prop();
                             /* Main window: stack base for the first popup's transient anchor. */
                             dcomp_popup_stack_push(target_hwnd);
                             FIXME("DComp: subclassed target %p, orig wndproc %p, timer started, sc=%p.\n",
