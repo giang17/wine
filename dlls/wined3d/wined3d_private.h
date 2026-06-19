@@ -4182,12 +4182,6 @@ struct wined3d_swapchain
     unsigned int surface_width;
     unsigned int surface_height;
     BOOL surface_valid;
-
-    /* Set TRUE after a real Present1 with dirty rects updates comp_dc.
-     * Cleared after the no-dirty-rect path reads back the buffer.
-     * When FALSE, the no-dirty-rect path skips the expensive GPU readback
-     * + StretchBlt and just re-blits the existing comp_dc to the window. */
-    BOOL comp_buffer_dirty;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);

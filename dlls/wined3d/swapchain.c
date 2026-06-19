@@ -252,6 +252,17 @@ void CDECL wined3d_swapchain_set_device_window(struct wined3d_swapchain *swapcha
     wined3d_swapchain_set_window(swapchain, window);
 }
 
+/* NOTE (known issue, tracked separately): the present-state setters below
+ * (set_force_gdi_present / set_premultiplied_alpha / set_dirty_rects) are called
+ * from the DXGI/client thread and write state — state.desc.flags and
+ * present_dirty_rects[] — that the present path reads on the CS thread without
+ * serialization. For the normal "set then Present" sequence on a single client
+ * thread the CS queue ordering provides the necessary happens-before, but a
+ * pipelined next-frame setter can still race a CS-thread present in flight. A
+ * correct fix needs a CS handoff (capture this state into the present command at
+ * emit time) or full wined3d_mutex coverage of the CS-thread read path; both are
+ * invasive to the present protocol and are intentionally left out of this
+ * robustness pass. */
 void CDECL wined3d_swapchain_set_force_gdi_present(struct wined3d_swapchain *swapchain, BOOL force)
 {
     TRACE("swapchain %p, force %d.\n", swapchain, force);
@@ -680,7 +691,7 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
             static unsigned int comp_log_count;
             ++comp_log_count;
             if (comp_log_count <= 10 || !(comp_log_count % 500))
-                FIXME("Composite child #%u: wnd=%p bits=%p %ux%u at (%d,%d) onto %ux%u.\n",
+                TRACE("Composite child #%u: wnd=%p bits=%p %ux%u at (%d,%d) onto %ux%u.\n",
                         i, child_wnd, child_bits, cw, ch, ox, oy, dst_w, dst_h);
         }
 
@@ -782,10 +793,31 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
 
-            swapchain->comp_dc = CreateCompatibleDC(swapchain->dc);
-            swapchain->comp_bitmap = CreateDIBSection(swapchain->comp_dc, &bmi,
-                    DIB_RGB_COLORS, (void **)&swapchain->comp_bits, NULL, 0);
-            swapchain->comp_old_bitmap = SelectObject(swapchain->comp_dc, swapchain->comp_bitmap);
+            if (!(swapchain->comp_dc = CreateCompatibleDC(swapchain->dc)))
+            {
+                WARN("Failed to create composition DC.\n");
+                swapchain->comp_bits = NULL;
+                goto done;
+            }
+            if (!(swapchain->comp_bitmap = CreateDIBSection(swapchain->comp_dc, &bmi,
+                    DIB_RGB_COLORS, (void **)&swapchain->comp_bits, NULL, 0)))
+            {
+                WARN("Failed to create composition DIB section.\n");
+                DeleteDC(swapchain->comp_dc);
+                swapchain->comp_dc = NULL;
+                swapchain->comp_bits = NULL;
+                goto done;
+            }
+            if (!(swapchain->comp_old_bitmap = SelectObject(swapchain->comp_dc, swapchain->comp_bitmap)))
+            {
+                WARN("Failed to select composition bitmap into DC.\n");
+                DeleteObject(swapchain->comp_bitmap);
+                swapchain->comp_bitmap = NULL;
+                DeleteDC(swapchain->comp_dc);
+                swapchain->comp_dc = NULL;
+                swapchain->comp_bits = NULL;
+                goto done;
+            }
             swapchain->comp_width = dst_w;
             swapchain->comp_height = dst_h;
             swapchain->last_blit_window = swapchain->win_handle;
@@ -814,8 +846,6 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                         dst_w * dst_h * sizeof(DWORD));
                 swapchain->surface_valid = TRUE;
             }
-
-            swapchain->comp_buffer_dirty = TRUE;
         }
         else if (swapchain->present_dirty_rect_count > 0)
         {
@@ -893,7 +923,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                 if (dirty_blit_count <= 10 || !(dirty_blit_count % 500))
                 {
                     const RECT *dr0 = &swapchain->present_dirty_rects[0];
-                    FIXME("Dirty blit #%u: win %p, %u rects, r0=(%ld,%ld)-(%ld,%ld) %s, buf=%ux%u.\n",
+                    TRACE("Dirty blit #%u: win %p, %u rects, r0=(%ld,%ld)-(%ld,%ld) %s, buf=%ux%u.\n",
                             dirty_blit_count, swapchain->win_handle,
                             swapchain->present_dirty_rect_count,
                             dr0->left, dr0->top, dr0->right, dr0->bottom,
@@ -915,17 +945,16 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                         if (r->right > union_r) union_r = r->right;
                         if (r->bottom > union_b) union_b = r->bottom;
                         total_area += (unsigned long)(r->right - r->left) * (r->bottom - r->top);
-                        FIXME("  r[%u]=(%ld,%ld)-(%ld,%ld) %ldx%ld\n",
+                        TRACE("  r[%u]=(%ld,%ld)-(%ld,%ld) %ldx%ld\n",
                                 j, r->left, r->top, r->right, r->bottom,
                                 r->right - r->left, r->bottom - r->top);
                     }
-                    FIXME("  union=(%ld,%ld)-(%ld,%ld) area=%lu/%lu (%.0f%%)\n",
+                    TRACE("  union=(%ld,%ld)-(%ld,%ld) area=%lu/%lu (%.0f%%)\n",
                             union_l, union_t, union_r, union_b,
                             total_area, (unsigned long)src_w * src_h,
                             100.0 * total_area / ((unsigned long)src_w * src_h));
                 }
             }
-            swapchain->comp_buffer_dirty = TRUE;
             /* Ensure surface_bits has latest root visual data after dirty-rect update. */
             if (swapchain->surface_bits && swapchain->comp_bits)
             {
@@ -978,7 +1007,6 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                     swapchain->surface_valid = TRUE;
                 }
             }
-            swapchain->comp_buffer_dirty = FALSE;
         }
 
         /* Phase 3 Compositor: rebuild comp_bits from clean root surface_bits,
@@ -1003,20 +1031,25 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         else
         {
             /* Always BitBlt full comp buffer to window — survives any surface reset. */
-            BitBlt(swapchain->dc, dst_rect->left, dst_rect->top, dst_w, dst_h,
-                    swapchain->comp_dc, 0, 0, SRCCOPY);
+            if (!BitBlt(swapchain->dc, dst_rect->left, dst_rect->top, dst_w, dst_h,
+                    swapchain->comp_dc, 0, 0, SRCCOPY))
+                WARN("Failed to blit composition buffer to window.\n");
         }
 
-        /* Store comp_dc as window property so WM_PAINT can re-blit. */
-        SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_dc", (HANDLE)swapchain->comp_dc);
+        /* Store comp_dc as window property so WM_PAINT can re-blit. Don't
+         * publish a partially-initialized composition state via props. */
+        if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_dc", (HANDLE)swapchain->comp_dc))
+            WARN("Failed to set __wine_dcomp_comp_dc property.\n");
         {
             /* Store dimensions as a single LPARAM-sized value. */
             LPARAM dims = MAKELPARAM(dst_w, dst_h);
-            SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_size", (HANDLE)dims);
+            if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_size", (HANDLE)dims))
+                WARN("Failed to set __wine_dcomp_comp_size property.\n");
         }
         /* Expose surface_bits so root can composite per-visual layers. */
-        SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_bits",
-                (HANDLE)(swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits));
+        if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_bits",
+                (HANDLE)(swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits)))
+            WARN("Failed to set __wine_dcomp_comp_bits property.\n");
 
         swapchain->present_dirty_rect_count = 0;
     }
@@ -1032,6 +1065,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
     /* Suppress spurious WM_PAINT after writing to the window surface. */
     ValidateRect(swapchain->win_handle, NULL);
 
+done:
     destroy_desc.hDc = src_dc;
     destroy_desc.hBitmap = bitmap;
     if ((status = D3DKMTDestroyDCFromMemory(&destroy_desc)))
@@ -1200,7 +1234,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
         gl_info = context_gl->gl_info;
 
         if (!(gl_present_count++ % 60))
-            FIXME("GL popup present #%u: dc %p, win %p.\n",
+            TRACE("GL popup present #%u: dc %p, win %p.\n",
                     gl_present_count, context_gl->dc, swapchain->win_handle);
 
         swapchain_gl_set_swap_interval(swapchain, context_gl, swap_interval);
