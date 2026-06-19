@@ -1134,6 +1134,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     Window group_leader = data->whole_window;
     HWND owner = NtUserGetWindowRelative( data->hwnd, GW_OWNER );
     Window owner_win = 0;
+    BOOL anchor_is_dcomp = FALSE;
     XWMHints *wm_hints;
 
     if (owner)
@@ -1174,12 +1175,25 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
         HWND active = get_active_window();
         if (active && active != data->hwnd)
         {
-            Window active_win = X11DRV_get_whole_window( NtUserGetAncestor( active, GA_ROOT ) );
+            HWND active_root = NtUserGetAncestor( active, GA_ROOT );
+            Window active_win = X11DRV_get_whole_window( active_root );
             if (active_win)
             {
                 owner_win = active_win;
                 group_leader = active_win;
             }
+            /* If the anchor (active window) is itself a DComp composition-swapchain
+             * window — the continuously GL-presenting main window, e.g. KORG Trinity
+             * standalone — this ownerless TOOLWINDOW is an in-plugin popup sitting
+             * over it.  Mark it so the type logic below uses DROPDOWN_MENU instead
+             * of UTILITY: the main window's present-driven self-reactivation steals
+             * _NET_ACTIVE_WINDOW from an activatable (UTILITY) popup → focus fight →
+             * flicker (same class as the #2 settings-popup regression, but these
+             * popups carry no __wine_dcomp_popup_parent property).  Embedded plugin
+             * GUIs anchor to the host window, which is NOT a DComp swapchain target,
+             * so they stay UTILITY → unchanged (no embedded regression). */
+            if (active_root && NtUserGetProp( active_root, dcomp_swapchain_prop ))
+                anchor_is_dcomp = TRUE;
         }
     }
 
@@ -1204,7 +1218,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
          * conflicts → front/back restack loop (the dropdown "blink"). DROPDOWN_MENU
          * stays managed (no override_redirect → embedded-safe) but is excluded
          * from focus rotation. */
-        if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ))
+        if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ) || anchor_is_dcomp)
             window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
         else
             window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );
