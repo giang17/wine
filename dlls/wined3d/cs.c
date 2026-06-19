@@ -165,6 +165,11 @@ struct wined3d_cs_present
     RECT dst_rect;
     unsigned int swap_interval;
     uint32_t flags;
+    /* Snapshot of the composition dirty rects at emit time, handed off to the
+     * CS thread so the present path does not read the live client-side buffer
+     * (which the app may concurrently overwrite for the next frame). */
+    RECT present_dirty_rects[16];
+    unsigned int present_dirty_rect_count;
 };
 
 struct wined3d_cs_clear
@@ -715,6 +720,15 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
                     &src_rect, WINED3D_BLT_ALPHA_TEST, NULL, WINED3D_TEXF_POINT);
     }
 
+    /* Publish this frame's dirty rects into the CS-thread-only active buffer
+     * that swapchain_blit_gdi reads.  Only the CS thread touches
+     * cs_present_dirty_rects[], so the present path is free of the client/CS
+     * data race on the live present_dirty_rects[] buffer. */
+    swapchain->cs_present_dirty_rect_count = op->present_dirty_rect_count;
+    if (op->present_dirty_rect_count)
+        memcpy(swapchain->cs_present_dirty_rects, op->present_dirty_rects,
+                op->present_dirty_rect_count * sizeof(*swapchain->cs_present_dirty_rects));
+
     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
 
     /* FLIP_SEQUENTIAL: copy the just-presented content back into back_buffer[0]
@@ -796,6 +810,22 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
     op->dst_rect = *dst_rect;
     op->swap_interval = swap_interval;
     op->flags = flags;
+
+    /* Snapshot the client-side dirty rects into the op.  This runs on the app
+     * thread under wined3d_mutex (held by wined3d_swapchain_present), in program
+     * order after wined3d_swapchain_set_dirty_rects, so it captures this frame's
+     * rects; the CS thread later reads them from the op, never from the live
+     * swapchain buffer. */
+    op->present_dirty_rect_count = swapchain->present_dirty_rect_count;
+    if (swapchain->present_dirty_rect_count)
+        memcpy(op->present_dirty_rects, swapchain->present_dirty_rects,
+                swapchain->present_dirty_rect_count * sizeof(*op->present_dirty_rects));
+    /* Consume the pending rects: they apply to exactly this present.  A
+     * subsequent plain Present() that does not call set_dirty_rects() (only
+     * Present1 does) must then present a full frame, not re-use stale rects.
+     * Reset here on the app thread rather than on the CS thread after the blit,
+     * so the client buffer is never written from two threads. */
+    swapchain->present_dirty_rect_count = 0;
 
     pending = InterlockedIncrement(&cs->pending_presents);
 

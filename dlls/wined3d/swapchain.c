@@ -252,17 +252,23 @@ void CDECL wined3d_swapchain_set_device_window(struct wined3d_swapchain *swapcha
     wined3d_swapchain_set_window(swapchain, window);
 }
 
-/* NOTE (known issue, tracked separately): the present-state setters below
- * (set_force_gdi_present / set_premultiplied_alpha / set_dirty_rects) are called
- * from the DXGI/client thread and write state — state.desc.flags and
- * present_dirty_rects[] — that the present path reads on the CS thread without
- * serialization. For the normal "set then Present" sequence on a single client
- * thread the CS queue ordering provides the necessary happens-before, but a
- * pipelined next-frame setter can still race a CS-thread present in flight. A
- * correct fix needs a CS handoff (capture this state into the present command at
- * emit time) or full wined3d_mutex coverage of the CS-thread read path; both are
- * invasive to the present protocol and are intentionally left out of this
- * robustness pass. */
+/* Composition present-state setters, called from the DXGI/client thread.
+ *
+ * set_dirty_rects() writes the per-frame dirty-rect buffer that the present
+ * path consumes on the CS thread.  To avoid the client/CS data race on that
+ * buffer (a pipelined next-frame set_dirty_rects() overwriting rects while a
+ * CS-thread present of the previous frame is still reading them), the rects are
+ * handed off through the present CS op: emit snapshots present_dirty_rects[]
+ * into the op (app thread, after this setter), and wined3d_cs_exec_present
+ * copies the op snapshot into cs_present_dirty_rects[], which is the only buffer
+ * the present path (swapchain_blit_gdi) reads.  present_dirty_rects[] is thus
+ * touched only on the app thread, cs_present_dirty_rects[] only on the CS thread.
+ *
+ * set_force_gdi_present() / set_premultiplied_alpha() write state.desc.flags
+ * bits that are also read on the CS-thread present path, but these are
+ * configured once at swapchain/target creation (see dlls/dxgi/factory.c) before
+ * any Present, never per frame, so they are not raced in practice and do not
+ * need the per-frame handoff. */
 void CDECL wined3d_swapchain_set_force_gdi_present(struct wined3d_swapchain *swapchain, BOOL force)
 {
     TRACE("swapchain %p, force %d.\n", swapchain, force);
@@ -847,7 +853,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                 swapchain->surface_valid = TRUE;
             }
         }
-        else if (swapchain->present_dirty_rect_count > 0)
+        else if (swapchain->cs_present_dirty_rect_count > 0)
         {
             /* Dirty rects: accumulate only changed regions into comp buffer.
              * Use alpha-aware copy to preserve existing content under transparent
@@ -861,9 +867,9 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
             if (use_alpha_copy)
                 GdiFlush();
 
-            for (i = 0; i < swapchain->present_dirty_rect_count; ++i)
+            for (i = 0; i < swapchain->cs_present_dirty_rect_count; ++i)
             {
-                const RECT *dr = &swapchain->present_dirty_rects[i];
+                const RECT *dr = &swapchain->cs_present_dirty_rects[i];
                 int sx = dr->left;
                 int sy = dr->top;
                 int sw = dr->right - dr->left;
@@ -922,24 +928,24 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                 ++dirty_blit_count;
                 if (dirty_blit_count <= 10 || !(dirty_blit_count % 500))
                 {
-                    const RECT *dr0 = &swapchain->present_dirty_rects[0];
+                    const RECT *dr0 = &swapchain->cs_present_dirty_rects[0];
                     TRACE("Dirty blit #%u: win %p, %u rects, r0=(%ld,%ld)-(%ld,%ld) %s, buf=%ux%u.\n",
                             dirty_blit_count, swapchain->win_handle,
-                            swapchain->present_dirty_rect_count,
+                            swapchain->cs_present_dirty_rect_count,
                             dr0->left, dr0->top, dr0->right, dr0->bottom,
                             is_full_frame ? "FULL-FRAME" : "partial",
                             src_w, src_h);
                 }
                 /* Log all rects for multi-rect blits (> 2 rects = likely UI change, not cursor blink). */
-                if (swapchain->present_dirty_rect_count > 2
+                if (swapchain->cs_present_dirty_rect_count > 2
                         && (dirty_blit_count <= 50 || !(dirty_blit_count % 100)))
                 {
                     unsigned int j;
                     LONG union_l = LONG_MAX, union_t = LONG_MAX, union_r = 0, union_b = 0;
                     unsigned long total_area = 0;
-                    for (j = 0; j < swapchain->present_dirty_rect_count; ++j)
+                    for (j = 0; j < swapchain->cs_present_dirty_rect_count; ++j)
                     {
-                        const RECT *r = &swapchain->present_dirty_rects[j];
+                        const RECT *r = &swapchain->cs_present_dirty_rects[j];
                         if (r->left < union_l) union_l = r->left;
                         if (r->top < union_t) union_t = r->top;
                         if (r->right > union_r) union_r = r->right;
@@ -1051,7 +1057,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                 (HANDLE)(swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits)))
             WARN("Failed to set __wine_dcomp_comp_bits property.\n");
 
-        swapchain->present_dirty_rect_count = 0;
+        swapchain->cs_present_dirty_rect_count = 0;
     }
     else
     {

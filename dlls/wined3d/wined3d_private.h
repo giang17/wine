@@ -4164,9 +4164,17 @@ struct wined3d_swapchain
     HWND win_handle;
     HDC dc;
 
-    /* DComp dirty rect tracking for Present1 */
+    /* DComp dirty rect tracking for Present1.
+     * present_dirty_rects[] is the client-side "pending" buffer written by
+     * wined3d_swapchain_set_dirty_rects on the app thread.  It is snapshotted
+     * into the present CS op at emit time and must NOT be read on the CS thread
+     * (the app may already be writing the next frame's rects).  The CS-thread
+     * present path reads cs_present_dirty_rects[] instead, which is filled from
+     * the op in wined3d_cs_exec_present and only ever touched on the CS thread. */
     RECT present_dirty_rects[16];
     unsigned int present_dirty_rect_count;
+    RECT cs_present_dirty_rects[16];
+    unsigned int cs_present_dirty_rect_count;
     HWND last_blit_window;
 
     /* DComp composition buffer (persistent, for dirty-rect accumulation) */
