@@ -1722,7 +1722,18 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
              * for the exposed area beneath the unmapped window, producing a
              * 1-frame flash visible as popup/tooltip close flicker.
              * (Same pattern as destroy_whole_window which does XSync before
-             * XDestroyWindow.) */
+             * XDestroyWindow.)
+             *
+             * Intentionally unconditional for the unmanaged (override-redirect)
+             * unmap path rather than gated on a DComp marker: the flush we are
+             * waiting on belongs to *sibling* DComp windows, so a per-window
+             * gate on the window being unmapped would miss the common case (a
+             * plain tooltip/popup closing over a DComp plugin underneath) and
+             * reintroduce the flash.  A correct gate would need a global
+             * "DComp window mapped" indicator, which winex11 does not track; the
+             * cost here is a single local X server round-trip on popup close,
+             * which is not perceptible — not worth that machinery + regression
+             * risk for a hot-path that is already limited to unmanaged unmaps. */
             XSync( gdi_display, False );
             XUnmapWindow( data->display, data->whole_window );
         }
