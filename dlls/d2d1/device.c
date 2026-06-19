@@ -137,6 +137,15 @@ static void d2d_layer_stack_cleanup(struct d2d_layer_stack *stack)
             ID2D1Bitmap1_Release(&stack->stack[i].prev_target->ID2D1Bitmap1_iface);
         if (stack->stack[i].prev_bs)
             ID3D11BlendState_Release(stack->stack[i].prev_bs);
+        /* PushLayer AddRefs these; PopLayer releases them. On teardown with a
+         * non-empty layer stack (error path / unbalanced PushLayer) they would
+         * otherwise leak. */
+        if (stack->stack[i].mask_geometry)
+            ID2D1Geometry_Release(stack->stack[i].mask_geometry);
+        if (stack->stack[i].opacity_brush)
+            ID2D1Brush_Release(stack->stack[i].opacity_brush);
+        if (stack->stack[i].stencil_geometry)
+            ID2D1Geometry_Release(stack->stack[i].stencil_geometry);
     }
     free(stack->stack);
 }
@@ -1187,6 +1196,7 @@ static void d2d_device_context_render_mask_to_stencil(struct d2d_device_context 
     D3D11_SUBRESOURCE_DATA buf_data;
     D3D11_BUFFER_DESC buf_desc;
     ID3D11Buffer *geo_ib, *geo_vb;
+    HRESULT hr;
 
     mask_geo = unsafe_impl_from_ID2D1Geometry(geometry);
     if (!mask_geo->fill.face_count)
@@ -1200,8 +1210,15 @@ static void d2d_device_context_render_mask_to_stencil(struct d2d_device_context 
     context->drawing_state.transform._31 = 0.0f;
     context->drawing_state.transform._32 = 0.0f;
 
-    d2d_device_context_update_vs_cb(context, &mask_geo->transform, 0.0f, 0.0f);
-    d2d_device_context_update_ps_cb(context, NULL, NULL, FALSE, FALSE);
+    /* Bail on CB map failure rather than drawing the stencil mask with stale
+     * constants, which would yield an undefined clip mask. */
+    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &mask_geo->transform, 0.0f, 0.0f))
+            || FAILED(hr = d2d_device_context_update_ps_cb(context, NULL, NULL, FALSE, FALSE)))
+    {
+        WARN("Failed to update constant buffers, hr %#lx.\n", hr);
+        context->drawing_state.transform = saved_transform;
+        return;
+    }
 
     buf_desc.Usage = D3D11_USAGE_DEFAULT;
     buf_desc.CPUAccessFlags = 0;
@@ -1958,33 +1975,6 @@ static HRESULT d2d_device_context_get_glyph_run_geometry(struct d2d_device_conte
     return hr;
 }
 
-static void d2d_device_context_draw_glyph_run_outline(struct d2d_device_context *context,
-        D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run, ID2D1Brush *brush)
-{
-    D2D1_MATRIX_3X2_F *transform, prev_transform;
-    D2D1_ANTIALIAS_MODE prev_antialias_mode;
-    ID2D1PathGeometry *geometry;
-    HRESULT hr;
-
-    if (FAILED(hr = d2d_device_context_get_glyph_run_geometry(context, glyph_run, &geometry)))
-    {
-        ERR("Failed to create geometry, hr %#lx.\n", hr);
-        return;
-    }
-
-    transform = &context->drawing_state.transform;
-    prev_transform = *transform;
-    transform->_31 += baseline_origin.x * transform->_11 + baseline_origin.y * transform->_21;
-    transform->_32 += baseline_origin.x * transform->_12 + baseline_origin.y * transform->_22;
-    prev_antialias_mode = d2d_device_context_set_aa_mode_from_text_aa_mode(context);
-    d2d_device_context_fill_geometry(context, unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
-            unsafe_impl_from_ID2D1Brush(brush), NULL);
-    context->drawing_state.antialiasMode = prev_antialias_mode;
-    *transform = prev_transform;
-
-    ID2D1PathGeometry_Release(geometry);
-}
-
 static HRESULT d2d_device_context_get_glyph_run_analysis(struct d2d_device_context *context,
         D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run,
         DWRITE_RENDERING_MODE rendering_mode, DWRITE_MEASURING_MODE measuring_mode,
@@ -2261,18 +2251,18 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
     }
 
     /* Force NATURAL rendering mode for better font quality with FreeType.
-     * ALIASED and OUTLINE modes produce poor results with Wine's FreeType backend. */
+     * ALIASED and OUTLINE modes produce poor results with Wine's FreeType
+     * backend. This forcing is intentional; because it leaves OUTLINE
+     * unreachable here the outline draw path (and its helper) was removed as
+     * dead code — all glyph runs go through the bitmap path below. */
     if (rendering_mode == DWRITE_RENDERING_MODE_ALIASED ||
         rendering_mode == DWRITE_RENDERING_MODE_OUTLINE)
     {
         rendering_mode = DWRITE_RENDERING_MODE_NATURAL;
     }
 
-    if (rendering_mode == DWRITE_RENDERING_MODE_OUTLINE)
-        d2d_device_context_draw_glyph_run_outline(context, baseline_origin, glyph_run, brush);
-    else
-        d2d_device_context_draw_glyph_run_bitmap(context, baseline_origin, glyph_run, brush,
-                rendering_mode, measuring_mode, antialias_mode);
+    d2d_device_context_draw_glyph_run_bitmap(context, baseline_origin, glyph_run, brush,
+            rendering_mode, measuring_mode, antialias_mode);
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_DrawGlyphRun(ID2D1DeviceContext6 *iface,
