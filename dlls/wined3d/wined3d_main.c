@@ -325,6 +325,7 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
             unsigned int err = GetLastError();
             ERR("Failed to free context TLS index, err %#x.\n", err);
         }
+        HeapDestroy(wined3d_heap);
         return FALSE;
     }
 

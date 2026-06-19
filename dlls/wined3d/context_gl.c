@@ -2794,6 +2794,20 @@ static void wined3d_allocator_chunk_gl_unmap(struct wined3d_allocator_chunk_gl *
     wined3d_allocator_chunk_gl_unlock(chunk_gl);
 }
 
+/* Device-global BO free list synchronization:
+ *
+ * The free list (device_gl->bo_free_list / bo_free_list_count) is device-wide
+ * but is only ever mutated through a valid wined3d_context_gl — push from
+ * wined3d_context_gl_destroy_bo, pop from wined3d_bo_gl_map and
+ * wined3d_device_gl_create_bo, and the cleanup sweeps in
+ * wined3d_context_gl_cleanup_resources / wined3d_device_gl_delete_opengl_contexts_cs.
+ * The client-thread allocation fast path (wined3d_device_gl_create_bo with
+ * context_gl == NULL) explicitly skips the free list and only touches the
+ * separately-locked suballocator. A GL context is thread-affine to the thread
+ * that owns it (the CS thread under CSMT, otherwise the single app thread), so
+ * all of these accesses are serialized onto that one thread — no concurrent
+ * cross-thread mutation occurs and no additional lock/atomic is required. */
+
 /* Push a non-suballocated BO to the device free list for later recycling.
  * The BO must already be unmapped. Returns TRUE if recycled, FALSE if the
  * free list is full and the caller should glDeleteBuffers instead. */
@@ -2862,19 +2876,30 @@ BOOL wined3d_context_gl_pop_free_bo(struct wined3d_context_gl *context_gl,
         {
             continue;
         }
-        if (r->size < size || r->size > size * 2)
+        /* Also match usage and coherency: a recycled BO with different usage
+         * or coherency than requested would otherwise be handed back with the
+         * retired attributes, causing subtle stale-data / sync issues. */
+        if (r->usage != usage || r->coherent != coherent)
+        {
+            continue;
+        }
+        /* Reject smaller than requested, or more than ~2x (waste cap). Use
+         * division instead of "size * 2" to avoid overflowing the signed
+         * GLsizeiptr multiply on pathological (exabyte) sizes. */
+        if (r->size < size || r->size / 2 > size)
         {
             continue;
         }
 
-        /* Found a match — recycle this BO. */
+        /* Found a match — recycle this BO. usage/coherent equal the requested
+         * values here (matched above), so set them from the request explicitly. */
         bo->id = r->id;
         bo->memory = NULL;
         bo->size = r->size;
         bo->binding = r->binding;
-        bo->usage = r->usage;
+        bo->usage = usage;
         bo->flags = r->flags;
-        bo->b.coherent = r->coherent;
+        bo->b.coherent = coherent;
         list_init(&bo->b.users);
         bo->command_fence_id = 0;
         bo->b.buffer_offset = 0;
