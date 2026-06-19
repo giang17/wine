@@ -238,7 +238,31 @@ static HRESULT STDMETHODCALLTYPE dxgi_surface_GetDC(IDXGISurface2 *iface, BOOL d
  * On Windows, DirectComposition composites DXGI surface content into
  * associated windows automatically. Wine lacks this compositing, so
  * after an app draws via GetDC/ReleaseDC on a standalone surface (not
- * a swapchain back buffer), we manually blit to matching popup windows. */
+ * a swapchain back buffer), we manually blit to matching popup windows.
+ *
+ * The targeting below is a size-match heuristic (visible WS_POPUP/owned
+ * window whose client area equals the surface) rather than a real
+ * surface->window binding, and it can blit to more than one same-size
+ * popup at once.  This is deliberate and, in practice, the only option:
+ * a proper binding would need the surface to be associated with a window
+ * through the DComp visual tree (IDCompositionVisual::SetContent on a
+ * visual whose target is the popup), but apps that actually hit this path
+ * do not do that.  Investigated for issue 10 (2026-06-19) with KORG Trinity,
+ * standalone and embedded: its popups are composition-swapchain targets and
+ * the GetDC/ReleaseDC surfaces (from IDCompositionSurface::BeginDraw with
+ * IID_IDXGISurface) are never set as visual content, so dcomp has no HWND to
+ * hand us — there is nothing to bind to.  A prototype binding (stamp the
+ * owning HWND onto the surface via SetPrivateData, read it here) was built
+ * and verified to never engage for any tested plugin, so it was dropped in
+ * favour of this documented heuristic.
+ *
+ * Blitting to every same-size popup is safe in the observed cases because
+ * such sibling popups carry identical content (e.g. symmetric scrollbar
+ * troughs).  The over-blit would only be visibly wrong for two same-size
+ * popups holding *different* content drawn from the same surface API; not
+ * observed in practice.  Tightening to a single window is NOT done: the
+ * correct target is always among the matches today, so picking one risks
+ * leaving the right window with stale content. */
 
 struct surface_blit_data
 {
