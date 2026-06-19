@@ -430,6 +430,49 @@ static void dcomp_reblit_comp_buffer(HWND hwnd, const char *reason)
  * in WM_NCDESTROY of both wndprocs.  Thread-safe via Interlocked ops. */
 LONG dcomp_subclassed_target_count;
 
+/* Popup transient-parent stack: the open DComp targets in open order
+ * [main, settings, dropdown, ...]. A new popup's transient_for anchor is the
+ * current top (the previously-opened target) — yielding the correct nested
+ * hierarchy main <- settings <- dropdown — instead of the unreliable
+ * get_active_window(), which (while the GL-presenting main window reactivates
+ * itself) drags every popup behind the main window (Trinity standalone z-order
+ * regression). Pushed after subclassing, removed in WM_NCDESTROY of both
+ * wndprocs. UI-thread-serialized (the SET_TARGET message and NCDESTROY run on
+ * the window's own thread) → no extra lock, like dcomp_subclassed_target_count.
+ * Global for now (shared across plugins); per-plugin scoping ties into #11. */
+#define DCOMP_POPUP_STACK_MAX 16
+static HWND dcomp_popup_stack[DCOMP_POPUP_STACK_MAX];
+static int dcomp_popup_stack_depth;
+
+static HWND dcomp_popup_stack_top(void)
+{
+    return dcomp_popup_stack_depth > 0 ? dcomp_popup_stack[dcomp_popup_stack_depth - 1] : NULL;
+}
+
+static void dcomp_popup_stack_push(HWND hwnd)
+{
+    if (dcomp_popup_stack_depth < DCOMP_POPUP_STACK_MAX)
+        dcomp_popup_stack[dcomp_popup_stack_depth++] = hwnd;
+    else
+        WARN("DComp popup stack full (%d), not pushing %p.\n", dcomp_popup_stack_depth, hwnd);
+}
+
+static void dcomp_popup_stack_remove(HWND hwnd)
+{
+    int i;
+
+    for (i = 0; i < dcomp_popup_stack_depth; ++i)
+    {
+        if (dcomp_popup_stack[i] == hwnd)
+        {
+            memmove(&dcomp_popup_stack[i], &dcomp_popup_stack[i + 1],
+                    (dcomp_popup_stack_depth - i - 1) * sizeof(*dcomp_popup_stack));
+            --dcomp_popup_stack_depth;
+            return;
+        }
+    }
+}
+
 /* Lightweight subclass for DComp popup windows (menus, tooltips).
  * Only blocks WM_ERASEBKGND and re-blits composition content on WM_PAINT.
  * NO timer, NO periodic Present â avoids dual-swapchain
@@ -479,6 +522,7 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
             IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
 
             InterlockedDecrement(&dcomp_subclassed_target_count);
+            dcomp_popup_stack_remove(hwnd);
             KillTimer(hwnd, DCOMP_POPUP_REBLIT_TIMER_ID);
 
             /* Before the popup window is destroyed, switch the swapchain back
@@ -635,6 +679,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             LRESULT result;
             IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
             InterlockedDecrement(&dcomp_subclassed_target_count);
+            dcomp_popup_stack_remove(hwnd);
             KillTimer(hwnd, DCOMP_REBLIT_TIMER_ID);
             /* Window dies first: clear the back-pointer so a later
              * d3d11_swapchain_Release won't touch this (recycled) HWND. */
@@ -750,6 +795,9 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                     BOOL is_popup_mode = FALSE;
                     LONG target_style = GetWindowLongW(target_hwnd, GWL_STYLE);
                     HWND target_parent = GetParent(target_hwnd);
+                    /* Transient anchor for a new popup = the previously-opened
+                     * target (top of the popup stack). */
+                    HWND popup_parent = dcomp_popup_stack_top();
 
                     FIXME("DComp popup-detect: target %p style=0x%08lx parent=%p count=%ld.\n",
                             target_hwnd, (unsigned long)target_style, target_parent,
@@ -768,10 +816,15 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                         {
                             SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
                             SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
+                            /* Anchor transient_for at the previously-opened target
+                             * (read by winex11 set_style_hints) instead of
+                             * get_active_window → nested hierarchy, no main-window pull. */
+                            SetPropW(target_hwnd, L"__wine_dcomp_popup_parent", (HANDLE)popup_parent);
                             SetTimer(target_hwnd, DCOMP_POPUP_REBLIT_TIMER_ID, 200, NULL);
                             InterlockedIncrement(&dcomp_subclassed_target_count);
-                            FIXME("DComp POPUP mode: target %p, orig wndproc %p, sc=%p (reblit timer 200ms).\n",
-                                    target_hwnd, orig, iface);
+                            dcomp_popup_stack_push(target_hwnd);
+                            FIXME("DComp POPUP mode: target %p, orig wndproc %p, sc=%p, transient->%p (reblit timer 200ms).\n",
+                                    target_hwnd, orig, iface, popup_parent);
                         }
                         else
                         {
@@ -790,6 +843,8 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                             SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
                             SetTimer(target_hwnd, DCOMP_REBLIT_TIMER_ID, 200, NULL);
                             InterlockedIncrement(&dcomp_subclassed_target_count);
+                            /* Main window: stack base for the first popup's transient anchor. */
+                            dcomp_popup_stack_push(target_hwnd);
                             FIXME("DComp: subclassed target %p, orig wndproc %p, timer started, sc=%p.\n",
                                     target_hwnd, orig, iface);
                         }

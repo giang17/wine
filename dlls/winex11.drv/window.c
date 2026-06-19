@@ -114,6 +114,9 @@ static const WCHAR *dcomp_swapchain_prop = dcomp_swapchain_propW;
 static const WCHAR dcomp_deferred_map_propW[] =
     {'_','_','w','i','n','e','_','d','c','o','m','p','_','d','e','f','e','r','r','e','d','_','m','a','p',0};
 static const WCHAR *dcomp_deferred_map_prop = dcomp_deferred_map_propW;
+static const WCHAR dcomp_popup_parent_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','o','p','u','p','_','p','a','r','e','n','t',0};
+static const WCHAR *dcomp_popup_parent_prop = dcomp_popup_parent_propW;
 
 static const char *debugstr_mwm_hints( const MwmHints *hints )
 {
@@ -1145,6 +1148,29 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
         owner_win = X11DRV_get_whole_window( owner );
     }
 
+    /* DComp popup-stack transient anchor (set by the dxgi SET_TARGET handler):
+     * the previously-opened popup/main target. This is a STABLE anchor that
+     * yields the correct nested hierarchy (main <- settings <- dropdown), unlike
+     * get_active_window() which drifts to the GL-presenting main window and pulls
+     * every popup behind it (Trinity standalone z-order regression). Read here
+     * before the TOOLWINDOW heuristic so it also covers the settings target
+     * (NORMAL/WS_CAPTION, which never enters the TOOLWINDOW branch). Windows
+     * without this property (e.g. embedded VST3 popups) fall through to the
+     * unchanged get_active_window() path below. */
+    if (!owner_win)
+    {
+        HWND popup_parent = NtUserGetProp( data->hwnd, dcomp_popup_parent_prop );
+        if (popup_parent && popup_parent != data->hwnd)
+        {
+            Window parent_win = X11DRV_get_whole_window( NtUserGetAncestor( popup_parent, GA_ROOT ) );
+            if (parent_win)
+            {
+                owner_win = parent_win;
+                group_leader = parent_win;
+            }
+        }
+    }
+
     /* For ownerless WS_POPUP|WS_EX_TOOLWINDOW windows (e.g. JUCE popup menus in
      * embedded VST3 plugins), use the active window as implicit transient parent.
      * Without transient_for, the window manager has no stacking context and may
@@ -1176,7 +1202,19 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
     else if ((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW) && !owner)
-        window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );
+    {
+        /* DComp dropdown popups (carry the popup-parent property from the dxgi
+         * popup stack): use DROPDOWN_MENU so the WM treats them as transient,
+         * non-activatable menus. UTILITY is an activatable window, which made KDE
+         * pull each popup into the focus/stacking rotation → _NET_ACTIVE_WINDOW
+         * conflicts → front/back restack loop (the dropdown "blink"). DROPDOWN_MENU
+         * stays managed (no override_redirect → embedded-safe) but is excluded
+         * from focus rotation. */
+        if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ))
+            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
+        else
+            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );
+    }
     else
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
 
