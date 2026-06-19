@@ -863,9 +863,16 @@ static HANDLE STDMETHODCALLTYPE d3d11_swapchain_GetFrameLatencyWaitableObject(ID
 
     if (!swapchain->frame_latency_event)
     {
-        swapchain->frame_latency_event = CreateEventW(NULL, FALSE, TRUE, NULL);
-        FIXME("Created frame latency event %p for swapchain %p.\n",
-                swapchain->frame_latency_event, swapchain);
+        HANDLE event = CreateEventW(NULL, FALSE, TRUE, NULL);
+
+        /* Install atomically: concurrent callers must not each create an event
+         * and race storing it (handle leak + inconsistent returned object).  If
+         * another thread won, keep theirs and close ours. */
+        if (InterlockedCompareExchangePointer((void * volatile *)&swapchain->frame_latency_event,
+                event, NULL))
+            CloseHandle(event);
+        else
+            FIXME("Created frame latency event %p for swapchain %p.\n", event, swapchain);
     }
 
     return swapchain->frame_latency_event;

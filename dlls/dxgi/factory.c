@@ -473,6 +473,23 @@ static void dcomp_popup_stack_remove(HWND hwnd)
     }
 }
 
+/* Restore a parent's style if we OR-ed in WS_CLIPCHILDREN for this target
+ * (see WM_WINE_DCOMP_SET_TARGET).  Keyed off the __wine_dcomp_parent_clip prop,
+ * which is set only when we actually added the bit, so a parent that already had
+ * WS_CLIPCHILDREN is left untouched.  Avoids a permanent host-window style change. */
+static void dcomp_restore_parent_clip(HWND hwnd)
+{
+    HWND phwnd = (HWND)GetPropW(hwnd, L"__wine_dcomp_parent_clip");
+
+    if (phwnd)
+    {
+        LONG pstyle = GetWindowLongW(phwnd, GWL_STYLE);
+        if (pstyle & WS_CLIPCHILDREN)
+            SetWindowLongW(phwnd, GWL_STYLE, pstyle & ~WS_CLIPCHILDREN);
+        RemovePropW(hwnd, L"__wine_dcomp_parent_clip");
+    }
+}
+
 /* Lightweight subclass for DComp popup windows (menus, tooltips).
  * Only blocks WM_ERASEBKGND and re-blits composition content on WM_PAINT.
  * NO timer, NO periodic Present â avoids dual-swapchain
@@ -559,6 +576,7 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
                 }
             }
 
+            dcomp_restore_parent_clip(hwnd);
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
             RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
@@ -685,6 +703,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
              * d3d11_swapchain_Release won't touch this (recycled) HWND. */
             if (sc)
                 d3d11_swapchain_from_IDXGISwapChain4(sc)->target_hwnd = NULL;
+            dcomp_restore_parent_clip(hwnd);
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
             RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
@@ -790,7 +809,20 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                 /* Detect popup mode via subclassed target count.
                  * First target (count == 0) gets full mode with timer +
                  * Present.  Subsequent targets get lightweight popup
-                 * mode to avoid dual-swapchain interference. */
+                 * mode to avoid dual-swapchain interference.
+                 *
+                 * NB: this is a deliberate process-global heuristic — "the first
+                 * DComp target created in the process is the plugin's main window,
+                 * later ones are its popups/menus".  It is order-dependent and in
+                 * principle a second unrelated plugin instance could influence the
+                 * mode assignment, but it holds for the embedded single-plugin
+                 * hosting we target and is empirically validated across all tested
+                 * plugins.  A per-target discriminator (e.g. by window style/owner)
+                 * would be less order-sensitive but is render-critical: a main
+                 * window misclassified as a popup loses its present timer.  Do not
+                 * swap the discriminator without a full plugin re-test.  The popup
+                 * *stacking* (transient anchor) is handled separately via the popup
+                 * stack below, not by this count. */
                 {
                     BOOL is_popup_mode = FALSE;
                     LONG target_style = GetWindowLongW(target_hwnd, GWL_STYLE);
@@ -856,13 +888,27 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                     }
                 }
 
-                /* Prevent black flickering between GL presents */
-                SetClassLongPtrW(target_hwnd, GCLP_HBRBACKGROUND, 0);
+                /* Prevent black flickering between GL presents.  The subclassed
+                 * wndproc already returns 1 for WM_ERASEBKGND on this window, so
+                 * the class background brush is never painted here — no need to
+                 * zero the (class-wide) GCLP_HBRBACKGROUND, which would also hit
+                 * unrelated windows sharing the class.
+                 *
+                 * Make the parent clip this child during its own painting.  Only
+                 * OR in WS_CLIPCHILDREN if the parent did not already have it, and
+                 * record the parent on the target so the style is restored on
+                 * teardown (avoids a permanent host-window style change). */
                 {
                     HWND phwnd = GetParent(target_hwnd);
                     if (phwnd)
-                        SetWindowLongW(phwnd, GWL_STYLE,
-                                GetWindowLongW(phwnd, GWL_STYLE) | WS_CLIPCHILDREN);
+                    {
+                        LONG pstyle = GetWindowLongW(phwnd, GWL_STYLE);
+                        if (!(pstyle & WS_CLIPCHILDREN))
+                        {
+                            SetWindowLongW(phwnd, GWL_STYLE, pstyle | WS_CLIPCHILDREN);
+                            SetPropW(target_hwnd, L"__wine_dcomp_parent_clip", (HANDLE)phwnd);
+                        }
+                    }
                 }
                 ValidateRect(target_hwnd, NULL);
 

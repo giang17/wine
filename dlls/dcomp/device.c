@@ -2010,9 +2010,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
     }
 
     /* Phase 5: Subclass target HWND for WM_ERASEBKGND / WM_PAINT protection.
-     * Kill the class background brush to prevent white flicker, then install
-     * our WndProc that suppresses erasure and re-blits the cached DIB frame. */
-    SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, 0);
+     * The installed WndProc suppresses WM_ERASEBKGND per-window (returns 1), so
+     * the class background brush is never painted for this target — we no longer
+     * zero the class-wide GCLP_HBRBACKGROUND, which would also affect unrelated
+     * windows sharing the class. */
     SetPropW(hwnd, dcomp_target_prop, (HANDLE)object);
     object->orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd,
             GWLP_WNDPROC, (LONG_PTR)dcomp_target_wndproc);
