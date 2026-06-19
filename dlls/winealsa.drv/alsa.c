@@ -732,11 +732,14 @@ static HRESULT map_channels(EDataFlow flow, const WAVEFORMATEX *fmt, int *alsa_c
     BOOL need_remap;
 
     if(fmt->nChannels > 32){
-        WARN("Channel count %u exceeds map size, clamping to stereo.\n", fmt->nChannels);
+        WARN("Channel count %u exceeds map size (32); not remapping.\n", fmt->nChannels);
         *alsa_channels = 2;
         map[0] = 0;
         map[1] = 1;
-        return S_OK;
+        /* Return S_FALSE (consistent with stream-creation's >32 rejection) so the
+         * caller leaves need_remapping FALSE and remap_channels() — which indexes
+         * the fixed alsa_channel_map[32] up to fmt->nChannels — is never reached. */
+        return S_FALSE;
     }
 
     if(flow != eCapture && (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE || fmt->nChannels > 2) ){

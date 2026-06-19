@@ -70,6 +70,9 @@ static HRESULT STDMETHODCALLTYPE vdm_QueryInterface(IUnknown *iface, REFIID riid
 
     TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(riid), out);
 
+    if (!out)
+        return E_POINTER;
+
     if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IVirtualDesktopManager))
     {
         *out = &This->lpVtbl;
