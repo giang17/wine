@@ -95,6 +95,7 @@ static void dcomp_send_child_mode(IUnknown *content)
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface);
+static void dcomp_device_auto_commit(IDCompositionDevice *iface);
 
 /* =====================================================================
  * IDCompositionSurface
@@ -539,28 +540,9 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_EndDraw(IDCompositionSurface *ifa
      * that don't call Commit() after every EndDraw (or call it too late)
      * still get timely screen updates.  This mirrors Windows behavior where
      * DWM presents composition changes at the next vsync boundary.
-     * Guard against reentrancy: Commit → BitBlt → WM_PAINT → BeginDraw/EndDraw.
-     * If reentrant EndDraw happens, set dirty flag so we re-commit after. */
+     * Reentrancy/per-device guard handled in dcomp_device_auto_commit. */
     if (surface->device_iface)
-    {
-        static BOOL in_auto_commit;
-        static BOOL commit_pending;
-        if (!in_auto_commit)
-        {
-            in_auto_commit = TRUE;
-            dcomp_device_Commit(surface->device_iface);
-            while (commit_pending)
-            {
-                commit_pending = FALSE;
-                dcomp_device_Commit(surface->device_iface);
-            }
-            in_auto_commit = FALSE;
-        }
-        else
-        {
-            commit_pending = TRUE;
-        }
-    }
+        dcomp_device_auto_commit(surface->device_iface);
 
     return S_OK;
 }
@@ -603,6 +585,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
         UINT width, UINT height)
 {
     struct dcomp_surface *surface = CONTAINING_RECORD(iface, struct dcomp_surface, IDCompositionSurface_iface);
+    ID3D11Texture2D *new_texture = NULL, *new_staging = NULL;
+    IDXGISurface *new_dxgi_surface = NULL;
     DWORD *new_bits;
 
     TRACE("iface %p, %ux%u (old %ux%u).\n", iface, width, height, surface->width, surface->height);
@@ -616,15 +600,71 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
         return DXGI_ERROR_INVALID_CALL;
     }
 
-    /* Reallocate system memory for composition. */
+    /* Two-phase resize: create ALL new resources first; only if everything
+     * succeeds do we release the old ones and swap in the new size.  On any
+     * failure the surface is left fully intact (old bits/textures/dimensions),
+     * so a failed Resize cannot leave new-size metadata with missing GPU
+     * objects (which would make later draws fail unpredictably). */
+
+    /* Phase 1 — allocate/create new resources without touching the surface. */
     new_bits = calloc(width * height, sizeof(DWORD));
     if (!new_bits)
         return E_OUTOFMEMORY;
+
+    if (surface->d3d11_device)
+    {
+        D3D11_TEXTURE2D_DESC tex_desc;
+        HRESULT hr;
+
+        memset(&tex_desc, 0, sizeof(tex_desc));
+        tex_desc.Width = width;
+        tex_desc.Height = height;
+        tex_desc.MipLevels = 1;
+        tex_desc.ArraySize = 1;
+        tex_desc.Format = surface->format;
+        tex_desc.SampleDesc.Count = 1;
+        tex_desc.Usage = D3D11_USAGE_DEFAULT;
+        tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &tex_desc, NULL, &new_texture);
+        if (FAILED(hr))
+        {
+            WARN("Failed to create resized render target texture: %#lx.\n", hr);
+            free(new_bits);
+            return hr;
+        }
+
+        tex_desc.Usage = D3D11_USAGE_STAGING;
+        tex_desc.BindFlags = 0;
+        tex_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &tex_desc, NULL, &new_staging);
+        if (FAILED(hr))
+        {
+            WARN("Failed to create resized staging texture: %#lx.\n", hr);
+            ID3D11Texture2D_Release(new_texture);
+            free(new_bits);
+            return hr;
+        }
+
+        hr = ID3D11Texture2D_QueryInterface(new_texture,
+                &IID_IDXGISurface, (void **)&new_dxgi_surface);
+        if (FAILED(hr))
+        {
+            WARN("Failed to get IDXGISurface from resized texture: %#lx.\n", hr);
+            ID3D11Texture2D_Release(new_staging);
+            ID3D11Texture2D_Release(new_texture);
+            free(new_bits);
+            return hr;
+        }
+    }
+
+    /* Phase 2 — everything created: release old resources and swap in the new. */
     free(surface->bits);
     surface->bits = new_bits;
 
-    /* Release D2D1 bitmaps — they will be recreated lazily in BeginDraw
-     * via dcomp_surface_ensure_d2d1_resources() with the new dimensions. */
+    /* D2D1 bitmaps are recreated lazily in BeginDraw via
+     * dcomp_surface_ensure_d2d1_resources() at the new dimensions. */
     if (surface->readback_bitmap)
     {
         ID2D1Bitmap1_Release(surface->readback_bitmap);
@@ -641,71 +681,17 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
         surface->persistent_context = NULL;
     }
 
-    /* Recreate D3D11 textures at the new size (no lazy-init in this path). */
     if (surface->d3d11_device)
     {
-        D3D11_TEXTURE2D_DESC tex_desc;
-        HRESULT hr;
-
         if (surface->dxgi_surface)
-        {
             IDXGISurface_Release(surface->dxgi_surface);
-            surface->dxgi_surface = NULL;
-        }
         if (surface->staging)
-        {
             ID3D11Texture2D_Release(surface->staging);
-            surface->staging = NULL;
-        }
         if (surface->texture)
-        {
             ID3D11Texture2D_Release(surface->texture);
-            surface->texture = NULL;
-        }
-
-        memset(&tex_desc, 0, sizeof(tex_desc));
-        tex_desc.Width = width;
-        tex_desc.Height = height;
-        tex_desc.MipLevels = 1;
-        tex_desc.ArraySize = 1;
-        tex_desc.Format = surface->format;
-        tex_desc.SampleDesc.Count = 1;
-        tex_desc.Usage = D3D11_USAGE_DEFAULT;
-        tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-        hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &tex_desc, NULL, &surface->texture);
-        if (FAILED(hr))
-        {
-            WARN("Failed to create resized render target texture: %#lx.\n", hr);
-            surface->width = width;
-            surface->height = height;
-            return hr;
-        }
-
-        tex_desc.Usage = D3D11_USAGE_STAGING;
-        tex_desc.BindFlags = 0;
-        tex_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-        hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &tex_desc, NULL, &surface->staging);
-        if (FAILED(hr))
-        {
-            WARN("Failed to create resized staging texture: %#lx.\n", hr);
-            ID3D11Texture2D_Release(surface->texture);
-            surface->texture = NULL;
-            surface->width = width;
-            surface->height = height;
-            return hr;
-        }
-
-        hr = ID3D11Texture2D_QueryInterface(surface->texture,
-                &IID_IDXGISurface, (void **)&surface->dxgi_surface);
-        if (FAILED(hr))
-        {
-            WARN("Failed to get IDXGISurface from resized texture: %#lx.\n", hr);
-            surface->width = width;
-            surface->height = height;
-            return hr;
-        }
+        surface->texture = new_texture;
+        surface->staging = new_staging;
+        surface->dxgi_surface = new_dxgi_surface;
     }
 
     surface->width = width;
@@ -1603,6 +1589,9 @@ struct dcomp_device
     ID3D11Device *d3d11_device;   /* QI from rendering_device, lazy-init */
     ID2D1Device *d2d1_device;     /* QI from rendering_device if it is ID2D1Device */
     struct dcomp_target *targets; /* singly-linked list of targets for Commit */
+    CRITICAL_SECTION cs;          /* protects the targets list (insert/remove/iterate) */
+    LONG in_auto_commit;          /* per-device EndDraw auto-commit reentrancy guard */
+    LONG commit_pending;          /* re-commit requested while in_auto_commit */
 };
 
 static inline struct dcomp_device *impl_from_IDCompositionDevice(IDCompositionDevice *iface)
@@ -1613,6 +1602,28 @@ static inline struct dcomp_device *impl_from_IDCompositionDevice(IDCompositionDe
 static inline struct dcomp_device *impl_from_IDCompositionDesktopDevice(IDCompositionDesktopDevice *iface)
 {
     return CONTAINING_RECORD(iface, struct dcomp_device, IDCompositionDesktopDevice_iface);
+}
+
+/* Auto-commit from EndDraw with a per-device reentrancy guard.
+ * Reentrancy path: Commit → BitBlt → WM_PAINT → BeginDraw/EndDraw → here.
+ * The guard is per-device (not a process-global static), so unrelated devices
+ * cannot drop each other's commits; atomics keep it safe under concurrent EndDraw. */
+static void dcomp_device_auto_commit(IDCompositionDevice *iface)
+{
+    struct dcomp_device *device = impl_from_IDCompositionDevice(iface);
+
+    if (!InterlockedCompareExchange(&device->in_auto_commit, TRUE, FALSE))
+    {
+        dcomp_device_Commit(iface);
+        while (InterlockedExchange(&device->commit_pending, FALSE))
+            dcomp_device_Commit(iface);
+        InterlockedExchange(&device->in_auto_commit, FALSE);
+    }
+    else
+    {
+        /* reentrant EndDraw: request a re-commit after the outer one finishes */
+        InterlockedExchange(&device->commit_pending, TRUE);
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device_QueryInterface(IDCompositionDevice *iface,
@@ -1667,6 +1678,7 @@ static ULONG STDMETHODCALLTYPE dcomp_device_Release(IDCompositionDevice *iface)
             ID3D11Device_Release(device->d3d11_device);
         if (device->rendering_device)
             IUnknown_Release(device->rendering_device);
+        DeleteCriticalSection(&device->cs);
         free(device);
     }
 
@@ -1769,13 +1781,17 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
 
 static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp_target *target)
 {
-    struct dcomp_target **pp = &device->targets;
+    struct dcomp_target **pp;
+
+    EnterCriticalSection(&device->cs);
+    pp = &device->targets;
     while (*pp && *pp != target)
         pp = &(*pp)->next_target;
     if (*pp)
         *pp = target->next_target;
     target->next_target = NULL;
     target->device = NULL;
+    LeaveCriticalSection(&device->cs);
 }
 
 static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width, UINT height)
@@ -1867,6 +1883,11 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
     struct dcomp_target *target;
     static unsigned int commit_log;
 
+    /* Hold the device lock across iteration so a concurrent CreateTargetForHwnd
+     * or target Release cannot mutate the list mid-walk (iterator invalidation /
+     * use-after-free).  Recursive (same-thread) re-entry via the auto-commit path
+     * is prevented by the in_auto_commit guard, so this does not self-deadlock. */
+    EnterCriticalSection(&device->cs);
     for (target = device->targets; target; target = target->next_target)
     {
         struct dcomp_surface *surface;
@@ -1964,6 +1985,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
         /* Also serialize child visual tree (for mixed surface+swapchain scenarios) */
         dcomp_commit_visual_tree(target->hwnd, target->root_visual);
     }
+    LeaveCriticalSection(&device->cs);
 
     return S_OK;
 }
@@ -2001,12 +2023,15 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
     object->refcount = 1;
     object->hwnd = hwnd;
 
-    /* Link target into device's list for Commit iteration */
+    /* Link target into device's list for Commit iteration (under the device lock,
+     * since Commit may be iterating the list from another thread). */
     {
         struct dcomp_device *device = impl_from_IDCompositionDevice(iface);
         object->device = device;
+        EnterCriticalSection(&device->cs);
         object->next_target = device->targets;
         device->targets = object;
+        LeaveCriticalSection(&device->cs);
     }
 
     /* Phase 5: Subclass target HWND for WM_ERASEBKGND / WM_PAINT protection.
@@ -2679,6 +2704,7 @@ static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void 
     object->IDCompositionDevice_iface.lpVtbl = &dcomp_device_vtbl;
     object->IDCompositionDesktopDevice_iface.lpVtbl = &dcomp_desktop_device_vtbl;
     object->refcount = 1;
+    InitializeCriticalSection(&object->cs);
 
     if (rendering_device)
     {
