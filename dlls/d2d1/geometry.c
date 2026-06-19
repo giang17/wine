@@ -157,10 +157,18 @@ static bool d2d_figure_new_segment(struct d2d_geometry *geometry, enum d2d_segme
         const void *data, unsigned int count)
 {
     struct d2d_figure *figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
-    size_t segment_size = d2d_figure_get_segment_data_size(type) * count;
+    size_t element_size = d2d_figure_get_segment_data_size(type);
     unsigned int segment_flags = geometry->u.path.segment_flags;
-    size_t size = segment_size + sizeof(struct d2d_segment);
+    size_t segment_size, size;
     struct d2d_segment *segment;
+
+    /* Guard the size math against overflow: on the 32-bit (i386 PE) build
+     * size_t is 32-bit, so a pathological count could wrap to an undersized
+     * allocation and OOB on replay. */
+    if (count > (SIZE_MAX - sizeof(struct d2d_segment)) / element_size)
+        return false;
+    segment_size = element_size * count;
+    size = segment_size + sizeof(struct d2d_segment);
 
     if (!d2d_array_reserve((void **)&figure->segments.data, &figure->segments.capacity,
             figure->segments.size + size, 1))
@@ -184,8 +192,14 @@ static bool d2d_figure_append_segment_data(struct d2d_geometry *geometry,
         enum d2d_segment_type type, const void *data, unsigned int count)
 {
     struct d2d_figure *figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
-    size_t size = d2d_figure_get_segment_data_size(type) * count;
+    size_t element_size = d2d_figure_get_segment_data_size(type);
+    size_t size;
     struct d2d_segment *segment;
+
+    /* Same overflow guard as d2d_figure_new_segment (32-bit PE size_t wrap). */
+    if (count > SIZE_MAX / element_size)
+        return false;
+    size = element_size * count;
 
     if (!d2d_array_reserve((void **)&figure->segments.data, &figure->segments.capacity,
             figure->segments.size + size, 1))
@@ -207,6 +221,12 @@ static bool d2d_figure_add_segment_data(struct d2d_geometry *geometry,
     struct d2d_figure *figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
     struct d2d_segment *current = d2d_figure_get_current_segment(figure);
     unsigned int segment_flags = geometry->u.path.segment_flags;
+
+    /* Nothing to add: a zero count would reach a memcpy() with size 0 and a
+     * possibly-NULL source (e.g. AddLines(NULL, 0)), which is C UB even for
+     * n == 0. */
+    if (!count)
+        return true;
 
     if (!current || current->flags != segment_flags || current->type != type)
         return d2d_figure_new_segment(geometry, type, data, count);
@@ -1429,9 +1449,12 @@ static bool d2d_figure_begin(struct d2d_figure *figure, D2D1_POINT_2F start_poin
     return d2d_figure_add_vertex(figure, start_point);
 }
 
-static void d2d_figure_end(struct d2d_figure *figure, D2D1_FIGURE_END figure_end)
+static bool d2d_figure_end(struct d2d_figure *figure, D2D1_FIGURE_END figure_end)
 {
-    d2d_figure_produce_vertices(figure);
+    /* Propagate allocation failures from deferred segment replay instead of
+     * dereferencing a partially-materialized vertex array below. */
+    if (!d2d_figure_produce_vertices(figure))
+        return false;
 
     if (memcmp(&figure->vertices[0], &figure->vertices[figure->vertex_count - 1], sizeof(*figure->vertices)))
         figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_LINE;
@@ -1439,6 +1462,8 @@ static void d2d_figure_end(struct d2d_figure *figure, D2D1_FIGURE_END figure_end
         figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_END;
     if (figure_end == D2D1_FIGURE_END_CLOSED)
         figure->flags |= D2D_FIGURE_FLAG_CLOSED;
+
+    return true;
 }
 
 static void d2d_figure_cleanup(struct d2d_figure *figure)
@@ -2924,15 +2949,24 @@ static BOOL d2d_grid_insert(struct d2d_grid *grid, size_t segment_idx,
         const D2D_RECT_F *bounds)
 {
     size_t cx0, cy0, cx1, cy1, cx, cy, cell_idx;
+    double fx0, fy0, fx1, fy1;
     struct d2d_grid_entry *entry;
 
-    /* Map AABB to grid cell range */
-    cx0 = (size_t)((bounds->left   - grid->origin_x) / grid->cell_w);
-    cy0 = (size_t)((bounds->top    - grid->origin_y) / grid->cell_h);
-    cx1 = (size_t)((bounds->right  - grid->origin_x) / grid->cell_w);
-    cy1 = (size_t)((bounds->bottom - grid->origin_y) / grid->cell_h);
+    /* Map AABB to grid cell range. Compute as signed doubles first: a slightly
+     * negative coordinate (float drift at the min edge) must clamp to cell 0,
+     * not wrap to a huge size_t (which the upper-bound clamp below would then
+     * fold to cols-1/rows-1, mis-bucketing boundary-heavy inputs). */
+    fx0 = (bounds->left   - grid->origin_x) / grid->cell_w;
+    fy0 = (bounds->top    - grid->origin_y) / grid->cell_h;
+    fx1 = (bounds->right  - grid->origin_x) / grid->cell_w;
+    fy1 = (bounds->bottom - grid->origin_y) / grid->cell_h;
 
-    /* Clamp to grid bounds (handles floating-point edge cases) */
+    cx0 = fx0 < 0.0 ? 0 : (size_t)fx0;
+    cy0 = fy0 < 0.0 ? 0 : (size_t)fy0;
+    cx1 = fx1 < 0.0 ? 0 : (size_t)fx1;
+    cy1 = fy1 < 0.0 ? 0 : (size_t)fy1;
+
+    /* Clamp the upper bound to grid extents (handles floating-point edge cases) */
     if (cx0 >= grid->cols) cx0 = grid->cols - 1;
     if (cy0 >= grid->rows) cy0 = grid->rows - 1;
     if (cx1 >= grid->cols) cx1 = grid->cols - 1;
@@ -3948,7 +3982,11 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_EndFigure(ID2D1GeometrySink *ifa
     }
 
     figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
-    d2d_figure_end(figure, figure_end);
+    if (!d2d_figure_end(figure, figure_end))
+    {
+        d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
+        return;
+    }
 
     if (figure_end == D2D1_FIGURE_END_CLOSED)
         ++geometry->u.path.segment_count;
