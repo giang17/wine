@@ -286,19 +286,21 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
     unsigned int tmpvalue;
     WNDCLASSA wc;
 
-    wined3d_heap = HeapCreate(0, 0, 0);
-    if (!wined3d_heap)
-    {
-        ERR("Failed to create wined3d private heap.\n");
-        return FALSE;
-    }
+    /* Issue 3: route wined3d allocations to the process heap instead of a private
+     * heap (a3f6c08). The private heap and the process heap recycle the same
+     * virtual address regions under wined3d's render-path alloc/free churn; an
+     * application pointer (e.g. KORG Trinity's waveform buffer, allocated via its
+     * CRT on the process heap) then ends up in a block owned by the other heap.
+     * Wine's strict HeapReAlloc returns NULL where Windows tolerates the mismatch,
+     * and the app's unchecked realloc result faults. A single shared owner removes
+     * the cross-heap mismatch. */
+    wined3d_heap = GetProcessHeap();
 
     wined3d_context_tls_idx = TlsAlloc();
     if (wined3d_context_tls_idx == TLS_OUT_OF_INDEXES)
     {
         unsigned int err = GetLastError();
         ERR("Failed to allocate context TLS index, err %#x.\n", err);
-        HeapDestroy(wined3d_heap);
         return FALSE;
     }
     context_set_tls_idx(wined3d_context_tls_idx);
@@ -325,7 +327,6 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
             unsigned int err = GetLastError();
             ERR("Failed to free context TLS index, err %#x.\n", err);
         }
-        HeapDestroy(wined3d_heap);
         return FALSE;
     }
 
@@ -548,14 +549,8 @@ static BOOL wined3d_dll_destroy(HINSTANCE hInstDLL)
     DeleteCriticalSection(&wined3d_wndproc_cs);
     DeleteCriticalSection(&wined3d_cs);
 
-    /* Destroy private heap — returns ALL wined3d memory to the OS at once,
-     * regardless of fragmentation state. This is the key benefit: the process
-     * heap's RSS is not polluted by wined3d's high-frequency alloc/free churn. */
-    if (wined3d_heap)
-    {
-        HeapDestroy(wined3d_heap);
-        wined3d_heap = NULL;
-    }
+    /* Issue 3: wined3d_heap aliases the process heap (see wined3d_dll_init), so it
+     * must not be destroyed here — that would tear down the whole process. */
 
     return TRUE;
 }
