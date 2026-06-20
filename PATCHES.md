@@ -17,15 +17,11 @@ and run stable in production use.
 
 | Branch | Description |
 |--------|-------------|
-| `d2d1-dcomp-11.10` | **Recommended for devel / rolling-release users** (e.g. `wine-tkg-dev`). Full stack rebased onto Wine 11.10 devel: D2D1 + DComp + DWrite + WineD3D performance + winex11. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineASIO). This is the rolling base for future devel rebases. |
-| `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable. Actively maintained. |
-| `d2d1-dcomp-11.8` | **Frozen** snapshot port onto Wine 11.8 devel. **Superseded by `d2d1-dcomp-11.10`** — kept for historical reference. Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
+| `d2d1-dcomp-11.11` | **Recommended for devel / rolling-release users** (e.g. `wine-tkg-dev`). Newest full stack rebased onto Wine 11.11 devel — the current rolling base. Same D2D1 + DComp + DWrite + WineD3D + winex11 stack as `d2d1-dcomp-11.0`, including the Tier 1-3 review hardening, the Trinity nested-popup z-order fix, the embedded-Trinity in-plugin (IFX) popup flicker fix, the DComp thread-safety hardening, and the WineD3D process-heap fix for the Trinity heap-mismatch crash. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineSynth). |
+| `d2d1-dcomp-11.10` | Same full stack rebased onto Wine 11.10 devel. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineASIO). **Superseded by `d2d1-dcomp-11.11`** as the rolling devel base — kept as the previous rolling snapshot. |
+| `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable: D2D1 + DComp + DWrite + WineD3D performance + winex11. Actively maintained. |
+| `d2d1-dcomp-11.8` | **Frozen** snapshot port onto Wine 11.8 devel. **Superseded by `d2d1-dcomp-11.11`** — kept for historical reference. Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
 | `d2d1-v6` | **Deprecated** (last update 2026-02-14). Was the upstream-targeted D2D1-only patch series; superseded by 41+ later commits in `d2d1-dcomp-11.0`. Kept for historical reference. |
-
-> **Note on Wine versioning**: WineHQ devel releases run `11.8 → 11.9 → 11.10 → …`
-> every two weeks; `.10` is the tenth devel iteration, not `1.0`. Stable `12.0`
-> arrives on the yearly cadence (≈ January 2027), not mid-2026. This fork tracks
-> devel releases on a rolling basis (currently 11.10) rather than waiting for 12.0.
 
 ## Full Stack (Branch: `d2d1-dcomp-11.0`)
 
@@ -70,14 +66,19 @@ NT synchronization primitives, significantly reducing audio latency (stable at 6
 `--enable-archs=i386,x86_64` instead of `--enable-win64` (thanks to @jibeape for
 figuring this out).
 
-**DXVK compatibility**: Do **not** install DXVK alongside this patch set. The DXGI
-patches (DComp popup handling, GL SwapBuffers) modify Wine's builtin `dxgi.dll`.
-DXVK replaces `dxgi.dll` with its own implementation, which discards these patches.
-Furthermore, DXVK's `d3d11.dll` and Wine's `dxgi.dll` are **not interchangeable** —
-they use different internal COM interfaces (`DxgiSwap*` / `D3D11DXGI*` vs
-`IWineDXGI*`) and mixing them causes crashes. With the DComp rendering path active,
-DXVK offers no benefit anyway — D2D1 draws go through a bitmap+BitBlt path, not the
-DXGI swapchain, so WineD3D performs equally well.
+**DXVK compatibility**: DXVK and this patch set are **not a hard conflict**, but they
+don't combine. The DComp/DXGI patches (DComp popup handling, GL SwapBuffers) live in
+Wine's builtin `dxgi.dll` — DXVK *replaces* that DLL with its own Vulkan-based
+implementation and so silently bypasses the composition-swapchain/DComp patches.
+The two can coexist on disk and be switched per-application via `WINEDLLOVERRIDES`:
+`d3d11,dxgi,d3d10core=n` activates DXVK, `=b` uses the patched builtin with the DComp
+path. **Switch the whole trio together** — overriding only part of it mixes DXVK's
+`d3d11.dll` with Wine's `dxgi.dll`, which use different internal COM interfaces
+(`DxgiSwap*` / `D3D11DXGI*` vs `IWineDXGI*`) and crash. For DComp-based plugins
+(Serum 2, Korg Trinity, Pianoteq 9) DXVK offers no benefit anyway — D2D1 draws go
+through a bitmap+BitBlt path, not the DXGI swapchain, so WineD3D performs equally
+well. The simplest, recommended setup is to **not install DXVK at all**, so the
+builtin DComp path is always used and no overrides are needed.
 
 **Serum2 settings** (recommended — DComp gives the best performance):
 - `"Disable DirectComposition": false`
