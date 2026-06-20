@@ -70,14 +70,19 @@ NT synchronization primitives, significantly reducing audio latency (stable at 6
 `--enable-archs=i386,x86_64` instead of `--enable-win64` (thanks to @jibeape for
 figuring this out).
 
-**DXVK compatibility**: Do **not** install DXVK alongside this patch set. The DXGI
-patches (DComp popup handling, GL SwapBuffers) modify Wine's builtin `dxgi.dll`.
-DXVK replaces `dxgi.dll` with its own implementation, which discards these patches.
-Furthermore, DXVK's `d3d11.dll` and Wine's `dxgi.dll` are **not interchangeable** —
-they use different internal COM interfaces (`DxgiSwap*` / `D3D11DXGI*` vs
-`IWineDXGI*`) and mixing them causes crashes. With the DComp rendering path active,
-DXVK offers no benefit anyway — D2D1 draws go through a bitmap+BitBlt path, not the
-DXGI swapchain, so WineD3D performs equally well.
+**DXVK compatibility**: DXVK and this patch set are **not a hard conflict**, but they
+don't combine. The DComp/DXGI patches (DComp popup handling, GL SwapBuffers) live in
+Wine's builtin `dxgi.dll` — DXVK *replaces* that DLL with its own Vulkan-based
+implementation and so silently bypasses the composition-swapchain/DComp patches.
+The two can coexist on disk and be switched per-application via `WINEDLLOVERRIDES`:
+`d3d11,dxgi,d3d10core=n` activates DXVK, `=b` uses the patched builtin with the DComp
+path. **Switch the whole trio together** — overriding only part of it mixes DXVK's
+`d3d11.dll` with Wine's `dxgi.dll`, which use different internal COM interfaces
+(`DxgiSwap*` / `D3D11DXGI*` vs `IWineDXGI*`) and crash. For DComp-based plugins
+(Serum 2, Korg Trinity, Pianoteq 9) DXVK offers no benefit anyway — D2D1 draws go
+through a bitmap+BitBlt path, not the DXGI swapchain, so WineD3D performs equally
+well. The simplest, recommended setup is to **not install DXVK at all**, so the
+builtin DComp path is always used and no overrides are needed.
 
 **Serum2 settings** (recommended — DComp gives the best performance):
 - `"Disable DirectComposition": false`
