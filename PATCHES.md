@@ -18,14 +18,15 @@ and run stable in production use.
 | Branch | Description |
 |--------|-------------|
 | `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable: D2D1 + DComp + DWrite + WineD3D performance + winex11. Actively maintained. This branch. |
-| `d2d1-dcomp-11.10` | **Recommended for devel / rolling-release users** (e.g. `wine-tkg-dev`). Same full stack rebased onto Wine 11.10 devel. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineASIO). The rolling base for future devel rebases. |
-| `d2d1-dcomp-11.8` | **Frozen** snapshot port onto Wine 11.8 devel. **Superseded by `d2d1-dcomp-11.10`** — kept for historical reference. Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
+| `d2d1-dcomp-11.11` | **Recommended for devel / rolling-release users** (e.g. `wine-tkg-dev`). Newest full stack rebased onto Wine 11.11 devel — the current rolling base. Same D2D1 + DComp + DWrite + WineD3D + winex11 stack as `d2d1-dcomp-11.0`, including the Tier 1-3 review hardening, the Trinity nested-popup z-order fix, the embedded-Trinity in-plugin (IFX) popup flicker fix, the DComp thread-safety hardening, and the WineD3D process-heap fix for the Trinity heap-mismatch crash. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineSynth). |
+| `d2d1-dcomp-11.10` | Same full stack rebased onto Wine 11.10 devel. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineASIO). **Superseded by `d2d1-dcomp-11.11`** as the rolling devel base — kept as the previous rolling snapshot. |
+| `d2d1-dcomp-11.8` | **Frozen** snapshot port onto Wine 11.8 devel. **Superseded by `d2d1-dcomp-11.11`** — kept for historical reference. Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
 | `d2d1-v6` | **Deprecated** (last update 2026-02-14). Was the upstream-targeted D2D1-only patch series; superseded by 41+ later commits in `d2d1-dcomp-11.0`. Kept for historical reference. |
 
 > **Note on Wine versioning**: WineHQ devel releases run `11.8 → 11.9 → 11.10 → …`
 > every two weeks; `.10` is the tenth devel iteration, not `1.0`. Stable `12.0`
 > arrives on the yearly cadence (≈ January 2027), not mid-2026. This fork tracks
-> devel releases on a rolling basis (currently 11.10) rather than waiting for 12.0.
+> devel releases on a rolling basis (currently 11.11) rather than waiting for 12.0.
 
 ## Full Stack (Branch: `d2d1-dcomp-11.0`)
 
