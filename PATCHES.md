@@ -23,11 +23,6 @@ and run stable in production use.
 | `d2d1-dcomp-11.8` | **Frozen** snapshot port onto Wine 11.8 devel. **Superseded by `d2d1-dcomp-11.11`** — kept for historical reference. Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
 | `d2d1-v6` | **Deprecated** (last update 2026-02-14). Was the upstream-targeted D2D1-only patch series; superseded by 41+ later commits in `d2d1-dcomp-11.0`. Kept for historical reference. |
 
-> **Note on Wine versioning**: WineHQ devel releases run `11.8 → 11.9 → 11.10 → …`
-> every two weeks; `.10` is the tenth devel iteration, not `1.0`. Stable `12.0`
-> arrives on the yearly cadence (≈ January 2027), not mid-2026. This fork tracks
-> devel releases on a rolling basis (currently 11.11) rather than waiting for 12.0.
-
 ## Full Stack (Branch: `d2d1-dcomp-11.0`)
 
 This is the recommended branch. It includes all 15 D2D1 patches plus:
