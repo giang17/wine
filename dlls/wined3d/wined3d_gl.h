@@ -867,6 +867,13 @@ struct wined3d_dummy_textures
 
 #define WINED3D_BO_FREE_LIST_MAX 256
 
+/* Upper bound on retired allocator blocks pending fence completion. When
+ * exceeded, fence completion is forced to drain the list, bounding RSS at
+ * the cost of occasional GPU stalls. Without this, a widened fence gap can
+ * cause unbounded accumulation (each retired block pins its 64 MiB chunk).
+ * See issue 46. */
+#define WINED3D_RETIRED_BLOCKS_MAX 4096
+
 struct wined3d_retired_bo_gl
 {
     GLuint id;

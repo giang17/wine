@@ -2686,6 +2686,33 @@ static void wined3d_context_gl_destroy_allocator_block(struct wined3d_context_gl
         return;
     }
 
+    /* Bound retired_blocks[] to prevent unbounded RSS growth when the fence
+     * gap widens (issue 46). Each retired block pins its 64 MiB allocator
+     * chunk; without a cap, 32k+ entries can accumulate during fence stalls. */
+    if (device_gl->retired_block_count >= WINED3D_RETIRED_BLOCKS_MAX)
+    {
+        SIZE_T i;
+        uint64_t oldest;
+
+        /* Try non-blocking drain first. */
+        wined3d_context_gl_cleanup_resources(context_gl);
+
+        if (device_gl->retired_block_count >= WINED3D_RETIRED_BLOCKS_MAX)
+        {
+            /* Submit any pending fence so all retired blocks' fences are
+             * in flight, then block-wait for the oldest pending fence. */
+            wined3d_context_gl_submit_command_fence(context_gl);
+
+            oldest = ~(uint64_t)0;
+            for (i = 0; i < device_gl->retired_block_count; ++i)
+            {
+                if (device_gl->retired_blocks[i].fence_id < oldest)
+                    oldest = device_gl->retired_blocks[i].fence_id;
+            }
+            wined3d_context_gl_wait_command_fence(context_gl, oldest);
+        }
+    }
+
     if (!wined3d_array_reserve((void **)&device_gl->retired_blocks,
             &device_gl->retired_blocks_size, device_gl->retired_block_count + 1,
             sizeof(*device_gl->retired_blocks)))
@@ -2697,8 +2724,6 @@ static void wined3d_context_gl_destroy_allocator_block(struct wined3d_context_gl
     r = &device_gl->retired_blocks[device_gl->retired_block_count++];
     r->block = block;
     r->fence_id = fence_id;
-
-
 }
 
 /* We always have buffer storage here. */
