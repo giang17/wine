@@ -766,6 +766,16 @@ struct d2d_device
     ID3D10Blob *precompiled_shape_vs[D2D_SHAPE_TYPE_COUNT];
     ID3D10Blob *precompiled_shape_ps;
 
+    /* Shared shape input layouts / vertex + pixel shaders, created lazily once per
+     * device (from the shared ID3D11Device) and referenced by every device context.
+     * Applications that recreate a D2D1 device context per redraw would otherwise
+     * re-create — and wined3d would re-parse — the identical precompiled shape
+     * shaders on every context, churning the process heap and growing RSS. */
+    CRITICAL_SECTION shape_cs;
+    BOOL shape_resources_ready;
+    struct d2d_shape_resources shape_resources[D2D_SHAPE_TYPE_COUNT];
+    ID3D11PixelShader *shape_ps;
+
     struct d2d_indexed_objects shaders;
 };
 

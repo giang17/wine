@@ -5688,6 +5688,76 @@ shape_info[] =
      "fill_aa",                     shape_vs_code_fill_aa,        sizeof(shape_vs_code_fill_aa) - 1},
 };
 
+/* Lazily create the device-wide shared shape input layouts / vertex + pixel
+ * shaders from the precompiled blobs. Called from every context creation but does
+ * the actual D3D work only once per device; subsequent contexts just AddRef the
+ * cached objects. All contexts of a device share the same ID3D11Device (queried
+ * from the device's dxgi_device), so the objects are valid across contexts. */
+static HRESULT d2d_device_ensure_shape_resources(struct d2d_device *device, ID3D11Device1 *d3d_device)
+{
+    struct d2d_shape_resources resources[D2D_SHAPE_TYPE_COUNT] = {0};
+    ID3D11PixelShader *ps = NULL;
+    ID3D10Blob *precompiled;
+    unsigned int i;
+    HRESULT hr = S_OK;
+
+    EnterCriticalSection(&device->shape_cs);
+    if (device->shape_resources_ready)
+    {
+        LeaveCriticalSection(&device->shape_cs);
+        return S_OK;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(shape_info); ++i)
+    {
+        const struct shape_info *si = &shape_info[i];
+
+        precompiled = device->precompiled_shape_vs[i];
+        if (FAILED(hr = ID3D11Device1_CreateInputLayout(d3d_device, si->il_desc, si->il_element_count,
+                ID3D10Blob_GetBufferPointer(precompiled), ID3D10Blob_GetBufferSize(precompiled),
+                &resources[si->shape_type].il)))
+        {
+            WARN("Failed to create input layout for shape type %#x, hr %#lx.\n", si->shape_type, hr);
+            goto fail;
+        }
+
+        if (FAILED(hr = ID3D11Device1_CreateVertexShader(d3d_device,
+                ID3D10Blob_GetBufferPointer(precompiled), ID3D10Blob_GetBufferSize(precompiled),
+                NULL, &resources[si->shape_type].vs)))
+        {
+            WARN("Failed to create vertex shader for shape type %#x, hr %#lx.\n", si->shape_type, hr);
+            goto fail;
+        }
+    }
+
+    precompiled = device->precompiled_shape_ps;
+    if (FAILED(hr = ID3D11Device1_CreatePixelShader(d3d_device,
+            ID3D10Blob_GetBufferPointer(precompiled), ID3D10Blob_GetBufferSize(precompiled),
+            NULL, &ps)))
+    {
+        WARN("Failed to create pixel shader, hr %#lx.\n", hr);
+        goto fail;
+    }
+
+    for (i = 0; i < D2D_SHAPE_TYPE_COUNT; ++i)
+        device->shape_resources[i] = resources[i];
+    device->shape_ps = ps;
+    device->shape_resources_ready = TRUE;
+    LeaveCriticalSection(&device->shape_cs);
+    return S_OK;
+
+fail:
+    for (i = 0; i < D2D_SHAPE_TYPE_COUNT; ++i)
+    {
+        if (resources[i].vs)
+            ID3D11VertexShader_Release(resources[i].vs);
+        if (resources[i].il)
+            ID3D11InputLayout_Release(resources[i].il);
+    }
+    LeaveCriticalSection(&device->shape_cs);
+    return hr;
+}
+
 static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
         struct d2d_device *device, IUnknown *outer_unknown, const struct d2d_device_context_ops *ops)
 {
@@ -5696,7 +5766,6 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
     D3D11_RASTERIZER_DESC rs_desc;
     D3D11_BUFFER_DESC buffer_desc;
     struct d2d_factory *factory;
-    ID3D10Blob *precompiled;
     unsigned int i;
     HRESULT hr;
 
@@ -5745,27 +5814,15 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
         goto err;
     }
 
-    for (i = 0; i < ARRAY_SIZE(shape_info); ++i)
+    if (FAILED(hr = d2d_device_ensure_shape_resources(device, render_target->d3d_device)))
+        goto err;
+
+    for (i = 0; i < D2D_SHAPE_TYPE_COUNT; ++i)
     {
-        const struct shape_info *si = &shape_info[i];
-
-        assert(device->precompiled_shape_vs[i]);
-        precompiled = device->precompiled_shape_vs[i];
-        if (FAILED(hr = ID3D11Device1_CreateInputLayout(render_target->d3d_device, si->il_desc, si->il_element_count,
-                ID3D10Blob_GetBufferPointer(precompiled), ID3D10Blob_GetBufferSize(precompiled),
-                &render_target->shape_resources[si->shape_type].il)))
-        {
-            WARN("Failed to create input layout for shape type %#x, hr %#lx.\n", si->shape_type, hr);
-            goto err;
-        }
-
-        if (FAILED(hr = ID3D11Device1_CreateVertexShader(render_target->d3d_device,
-                ID3D10Blob_GetBufferPointer(precompiled), ID3D10Blob_GetBufferSize(precompiled),
-                NULL, &render_target->shape_resources[si->shape_type].vs)))
-        {
-            WARN("Failed to create vertex shader for shape type %#x, hr %#lx.\n", si->shape_type, hr);
-            goto err;
-        }
+        render_target->shape_resources[i].il = device->shape_resources[i].il;
+        ID3D11InputLayout_AddRef(render_target->shape_resources[i].il);
+        render_target->shape_resources[i].vs = device->shape_resources[i].vs;
+        ID3D11VertexShader_AddRef(render_target->shape_resources[i].vs);
     }
 
     buffer_desc.ByteWidth = sizeof(struct d2d_vs_cb);
@@ -5781,15 +5838,8 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
         goto err;
     }
 
-    assert(device->precompiled_shape_ps);
-    precompiled = device->precompiled_shape_ps;
-    if (FAILED(hr = ID3D11Device1_CreatePixelShader(render_target->d3d_device,
-            ID3D10Blob_GetBufferPointer(precompiled), ID3D10Blob_GetBufferSize(precompiled),
-            NULL, &render_target->ps)))
-    {
-        WARN("Failed to create pixel shader, hr %#lx.\n", hr);
-        goto err;
-    }
+    render_target->ps = device->shape_ps;
+    ID3D11PixelShader_AddRef(render_target->ps);
 
     buffer_desc.ByteWidth = sizeof(struct d2d_ps_cb);
     buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
@@ -6046,6 +6096,19 @@ static ULONG WINAPI d2d_device_Release(ID2D1Device6 *iface)
         }
         if (device->precompiled_shape_ps)
             ID3D10Blob_Release(device->precompiled_shape_ps);
+        if (device->shape_resources_ready)
+        {
+            for (unsigned int i = 0; i < D2D_SHAPE_TYPE_COUNT; ++i)
+            {
+                if (device->shape_resources[i].vs)
+                    ID3D11VertexShader_Release(device->shape_resources[i].vs);
+                if (device->shape_resources[i].il)
+                    ID3D11InputLayout_Release(device->shape_resources[i].il);
+            }
+            if (device->shape_ps)
+                ID3D11PixelShader_Release(device->shape_ps);
+        }
+        DeleteCriticalSection(&device->shape_cs);
         free(device);
     }
 
@@ -6278,6 +6341,9 @@ HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGI
 
     device->ID2D1Device6_iface.lpVtbl = &d2d_device_vtbl;
     device->refcount = 1;
+    /* Initialise first so the destructor can always DeleteCriticalSection, even
+     * if this function fails below (the device is then released via the vtbl). */
+    InitializeCriticalSection(&device->shape_cs);
     device->factory = factory;
     ID2D1Factory1_AddRef(device->factory);
     device->dxgi_device = dxgi_device;
