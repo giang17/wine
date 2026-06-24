@@ -1176,8 +1176,15 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     /* For ownerless WS_POPUP|WS_EX_TOOLWINDOW windows (e.g. JUCE popup menus in
      * embedded VST3 plugins), use the active window as implicit transient parent.
      * Without transient_for, the window manager has no stacking context and may
-     * place the popup behind the application window. */
-    if (!owner_win && (style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW))
+     * place the popup behind the application window.
+     *
+     * Exclude windows that carry WS_CAPTION: a titled WS_EX_TOOLWINDOW is a
+     * decorated top-level app window (e.g. FL Studio's invisible 1x1 container,
+     * style 0x94ca0000 = WS_POPUP|WS_CAPTION|WS_SYSMENU), not a borderless popup
+     * menu.  Such windows must stay out of the popup heuristic — see the matching
+     * WS_CAPTION guard on the UTILITY branch below (issue 50). */
+    if (!owner_win && (style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW)
+            && !(style & WS_CAPTION))
     {
         HWND active = get_active_window();
         if (active && active != data->hwnd)
@@ -1216,9 +1223,20 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
      */
     if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
-    else if ((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW) && !owner)
+    else if ((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW) && !owner
+            && !(style & WS_CAPTION))
     {
-        /* DComp dropdown popups (carry the popup-parent property from the dxgi
+        /* The WS_CAPTION guard above keeps decorated app windows out of this
+         * branch: FL Studio's ownerless WS_POPUP|WS_EX_TOOLWINDOW main container
+         * (style 0x94ca0000) was wrongly tagged UTILITY here, which KDE treats as
+         * an activation-coupled tool window and minimizes on every _NET_ACTIVE_-
+         * WINDOW change → _NET_WM_STATE_HIDDEN → taskbar click no longer raises it
+         * (issue 50).  Vanilla has no UTILITY branch and leaves it NORMAL; with
+         * the guard such windows now fall through to NORMAL below, matching vanilla.
+         * Only borderless popup menus (no WS_CAPTION) reach the UTILITY/DROPDOWN
+         * logic this branch was written for.
+         *
+         * DComp dropdown popups (carry the popup-parent property from the dxgi
          * popup stack): use DROPDOWN_MENU so the WM treats them as transient,
          * non-activatable menus. UTILITY is an activatable window, which made KDE
          * pull each popup into the focus/stacking rotation → _NET_ACTIVE_WINDOW
