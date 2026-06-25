@@ -104,6 +104,19 @@ static const WCHAR clip_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
 static const WCHAR focus_time_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','f','o','c','u','s','_','t','i','m','e',0};
+static const WCHAR dcomp_swapchain_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','s','w','a','p','c','h','a','i','n',0};
+static const WCHAR *dcomp_swapchain_prop = dcomp_swapchain_propW;
+static const WCHAR dcomp_popup_parent_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','o','p','u','p','_','p','a','r','e','n','t',0};
+static const WCHAR *dcomp_popup_parent_prop = dcomp_popup_parent_propW;
+/* Set on the desktop window by dxgi while a DComp plugin GUI is hosted in this
+ * session.  Used to mark embedded ownerless TOOLWINDOW popups as DROPDOWN_MENU
+ * (see set_style_hints) — they anchor to the host window, so the per-window
+ * dcomp discriminators below cannot see they belong to a DComp plugin. */
+static const WCHAR dcomp_active_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','a','c','t','i','v','e',0};
+static const WCHAR *dcomp_active_prop = dcomp_active_propW;
 
 static const char *debugstr_mwm_hints( const MwmHints *hints )
 {
@@ -525,13 +538,33 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
     attr->bit_gravity       = NorthWestGravity;
     attr->backing_store     = NotUseful;
     attr->border_pixel      = 0;
-    attr->background_pixel  = 0;
     attr->event_mask        = (ExposureMask | KeyPressMask | KeyReleaseMask |
                                FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask);
     /* for transparent windows, exclude mouse events to allow mouse pass-through */
     if (!(ex_style & WS_EX_TRANSPARENT)) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
                                                               ButtonReleaseMask | EnterWindowMask);
 
+    /* DComp windows: use None background_pixmap to avoid black flash on map.
+     * Without this, XMapWindow shows background_pixel=0 (black) for 1 frame
+     * before the first surface_flush writes content. With None, the X server
+     * does not paint any background, so the parent content shows through.
+     *
+     * Also enable backing_store = Always so the X server saves window content
+     * written via surface_flush (XPutImage).  When a popup/tooltip above this
+     * window is unmapped, the X server uses the saved backing store to repaint
+     * the exposed area immediately, avoiding a 1-frame flash of undefined
+     * content (garbage, terminal, white) that occurs with NotUseful because
+     * the client has not yet processed the Expose event. */
+    if (NtUserGetProp( data->hwnd, dcomp_swapchain_prop ))
+    {
+        TRACE( "using None background_pixmap + Always backing_store for DComp window %p\n", data->hwnd );
+        attr->background_pixmap = None;
+        attr->backing_store = Always;
+        return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixmap |
+                CWEventMask | CWBitGravity | CWBackingStore);
+    }
+
+    attr->background_pixel  = 0;
     return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
             CWEventMask | CWBitGravity | CWBackingStore);
 }
@@ -1107,12 +1140,74 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     Window group_leader = data->whole_window;
     HWND owner = NtUserGetWindowRelative( data->hwnd, GW_OWNER );
     Window owner_win = 0;
+    BOOL anchor_is_dcomp = FALSE;
     XWMHints *wm_hints;
 
     if (owner)
     {
         owner = NtUserGetAncestor( owner, GA_ROOT );
         owner_win = X11DRV_get_whole_window( owner );
+    }
+
+    /* DComp popup-stack transient anchor (set by the dxgi SET_TARGET handler):
+     * the previously-opened popup/main target. This is a STABLE anchor that
+     * yields the correct nested hierarchy (main <- settings <- dropdown), unlike
+     * get_active_window() which drifts to the GL-presenting main window and pulls
+     * every popup behind it (Trinity standalone z-order regression). Read here
+     * before the TOOLWINDOW heuristic so it also covers the settings target
+     * (NORMAL/WS_CAPTION, which never enters the TOOLWINDOW branch). Windows
+     * without this property (e.g. embedded VST3 popups) fall through to the
+     * unchanged get_active_window() path below. */
+    if (!owner_win)
+    {
+        HWND popup_parent = NtUserGetProp( data->hwnd, dcomp_popup_parent_prop );
+        if (popup_parent && popup_parent != data->hwnd)
+        {
+            Window parent_win = X11DRV_get_whole_window( NtUserGetAncestor( popup_parent, GA_ROOT ) );
+            if (parent_win)
+            {
+                owner_win = parent_win;
+                group_leader = parent_win;
+            }
+        }
+    }
+
+    /* For ownerless WS_POPUP|WS_EX_TOOLWINDOW windows (e.g. JUCE popup menus in
+     * embedded VST3 plugins), use the active window as implicit transient parent.
+     * Without transient_for, the window manager has no stacking context and may
+     * place the popup behind the application window.
+     *
+     * Exclude windows that carry WS_CAPTION: a titled WS_EX_TOOLWINDOW is a
+     * decorated top-level app window (e.g. FL Studio's invisible 1x1 container,
+     * style 0x94ca0000 = WS_POPUP|WS_CAPTION|WS_SYSMENU), not a borderless popup
+     * menu.  Such windows must stay out of the popup heuristic — see the matching
+     * WS_CAPTION guard on the UTILITY branch below (issue 50). */
+    if (!owner_win && (style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW)
+            && !(style & WS_CAPTION))
+    {
+        HWND active = get_active_window();
+        if (active && active != data->hwnd)
+        {
+            HWND active_root = NtUserGetAncestor( active, GA_ROOT );
+            Window active_win = X11DRV_get_whole_window( active_root );
+            if (active_win)
+            {
+                owner_win = active_win;
+                group_leader = active_win;
+            }
+            /* If the anchor (active window) is itself a DComp composition-swapchain
+             * window — the continuously GL-presenting main window, e.g. KORG Trinity
+             * standalone — this ownerless TOOLWINDOW is an in-plugin popup sitting
+             * over it.  Mark it so the type logic below uses DROPDOWN_MENU instead
+             * of UTILITY: the main window's present-driven self-reactivation steals
+             * _NET_ACTIVE_WINDOW from an activatable (UTILITY) popup → focus fight →
+             * flicker (same class as the #2 settings-popup regression, but these
+             * popups carry no __wine_dcomp_popup_parent property).  Embedded plugin
+             * GUIs anchor to the host window, which is NOT a DComp swapchain target,
+             * so they stay UTILITY → unchanged (no embedded regression). */
+            if (active_root && NtUserGetProp( active_root, dcomp_swapchain_prop ))
+                anchor_is_dcomp = TRUE;
+        }
     }
 
     if (owner_win)
@@ -1127,6 +1222,42 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
      */
     if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
+    else if ((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW) && !owner
+            && !(style & WS_CAPTION))
+    {
+        /* The WS_CAPTION guard above keeps decorated app windows out of this
+         * branch: FL Studio's ownerless WS_POPUP|WS_EX_TOOLWINDOW main container
+         * (style 0x94ca0000) was wrongly tagged UTILITY here, which KDE treats as
+         * an activation-coupled tool window and minimizes on every _NET_ACTIVE_-
+         * WINDOW change → _NET_WM_STATE_HIDDEN → taskbar click no longer raises it
+         * (issue 50).  Vanilla has no UTILITY branch and leaves it NORMAL; with
+         * the guard such windows now fall through to NORMAL below, matching vanilla.
+         * Only borderless popup menus (no WS_CAPTION) reach the UTILITY/DROPDOWN
+         * logic this branch was written for.
+         *
+         * DComp dropdown popups (carry the popup-parent property from the dxgi
+         * popup stack): use DROPDOWN_MENU so the WM treats them as transient,
+         * non-activatable menus. UTILITY is an activatable window, which made KDE
+         * pull each popup into the focus/stacking rotation → _NET_ACTIVE_WINDOW
+         * conflicts → front/back restack loop (the dropdown "blink"). DROPDOWN_MENU
+         * stays managed (no override_redirect → embedded-safe) but is excluded
+         * from focus rotation.
+         *
+         * Third discriminator (embedded, broad): a DComp plugin GUI is hosted in
+         * this session (dxgi published __wine_dcomp_active on the desktop). In the
+         * embedded case (plugin in a Windows host under Wine) the in-plugin popups
+         * anchor to the host window, not to a DComp swapchain — so neither the
+         * popup-parent property nor anchor_is_dcomp fires, and they stayed UTILITY
+         * → the same focus war among themselves (Trinity IFX list flicker). This
+         * flag catches them. It is deliberately broad (any TOOLWINDOW popup while
+         * a DComp GUI is open) — validated against Serum2 (embedded dropdowns must
+         * not regress). */
+        if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ) || anchor_is_dcomp
+                || NtUserGetProp( NtUserGetDesktopWindow(), dcomp_active_prop ))
+            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
+        else
+            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );
+    }
     else
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
 
@@ -1617,8 +1748,32 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     if (new_state == NormalState)
     {
         /* try forcing activation if the window is supposed to be foreground or if it is fullscreen */
+        BOOL allow_focus;
         if (data->hwnd == foreground || data->is_fullscreen) activate = TRUE;
-        window_set_user_time( data, activate ? -1 : 0, TRUE );
+        allow_focus = activate;
+        /* A decorated, ownerless top-level that is not itself the foreground window is
+         * otherwise mapped with _NET_WM_USER_TIME=0 (the freedesktop "do not focus on
+         * map" hint), which strands it behind on the WM stack.  When the foreground
+         * window belongs to the SAME process the application is already in front and
+         * this is just its taskbar/main frame whose visible child holds the foreground
+         * (e.g. FL Studio's 1x1 WS_CAPTION container with a transient content child).
+         * Clear only the "do not focus" hint so the WM may bring the app forward on
+         * startup (issue 52) -- but do NOT set 'activate': that would additionally
+         * request a Win32 activation for the container and fight the foreground content
+         * child, producing a server-side activation ping-pong that hangs the app.
+         * Restricted to managed, non-embedded, ownerless, captioned windows so it never
+         * affects embedded VST3/DComp plugin frames, tool/popup windows, or splash
+         * screens (no WS_CAPTION). */
+        if (!allow_focus && foreground && data->managed && !data->embedded
+                 && (NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_CAPTION)
+                 && !NtUserGetWindowRelative( data->hwnd, GW_OWNER ))
+        {
+            DWORD pid = 0, fg_pid = 0;
+            NtUserGetWindowThread( data->hwnd, &pid );
+            NtUserGetWindowThread( foreground, &fg_pid );
+            if (pid && pid == fg_pid) allow_focus = TRUE;
+        }
+        window_set_user_time( data, allow_focus ? -1 : 0, TRUE );
     }
 
     data->pending_state.wm_state = new_state;
@@ -1638,7 +1793,30 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     case MAKELONG(NormalState, WithdrawnState):
     case MAKELONG(IconicState, WithdrawnState):
         if (data->embedded) set_xembed_flags( data, 0 );
-        else if (!data->managed) XUnmapWindow( data->display, data->whole_window );
+        else if (!data->managed)
+        {
+            /* Sync gdi_display before unmapping so any pending surface flush
+             * (XPutImage on gdi_display) from sibling DComp windows is
+             * completed by the X server before it processes the unmap.
+             * Without this, the X server may show stale backing-store content
+             * for the exposed area beneath the unmapped window, producing a
+             * 1-frame flash visible as popup/tooltip close flicker.
+             * (Same pattern as destroy_whole_window which does XSync before
+             * XDestroyWindow.)
+             *
+             * Intentionally unconditional for the unmanaged (override-redirect)
+             * unmap path rather than gated on a DComp marker: the flush we are
+             * waiting on belongs to *sibling* DComp windows, so a per-window
+             * gate on the window being unmapped would miss the common case (a
+             * plain tooltip/popup closing over a DComp plugin underneath) and
+             * reintroduce the flash.  A correct gate would need a global
+             * "DComp window mapped" indicator, which winex11 does not track; the
+             * cost here is a single local X server round-trip on popup close,
+             * which is not perceptible — not worth that machinery + regression
+             * risk for a hot-path that is already limited to unmanaged unmaps. */
+            XSync( gdi_display, False );
+            XUnmapWindow( data->display, data->whole_window );
+        }
         else XWithdrawWindow( data->display, data->whole_window, data->vis.screen );
         break;
     case MAKELONG(NormalState, IconicState):
@@ -2151,6 +2329,18 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
     update_net_wm_states( data );
 
     new_rect = data->rects.visible;
+
+    /* For WS_CHILD windows with forced whole_window (non-desktop parent),
+     * data->rects.visible is parent-relative but window_set_config passes
+     * it through virtual_screen_to_root which expects screen coordinates.
+     * Convert to screen coords so the X11 window position is correct. */
+    if ((style & WS_CHILD) && data->whole_window)
+    {
+        HWND parent = NtUserGetAncestor( data->hwnd, GA_PARENT );
+        if (parent && parent != NtUserGetDesktopWindow())
+            NtUserMapWindowPoints( parent, 0, (POINT *)&new_rect, 2,
+                    NtUserGetWinMonitorDpi( data->hwnd, MDT_RAW_DPI ) );
+    }
 
     /* if the window has been moved offscreen by the window manager, we didn't tell the Win32 side about it */
     window_rect = window_rect_from_visible( old_rects, data->desired_state.rect );

@@ -314,6 +314,9 @@ system_fallback_config[] =
     /* Dingbats - 2700-27BF */
     { "2700-27BF",              L"Noto Sans Symbols2, Noto Sans Symbols 2" },
 
+    /* Miscellaneous Symbols and Arrows - 2B00-2BFF (includes U+2B50 star) */
+    { "2B00-2BFF",              L"Noto Sans Symbols2, Noto Sans Symbols 2, Symbola, FreeSans" },
+
     { "2C80-2CFF",              L"Noto Sans Coptic" },
     { "2D30-2D7F",              L"Noto Sans Tifinagh" },
 
@@ -429,6 +432,12 @@ static void text_source_get_u32_char(struct text_source_context *context)
     available = context->chunk_length - context->cursor;
     text = context->text + context->cursor;
 
+    if (!text || !available)
+    {
+        context->ch = 0;
+        return;
+    }
+
     if (available > 1 && IS_HIGH_SURROGATE(*text) && IS_LOW_SURROGATE(*(text + 1)))
     {
         context->cursor += 2;
@@ -437,6 +446,11 @@ static void text_source_get_u32_char(struct text_source_context *context)
         return;
     }
 
+    if (!text)
+    {
+        context->ch = 0;
+        return;
+    }
     context->cursor++;
     context->consumed++;
     context->ch = *text;

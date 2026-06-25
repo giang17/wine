@@ -228,8 +228,41 @@ static BOOL needs_client_window_clipping( HWND hwnd )
 
 BOOL needs_offscreen_rendering( HWND hwnd )
 {
+    static const WCHAR dcomp_target_propW[] =
+        {'_','_','w','i','n','e','_','d','c','o','m','p','_','t','a','r','g','e','t',0};
+    static const WCHAR d3d_hwnd_target_propW[] =
+        {'_','_','w','i','n','e','_','d','3','d','_','h','w','n','d','_','t','a','r','g','e','t',0};
+
     if (NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
-    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return TRUE; /* child window, needs compositing */
+    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow())
+    {
+        /* DComp target windows render via their own BitBlt path (comp_dc → GetDC),
+         * not through the GL client_surface.  Offscreen XComposite compositing is
+         * unnecessary and causes flicker when popups open/close over the plugin.
+         *
+         * NB: this keys off __wine_dcomp_target (set by dcomp/device.c for the
+         * IDCompositionTarget COM-API BitBlt path), deliberately NOT off
+         * __wine_dcomp_swapchain (set by dxgi/factory.c for the composition-
+         * swapchain blit path).  The two markers denote distinct rendering
+         * subsystems, not the same window — neither producer sets the other's
+         * property.  The swapchain blit path presents through its own GDI route,
+         * so swapchain-only windows are not expected to need the offscreen skip
+         * and are left on the normal compositing path.  Do not "unify" the two
+         * markers here without a verified swapchain-child test case: it would
+         * change the offscreen decision for currently-working windows. */
+        if (NtUserGetProp( hwnd, dcomp_target_propW )) return FALSE;
+        /* ID2D1HwndRenderTarget windows (e.g. VSTGUI plugins with DComp disabled)
+         * render via wined3d's swapchain_blit_gdi to the HWND DC, but the GDI
+         * present path never triggers client_surface_present.  When the window
+         * is offscreen-redirected the rendered pixels are stuck in an X11
+         * pixmap that nothing blits to the toplevel — result is a black plugin
+         * window until external events (window move, mouse hover) kick a
+         * repaint.  Skip offscreen for these windows so the plugin's X11 child
+         * is attached directly to the parent and visible without a composite
+         * trigger. */
+        if (NtUserGetProp( hwnd, d3d_hwnd_target_propW )) return FALSE;
+        return TRUE; /* child window, needs compositing */
+    }
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
     return FALSE;
 }
@@ -430,6 +463,7 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     client_surface_update_offscreen( hwnd, surface );
 
     if (!hdc) return;
+    if (!surface->hdc_dst) return; /* non-offscreen, GL presents directly */
     window = X11DRV_get_whole_window( toplevel );
 
     if (NtUserGetPresentRect( toplevel, &rect_dst, -1 /* raw dpi */ ))
