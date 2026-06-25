@@ -1742,8 +1742,32 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     if (new_state == NormalState)
     {
         /* try forcing activation if the window is supposed to be foreground or if it is fullscreen */
+        BOOL allow_focus;
         if (data->hwnd == foreground || data->is_fullscreen) activate = TRUE;
-        window_set_user_time( data, activate ? -1 : 0, TRUE );
+        allow_focus = activate;
+        /* A decorated, ownerless top-level that is not itself the foreground window is
+         * otherwise mapped with _NET_WM_USER_TIME=0 (the freedesktop "do not focus on
+         * map" hint), which strands it behind on the WM stack.  When the foreground
+         * window belongs to the SAME process the application is already in front and
+         * this is just its taskbar/main frame whose visible child holds the foreground
+         * (e.g. FL Studio's 1x1 WS_CAPTION container with a transient content child).
+         * Clear only the "do not focus" hint so the WM may bring the app forward on
+         * startup (issue 52) -- but do NOT set 'activate': that would additionally
+         * request a Win32 activation for the container and fight the foreground content
+         * child, producing a server-side activation ping-pong that hangs the app.
+         * Restricted to managed, non-embedded, ownerless, captioned windows so it never
+         * affects embedded VST3/DComp plugin frames, tool/popup windows, or splash
+         * screens (no WS_CAPTION). */
+        if (!allow_focus && foreground && data->managed && !data->embedded
+                 && (NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_CAPTION)
+                 && !NtUserGetWindowRelative( data->hwnd, GW_OWNER ))
+        {
+            DWORD pid = 0, fg_pid = 0;
+            NtUserGetWindowThread( data->hwnd, &pid );
+            NtUserGetWindowThread( foreground, &fg_pid );
+            if (pid && pid == fg_pid) allow_focus = TRUE;
+        }
+        window_set_user_time( data, allow_focus ? -1 : 0, TRUE );
     }
 
     data->pending_state.wm_state = new_state;
