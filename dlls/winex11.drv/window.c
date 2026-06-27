@@ -565,6 +565,18 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
                 CWEventMask | CWBitGravity | CWBackingStore);
     }
 
+    /* Issue 55: WS_EX_LAYERED windows (e.g. VSTGUI drag-bitmap) render their own
+     * content; let the X server paint NO background on expose (None) instead of
+     * black (background_pixel=0), which otherwise flashes black on every move.
+     * Note: NO backing_store=Always here — that froze a black frame for a moving
+     * window (it caches stale content).  None alone keeps the prior X content. */
+    if (ex_style & WS_EX_LAYERED)
+    {
+        attr->background_pixmap = None;
+        return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixmap |
+                CWEventMask | CWBitGravity | CWBackingStore);
+    }
+
     attr->background_pixel  = 0;
     return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
             CWEventMask | CWBitGravity | CWBackingStore);
