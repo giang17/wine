@@ -95,6 +95,8 @@ static void dcomp_send_child_mode(IUnknown *content)
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface);
+static LONGLONG dcomp_qpc_now(void);
+static LONGLONG dcomp_qpc_freq(void);
 static void dcomp_device_auto_commit(IDCompositionDevice *iface);
 
 /* =====================================================================
@@ -131,6 +133,12 @@ struct dcomp_surface
     BOOL has_dirty_rect;               /* TRUE if BeginDraw got a valid sub-rect */
     RECT dirty_rect;                   /* clamped to surface bounds */
     BOOL needs_full_init_copy;         /* TRUE before first readback — must copy full surface once */
+    /* Readback coalescing (issue 56): the GPU→CPU Map in a readback forces a ~1.3ms GPU
+     * sync stall.  A fast drag does ~10 EndDraws/frame (~500/s) → the render thread would
+     * stall ~650ms/s.  So EndDraw only ACCUMULATES the dirty region here and defers the
+     * readback to the throttled present (~60/s). */
+    RECT pending_dirty;                /* union of dirty rects awaiting readback+present */
+    BOOL has_pending;                  /* GPU has content not yet read back to surface->bits */
 };
 
 static inline struct dcomp_surface *impl_from_IDCompositionSurface(IDCompositionSurface *iface)
@@ -404,7 +412,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_EndDraw(IDCompositionSurface *ifa
 {
     struct dcomp_surface *surface = impl_from_IDCompositionSurface(iface);
     HRESULT hr;
-    unsigned int y;
 
     TRACE("iface %p.\n", iface);
 
@@ -430,110 +437,27 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_EndDraw(IDCompositionSurface *ifa
 
     surface->drawing = FALSE;
 
-    /* Determine the readback region:
-     *   - first frame after surface (re)creation: full surface — CPU bits are uninitialized
-     *   - subsequent frames with a clamped dirty rect: only the dirty sub-rect
-     *   - no dirty rect (full redraw or unsupported): full surface
-     * surface->bits and the readback/staging bitmaps are persistent across frames,
-     * so the non-dirty pixels remain valid from the previous readback. */
+    /* D2D command finalization must run per draw cycle (cheap, ~0us).  The expensive
+     * GPU→CPU readback (~1.3ms GPU sync stall) is deferred to the throttled present
+     * (issue 56) — here we only accumulate the dirty region into surface->pending_dirty. */
+    if (surface->d2d1_device && surface->persistent_context)
     {
-        BOOL use_dirty = surface->has_dirty_rect && !surface->needs_full_init_copy;
-        LONG copy_left   = use_dirty ? surface->dirty_rect.left   : 0;
-        LONG copy_top    = use_dirty ? surface->dirty_rect.top    : 0;
-        LONG copy_right  = use_dirty ? surface->dirty_rect.right  : (LONG)surface->width;
-        LONG copy_bottom = use_dirty ? surface->dirty_rect.bottom : (LONG)surface->height;
-        unsigned int copy_w = (unsigned int)(copy_right - copy_left);
+        hr = ID2D1DeviceContext_EndDraw(surface->persistent_context, NULL, NULL);
+        if (FAILED(hr))
+            FIXME("ID2D1DeviceContext_EndDraw failed: %#lx.\n", hr);
+    }
 
-        if (surface->d2d1_device && surface->persistent_context)
-        {
-            D2D1_MAPPED_RECT d2d_mapped;
-            D2D1_POINT_2U dest_point;
-            D2D1_RECT_U src_rect;
-
-            dest_point.x = (UINT32)copy_left;
-            dest_point.y = (UINT32)copy_top;
-            src_rect.left   = (UINT32)copy_left;
-            src_rect.top    = (UINT32)copy_top;
-            src_rect.right  = (UINT32)copy_right;
-            src_rect.bottom = (UINT32)copy_bottom;
-
-            hr = ID2D1DeviceContext_EndDraw(surface->persistent_context, NULL, NULL);
-            if (FAILED(hr))
-                FIXME("ID2D1DeviceContext_EndDraw failed: %#lx.\n", hr);
-
-            /* Copy render target → CPU-readable bitmap (dirty sub-rect only when possible). */
-            hr = ID2D1Bitmap1_CopyFromBitmap(surface->readback_bitmap, &dest_point,
-                    (ID2D1Bitmap *)surface->target_bitmap, &src_rect);
-            if (FAILED(hr))
-            {
-                FIXME("CopyFromBitmap failed: %#lx.\n", hr);
-                return hr;
-            }
-
-            /* Map the readback bitmap and copy the dirty rows into system memory. */
-            hr = ID2D1Bitmap1_Map(surface->readback_bitmap, D2D1_MAP_OPTIONS_READ, &d2d_mapped);
-            if (SUCCEEDED(hr))
-            {
-                for (y = (unsigned int)copy_top; y < (unsigned int)copy_bottom; ++y)
-                {
-                    memcpy(surface->bits + y * surface->width + copy_left,
-                            (const BYTE *)d2d_mapped.bits + y * d2d_mapped.pitch
-                                    + copy_left * sizeof(DWORD),
-                            copy_w * sizeof(DWORD));
-                }
-                ID2D1Bitmap1_Unmap(surface->readback_bitmap);
-                surface->needs_full_init_copy = FALSE;
-            }
-            else
-            {
-                FIXME("ID2D1Bitmap1_Map failed: %#lx.\n", hr);
-            }
-        }
-        else if (surface->staging && surface->texture && surface->bits)
-        {
-            ID3D11DeviceContext *d3d_context;
-            D3D11_MAPPED_SUBRESOURCE mapped;
-            D3D11_BOX src_box;
-
-            ID3D11Device_GetImmediateContext(surface->d3d11_device, &d3d_context);
-
-            src_box.left   = (UINT)copy_left;
-            src_box.top    = (UINT)copy_top;
-            src_box.right  = (UINT)copy_right;
-            src_box.bottom = (UINT)copy_bottom;
-            src_box.front = 0;
-            src_box.back  = 1;
-
-            /* CopySubresourceRegion with the dirty box; if not using dirty,
-             * pass the full box (equivalent to the previous CopyResource). */
-            ID3D11DeviceContext_CopySubresourceRegion(d3d_context,
-                    (ID3D11Resource *)surface->staging, 0,
-                    (UINT)copy_left, (UINT)copy_top, 0,
-                    (ID3D11Resource *)surface->texture, 0, &src_box);
-
-            hr = ID3D11DeviceContext_Map(d3d_context,
-                    (ID3D11Resource *)surface->staging, 0,
-                    D3D11_MAP_READ, 0, &mapped);
-            if (SUCCEEDED(hr))
-            {
-                for (y = (unsigned int)copy_top; y < (unsigned int)copy_bottom; ++y)
-                {
-                    memcpy(surface->bits + y * surface->width + copy_left,
-                            (const BYTE *)mapped.pData + y * mapped.RowPitch
-                                    + copy_left * sizeof(DWORD),
-                            copy_w * sizeof(DWORD));
-                }
-                ID3D11DeviceContext_Unmap(d3d_context,
-                        (ID3D11Resource *)surface->staging, 0);
-                surface->needs_full_init_copy = FALSE;
-            }
-            else
-            {
-                FIXME("Failed to map staging texture: %#lx.\n", hr);
-            }
-
-            ID3D11DeviceContext_Release(d3d_context);
-        }
+    {
+        RECT d;
+        if (surface->has_dirty_rect && !surface->needs_full_init_copy)
+            d = surface->dirty_rect;
+        else
+            SetRect(&d, 0, 0, (LONG)surface->width, (LONG)surface->height);
+        if (surface->has_pending)
+            UnionRect(&surface->pending_dirty, &surface->pending_dirty, &d);
+        else
+            surface->pending_dirty = d;
+        surface->has_pending = TRUE;
     }
 
     /* Auto-commit: present the updated surface immediately so that apps
@@ -1476,6 +1400,8 @@ struct dcomp_target
     HBITMAP comp_bitmap;
     DWORD *comp_bits;                     /* DIB section pixel buffer */
     UINT comp_width, comp_height;
+    BOOL comp_needs_full_present;         /* force a full BitBlt on first present after DIB (re)create */
+    LONGLONG last_present_qpc;            /* QPC of last actual present — drives ~60 Hz coalescing (issue 56) */
     /* WndProc subclass for WM_ERASEBKGND / WM_PAINT protection (Phase 5) */
     WNDPROC orig_wndproc;
 };
@@ -1840,9 +1766,259 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
     SelectObject(target->comp_dc, target->comp_bitmap);
     target->comp_width = width;
     target->comp_height = height;
+    target->comp_needs_full_present = TRUE;
 
     FIXME("Created comp DC %p with %ux%u DIB for target hwnd %p.\n",
             target->comp_dc, width, height, target->hwnd);
+}
+
+#define DCOMP_COALESCE_TIMER  ((UINT_PTR)0xDC0FFEE1)
+#define DCOMP_FRAME_MS        15u   /* ~66 Hz present cap (issue 56) */
+
+/* Read back region [l,r)x[t,b) of the GPU render target into surface->bits.  Split out of
+ * EndDraw and deferred to the throttled present (issue 56): the GPU→CPU Map forces a
+ * ~1.3ms GPU sync stall, so running it once per present (~60/s) instead of once per
+ * EndDraw (~500/s during a fast drag) keeps the render thread free.  D2D command
+ * finalization (ID2D1DeviceContext_EndDraw) already ran in dcomp_surface_EndDraw. */
+static void dcomp_surface_readback_region(struct dcomp_surface *surface,
+        LONG l, LONG t, LONG r, LONG b)
+{
+    unsigned int y, copy_w;
+    HRESULT hr;
+
+    if (r <= l || b <= t)
+        return;
+    copy_w = (unsigned int)(r - l);
+
+    if (surface->d2d1_device && surface->persistent_context && surface->readback_bitmap)
+    {
+        D2D1_MAPPED_RECT d2d_mapped;
+        D2D1_POINT_2U dest_point;
+        D2D1_RECT_U src_rect;
+
+        dest_point.x = (UINT32)l;
+        dest_point.y = (UINT32)t;
+        src_rect.left = (UINT32)l;   src_rect.top    = (UINT32)t;
+        src_rect.right = (UINT32)r;  src_rect.bottom = (UINT32)b;
+
+        hr = ID2D1Bitmap1_CopyFromBitmap(surface->readback_bitmap, &dest_point,
+                (ID2D1Bitmap *)surface->target_bitmap, &src_rect);
+        if (FAILED(hr))
+        {
+            FIXME("CopyFromBitmap failed: %#lx.\n", hr);
+            return;
+        }
+
+        hr = ID2D1Bitmap1_Map(surface->readback_bitmap, D2D1_MAP_OPTIONS_READ, &d2d_mapped);
+        if (SUCCEEDED(hr))
+        {
+            for (y = (unsigned int)t; y < (unsigned int)b; ++y)
+                memcpy(surface->bits + y * surface->width + l,
+                        (const BYTE *)d2d_mapped.bits + y * d2d_mapped.pitch + l * sizeof(DWORD),
+                        copy_w * sizeof(DWORD));
+            ID2D1Bitmap1_Unmap(surface->readback_bitmap);
+        }
+        else
+            FIXME("ID2D1Bitmap1_Map failed: %#lx.\n", hr);
+    }
+    else if (surface->staging && surface->texture && surface->bits)
+    {
+        ID3D11DeviceContext *d3d_context;
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        D3D11_BOX src_box;
+
+        ID3D11Device_GetImmediateContext(surface->d3d11_device, &d3d_context);
+        src_box.left = (UINT)l;  src_box.top = (UINT)t;
+        src_box.right = (UINT)r; src_box.bottom = (UINT)b;
+        src_box.front = 0; src_box.back = 1;
+        ID3D11DeviceContext_CopySubresourceRegion(d3d_context,
+                (ID3D11Resource *)surface->staging, 0, (UINT)l, (UINT)t, 0,
+                (ID3D11Resource *)surface->texture, 0, &src_box);
+
+        hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)surface->staging, 0,
+                D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+            for (y = (unsigned int)t; y < (unsigned int)b; ++y)
+                memcpy(surface->bits + y * surface->width + l,
+                        (const BYTE *)mapped.pData + y * mapped.RowPitch + l * sizeof(DWORD),
+                        copy_w * sizeof(DWORD));
+            ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)surface->staging, 0);
+        }
+        else
+            FIXME("Failed to map staging texture: %#lx.\n", hr);
+        ID3D11DeviceContext_Release(d3d_context);
+    }
+    surface->needs_full_init_copy = FALSE;
+}
+
+static LONGLONG dcomp_qpc_now(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart;
+}
+
+static LONGLONG dcomp_qpc_freq(void)
+{
+    static LONGLONG freq;
+    if (!freq)
+    {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart ? f.QuadPart : 1;
+    }
+    return freq;
+}
+
+/* Present region [left,right)x[top,bottom) of the target's root surface to its HWND.
+ * Caller holds device->cs and has validated root_visual/surface->bits/comp_bits. */
+static void dcomp_target_present_region(struct dcomp_target *target,
+        struct dcomp_surface *surface, LONG left, LONG top, LONG right, LONG bottom,
+        BOOL present_dirty)
+{
+    static unsigned int present_log;
+    HDC hdc;
+
+    /* Copy surface bits → DIB.  Dirty rows only when present_dirty; the rest of
+     * comp_bits stays valid from the previous frame (persistent DIB section). */
+    if (present_dirty)
+    {
+        LONG yy;
+        for (yy = top; yy < bottom; yy++)
+            memcpy((DWORD *)target->comp_bits + yy * surface->width + left,
+                    (DWORD *)surface->bits + yy * surface->width + left,
+                    (right - left) * sizeof(DWORD));
+    }
+    else
+    {
+        memcpy(target->comp_bits, surface->bits,
+                surface->width * surface->height * sizeof(DWORD));
+    }
+
+    /* Composite child visual surfaces on top (premultiplied alpha over) */
+    {
+        struct dcomp_visual *child;
+        static unsigned int child_comp_log;
+
+        for (child = target->root_visual->children; child; child = child->next_sibling)
+        {
+            struct dcomp_surface *child_surf = child->surface_content;
+            int ox, oy, src_x, src_y, dst_x, dst_y, copy_w, copy_h, y, x;
+            DWORD *dst_row, *src_row;
+
+            if (!child_surf || !child_surf->bits || !child_surf->width || !child_surf->height)
+                continue;
+
+            ox = (int)child->offset_x;
+            oy = (int)child->offset_y;
+
+            src_x = (ox < 0) ? -ox : 0;
+            src_y = (oy < 0) ? -oy : 0;
+            dst_x = (ox < 0) ? 0 : ox;
+            dst_y = (oy < 0) ? 0 : oy;
+            copy_w = min((int)child_surf->width - src_x, (int)surface->width - dst_x);
+            copy_h = min((int)child_surf->height - src_y, (int)surface->height - dst_y);
+
+            if (copy_w <= 0 || copy_h <= 0)
+                continue;
+
+            if (++child_comp_log <= 5)
+                FIXME("Compositing child visual %ux%u at (%d,%d) onto %ux%u root.\n",
+                        child_surf->width, child_surf->height, ox, oy,
+                        surface->width, surface->height);
+
+            for (y = 0; y < copy_h; y++)
+            {
+                dst_row = (DWORD *)target->comp_bits + (dst_y + y) * surface->width + dst_x;
+                src_row = (DWORD *)child_surf->bits + (src_y + y) * child_surf->width + src_x;
+                for (x = 0; x < copy_w; x++)
+                {
+                    DWORD s = src_row[x];
+                    BYTE sa = (s >> 24);
+                    if (sa == 0xff)
+                    {
+                        dst_row[x] = s;
+                    }
+                    else if (sa > 0)
+                    {
+                        /* Premultiplied alpha: out = src + dst * (1 - sa/255) */
+                        DWORD d = dst_row[x];
+                        BYTE ia = 255 - sa;
+                        dst_row[x] = ((min(sa + (((d >> 24) * ia + 127) / 255), 255u)) << 24)
+                                   | ((((s >> 16) & 0xff) + ((((d >> 16) & 0xff) * ia + 127) / 255)) << 16)
+                                   | ((((s >> 8) & 0xff) + ((((d >> 8) & 0xff) * ia + 127) / 255)) << 8)
+                                   | (((s & 0xff) + (((d & 0xff) * ia + 127) / 255)));
+                    }
+                }
+            }
+        }
+    }
+
+    /* BitBlt only the present region to the target window (the rest already shows the
+     * prior frame — WM_ERASEBKGND is suppressed). */
+    hdc = GetDC(target->hwnd);
+    if (hdc)
+    {
+        BitBlt(hdc, left, top, right - left, bottom - top,
+                target->comp_dc, left, top, SRCCOPY);
+        ReleaseDC(target->hwnd, hdc);
+    }
+    target->comp_needs_full_present = FALSE;
+
+    if (++present_log <= 5)
+        FIXME("Present: %s %ldx%ld@(%ld,%ld) of %ux%u to hwnd %p%s.\n",
+                present_dirty ? "DIRTY" : "FULL",
+                right - left, bottom - top, left, top,
+                surface->width, surface->height, target->hwnd,
+                target->root_visual->children ? " [children]" : "");
+
+    /* Also serialize child visual tree (for mixed surface+swapchain scenarios) */
+    dcomp_commit_visual_tree(target->hwnd, target->root_visual);
+}
+
+/* Readback the accumulated dirty region GPU→CPU, then present it (issue 56).  Caller holds
+ * device->cs and has validated surface->bits/comp_bits.  Shared by the throttled commit and
+ * the WM_TIMER trailing flush. */
+static void dcomp_target_flush_present(struct dcomp_target *target, struct dcomp_surface *surface)
+{
+    BOOL present_dirty = surface->has_pending && !target->root_visual->children
+                      && !target->comp_needs_full_present;
+    LONG l, t, r, b;
+
+    if (present_dirty)
+    {
+        l = surface->pending_dirty.left;  t = surface->pending_dirty.top;
+        r = surface->pending_dirty.right; b = surface->pending_dirty.bottom;
+        if (l < 0) l = 0;
+        if (t < 0) t = 0;
+        if (r > (LONG)surface->width)  r = (LONG)surface->width;
+        if (b > (LONG)surface->height) b = (LONG)surface->height;
+    }
+    else
+    {
+        l = 0; t = 0;
+        r = (LONG)surface->width;
+        b = (LONG)surface->height;
+    }
+
+    if (r <= l || b <= t)
+    {
+        surface->has_pending = FALSE;
+        SetRectEmpty(&surface->pending_dirty);
+        return;
+    }
+
+    /* Deferred GPU→CPU readback of the accumulated region — the expensive part (~1.3ms),
+     * now run once per present instead of once per EndDraw. */
+    if (surface->has_pending)
+        dcomp_surface_readback_region(surface, l, t, r, b);
+    surface->has_pending = FALSE;
+    SetRectEmpty(&surface->pending_dirty);
+
+    dcomp_target_present_region(target, surface, l, t, r, b, present_dirty);
+    target->comp_needs_full_present = FALSE;
+    target->last_present_qpc = dcomp_qpc_now();
 }
 
 /* Phase 5: WndProc subclass — suppresses WM_ERASEBKGND to prevent white-on-open.
@@ -1866,6 +2042,26 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
          * after window events (resize, show, focus change) → white-on-open. */
         return 1;
 
+    case WM_TIMER:
+        /* Coalescing trailing flush (issue 56): a present was throttled within the ~60 Hz
+         * window; this fires once the UI thread goes idle (drag pause/end) and flushes the
+         * accumulated dirty region (readback + present) so the final frame is never stale. */
+        if (wparam == DCOMP_COALESCE_TIMER)
+        {
+            KillTimer(hwnd, DCOMP_COALESCE_TIMER);
+            if (target->device && target->root_visual && target->root_visual->surface_content)
+            {
+                struct dcomp_surface *surface = target->root_visual->surface_content;
+                EnterCriticalSection(&target->device->cs);
+                if (surface->has_pending && surface->bits && surface->width
+                        && surface->height && target->comp_bits)
+                    dcomp_target_flush_present(target, surface);
+                LeaveCriticalSection(&target->device->cs);
+            }
+            return 0;
+        }
+        break;
+
     case WM_NCDESTROY:
         /* Window is being destroyed — clean up subclass and forward */
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig_wndproc);
@@ -1881,7 +2077,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
 {
     struct dcomp_device *device = impl_from_IDCompositionDevice(iface);
     struct dcomp_target *target;
-    static unsigned int commit_log;
 
     /* Hold the device lock across iteration so a concurrent CreateTargetForHwnd
      * or target Release cannot mutate the list mid-walk (iterator invalidation /
@@ -1891,7 +2086,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
     for (target = device->targets; target; target = target->next_target)
     {
         struct dcomp_surface *surface;
-        HDC hdc;
+        LONGLONG now;
 
         if (!target->root_visual || !target->root_visual->surface_content)
             continue;
@@ -1905,85 +2100,26 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
         if (!target->comp_bits)
             continue;
 
-        /* Copy surface bits to DIB section */
-        memcpy(target->comp_bits, surface->bits,
-                surface->width * surface->height * sizeof(DWORD));
+        /* Nothing new since the last present and no forced full present pending. */
+        if (!surface->has_pending && !target->comp_needs_full_present)
+            continue;
 
-        /* Composite child visual surfaces on top (premultiplied alpha over) */
+        /* Coalesce: cap the present (and its deferred ~1.3ms GPU readback) to ~60 Hz.
+         * FL does ~10 EndDraws/frame during a fast drag (~500/s); doing the readback for
+         * each starves the render thread (issue 56).  EndDraw already accumulated the dirty
+         * region; skipping here defers readback+present to the next slot, with the WM_TIMER
+         * trailing flush guaranteeing the final frame.  Forced full presents (first frame /
+         * DIB recreate) always go through. */
+        now = dcomp_qpc_now();
+        if (!target->comp_needs_full_present && target->last_present_qpc
+                && (now - target->last_present_qpc) * 1000 / dcomp_qpc_freq() < DCOMP_FRAME_MS)
         {
-            struct dcomp_visual *child;
-            static unsigned int child_comp_log;
-
-            for (child = target->root_visual->children; child; child = child->next_sibling)
-            {
-                struct dcomp_surface *child_surf = child->surface_content;
-                int ox, oy, src_x, src_y, dst_x, dst_y, copy_w, copy_h, y, x;
-                DWORD *dst_row, *src_row;
-
-                if (!child_surf || !child_surf->bits || !child_surf->width || !child_surf->height)
-                    continue;
-
-                ox = (int)child->offset_x;
-                oy = (int)child->offset_y;
-
-                /* Clip to destination bounds */
-                src_x = (ox < 0) ? -ox : 0;
-                src_y = (oy < 0) ? -oy : 0;
-                dst_x = (ox < 0) ? 0 : ox;
-                dst_y = (oy < 0) ? 0 : oy;
-                copy_w = min((int)child_surf->width - src_x, (int)surface->width - dst_x);
-                copy_h = min((int)child_surf->height - src_y, (int)surface->height - dst_y);
-
-                if (copy_w <= 0 || copy_h <= 0)
-                    continue;
-
-                if (++child_comp_log <= 5)
-                    FIXME("Compositing child visual %ux%u at (%d,%d) onto %ux%u root.\n",
-                            child_surf->width, child_surf->height, ox, oy,
-                            surface->width, surface->height);
-
-                for (y = 0; y < copy_h; y++)
-                {
-                    dst_row = (DWORD *)target->comp_bits + (dst_y + y) * surface->width + dst_x;
-                    src_row = (DWORD *)child_surf->bits + (src_y + y) * child_surf->width + src_x;
-                    for (x = 0; x < copy_w; x++)
-                    {
-                        DWORD s = src_row[x];
-                        BYTE sa = (s >> 24);
-                        if (sa == 0xff)
-                        {
-                            dst_row[x] = s;
-                        }
-                        else if (sa > 0)
-                        {
-                            /* Premultiplied alpha: out = src + dst * (1 - sa/255) */
-                            DWORD d = dst_row[x];
-                            BYTE ia = 255 - sa;
-                            dst_row[x] = ((min(sa + (((d >> 24) * ia + 127) / 255), 255u)) << 24)
-                                       | ((((s >> 16) & 0xff) + ((((d >> 16) & 0xff) * ia + 127) / 255)) << 16)
-                                       | ((((s >> 8) & 0xff) + ((((d >> 8) & 0xff) * ia + 127) / 255)) << 8)
-                                       | (((s & 0xff) + (((d & 0xff) * ia + 127) / 255)));
-                        }
-                    }
-                }
-            }
+            SetTimer(target->hwnd, DCOMP_COALESCE_TIMER, DCOMP_FRAME_MS, NULL);
+            continue;
         }
 
-        /* BitBlt to the target window */
-        hdc = GetDC(target->hwnd);
-        if (hdc)
-        {
-            BitBlt(hdc, 0, 0, surface->width, surface->height,
-                    target->comp_dc, 0, 0, SRCCOPY);
-            ReleaseDC(target->hwnd, hdc);
-        }
-
-        if (++commit_log <= 5)
-            FIXME("Commit: presented %ux%u surface to hwnd %p.\n",
-                    surface->width, surface->height, target->hwnd);
-
-        /* Also serialize child visual tree (for mixed surface+swapchain scenarios) */
-        dcomp_commit_visual_tree(target->hwnd, target->root_visual);
+        KillTimer(target->hwnd, DCOMP_COALESCE_TIMER);
+        dcomp_target_flush_present(target, surface);
     }
     LeaveCriticalSection(&device->cs);
 
