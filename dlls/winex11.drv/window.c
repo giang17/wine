@@ -2663,6 +2663,12 @@ static void create_whole_window( struct x11drv_win_data *data )
     sync_window_opacity( data->display, data->whole_window, alpha, layered_flags );
     sync_window_input_shape( data );
 
+    /* give the window a visible default arrow cursor so that windows which
+       never set a cursor of their own (e.g. cross-process embedded WebView2
+       surfaces) don't end up blank once WM reparenting breaks the X11 cursor
+       inheritance to the owner window */
+    XDefineCursor( data->display, data->whole_window, get_default_cursor() );
+
     XFlush( data->display );  /* make sure the window exists before we start painting to it */
 
 done:
