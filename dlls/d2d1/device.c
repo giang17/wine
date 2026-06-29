@@ -3971,7 +3971,7 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
         }
 
         ID2D1Effect_Release(effect);
-        if (FAILED(hr = ID2D1Image_QueryInterface(input, &IID_ID2D1Effect, (void **)&effect))))
+        if (FAILED(hr = ID2D1Image_QueryInterface(input, &IID_ID2D1Effect, (void **)&effect)))
         {
             ID2D1Image_Release(input);
             return hr;
