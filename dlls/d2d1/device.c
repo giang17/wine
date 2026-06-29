@@ -3862,19 +3862,19 @@ static void d2d_convolve_matrix_apply_pass(const BYTE *src, BYTE *dst, UINT32 wi
             {
                 int sy = (int)y + (int)ky - (int)(pass->kernel_size_y / 2);
 
-                if (sy < 0)
-                    sy = 0;
-                else if (sy >= (int)height)
-                    sy = (int)height - 1;
+                /* SOFT border mode (the D2D default, which JUCE relies on): samples
+                 * outside the input are transparent black (0), not clamped to the edge.
+                 * Skipping the contribution lets the convolution fade to 0 at the image
+                 * borders instead of smearing the edge alpha outward. */
+                if (sy < 0 || sy >= (int)height)
+                    continue;
 
                 for (kx = 0; kx < pass->kernel_size_x; ++kx)
                 {
                     int sx = (int)x + (int)kx - (int)(pass->kernel_size_x / 2);
 
-                    if (sx < 0)
-                        sx = 0;
-                    else if (sx >= (int)width)
-                        sx = (int)width - 1;
+                    if (sx < 0 || sx >= (int)width)
+                        continue;
 
                     sum += src[sy * width + sx] * pass->kernel[ky * pass->kernel_size_x + kx];
                 }
