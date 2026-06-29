@@ -565,13 +565,32 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
                 CWEventMask | CWBitGravity | CWBackingStore);
     }
 
-    /* Issue 55: WS_EX_LAYERED windows (e.g. VSTGUI drag-bitmap) render their own
-     * content; let the X server paint NO background on expose (None) instead of
-     * black (background_pixel=0), which otherwise flashes black on every move.
-     * Note: NO backing_store=Always here — that froze a black frame for a moving
-     * window (it caches stale content).  None alone keeps the prior X content. */
+    /* Issue 55: WS_EX_LAYERED windows render their own content; how to handle the
+     * X expose background depends on the window's visual:
+     *
+     * - Per-pixel-alpha layered windows (UpdateLayeredWindow/ULW_ALPHA, ARGB32
+     *   visual, data->use_alpha) such as JUCE's DropShadower use a 32-bit ARGB
+     *   visual where background_pixel = 0 means fully TRANSPARENT (alpha 0).  That
+     *   is exactly what the unpainted shadow border needs, so keep background_pixel
+     *   = 0.  Using background_pixmap = None here leaves the ARGB buffer
+     *   uninitialised, which a compositor shows as an opaque/milky border (issue
+     *   55 follow-up: KORG LegacyCell audio-device dropdown shadow).
+     *
+     * - Constant-alpha / colour-key layered windows (SetLayeredWindowAttributes,
+     *   default RGB visual, !data->use_alpha) such as the VSTGUI Win32DragBitmap
+     *   have background_pixel = 0 == opaque BLACK, which flashes black on every
+     *   move expose.  For those paint NO expose background (None) instead.  NO
+     *   backing_store = Always — that froze a black frame for a moving window. */
     if (ex_style & WS_EX_LAYERED)
     {
+        TRACE( "layered window %p use_alpha=%u layered=%u\n",
+               data->hwnd, data->use_alpha, data->layered );
+        if (data->use_alpha)
+        {
+            attr->background_pixel = 0;  /* ARGB32: pixel 0 == transparent */
+            return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
+                    CWEventMask | CWBitGravity | CWBackingStore);
+        }
         attr->background_pixmap = None;
         return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixmap |
                 CWEventMask | CWBitGravity | CWBackingStore);
