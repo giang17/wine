@@ -1424,6 +1424,124 @@ static HRESULT __stdcall flood_factory(IUnknown **effect)
     return d2d_effect_create_impl(effect, &properties, sizeof(properties));
 }
 
+
+#define CONVOLVE_MATRIX_MAX_KERNEL_SIZE 1024
+
+static const WCHAR convolve_matrix_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Convolve Matrix'/>  \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Convolve Matrix'/>  \
+    <Inputs>                                                              \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='KernelUnitLength' type='vector2' />                   \
+    <Property name='ScaleMode' type='enum' />                             \
+    <Property name='KernelSizeX' type='uint32' />                         \
+    <Property name='KernelSizeY' type='uint32' />                         \
+    <Property name='KernelMatrix' type='blob' />                          \
+    <Property name='Divisor' type='float' />                              \
+    <Property name='Bias' type='float' />                                 \
+    <Property name='KernelOffset' type='vector2' />                       \
+    <Property name='PreserveAlpha' type='bool' />                         \
+    <Property name='BorderMode' type='enum' />                            \
+    <Property name='ClampOutput' type='bool' />                           \
+  </Effect>";
+
+struct convolve_matrix_properties
+{
+    D2D_VECTOR_2F kernel_unit_length;
+    D2D1_CONVOLVEMATRIX_SCALE_MODE scale_mode;
+    UINT32 kernel_size_x;
+    UINT32 kernel_size_y;
+    float kernel_matrix[CONVOLVE_MATRIX_MAX_KERNEL_SIZE];
+    UINT32 kernel_matrix_size;
+    float divisor;
+    float bias;
+    D2D_VECTOR_2F kernel_offset;
+    BOOL preserve_alpha;
+    D2D1_BORDER_MODE border_mode;
+    BOOL clamp_output;
+};
+
+EFFECT_PROPERTY_RW(convolve_matrix, kernel_unit_length, VECTOR2)
+EFFECT_PROPERTY_RW(convolve_matrix, scale_mode, ENUM)
+EFFECT_PROPERTY_RW(convolve_matrix, kernel_size_x, UINT32)
+EFFECT_PROPERTY_RW(convolve_matrix, kernel_size_y, UINT32)
+EFFECT_PROPERTY_RW(convolve_matrix, divisor, FLOAT)
+EFFECT_PROPERTY_RW(convolve_matrix, bias, FLOAT)
+EFFECT_PROPERTY_RW(convolve_matrix, kernel_offset, VECTOR2)
+EFFECT_PROPERTY_RW(convolve_matrix, preserve_alpha, BOOL)
+EFFECT_PROPERTY_RW(convolve_matrix, border_mode, ENUM)
+EFFECT_PROPERTY_RW(convolve_matrix, clamp_output, BOOL)
+
+static HRESULT __stdcall convolve_matrix_kernel_matrix_set(IUnknown *iface, const BYTE *data, UINT32 data_size)
+{
+    struct d2d_effect_impl *effect = impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)iface);
+    struct convolve_matrix_properties *props = (struct convolve_matrix_properties *)(effect + 1);
+
+    if (!data_size || data_size > sizeof(props->kernel_matrix) || data_size % sizeof(float))
+        return E_INVALIDARG;
+
+    memcpy(props->kernel_matrix, data, data_size);
+    props->kernel_matrix_size = data_size;
+
+    return S_OK;
+}
+
+static HRESULT __stdcall convolve_matrix_kernel_matrix_get(const IUnknown *iface, BYTE *data,
+        UINT32 data_size, UINT32 *actual_size)
+{
+    struct d2d_effect_impl *effect = impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)iface);
+    struct convolve_matrix_properties *props = (struct convolve_matrix_properties *)(effect + 1);
+    UINT32 size = props->kernel_matrix_size;
+
+    if (actual_size)
+        *actual_size = size;
+
+    if (data && data_size)
+    {
+        if (data_size < size)
+            return E_NOT_SUFFICIENT_BUFFER;
+        memcpy(data, props->kernel_matrix, size);
+    }
+
+    return S_OK;
+}
+
+static const D2D1_PROPERTY_BINDING convolve_matrix_bindings[] =
+{
+    { L"KernelUnitLength", BINDING_RW(convolve_matrix, kernel_unit_length) },
+    { L"ScaleMode", BINDING_RW(convolve_matrix, scale_mode) },
+    { L"KernelSizeX", BINDING_RW(convolve_matrix, kernel_size_x) },
+    { L"KernelSizeY", BINDING_RW(convolve_matrix, kernel_size_y) },
+    { L"KernelMatrix", BINDING_RW(convolve_matrix, kernel_matrix) },
+    { L"Divisor", BINDING_RW(convolve_matrix, divisor) },
+    { L"Bias", BINDING_RW(convolve_matrix, bias) },
+    { L"KernelOffset", BINDING_RW(convolve_matrix, kernel_offset) },
+    { L"PreserveAlpha", BINDING_RW(convolve_matrix, preserve_alpha) },
+    { L"BorderMode", BINDING_RW(convolve_matrix, border_mode) },
+    { L"ClampOutput", BINDING_RW(convolve_matrix, clamp_output) },
+};
+
+static HRESULT __stdcall convolve_matrix_factory(IUnknown **effect)
+{
+    static const struct convolve_matrix_properties properties =
+    {
+        .kernel_unit_length = { 1.0f, 1.0f },
+        .scale_mode = D2D1_CONVOLVEMATRIX_SCALE_MODE_LINEAR,
+        .kernel_size_x = 1,
+        .kernel_size_y = 1,
+        .kernel_matrix = { 1.0f },
+        .kernel_matrix_size = sizeof(float),
+        .divisor = 0.0f,
+        .border_mode = D2D1_BORDER_MODE_SOFT,
+    };
+    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+}
+
 static const WCHAR gaussian_blur_description[] =
 L"<?xml version='1.0'?>                                                   \
   <Effect>                                                                \
@@ -1861,6 +1979,7 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
         { &CLSID_D2D1ColorMatrix, X2(color_matrix) },
         { &CLSID_D2D1Flood, X2(flood) },
         { &CLSID_D2D1GaussianBlur, X2(gaussian_blur) },
+        { &CLSID_D2D1ConvolveMatrix, X2(convolve_matrix) },
         { &CLSID_D2D1PointSpecular, X2(point_specular) },
         { &CLSID_D2D1ArithmeticComposite, X2(arithmetic_composite) },
         { &CLSID_D2D1Blend, X2(blend) },
