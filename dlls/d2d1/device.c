@@ -3741,6 +3741,323 @@ static D2D1_UNIT_MODE STDMETHODCALLTYPE d2d_device_context_GetUnitMode(ID2D1Devi
     return context->drawing_state.unitMode;
 }
 
+#define D2D_CONVOLVE_MATRIX_MAX_KERNEL_SIZE 1024
+
+struct d2d_convolve_matrix_pass
+{
+    UINT32 kernel_size_x;
+    UINT32 kernel_size_y;
+    float kernel[D2D_CONVOLVE_MATRIX_MAX_KERNEL_SIZE];
+    UINT32 kernel_size;
+    float divisor;
+    float bias;
+};
+
+static void d2d_device_context_draw_effect_bitmap(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
+        float opacity, D2D1_INTERPOLATION_MODE interpolation_mode, const D2D1_RECT_F *image_rect,
+        const D2D1_POINT_2F *target_offset, D2D1_COMPOSITE_MODE composite_mode)
+{
+    if (composite_mode == D2D1_COMPOSITE_MODE_SOURCE_COPY)
+    {
+        ID3D11BlendState *prev_bs = context->bs;
+
+        context->bs = NULL;
+
+        d2d_device_context_draw_bitmap(context, bitmap, NULL, opacity,
+                interpolation_mode, image_rect, target_offset, NULL);
+
+        context->bs = prev_bs;
+    }
+    else
+    {
+        d2d_device_context_draw_bitmap(context, bitmap, NULL, opacity,
+                interpolation_mode, image_rect, target_offset, NULL);
+    }
+}
+
+static HRESULT d2d_convolve_matrix_readback_bitmap(struct d2d_device_context *context,
+        struct d2d_bitmap *bitmap, ID3D11Texture2D **texture, D3D11_MAPPED_SUBRESOURCE *mapped)
+{
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11DeviceContext *d3d_context;
+    ID3D11Texture2D *src_texture;
+    HRESULT hr;
+
+    if (bitmap->format.format != DXGI_FORMAT_A8_UNORM)
+    {
+        FIXME("Unhandled ConvolveMatrix bitmap format %#x.\n", bitmap->format.format);
+        return E_NOTIMPL;
+    }
+
+    if (FAILED(hr = ID3D11Resource_QueryInterface(bitmap->resource, &IID_ID3D11Texture2D, (void **)&src_texture)))
+        return hr;
+
+    ID3D11Texture2D_GetDesc(src_texture, &desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+
+    if (FAILED(hr = ID3D11Device1_CreateTexture2D(context->d3d_device, &desc, NULL, texture)))
+    {
+        ID3D11Texture2D_Release(src_texture);
+        return hr;
+    }
+
+    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+    ID3D11DeviceContext_CopyResource(d3d_context, (ID3D11Resource *)*texture, bitmap->resource);
+    hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)*texture, 0, D3D11_MAP_READ, 0, mapped);
+    ID3D11DeviceContext_Release(d3d_context);
+    ID3D11Texture2D_Release(src_texture);
+
+    if (FAILED(hr))
+    {
+        ID3D11Texture2D_Release(*texture);
+        *texture = NULL;
+    }
+
+    return hr;
+}
+
+static void d2d_convolve_matrix_unmap_bitmap(struct d2d_device_context *context, ID3D11Texture2D *texture)
+{
+    ID3D11DeviceContext *d3d_context;
+
+    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)texture, 0);
+    ID3D11DeviceContext_Release(d3d_context);
+    ID3D11Texture2D_Release(texture);
+}
+
+static BYTE d2d_convolve_matrix_clamp(float value)
+{
+    if (value < 0.0f)
+        return 0;
+    if (value > 255.0f)
+        return 255;
+    return value + 0.5f;
+}
+
+static void d2d_convolve_matrix_apply_pass(const BYTE *src, BYTE *dst, UINT32 width, UINT32 height,
+        const struct d2d_convolve_matrix_pass *pass)
+{
+    unsigned int x, y, kx, ky;
+    float divisor = pass->divisor;
+
+    if (divisor == 0.0f)
+    {
+        for (ky = 0; ky < pass->kernel_size; ++ky)
+            divisor += pass->kernel[ky];
+        if (divisor == 0.0f)
+            divisor = 1.0f;
+    }
+
+    for (y = 0; y < height; ++y)
+    {
+        for (x = 0; x < width; ++x)
+        {
+            float sum = 0.0f;
+
+            for (ky = 0; ky < pass->kernel_size_y; ++ky)
+            {
+                int sy = (int)y + (int)ky - (int)(pass->kernel_size_y / 2);
+
+                if (sy < 0)
+                    sy = 0;
+                else if (sy >= (int)height)
+                    sy = (int)height - 1;
+
+                for (kx = 0; kx < pass->kernel_size_x; ++kx)
+                {
+                    int sx = (int)x + (int)kx - (int)(pass->kernel_size_x / 2);
+
+                    if (sx < 0)
+                        sx = 0;
+                    else if (sx >= (int)width)
+                        sx = (int)width - 1;
+
+                    sum += src[sy * width + sx] * pass->kernel[ky * pass->kernel_size_x + kx];
+                }
+            }
+
+            dst[y * width + x] = d2d_convolve_matrix_clamp(sum / divisor + pass->bias * 255.0f);
+        }
+    }
+}
+
+static HRESULT d2d_convolve_matrix_get_pass(ID2D1Effect *effect, struct d2d_convolve_matrix_pass *pass)
+{
+    UINT32 matrix_size;
+    HRESULT hr;
+
+    memset(pass, 0, sizeof(*pass));
+    if (FAILED(hr = ID2D1Effect_GetValue(effect, D2D1_CONVOLVEMATRIX_PROP_KERNEL_SIZE_X,
+            D2D1_PROPERTY_TYPE_UINT32, (BYTE *)&pass->kernel_size_x, sizeof(pass->kernel_size_x))))
+        return hr;
+    if (FAILED(hr = ID2D1Effect_GetValue(effect, D2D1_CONVOLVEMATRIX_PROP_KERNEL_SIZE_Y,
+            D2D1_PROPERTY_TYPE_UINT32, (BYTE *)&pass->kernel_size_y, sizeof(pass->kernel_size_y))))
+        return hr;
+
+    if (!pass->kernel_size_x || !pass->kernel_size_y
+            || pass->kernel_size_x > D2D_CONVOLVE_MATRIX_MAX_KERNEL_SIZE / pass->kernel_size_y)
+        return E_INVALIDARG;
+
+    pass->kernel_size = pass->kernel_size_x * pass->kernel_size_y;
+    if (pass->kernel_size > D2D_CONVOLVE_MATRIX_MAX_KERNEL_SIZE)
+        return E_INVALIDARG;
+
+    matrix_size = ID2D1Effect_GetValueSize(effect, D2D1_CONVOLVEMATRIX_PROP_KERNEL_MATRIX);
+    if (matrix_size < pass->kernel_size * sizeof(float) || matrix_size > sizeof(pass->kernel)
+            || matrix_size % sizeof(float))
+        return E_INVALIDARG;
+    if (FAILED(hr = ID2D1Effect_GetValue(effect, D2D1_CONVOLVEMATRIX_PROP_KERNEL_MATRIX,
+            D2D1_PROPERTY_TYPE_BLOB, (BYTE *)pass->kernel, matrix_size)))
+        return hr;
+
+    ID2D1Effect_GetValue(effect, D2D1_CONVOLVEMATRIX_PROP_DIVISOR,
+            D2D1_PROPERTY_TYPE_FLOAT, (BYTE *)&pass->divisor, sizeof(pass->divisor));
+    ID2D1Effect_GetValue(effect, D2D1_CONVOLVEMATRIX_PROP_BIAS,
+            D2D1_PROPERTY_TYPE_FLOAT, (BYTE *)&pass->bias, sizeof(pass->bias));
+
+    return S_OK;
+}
+
+static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context *context, ID2D1Effect *effect,
+        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
+        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
+{
+    struct d2d_convolve_matrix_pass passes[16];
+    struct d2d_bitmap *src_bitmap, *result_impl;
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    ID3D11Texture2D *staging = NULL;
+    D2D1_SIZE_U size;
+    D2D1_PIXEL_FORMAT format;
+    ID2D1Image *input;
+    ID2D1Bitmap *bitmap;
+    BYTE *buffers[2];
+    float dpi_x, dpi_y;
+    unsigned int i;
+    UINT32 y;
+    HRESULT hr;
+
+    ID2D1Effect_AddRef(effect);
+    for (i = 0;; ++i)
+    {
+        CLSID clsid;
+
+        if (i == ARRAY_SIZE(passes))
+        {
+            ID2D1Effect_Release(effect);
+            return E_NOTIMPL;
+        }
+        if (FAILED(hr = d2d_convolve_matrix_get_pass(effect, &passes[i])))
+        {
+            ID2D1Effect_Release(effect);
+            return hr;
+        }
+
+        ID2D1Effect_GetInput(effect, 0, &input);
+        if (!input)
+        {
+            ID2D1Effect_Release(effect);
+            return E_INVALIDARG;
+        }
+
+        if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
+        {
+            ID2D1Image_Release(input);
+            break;
+        }
+
+        ID2D1Effect_Release(effect);
+        if (FAILED(hr = ID2D1Image_QueryInterface(input, &IID_ID2D1Effect, (void **)&effect))))
+        {
+            ID2D1Image_Release(input);
+            return hr;
+        }
+        ID2D1Image_Release(input);
+
+        if (FAILED(hr = ID2D1Effect_GetValue(effect, D2D1_PROPERTY_CLSID, D2D1_PROPERTY_TYPE_CLSID,
+                (BYTE *)&clsid, sizeof(clsid))))
+        {
+            ID2D1Effect_Release(effect);
+            return hr;
+        }
+        if (!IsEqualGUID(&clsid, &CLSID_D2D1ConvolveMatrix))
+        {
+            ID2D1Effect_Release(effect);
+            return E_NOTIMPL;
+        }
+    }
+    ID2D1Effect_Release(effect);
+
+    src_bitmap = unsafe_impl_from_ID2D1Bitmap(bitmap);
+    size = src_bitmap->pixel_size;
+    format = src_bitmap->format;
+    dpi_x = src_bitmap->dpi_x;
+    dpi_y = src_bitmap->dpi_y;
+    if (!size.width || !size.height)
+    {
+        ID2D1Bitmap_Release(bitmap);
+        return E_INVALIDARG;
+    }
+
+    if (FAILED(hr = d2d_convolve_matrix_readback_bitmap(context, src_bitmap, &staging, &mapped)))
+    {
+        ID2D1Bitmap_Release(bitmap);
+        return hr;
+    }
+
+    if (size.height && size.width > ~(size_t)0 / size.height)
+    {
+        d2d_convolve_matrix_unmap_bitmap(context, staging);
+        ID2D1Bitmap_Release(bitmap);
+        return E_OUTOFMEMORY;
+    }
+
+    if (!(buffers[0] = malloc(size.width * size.height)) || !(buffers[1] = malloc(size.width * size.height)))
+    {
+        d2d_convolve_matrix_unmap_bitmap(context, staging);
+        ID2D1Bitmap_Release(bitmap);
+        free(buffers[0]);
+        return E_OUTOFMEMORY;
+    }
+
+    for (y = 0; y < size.height; ++y)
+        memcpy(buffers[0] + y * size.width, (BYTE *)mapped.pData + y * mapped.RowPitch, size.width);
+
+    d2d_convolve_matrix_unmap_bitmap(context, staging);
+    ID2D1Bitmap_Release(bitmap);
+
+    for (;;)
+    {
+        d2d_convolve_matrix_apply_pass(buffers[0], buffers[1], size.width, size.height, &passes[i]);
+        memcpy(buffers[0], buffers[1], size.width * size.height);
+        if (!i)
+            break;
+        --i;
+    }
+
+    bitmap_desc.pixelFormat = format;
+    bitmap_desc.dpiX = dpi_x;
+    bitmap_desc.dpiY = dpi_y;
+    bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+    bitmap_desc.colorContext = NULL;
+
+    hr = d2d_bitmap_create(context, size, buffers[0], size.width, &bitmap_desc, &result_impl);
+    free(buffers[0]);
+    free(buffers[1]);
+    if (FAILED(hr))
+        return hr;
+
+    d2d_device_context_draw_effect_bitmap(context, (ID2D1Bitmap *)&result_impl->ID2D1Bitmap1_iface,
+            1.0f, interpolation_mode, image_rect, target_offset, composite_mode);
+    ID2D1Bitmap1_Release(&result_impl->ID2D1Bitmap1_iface);
+
+    return S_OK;
+}
+
 static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_DrawGlyphRun(ID2D1DeviceContext6 *iface,
         D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run,
         const DWRITE_GLYPH_RUN_DESCRIPTION *glyph_run_desc, ID2D1Brush *brush, DWRITE_MEASURING_MODE measuring_mode)
@@ -3792,53 +4109,53 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
         return;
     }
 
-    /* If the image is an effect output, extract its input bitmap and apply
-     * basic effect processing. For the D2D1 Opacity effect, read the opacity
-     * property and use it when drawing. For SOURCE_COPY composite mode with
-     * opacity=0, this effectively clears the area to transparent — which is
-     * how JUCE's multiplyAllAlphasInArea() erases component content. */
+    /* If the image is an effect output, dispatch basic effect processing by
+     * CLSID. SOURCE_COPY draws with blending disabled so the processed pixels
+     * replace the render target directly. */
     {
         ID2D1Effect *effect;
 
         if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1Effect, (void **)&effect)))
         {
-            ID2D1Image *input = NULL;
-            float opacity = 1.0f;
+            CLSID clsid;
 
-            /* Read the first custom property (index 0 = Opacity for D2D1Opacity effect). */
-            ID2D1Effect_GetValue(effect, 0, D2D1_PROPERTY_TYPE_FLOAT,
-                    (BYTE *)&opacity, sizeof(opacity));
-
-            ID2D1Effect_GetInput(effect, 0, &input);
-            if (input)
+            if (SUCCEEDED(ID2D1Effect_GetValue(effect, D2D1_PROPERTY_CLSID, D2D1_PROPERTY_TYPE_CLSID,
+                    (BYTE *)&clsid, sizeof(clsid))))
             {
-                if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
+                if (IsEqualGUID(&clsid, &CLSID_D2D1Opacity))
                 {
-                    if (composite_mode == D2D1_COMPOSITE_MODE_SOURCE_COPY)
-                    {
-                        /* SOURCE_COPY: replace destination with source.
-                         * The opacity effect multiplies alpha, then SOURCE_COPY writes it back.
-                         * We implement this by drawing with blend disabled (NULL blend state)
-                         * which makes the pixel shader output replace the render target directly.
-                         * The opacity is baked into the brush/color via draw_bitmap's opacity param. */
-                        ID3D11BlendState *prev_bs = context->bs;
-                        if (prev_bs)
-                            ID3D11BlendState_AddRef(prev_bs);
-                        context->bs = NULL;
+                    ID2D1Image *input = NULL;
+                    float opacity = 1.0f;
 
-                        d2d_device_context_draw_bitmap(context, bitmap, NULL, opacity,
-                                interpolation_mode, image_rect, target_offset, NULL);
+                    ID2D1Effect_GetValue(effect, D2D1_OPACITY_PROP_OPACITY, D2D1_PROPERTY_TYPE_FLOAT,
+                            (BYTE *)&opacity, sizeof(opacity));
 
-                        context->bs = prev_bs;
-                    }
-                    else
+                    ID2D1Effect_GetInput(effect, 0, &input);
+                    if (input)
                     {
-                        d2d_device_context_draw_bitmap(context, bitmap, NULL, opacity,
-                                interpolation_mode, image_rect, target_offset, NULL);
+                        if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
+                        {
+                            d2d_device_context_draw_effect_bitmap(context, bitmap, opacity,
+                                    interpolation_mode, image_rect, target_offset, composite_mode);
+                            ID2D1Bitmap_Release(bitmap);
+                        }
+                        ID2D1Image_Release(input);
                     }
-                    ID2D1Bitmap_Release(bitmap);
                 }
-                ID2D1Image_Release(input);
+                else if (IsEqualGUID(&clsid, &CLSID_D2D1ConvolveMatrix))
+                {
+                    HRESULT hr;
+
+                    if (FAILED(hr = d2d_device_context_draw_convolve_matrix(context, effect,
+                            target_offset, image_rect, interpolation_mode, composite_mode)))
+                    {
+                        FIXME("Failed to draw ConvolveMatrix effect, hr %#lx.\n", hr);
+                    }
+                }
+                else
+                {
+                    FIXME("Unhandled effect %s.\n", debugstr_guid(&clsid));
+                }
             }
             ID2D1Effect_Release(effect);
             return;
