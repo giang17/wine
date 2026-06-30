@@ -3922,49 +3922,49 @@ static HRESULT d2d_convolve_matrix_get_pass(ID2D1Effect *effect, struct d2d_conv
     return S_OK;
 }
 
-static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context *context, ID2D1Effect *effect,
-        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
-        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
+/* Walk the ConvolveMatrix effect chain (JUCE's box-blur builds 2 x radius of them,
+ * horizontal then vertical) into a dynamically grown pass array, so realistic blur
+ * radii (radius > 8, i.e. more than the old fixed 16 passes) are no longer rejected
+ * with E_NOTIMPL.  On success the caller owns *passes (free it) and a reference to
+ * *bitmap (the chain's bitmap input); on failure everything is released here. */
+static HRESULT d2d_convolve_matrix_collect_passes(ID2D1Effect *effect,
+        struct d2d_convolve_matrix_pass **passes, unsigned int *pass_count, ID2D1Bitmap **bitmap)
 {
-    struct d2d_convolve_matrix_pass passes[16];
-    struct d2d_bitmap *src_bitmap, *result_impl;
-    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    ID3D11Texture2D *staging = NULL;
-    D2D1_SIZE_U size;
-    D2D1_PIXEL_FORMAT format;
+    struct d2d_convolve_matrix_pass *array = NULL;
+    unsigned int count = 0, capacity = 0;
+    ID2D1Bitmap *input_bitmap = NULL;
     ID2D1Image *input;
-    ID2D1Bitmap *bitmap;
-    BYTE *buffers[2];
-    float dpi_x, dpi_y;
-    unsigned int i;
-    UINT32 y;
-    HRESULT hr;
+    HRESULT hr = S_OK;
 
     ID2D1Effect_AddRef(effect);
-    for (i = 0;; ++i)
+    for (;;)
     {
         CLSID clsid;
 
-        if (i == ARRAY_SIZE(passes))
+        if (count == capacity)
         {
-            ID2D1Effect_Release(effect);
-            return E_NOTIMPL;
+            struct d2d_convolve_matrix_pass *new_array;
+
+            capacity = capacity ? capacity * 2 : 8;
+            if (!(new_array = realloc(array, capacity * sizeof(*array))))
+            {
+                hr = E_OUTOFMEMORY;
+                break;
+            }
+            array = new_array;
         }
-        if (FAILED(hr = d2d_convolve_matrix_get_pass(effect, &passes[i])))
-        {
-            ID2D1Effect_Release(effect);
-            return hr;
-        }
+        if (FAILED(hr = d2d_convolve_matrix_get_pass(effect, &array[count])))
+            break;
+        ++count;
 
         ID2D1Effect_GetInput(effect, 0, &input);
         if (!input)
         {
-            ID2D1Effect_Release(effect);
-            return E_INVALIDARG;
+            hr = E_INVALIDARG;
+            break;
         }
 
-        if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
+        if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&input_bitmap)))
         {
             ID2D1Image_Release(input);
             break;
@@ -3974,23 +3974,55 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
         if (FAILED(hr = ID2D1Image_QueryInterface(input, &IID_ID2D1Effect, (void **)&effect)))
         {
             ID2D1Image_Release(input);
-            return hr;
+            effect = NULL;
+            break;
         }
         ID2D1Image_Release(input);
 
         if (FAILED(hr = ID2D1Effect_GetValue(effect, D2D1_PROPERTY_CLSID, D2D1_PROPERTY_TYPE_CLSID,
                 (BYTE *)&clsid, sizeof(clsid))))
-        {
-            ID2D1Effect_Release(effect);
-            return hr;
-        }
+            break;
         if (!IsEqualGUID(&clsid, &CLSID_D2D1ConvolveMatrix))
         {
-            ID2D1Effect_Release(effect);
-            return E_NOTIMPL;
+            hr = E_NOTIMPL;
+            break;
         }
     }
-    ID2D1Effect_Release(effect);
+    if (effect)
+        ID2D1Effect_Release(effect);
+
+    if (FAILED(hr))
+    {
+        free(array);
+        return hr;
+    }
+
+    *passes = array;
+    *pass_count = count;
+    *bitmap = input_bitmap;
+    return S_OK;
+}
+
+static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context *context, ID2D1Effect *effect,
+        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
+        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
+{
+    struct d2d_convolve_matrix_pass *passes;
+    struct d2d_bitmap *src_bitmap, *result_impl;
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    ID3D11Texture2D *staging = NULL;
+    D2D1_SIZE_U size;
+    D2D1_PIXEL_FORMAT format;
+    ID2D1Bitmap *bitmap;
+    BYTE *buffers[2];
+    float dpi_x, dpi_y;
+    unsigned int pass_count, i;
+    UINT32 y;
+    HRESULT hr;
+
+    if (FAILED(hr = d2d_convolve_matrix_collect_passes(effect, &passes, &pass_count, &bitmap)))
+        return hr;
 
     src_bitmap = unsafe_impl_from_ID2D1Bitmap(bitmap);
     size = src_bitmap->pixel_size;
@@ -4000,12 +4032,14 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
     if (!size.width || !size.height)
     {
         ID2D1Bitmap_Release(bitmap);
+        free(passes);
         return E_INVALIDARG;
     }
 
     if (FAILED(hr = d2d_convolve_matrix_readback_bitmap(context, src_bitmap, &staging, &mapped)))
     {
         ID2D1Bitmap_Release(bitmap);
+        free(passes);
         return hr;
     }
 
@@ -4013,6 +4047,7 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
     {
         d2d_convolve_matrix_unmap_bitmap(context, staging);
         ID2D1Bitmap_Release(bitmap);
+        free(passes);
         return E_OUTOFMEMORY;
     }
 
@@ -4021,6 +4056,7 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
         d2d_convolve_matrix_unmap_bitmap(context, staging);
         ID2D1Bitmap_Release(bitmap);
         free(buffers[0]);
+        free(passes);
         return E_OUTOFMEMORY;
     }
 
@@ -4030,6 +4066,7 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
     d2d_convolve_matrix_unmap_bitmap(context, staging);
     ID2D1Bitmap_Release(bitmap);
 
+    i = pass_count - 1;
     for (;;)
     {
         d2d_convolve_matrix_apply_pass(buffers[0], buffers[1], size.width, size.height, &passes[i]);
@@ -4038,6 +4075,7 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
             break;
         --i;
     }
+    free(passes);
 
     bitmap_desc.pixelFormat = format;
     bitmap_desc.dpiX = dpi_x;
