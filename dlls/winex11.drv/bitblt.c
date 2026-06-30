@@ -1857,15 +1857,32 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
      * Issue 57 (Trinity JUCE DropShadower): the per-pixel-alpha shadow windows
      * are premultiplied black (RGB 0, alpha gradient), so they read as "fully
      * black" here too.  Suppressing them removes the spurious opaque shadow that
-     * native Windows does not show.  The height bound is raised 200 -> 400 to
-     * cover the tall left/right shadow windows (shadowEdge x popup-height).  Tall
-     * popups (> 400 px, long FX lists) are still let through; a clean fix keyed on
-     * data->use_alpha rather than surface size is tracked separately. */
+     * native Windows does not show.  These edge windows are taller than the
+     * small-surface bound (shadowEdge x popup-height), so above that bound we
+     * key on the window's per-pixel-alpha flag instead: a layered window
+     * flushing an all-RGB-black frame is always the unwanted shadow (a
+     * translucent ARGB shadow, or the opaque initial RGB flush before the ARGB
+     * re-creation), whereas legitimate layered content has colour (black !=
+     * total).  The opaque main window is not use_alpha, so it pays only a cheap
+     * win-data lookup and no pixel scan. */
     if (color_info->bmiHeader.biBitCount == 32)
     {
         int sw = color_info->bmiHeader.biWidth, sh = abs( color_info->bmiHeader.biHeight );
+        BOOL within_size = (sw > 0 && sw <= 400 && sh > 0 && sh <= 400);
+        BOOL win_use_alpha = FALSE;
 
-        if (sw > 0 && sw <= 400 && sh > 0 && sh <= 400)
+        if (sw > 0 && sh > 0 && !within_size)
+        {
+            struct x11drv_win_data *data = get_win_data( window_surface->hwnd );
+
+            if (data)
+            {
+                win_use_alpha = data->use_alpha;
+                release_win_data( data );
+            }
+        }
+
+        if (within_size || win_use_alpha)
         {
             const DWORD *px = color_bits;
             unsigned int black = 0, total = 0, x, y;
