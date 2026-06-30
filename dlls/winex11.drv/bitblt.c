@@ -1852,13 +1852,20 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
      * drag window's win32u surface is recreated black on every move (VSTGUI
      * per-paint swapchain churn) and flushed before the async wined3d BitBlt
      * lands.  Suppress a fully-black flush for small surfaces so the X window
-     * keeps the last good (bitmap) frame.  Paired with background_pixmap=None
-     * (X no longer paints the expose background black either). */
+     * keeps the last good (bitmap) frame.
+     *
+     * Issue 57 (Trinity JUCE DropShadower): the per-pixel-alpha shadow windows
+     * are premultiplied black (RGB 0, alpha gradient), so they read as "fully
+     * black" here too.  Suppressing them removes the spurious opaque shadow that
+     * native Windows does not show.  The height bound is raised 200 -> 400 to
+     * cover the tall left/right shadow windows (shadowEdge x popup-height).  Tall
+     * popups (> 400 px, long FX lists) are still let through; a clean fix keyed on
+     * data->use_alpha rather than surface size is tracked separately. */
     if (color_info->bmiHeader.biBitCount == 32)
     {
         int sw = color_info->bmiHeader.biWidth, sh = abs( color_info->bmiHeader.biHeight );
 
-        if (sw > 0 && sw <= 400 && sh > 0 && sh <= 200)
+        if (sw > 0 && sw <= 400 && sh > 0 && sh <= 400)
         {
             const DWORD *px = color_bits;
             unsigned int black = 0, total = 0, x, y;
