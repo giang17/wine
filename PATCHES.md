@@ -17,10 +17,8 @@ and run stable in production use.
 
 | Branch | Description |
 |--------|-------------|
-| `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable: D2D1 + DComp + DWrite + WineD3D performance + winex11. Actively maintained. This branch. |
-| `d2d1-dcomp-11.11` | **Recommended for devel / rolling-release users** (e.g. `wine-tkg-dev`). Newest full stack rebased onto Wine 11.11 devel — the current rolling base. Same D2D1 + DComp + DWrite + WineD3D + winex11 stack as `d2d1-dcomp-11.0`, including the Tier 1-3 review hardening, the Trinity nested-popup z-order fix, the embedded-Trinity in-plugin (IFX) popup flicker fix, the DComp thread-safety hardening, and the WineD3D process-heap fix for the Trinity heap-mismatch crash. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineSynth). |
-| `d2d1-dcomp-11.10` | Same full stack rebased onto Wine 11.10 devel. Plugin-tested by maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineASIO). **Superseded by `d2d1-dcomp-11.11`** as the rolling devel base — kept as the previous rolling snapshot. |
-| `d2d1-dcomp-11.8` | **Frozen** snapshot port onto Wine 11.8 devel. **Superseded by `d2d1-dcomp-11.11`** — kept for historical reference. Compiles clean against `wine-11.8`, not full plugin-tested by maintainer. |
+| `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable: D2D1 + DComp + DWrite + WineD3D performance + winex11. Actively maintained. |
+| `d2d1-dcomp-11.<N>` (newest devel) | **Recommended for devel / rolling-release users** (e.g. `wine-tkg-dev`). The same full stack as `d2d1-dcomp-11.0` — D2D1 + DComp + DWrite + WineD3D + winex11, including the Tier 1-3 review hardening, the Trinity nested-popup z-order fix, the embedded-Trinity (IFX) popup flicker fix, the DComp thread-safety hardening, and the WineD3D process-heap fix — rebased onto the latest WineHQ devel tag and rolled forward roughly every 2 weeks. **Use the highest-numbered `d2d1-dcomp-11.*` branch**: it is always the current rolling base. Lower-numbered `d2d1-dcomp-11.x` devel branches are previous rolling snapshots, superseded. Plugin-tested by the maintainer (Serum 2, Korg Trinity, Pianoteq 9, WineSynth). |
 | `d2d1-v6` | **Deprecated** (last update 2026-02-14). Was the upstream-targeted D2D1-only patch series; superseded by 41+ later commits in `d2d1-dcomp-11.0`. Kept for historical reference. |
 
 ## Full Stack (Branch: `d2d1-dcomp-11.0`)
