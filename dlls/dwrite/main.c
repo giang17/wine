@@ -36,6 +36,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(dwrite);
 
 HMODULE dwrite_module = 0;
+HANDLE dwrite_heap;
 static IDWriteFactory7 *shared_factory;
 static void release_shared_factory(IDWriteFactory7 *factory);
 
@@ -44,6 +45,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
+        dwrite_heap = HeapCreate(0, 0, 0);
+        if (!dwrite_heap) return FALSE;
         dwrite_module = hinstDLL;
         DisableThreadLibraryCalls( hinstDLL );
         if (!__wine_init_unix_call())
@@ -55,6 +58,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
         release_shared_factory(shared_factory);
         release_system_fallback_data();
         UNIX_CALL(process_detach, NULL);
+        if (dwrite_heap)
+        {
+            HeapDestroy(dwrite_heap);
+            dwrite_heap = NULL;
+        }
     }
     return TRUE;
 }

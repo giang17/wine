@@ -1848,6 +1848,35 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
 #endif /* HAVE_LIBXSHAPE */
     }
 
+    /* Issue 55 (Serum2 ENV drag-bitmap black flicker): a small WS_EX_LAYERED
+     * drag window's win32u surface is recreated black on every move (VSTGUI
+     * per-paint swapchain churn) and flushed before the async wined3d BitBlt
+     * lands.  Suppress a fully-black flush for small surfaces so the X window
+     * keeps the last good (bitmap) frame.  Paired with background_pixmap=None
+     * (X no longer paints the expose background black either). */
+    if (color_info->bmiHeader.biBitCount == 32)
+    {
+        int sw = color_info->bmiHeader.biWidth, sh = abs( color_info->bmiHeader.biHeight );
+
+        if (sw > 0 && sw <= 400 && sh > 0 && sh <= 200)
+        {
+            const DWORD *px = color_bits;
+            unsigned int black = 0, total = 0, x, y;
+
+            for (y = dirty->top; y < (UINT)dirty->bottom; y++)
+                for (x = dirty->left; x < (UINT)dirty->right; x++)
+                {
+                    if ((px[y * sw + x] & 0x00ffffff) == 0) ++black;
+                    ++total;
+                }
+            if (total && black == total)
+            {
+                XFlush( gdi_display );
+                return TRUE; /* keep previous X content, skip the black push */
+            }
+        }
+    }
+
     if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
