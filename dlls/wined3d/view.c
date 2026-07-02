@@ -81,15 +81,20 @@ static GLenum get_texture_view_target(const struct wined3d_gl_info *gl_info,
     return texture_gl->target;
 }
 
-static bool find_format_plane_idx(const struct wined3d_format *resource_format,
-        const struct wined3d_format *plane_format, unsigned int *plane_idx)
+static bool find_format_plane_idx(const struct wined3d_adapter *adapter,
+        const struct wined3d_format *resource_format, const struct wined3d_format *plane_format,
+        unsigned int *plane_idx)
 {
-    if (plane_format->id == resource_format->plane_formats[0])
+    const struct wined3d_format *format;
+
+    format = wined3d_get_format(adapter, resource_format->plane_formats[0], 0);
+    if (plane_format->typeless_id == format->typeless_id)
     {
         *plane_idx = 0;
         return true;
     }
-    if (plane_format->id == resource_format->plane_formats[1])
+    format = wined3d_get_format(adapter, resource_format->plane_formats[1], 0);
+    if (plane_format->typeless_id == format->typeless_id)
     {
         *plane_idx = 1;
         return true;
@@ -157,7 +162,7 @@ static const struct wined3d_format *validate_resource_view(const struct wined3d_
 
         if (resource->format->attrs & WINED3D_FORMAT_ATTR_PLANAR)
         {
-            if (!find_format_plane_idx(resource->format, format, &plane_idx))
+            if (!find_format_plane_idx(adapter, resource->format, format, &plane_idx))
             {
                 WARN("Invalid view format %s for planar format %s.\n",
                         debug_d3dformat(format->id), debug_d3dformat(resource->format->id));
@@ -863,7 +868,7 @@ static VkImageView wined3d_view_vk_create_vk_image_view(struct wined3d_context_v
     {
         unsigned int plane_idx = 0;
 
-        find_format_plane_idx(resource->format, &view_format_vk->f, &plane_idx);
+        find_format_plane_idx(resource->device->adapter, resource->format, &view_format_vk->f, &plane_idx);
         create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT << plane_idx;
     }
     else
