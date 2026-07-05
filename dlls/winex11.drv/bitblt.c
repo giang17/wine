@@ -1861,19 +1861,21 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
         if (sw > 0 && sw <= 400 && sh > 0 && sh <= 200)
         {
             const DWORD *px = color_bits;
-            unsigned int black = 0, total = 0, x, y;
+            unsigned int x, y;
 
+            /* Suppress only if every pixel is black. Bail on the first
+             * non-black pixel — O(1) in the common case (drag bitmap with
+             * visible content), worst case stays O(n) only for genuinely
+             * black frames. (Issue 73 perf, was per-pixel black-count scan.) */
             for (y = dirty->top; y < (UINT)dirty->bottom; y++)
                 for (x = dirty->left; x < (UINT)dirty->right; x++)
-                {
-                    if ((px[y * sw + x] & 0x00ffffff) == 0) ++black;
-                    ++total;
-                }
-            if (total && black == total)
-            {
-                XFlush( gdi_display );
-                return TRUE; /* keep previous X content, skip the black push */
-            }
+                    if ((px[y * sw + x] & 0x00ffffff) != 0)
+                        goto not_all_black;
+
+            XFlush( gdi_display );
+            return TRUE; /* keep previous X content, skip the black push */
+        not_all_black:
+            ;
         }
     }
 
