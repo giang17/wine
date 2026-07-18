@@ -874,6 +874,14 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
     if (render_target->desc.type == D2D1_RENDER_TARGET_TYPE_DEFAULT)
         render_target->desc.type = D2D1_RENDER_TARGET_TYPE_HARDWARE;
 
+    /* Mark this HWND so winex11.drv's needs_offscreen_rendering() returns FALSE
+     * BEFORE the swapchain is created.  Otherwise the swapchain wires itself
+     * up to an X11 XComposite pixmap that nothing ever blits to the toplevel —
+     * toggling the property afterwards leaves the swapchain dangling.  This
+     * covers both embedded plugins (VSTGUI in Reaper) and standalone D2D apps
+     * (Garritan CFX/ARIA), so no owner_pid heuristic is needed. */
+    SetPropW(hwnd_rt_desc->hwnd, L"__wine_d3d_hwnd_target", (HANDLE)1);
+
     swapchain_desc.BufferDesc.Width = hwnd_rt_desc->pixelSize.width;
     swapchain_desc.BufferDesc.Height = hwnd_rt_desc->pixelSize.height;
     swapchain_desc.BufferDesc.RefreshRate.Numerator = 60;
@@ -887,8 +895,16 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
     swapchain_desc.BufferCount = 1;
     swapchain_desc.OutputWindow = hwnd_rt_desc->hwnd;
     swapchain_desc.Windowed = TRUE;
-    swapchain_desc.SwapEffect = hwnd_rt_desc->presentOptions & D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS ?
-        DXGI_SWAP_EFFECT_SEQUENTIAL : DXGI_SWAP_EFFECT_DISCARD;
+    /* Always use SEQUENTIAL so the backbuffer contents survive Present.  VSTGUI-
+     * based plugins (Garritan CFX/ARIA, etc.) rely on partial-repaint between
+     * frames: tab switches and small UI updates only redraw the dirty sub-rect
+     * via PushAxisAlignedClip, leaving the rest of the backbuffer untouched.
+     * On Windows DISCARD often happens to preserve those pixels (driver
+     * behaviour); Wine implements DISCARD strictly, so unmodified regions
+     * become stale/garbage on the next Present.  D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS
+     * is observed by promoting to FLIP_SEQUENTIAL would-be a stricter mode, but
+     * SEQUENTIAL alone is enough to fix the stale-tab regression. */
+    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
     swapchain_desc.Flags = 0;
     if (desc->usage & D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE)
         swapchain_desc.Flags = DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE;
@@ -948,6 +964,14 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
         IDXGISwapChain_Release(render_target->swapchain);
         return hr;
     }
+
+    /* Force update_client_surfaces() so the X11 child is re-attached to the
+     * toplevel immediately rather than at the next geometry change.  Must
+     * happen AFTER the swapchain has wired up the X11 child — otherwise the
+     * re-attach has nothing to attach. */
+    SetWindowPos(hwnd_rt_desc->hwnd, NULL, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+            | SWP_NOREDRAW | SWP_FRAMECHANGED);
 
     return S_OK;
 }

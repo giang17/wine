@@ -740,6 +740,12 @@ void wined3d_context_gl_alloc_timestamp_query(struct wined3d_context_gl *context
         struct wined3d_timestamp_query *query);
 GLuint wined3d_context_gl_allocate_vram_chunk_buffer(struct wined3d_context_gl *context_gl,
         unsigned int pool, size_t size);
+
+BOOL wined3d_context_gl_push_free_bo(struct wined3d_context_gl *context_gl,
+        const struct wined3d_bo_gl *bo);
+BOOL wined3d_context_gl_pop_free_bo(struct wined3d_context_gl *context_gl,
+        GLsizeiptr size, GLenum binding, GLenum usage, bool coherent, GLbitfield flags,
+        struct wined3d_bo_gl *bo);
 void wined3d_context_gl_apply_blit_state(struct wined3d_context_gl *context_gl, const struct wined3d_device *device);
 BOOL wined3d_context_gl_apply_clear_state(struct wined3d_context_gl *context_gl, const struct wined3d_state *state,
         unsigned int rt_count, const struct wined3d_fb_state *fb);
@@ -859,6 +865,26 @@ struct wined3d_dummy_textures
     GLuint tex_2d_ms_array;
 };
 
+#define WINED3D_BO_FREE_LIST_MAX 256
+
+/* Upper bound on retired allocator blocks pending fence completion. When
+ * exceeded, fence completion is forced to drain the list, bounding RSS at
+ * the cost of occasional GPU stalls. Without this, a widened fence gap can
+ * cause unbounded accumulation (each retired block pins its 64 MiB chunk).
+ * See issue 46. */
+#define WINED3D_RETIRED_BLOCKS_MAX 4096
+
+struct wined3d_retired_bo_gl
+{
+    GLuint id;
+    GLsizeiptr size;
+    GLenum binding;
+    GLenum usage;
+    GLbitfield flags;
+    bool coherent;
+    uint64_t fence_id;
+};
+
 struct wined3d_device_gl
 {
     struct wined3d_device d;
@@ -879,6 +905,10 @@ struct wined3d_device_gl
     } *retired_blocks;
     SIZE_T retired_blocks_size;
     SIZE_T retired_block_count;
+
+    struct wined3d_retired_bo_gl *bo_free_list;
+    SIZE_T bo_free_list_size;
+    SIZE_T bo_free_list_count;
 
     HWND backup_wnd;
     HDC backup_dc;
