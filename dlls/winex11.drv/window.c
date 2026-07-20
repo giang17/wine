@@ -1171,7 +1171,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     Window group_leader = data->whole_window;
     HWND owner = NtUserGetWindowRelative( data->hwnd, GW_OWNER );
     Window owner_win = 0;
-    BOOL anchor_is_dcomp = FALSE;
+    BOOL owner_from_heuristic = FALSE, anchor_is_dcomp = FALSE;
     XWMHints *wm_hints;
 
     if (owner)
@@ -1224,7 +1224,15 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
             if (active_win)
             {
                 owner_win = active_win;
-                group_leader = active_win;
+                /* Issue 81: do NOT fold this ownerless window into the active
+                 * window's WM_HINTS window_group.  The transient_for set below
+                 * is enough for stacking; grouping ownerless TOOLWINDOWs (e.g.
+                 * JUCE/KM88 navigation panels) with the main window makes KWin
+                 * propagate _NET_WM_STATE_DEMANDS_ATTENTION from the group
+                 * members onto the taskbar entry persistently.  Native Windows
+                 * has no such propagation (TOOLWINDOWs carry no taskbar entry),
+                 * so leave group_leader at the per-window default. */
+                owner_from_heuristic = TRUE;
             }
             /* If the anchor (active window) is itself a DComp composition-swapchain
              * window — the continuously GL-presenting main window, e.g. KORG Trinity
@@ -1244,7 +1252,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     if (owner_win)
     {
         XSetTransientForHint( data->display, data->whole_window, owner_win );
-        group_leader = owner_win;
+        if (!owner_from_heuristic) group_leader = owner_win;
     }
 
     /* Only use dialog type for owned popups. Metacity allows making fullscreen
