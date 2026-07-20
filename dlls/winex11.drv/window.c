@@ -1223,15 +1223,14 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
             Window active_win = X11DRV_get_whole_window( active_root );
             if (active_win)
             {
-                owner_win = active_win;
-                /* Issue 81: do NOT fold this ownerless window into the active
-                 * window's WM_HINTS window_group.  The transient_for set below
-                 * is enough for stacking; grouping ownerless TOOLWINDOWs (e.g.
-                 * JUCE/KM88 navigation panels) with the main window makes KWin
-                 * propagate _NET_WM_STATE_DEMANDS_ATTENTION from the group
-                 * members onto the taskbar entry persistently.  Native Windows
-                 * has no such propagation (TOOLWINDOWs carry no taskbar entry),
-                 * so leave group_leader at the per-window default. */
+                /* Issue 81 + 82: do NOT set WM_TRANSIENT_FOR and do NOT fold
+                 * this window into the active window's WM_HINTS window_group.
+                 * KWin propagates _NET_WM_STATE_DEMANDS_ATTENTION both via
+                 * window_group (issue 81: persistent frame) AND via the
+                 * transient-parent (issue 82: frame while a menu popup is
+                 * open).  Vanilla sets neither on ownerless TOOLWINDOWs and has
+                 * neither problem; matching that here.  DComp popups still get
+                 * their anchor via the dcomp_popup_parent_prop path above. */
                 owner_from_heuristic = TRUE;
             }
             /* If the anchor (active window) is itself a DComp composition-swapchain
