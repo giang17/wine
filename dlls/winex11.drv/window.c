@@ -1294,7 +1294,20 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
                 || NtUserGetProp( NtUserGetDesktopWindow(), dcomp_active_prop ))
             window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
         else
-            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_UTILITY );
+            /* Issue 84: ownerless TOOLWINDOW popups of non-DComp apps (KM88
+             * Editor, other pure-D2D/JUCE standalone editors) use NORMAL, not
+             * UTILITY.  After the issue 82 fix these windows carry no
+             * WM_TRANSIENT_FOR, so a UTILITY type gives KWin no stacking anchor
+             * and the WM holds the window above normal windows → popups stay
+             * topmost over unrelated focused windows.  Vanilla upstream has no
+             * UTILITY branch here and leaves them NORMAL (no symptom).  Verified
+             * xprop custom-vs-vanilla on KM88: across all ownerless TOOLWINDOW
+             * children only _NET_WM_WINDOW_TYPE differs (UTILITY vs NORMAL);
+             * transient_for, window_group and _NET_WM_STATE are identical.
+             * DComp apps (Trinity standalone via anchor_is_dcomp, embedded IFX
+             * popups via the desktop dcomp_active flag) still take DROPDOWN_MENU
+             * above, so issue 2 / popup-flicker coverage is unchanged. */
+            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
     }
     else
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
