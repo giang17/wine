@@ -261,6 +261,48 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
             WARN("Releasing fullscreen swapchain.\n");
             IDXGIOutput_Release(swapchain->target);
         }
+        /* Tear down DComp composition-window subclassing/props before the
+         * swapchain is freed.  A reblit timer on a *surviving* plugin window
+         * would otherwise fire and dereference this freed swapchain pointer
+         * (use-after-free).  Window properties are server-side and safe to
+         * remove cross-thread, so the swapchain back-reference is always
+         * broken; the window-owning operations (KillTimer, WndProc restore,
+         * DestroyWindow) only run when Release happens on the window's own UI
+         * thread, where they are valid. */
+        if (swapchain->target_hwnd)
+        {
+            HWND t = swapchain->target_hwnd;
+
+            RemovePropW(t, L"__wine_dcomp_swapchain");
+            if (IsWindow(t) && GetWindowThreadProcessId(t, NULL) == GetCurrentThreadId())
+            {
+                WNDPROC orig = (WNDPROC)GetPropW(t, L"__wine_dcomp_orig_wndproc");
+
+                KillTimer(t, DCOMP_REBLIT_TIMER_ID);
+                KillTimer(t, DCOMP_POPUP_REBLIT_TIMER_ID);
+                if (orig)
+                    SetWindowLongPtrW(t, GWLP_WNDPROC, (LONG_PTR)orig);
+                RemovePropW(t, L"__wine_dcomp_orig_wndproc");
+                RemovePropW(t, L"__wine_dcomp_comp_dc");
+                RemovePropW(t, L"__wine_dcomp_comp_size");
+                RemovePropW(t, L"__wine_dcomp_comp_bits");
+                InterlockedDecrement(&dcomp_subclassed_target_count);
+            }
+            swapchain->target_hwnd = NULL;
+        }
+        if (swapchain->comp_wnd)
+        {
+            WCHAR prop_name[64];
+
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    L"__wine_dcomp_wnd_%I64x", (UINT_PTR)iface);
+            RemovePropW(GetDesktopWindow(), prop_name);
+            RemovePropW(swapchain->comp_wnd, L"__wine_dcomp_swapchain");
+            if (IsWindow(swapchain->comp_wnd)
+                    && GetWindowThreadProcessId(swapchain->comp_wnd, NULL) == GetCurrentThreadId())
+                DestroyWindow(swapchain->comp_wnd);
+            swapchain->comp_wnd = NULL;
+        }
         IWineDXGIFactory_Release(swapchain->factory);
         wined3d_swapchain_decref(swapchain->wined3d_swapchain);
         IWineDXGIDevice_Release(device);
@@ -346,7 +388,12 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
     }
 
     if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, NULL, sync_interval, 0)))
+    {
+        /* Back-buffer copy for FLIP_SEQUENTIAL/FLIP_DISCARD is now handled
+         * inside the wined3d CS present handler (wined3d_cs_exec_present). */
+
         InterlockedIncrement(&swapchain->present_count);
+    }
     return hr;
 }
 
@@ -659,7 +706,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetDesc1(IDXGISwapChain4 *iface
     wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &wined3d_desc);
     wined3d_mutex_unlock();
 
-    FIXME("Ignoring Stereo, Scaling and AlphaMode.\n");
+    FIXME("Ignoring Stereo and Scaling.\n");
 
     desc->Width = wined3d_desc.backbuffer_width;
     desc->Height = wined3d_desc.backbuffer_height;
@@ -671,7 +718,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetDesc1(IDXGISwapChain4 *iface
     desc->BufferCount = wined3d_desc.backbuffer_count;
     desc->Scaling = DXGI_SCALING_STRETCH;
     desc->SwapEffect = dxgi_swap_effect_from_wined3d(wined3d_desc.swap_effect);
-    desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    desc->AlphaMode = swapchain->alpha_mode;
     desc->Flags = dxgi_swapchain_flags_from_wined3d(wined3d_desc.flags);
 
     return S_OK;
@@ -738,8 +785,17 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_Present1(IDXGISwapChain4 *iface
     TRACE("iface %p, sync_interval %u, flags %#x, present_parameters %p.\n",
             iface, sync_interval, flags, present_parameters);
 
-    if (present_parameters)
-        FIXME("Ignored present parameters %p.\n", present_parameters);
+    /* Pass dirty rects to wined3d for partial GDI blit (DComp composition). */
+    if (present_parameters && present_parameters->DirtyRectsCount > 0
+            && present_parameters->pDirtyRects)
+    {
+        wined3d_swapchain_set_dirty_rects(swapchain->wined3d_swapchain,
+                present_parameters->pDirtyRects, present_parameters->DirtyRectsCount);
+    }
+    else
+    {
+        wined3d_swapchain_set_dirty_rects(swapchain->wined3d_swapchain, NULL, 0);
+    }
 
     return d3d11_swapchain_present(swapchain, sync_interval, flags);
 }
@@ -838,6 +894,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetMaximumFrameLatency(IDXGISwa
 static HANDLE STDMETHODCALLTYPE d3d11_swapchain_GetFrameLatencyWaitableObject(IDXGISwapChain4 *iface)
 {
     struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
+
 
     TRACE("iface %p.\n", iface);
 

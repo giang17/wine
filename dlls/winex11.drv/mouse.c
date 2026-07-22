@@ -190,6 +190,32 @@ static Cursor get_empty_cursor(void)
 }
 
 /***********************************************************************
+ *		get_default_cursor
+ *
+ * Return a shared visible arrow cursor used as the initial cursor for newly
+ * created windows.  Without it a window keeps the X11 default of inheriting
+ * its parent's cursor; this breaks for cross-process embedded surfaces (e.g.
+ * WebView2/Chromium content windows) which never call SetCursor and whose
+ * inheritance chain to the owner window is severed once the window manager
+ * reparents the toplevel into a frame, leaving the cursor blank.
+ */
+Cursor get_default_cursor(void)
+{
+    static Cursor cursor;
+
+    if (!cursor)
+    {
+        Cursor new = XCreateFontCursor( gdi_display, XC_left_ptr );
+        /* flush so the cursor is known to the server before another display
+           connection (create_whole_window uses data->display) references it */
+        XFlush( gdi_display );
+        if (InterlockedCompareExchangePointer( (void **)&cursor, (void *)new, 0 ))
+            XFreeCursor( gdi_display, new );
+    }
+    return cursor;
+}
+
+/***********************************************************************
  *		set_window_cursor
  */
 static void set_window_cursor( Window window, HCURSOR handle )
