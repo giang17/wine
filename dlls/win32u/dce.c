@@ -548,7 +548,7 @@ W32KAPI struct window_surface *window_surface_create( UINT size, const struct wi
 
     pthread_mutex_init( &surface->mutex, NULL );
 
-    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
+    memset( window_surface_get_color( surface, info ), 0x00, info->bmiHeader.biSizeImage );
 
     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
     return surface;
