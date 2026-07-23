@@ -842,9 +842,14 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                 swapchain->surface_valid = FALSE;
             }
 
-            /* First frame: full copy to comp buffer AND surface_bits. */
+            /* First frame: full copy to comp buffer AND surface_bits.
+             * Copy the FULL backbuffer, not the present's src_rect: with
+             * dirty-rect presents src_rect covers only the changed region,
+             * and stretching that partial region over the whole window
+             * produced a distorted/blank frame on every resize (issue 88).
+             * Flip/sequential backbuffers always hold the complete frame. */
             StretchBlt(swapchain->comp_dc, 0, 0, dst_w, dst_h,
-                    src_dc, src_rect->left, src_rect->top, src_w, src_h, SRCCOPY);
+                    src_dc, 0, 0, create_desc.Width, create_desc.Height, SRCCOPY);
             if (swapchain->surface_bits && swapchain->comp_bits)
             {
                 GdiFlush();
