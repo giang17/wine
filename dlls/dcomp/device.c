@@ -82,6 +82,7 @@ static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp
  * target-side composite in dcomp_target_composite_tree(). */
 #define DCOMP_TREE_TIMER     ((UINT_PTR)0xDC0FFEE2)
 #define DCOMP_TREE_TIMER_MS  100
+#define DCOMP_TREE_FRAME_MS  16   /* ~60 Hz rate limit for hook-driven composites */
 
 static void dcomp_send_child_mode(IUnknown *content)
 {
@@ -1421,6 +1422,8 @@ struct dcomp_target
     UINT comp_width, comp_height;
     BOOL comp_needs_full_present;         /* force a full BitBlt on first present after DIB (re)create */
     LONGLONG last_present_qpc;            /* QPC of last actual present — drives ~60 Hz coalescing (issue 56) */
+    BOOL foreign;                         /* target hwnd belongs to another process — no subclass, hook-driven compositing (issue 88) */
+    DWORD last_tree_composite_tick;       /* GetTickCount of last hook-driven tree composite (~60 Hz rate limit) */
     /* WndProc subclass for WM_ERASEBKGND / WM_PAINT protection (Phase 5) */
     WNDPROC orig_wndproc;
 };
@@ -1647,6 +1650,8 @@ static ULONG STDMETHODCALLTYPE dcomp_device_Release(IDCompositionDevice *iface)
     return refcount;
 }
 
+static void dcomp_target_composite_tree(struct dcomp_target *target);
+
 /* Depth-first leaf serialization with accumulated offsets. The visual's own
  * offset positions its whole subtree (DComp semantics), so it is added on
  * entry. A content-bearing visual is serialized before its children (children
@@ -1743,10 +1748,25 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
     SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)(ULONG_PTR)idx);
 
     /* Rootless tree (Chromium): no root Present will ever composite the
-     * leaves — drive the target-side composite periodically instead. With a
-     * content-bearing root the swapchain Present path handles it. */
+     * leaves. In-process targets get the 100ms timer as backstop; foreign-
+     * process targets cannot be subclassed, so their only drive is this
+     * hook (Chromium calls SetContent per frame). The hook-driven composite
+     * also runs for in-process targets — rate-limited to ~60 Hz — so page
+     * updates don't wait for the timer. With a content-bearing root the
+     * swapchain Present path handles compositing. */
     if (idx > 0 && !root->content && !root->surface_content)
-        SetTimer(target_hwnd, DCOMP_TREE_TIMER, DCOMP_TREE_TIMER_MS, NULL);
+    {
+        struct dcomp_target *target = (struct dcomp_target *)GetPropW(target_hwnd, dcomp_target_prop);
+        DWORD now = GetTickCount();
+
+        if (target && !target->foreign)
+            SetTimer(target_hwnd, DCOMP_TREE_TIMER, DCOMP_TREE_TIMER_MS, NULL);
+        if (target && now - target->last_tree_composite_tick >= DCOMP_TREE_FRAME_MS)
+        {
+            target->last_tree_composite_tick = now;
+            dcomp_target_composite_tree(target);
+        }
+    }
     else
         KillTimer(target_hwnd, DCOMP_TREE_TIMER);
 
@@ -1940,8 +1960,18 @@ static void dcomp_target_composite_tree(struct dcomp_target *target)
     if (target->comp_bits)
     {
         static unsigned int comp_tree_log;
+        HDC hdc_win = GetDC(target->hwnd);
 
-        memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
+        /* Capture the live window content as backdrop: transparent page
+         * areas must show what is behind (loader artwork / host content),
+         * not opaque black (issue 88). Falls back to black when the capture
+         * fails (e.g. unreadable foreign window DC). */
+        if (!hdc_win || !BitBlt(target->comp_dc, 0, 0, rc.right, rc.bottom,
+                hdc_win, 0, 0, SRCCOPY))
+            memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
+        if (hdc_win)
+            ReleaseDC(target->hwnd, hdc_win);
+
         for (child = root->children; child; child = child->next_sibling)
             dcomp_target_composite_leaves(target, child,
                     (int)root->offset_x, (int)root->offset_y);
@@ -2392,6 +2422,28 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
      * zero the class-wide GCLP_HBRBACKGROUND, which would also affect unrelated
      * windows sharing the class. */
     SetPropW(hwnd, dcomp_target_prop, (HANDLE)object);
+
+    /* Cross-process targets (e.g. Tauri/WebView2 helper targeting a window
+     * owned by the main process, issue 88): do NOT subclass. The installed
+     * WndProc would live in this process, so every BeginPaint in the owner
+     * process would try to send WM_ERASEBKGND across the process boundary —
+     * wineserver cannot pack it (HDC payload) and the owner's paint loop
+     * wedges. Foreign targets are composited from the AddVisual/SetContent
+     * hooks instead (plain GDI ops work cross-process). */
+    {
+        DWORD pid = 0;
+
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid && pid != GetCurrentProcessId())
+        {
+            object->foreign = TRUE;
+            FIXME("Created composition target %p for hwnd %p (foreign process %lu, no subclass).\n",
+                    object, hwnd, pid);
+            *target = &object->IDCompositionTarget_iface;
+            return S_OK;
+        }
+    }
+
     object->orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd,
             GWLP_WNDPROC, (LONG_PTR)dcomp_target_wndproc);
 
