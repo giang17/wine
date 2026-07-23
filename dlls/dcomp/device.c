@@ -76,6 +76,13 @@ struct dcomp_target;
 static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp_target *target);
 
 /* Send child mode message to a swapchain's comp window */
+/* Periodic tree compositing for rootless trees (Chromium/WebView2, issue 88):
+ * the root visual carries no content, the swapchains hang on nested leaf
+ * visuals, so no root Present ever composites them. The timer drives the
+ * target-side composite in dcomp_target_composite_tree(). */
+#define DCOMP_TREE_TIMER     ((UINT_PTR)0xDC0FFEE2)
+#define DCOMP_TREE_TIMER_MS  100
+
 static void dcomp_send_child_mode(IUnknown *content)
 {
     WCHAR prop_name[64];
@@ -1156,6 +1163,18 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
     else
         dcomp_send_child_mode(visual->content);
 
+    /* Chromium swaps swapchain content on an existing leaf visual per frame.
+     * Re-serialize the tree so the target's child props track the current
+     * comp window (the AddVisual hook only fires on tree changes). */
+    {
+        struct dcomp_visual *root = visual;
+
+        while (root->parent)
+            root = root->parent;
+        if (root->target_hwnd)
+            dcomp_commit_visual_tree(root->target_hwnd, root);
+    }
+
     return S_OK;
 }
 
@@ -1453,6 +1472,10 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         if (target->device)
             dcomp_device_remove_target(target->device, target);
 
+        /* Stop tree compositing (safe even if the hwnd is already gone) */
+        if (target->hwnd)
+            KillTimer(target->hwnd, DCOMP_TREE_TIMER);
+
         /* Remove WndProc subclass (Phase 5) */
         if (target->orig_wndproc && target->hwnd && IsWindow(target->hwnd))
         {
@@ -1624,95 +1647,112 @@ static ULONG STDMETHODCALLTYPE dcomp_device_Release(IDCompositionDevice *iface)
     return refcount;
 }
 
+/* Depth-first leaf serialization with accumulated offsets. The visual's own
+ * offset positions its whole subtree (DComp semantics), so it is added on
+ * entry. A content-bearing visual is serialized before its children (children
+ * render on top). Container visuals (no content) only pass offsets down. */
+static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp_visual *visual,
+        int base_x, int base_y, unsigned int idx)
+{
+    WCHAR prop_name[64];
+    struct dcomp_visual *child;
+    int vx = base_x + (int)visual->offset_x;
+    int vy = base_y + (int)visual->offset_y;
+
+    if (idx >= 16)
+        return idx;
+
+    /* Surface content: store bits pointer and size directly.
+     * No window indirection needed — wined3d reads bits directly. */
+    if (visual->surface_content)
+    {
+        struct dcomp_surface *surf = visual->surface_content;
+
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_child_%u_wnd", idx);
+        SetPropW(target_hwnd, prop_name, (HANDLE)0);
+
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_child_%u_bits", idx);
+        SetPropW(target_hwnd, prop_name, (HANDLE)surf->bits);
+
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_child_%u_size", idx);
+        SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(surf->width, surf->height));
+
+        /* Pack offset as two signed 16-bit values */
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_child_%u_offset", idx);
+        SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
+
+        ++idx;
+    }
+    else if (visual->content)
+    {
+        /* Swapchain content: look up the visual's composition window */
+        HWND child_comp_wnd;
+
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_wnd_%I64x", (UINT_PTR)visual->content);
+        child_comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
+        if (child_comp_wnd)
+        {
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    L"__wine_dcomp_child_%u_wnd", idx);
+            SetPropW(target_hwnd, prop_name, (HANDLE)child_comp_wnd);
+
+            /* Pack offset as two signed 16-bit values */
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    L"__wine_dcomp_child_%u_offset", idx);
+            SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
+
+            ++idx;
+        }
+    }
+
+    for (child = visual->children; child && idx < 16; child = child->next_sibling)
+        idx = dcomp_serialize_visual_leaves(target_hwnd, child, vx, vy, idx);
+
+    return idx;
+}
+
 static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root)
 {
-    struct dcomp_visual *child;
-    WCHAR prop_name[64];
     unsigned int idx = 0;
 
     if (!root || !root->children || !target_hwnd)
     {
         if (target_hwnd)
+        {
             SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)0);
+            KillTimer(target_hwnd, DCOMP_TREE_TIMER);
+        }
         return;
     }
 
-    for (child = root->children; child && idx < 16; child = child->next_sibling)
+    /* The root's own content is presented by its swapchain/surface path and
+     * must NOT be serialized as a child (it would composite onto itself) —
+     * start the walk at its children. */
     {
-        HWND child_comp_wnd;
-
-        if (!child->content && !child->surface_content)
-            continue;
-
-        /* Surface content: store bits pointer and size directly.
-         * No window indirection needed — wined3d reads bits directly. */
-        if (child->surface_content)
-        {
-            struct dcomp_surface *surf = child->surface_content;
-
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_wnd", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)0);
-
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_bits", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)surf->bits);
-
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_size", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(surf->width, surf->height));
-
-            /* Pack offset as two signed 16-bit values */
-            {
-                int ox = (int)child->offset_x;
-                int oy = (int)child->offset_y;
-                swprintf(prop_name, ARRAY_SIZE(prop_name),
-                        L"__wine_dcomp_child_%u_offset", idx);
-                SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(ox, oy));
-            }
-
-            {
-                static unsigned int surf_log;
-                ++surf_log;
-                if (surf_log <= 10)
-                    FIXME("Commit surface child #%u: %ux%u bits=%p at (%d,%d).\n",
-                            idx, surf->width, surf->height, surf->bits,
-                            (int)child->offset_x, (int)child->offset_y);
-            }
-
-            ++idx;
-            continue;
-        }
-
-        /* Swapchain content: look up the child's composition window */
-        /* Look up the child's composition window (same mechanism as try_reparent) */
-        swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_wnd_%I64x", (UINT_PTR)child->content);
-        child_comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
-        if (!child_comp_wnd)
-            continue;
-
-        swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_child_%u_wnd", idx);
-        SetPropW(target_hwnd, prop_name, (HANDLE)child_comp_wnd);
-
-        /* Pack offset as two signed 16-bit values */
-        {
-            int ox = (int)child->offset_x;
-            int oy = (int)child->offset_y;
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_offset", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(ox, oy));
-        }
-
-        ++idx;
+        struct dcomp_visual *child;
+        for (child = root->children; child && idx < 16; child = child->next_sibling)
+            idx = dcomp_serialize_visual_leaves(target_hwnd, child,
+                    (int)root->offset_x, (int)root->offset_y, idx);
     }
 
     SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)(ULONG_PTR)idx);
 
+    /* Rootless tree (Chromium): no root Present will ever composite the
+     * leaves — drive the target-side composite periodically instead. With a
+     * content-bearing root the swapchain Present path handles it. */
+    if (idx > 0 && !root->content && !root->surface_content)
+        SetTimer(target_hwnd, DCOMP_TREE_TIMER, DCOMP_TREE_TIMER_MS, NULL);
+    else
+        KillTimer(target_hwnd, DCOMP_TREE_TIMER);
+
     {
         static unsigned int commit_count;
-        if (++commit_count <= 5)
+        if (++commit_count <= 5 || !(commit_count % 100))
             FIXME("Commit #%u: serialized %u child visuals for target %p.\n",
                     commit_count, idx, target_hwnd);
     }
@@ -1783,6 +1823,144 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
 
     FIXME("Created comp DC %p with %ux%u DIB for target hwnd %p.\n",
             target->comp_dc, width, height, target->hwnd);
+}
+
+/* -------------------------------------------------------------------------
+ * Target-side tree compositing for rootless visual trees (Chromium/WebView2,
+ * issue 88). When the root visual carries no content of its own, no root
+ * Present ever runs, so the serialized leaf visuals would stay invisible.
+ * dcomp_target_composite_tree() walks the tree like the serializer, fetches
+ * each leaf's comp bits (DComp surface: bits directly; swapchain content:
+ * the __wine_dcomp_comp_bits/__wine_dcomp_comp_size props wined3d maintains
+ * on the leaf's hidden comp window in child mode) and Porter-Duff-Over-
+ * composites them into the target DIB, then blits to the target window.
+ * Driven by DCOMP_TREE_TIMER (armed by dcomp_commit_visual_tree) and by
+ * WM_PAINT on the target hwnd.
+ */
+
+static void dcomp_composite_premul_over(DWORD *dst_bits, UINT dst_w, UINT dst_h,
+        const DWORD *src_bits, UINT src_w, UINT src_h, int ox, int oy)
+{
+    int src_x = (ox < 0) ? -ox : 0;
+    int src_y = (oy < 0) ? -oy : 0;
+    int dst_x = (ox < 0) ? 0 : ox;
+    int dst_y = (oy < 0) ? 0 : oy;
+    int copy_w = min((int)src_w - src_x, (int)dst_w - dst_x);
+    int copy_h = min((int)src_h - src_y, (int)dst_h - dst_y);
+    int x, y;
+
+    if (copy_w <= 0 || copy_h <= 0)
+        return;
+
+    for (y = 0; y < copy_h; y++)
+    {
+        DWORD *dst_row = dst_bits + (dst_y + y) * dst_w + dst_x;
+        const DWORD *src_row = src_bits + (src_y + y) * src_w + src_x;
+        for (x = 0; x < copy_w; x++)
+        {
+            DWORD s = src_row[x];
+            BYTE sa = (s >> 24);
+            if (sa == 0xff)
+            {
+                dst_row[x] = s;
+            }
+            else if (sa > 0)
+            {
+                /* Premultiplied alpha: out = src + dst * (1 - sa/255) */
+                DWORD d = dst_row[x];
+                BYTE ia = 255 - sa;
+                dst_row[x] = ((min(sa + (((d >> 24) * ia + 127) / 255), 255u)) << 24)
+                           | ((((s >> 16) & 0xff) + ((((d >> 16) & 0xff) * ia + 127) / 255)) << 16)
+                           | ((((s >> 8) & 0xff) + ((((d >> 8) & 0xff) * ia + 127) / 255)) << 8)
+                           | (((s & 0xff) + (((d & 0xff) * ia + 127) / 255)));
+            }
+        }
+    }
+}
+
+static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dcomp_visual *visual,
+        int base_x, int base_y)
+{
+    struct dcomp_visual *child;
+    int vx = base_x + (int)visual->offset_x;
+    int vy = base_y + (int)visual->offset_y;
+
+    if (visual->surface_content && visual->surface_content->bits)
+    {
+        dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
+                visual->surface_content->bits, visual->surface_content->width,
+                visual->surface_content->height, vx, vy);
+    }
+    else if (visual->content)
+    {
+        WCHAR prop_name[64];
+        HWND comp_wnd;
+        DWORD *bits;
+        ULONG_PTR dims;
+
+        /* Same lookup the serializer uses: comp window via desktop prop. */
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_wnd_%I64x", (UINT_PTR)visual->content);
+        comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
+        if (comp_wnd)
+        {
+            bits = (DWORD *)GetPropW(comp_wnd, L"__wine_dcomp_comp_bits");
+            dims = (ULONG_PTR)GetPropW(comp_wnd, L"__wine_dcomp_comp_size");
+            if (bits && dims)
+                dcomp_composite_premul_over(target->comp_bits, target->comp_width,
+                        target->comp_height, bits, LOWORD(dims), HIWORD(dims), vx, vy);
+        }
+    }
+
+    for (child = visual->children; child; child = child->next_sibling)
+        dcomp_target_composite_leaves(target, child, vx, vy);
+}
+
+static void dcomp_target_composite_tree(struct dcomp_target *target)
+{
+    struct dcomp_visual *root;
+    struct dcomp_visual *child;
+    RECT rc;
+    HDC hdc;
+
+    if (!target->device || !target->hwnd || !IsWindow(target->hwnd))
+        return;
+    root = target->root_visual;
+    /* Content-bearing roots composite their children via their own Present —
+     * this path is only for rootless trees (Chromium/WebView2). */
+    if (!root || root->content || root->surface_content)
+        return;
+
+    GetClientRect(target->hwnd, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0)
+        return;
+
+    EnterCriticalSection(&target->device->cs);
+    dcomp_target_ensure_comp_dc(target, rc.right, rc.bottom);
+    if (target->comp_bits)
+    {
+        static unsigned int comp_tree_log;
+
+        memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
+        for (child = root->children; child; child = child->next_sibling)
+            dcomp_target_composite_leaves(target, child,
+                    (int)root->offset_x, (int)root->offset_y);
+
+        if (++comp_tree_log <= 5 || !(comp_tree_log % 100))
+            FIXME("Composited visual tree #%u onto target hwnd %p (%ldx%ld).\n",
+                    comp_tree_log, target->hwnd, (long)rc.right, (long)rc.bottom);
+    }
+    LeaveCriticalSection(&target->device->cs);
+
+    if (target->comp_dc)
+    {
+        hdc = GetDC(target->hwnd);
+        if (hdc)
+        {
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, target->comp_dc, 0, 0, SRCCOPY);
+            ReleaseDC(target->hwnd, hdc);
+        }
+    }
 }
 
 #define DCOMP_COALESCE_TIMER  ((UINT_PTR)0xDC0FFEE1)
@@ -2073,10 +2251,35 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             }
             return 0;
         }
+        /* Rootless-tree compositing (issue 88): the leaves present into their
+         * hidden comp windows independently; we re-compose them onto the
+         * target window periodically. */
+        if (wparam == DCOMP_TREE_TIMER)
+        {
+            dcomp_target_composite_tree(target);
+            return 0;
+        }
+        break;
+
+    case WM_PAINT:
+        /* Rootless tree (issue 88): repaint from the composed tree instead of
+         * the original wndproc (which would show the empty/loader content).
+         * Content-bearing roots keep the VSTGUI paint path. */
+        if (target->root_visual && !target->root_visual->content
+                && !target->root_visual->surface_content)
+        {
+            PAINTSTRUCT ps;
+
+            dcomp_target_composite_tree(target);
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
         break;
 
     case WM_NCDESTROY:
         /* Window is being destroyed — clean up subclass and forward */
+        KillTimer(hwnd, DCOMP_TREE_TIMER);
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig_wndproc);
         RemovePropW(hwnd, dcomp_target_prop);
         target->orig_wndproc = NULL;
