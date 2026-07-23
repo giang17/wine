@@ -1396,6 +1396,15 @@ static void dcomp_visual_try_reparent(struct dcomp_visual *visual)
      * wined3d_swapchain_set_window, which triggers lazy GL context rebinding. */
     SendMessageW(comp_wnd, WM_WINE_DCOMP_SET_TARGET, 0, (LPARAM)visual->target_hwnd);
 
+    /* DWM composes swapchain content into the target's background — always
+     * below child windows. Our comp window is a real child window and would
+     * otherwise land on top of the sibling stack, covering e.g. the WebView2/
+     * Chromium child window with the loader's placeholder (issue 88: grey box
+     * over the EPROM login UI, z-fight on every resize). Single-child plugin
+     * targets are unaffected by HWND_BOTTOM. */
+    SetWindowPos(comp_wnd, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
     FIXME("Requested swapchain window switch from %p to target %p.\n",
             comp_wnd, visual->target_hwnd);
 }
