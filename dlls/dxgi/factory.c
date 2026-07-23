@@ -628,33 +628,36 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
 
         case WM_PAINT:
         {
-            PAINTSTRUCT ps;
-            HDC comp_dc = (HDC)GetPropW(hwnd, L"__wine_dcomp_comp_dc");
-            LPARAM dims = (LPARAM)GetPropW(hwnd, L"__wine_dcomp_comp_size");
-
-            BeginPaint(hwnd, &ps);
-            if (comp_dc && dims)
-            {
-                unsigned int w = LOWORD(dims);
-                unsigned int h = HIWORD(dims);
-                BitBlt(ps.hdc, 0, 0, w, h, comp_dc, 0, 0, SRCCOPY);
-                {
-                    static unsigned int paint_count;
-                    ++paint_count;
-                    if (paint_count <= 5 || !(paint_count % 200))
-                        FIXME("WM_PAINT #%u: hwnd %p %ux%u, comp_dc=%p.\n",
-                                paint_count, hwnd, w, h, comp_dc);
-                }
-            }
+            /* Forward WM_PAINT to the app's original wndproc FIRST.  DComp
+             * plugins whose UI is paint-driven (EPROM's WebView2 loader only
+             * re-renders on WM_SIZE/WM_PAINT, not on a timer) otherwise never
+             * get their invalidation callback: hover/click state changes call
+             * InvalidateRect, the generated WM_PAINT was swallowed here, and
+             * the UI stayed frozen until the next resize forced a WM_SIZE
+             * redraw.  The app's paint may trigger a re-render + Present,
+             * which updates the comp buffer as a side effect.  Its own
+             * BeginPaint sends WM_ERASEBKGND, which this subclass still
+             * suppresses (returns 1), so no background erase happens.
+             *
+             * Afterwards re-blit the comp buffer via GetDC (NOT BeginPaint:
+             * the app's EndPaint already validated the update region, so a
+             * second BeginPaint would return an empty clip region and eat
+             * our blit) so the swapchain content stays on top of whatever
+             * the app painted. */
+            if (orig)
+                CallWindowProcW(orig, hwnd, msg, wparam, lparam);
             else
+                DefWindowProcW(hwnd, msg, wparam, lparam);
+
             {
-                static unsigned int paint_null;
-                ++paint_null;
-                if (paint_null <= 3)
-                    FIXME("WM_PAINT: no comp buffer for hwnd %p (dc=%p dims=%#Ix).\n",
-                            hwnd, comp_dc, (ULONG_PTR)dims);
+                static unsigned int paint_count;
+                ++paint_count;
+                if (paint_count <= 5 || !(paint_count % 200))
+                    FIXME("WM_PAINT #%u (forwarded): hwnd %p, comp_dc=%p.\n",
+                            paint_count, hwnd,
+                            (HDC)GetPropW(hwnd, L"__wine_dcomp_comp_dc"));
             }
-            EndPaint(hwnd, &ps);
+            dcomp_reblit_comp_buffer(hwnd, "paint");
             ValidateRect(hwnd, NULL);
             return 0;
         }
