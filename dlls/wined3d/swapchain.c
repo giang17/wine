@@ -848,23 +848,15 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                 swapchain->surface_valid = FALSE;
             }
 
-            /* First frame: full copy to comp buffer AND surface_bits.
-             * Copy the FULL backbuffer, not the present's src_rect: with
-             * dirty-rect presents src_rect covers only the changed region,
-             * and stretching that partial region over the whole window
-             * produced a distorted/blank frame on every resize (issue 88).
-             * Flip/sequential backbuffers always hold the complete frame. */
-            StretchBlt(swapchain->comp_dc, 0, 0, dst_w, dst_h,
-                    src_dc, 0, 0, create_desc.Width, create_desc.Height, SRCCOPY);
-            if (swapchain->surface_bits && swapchain->comp_bits)
-            {
-                GdiFlush();
-                memcpy(swapchain->surface_bits, swapchain->comp_bits,
-                        dst_w * dst_h * sizeof(DWORD));
-                swapchain->surface_valid = TRUE;
-            }
+            /* No content guess on recreate: copying the full backbuffer pulls
+             * stale frames after a resize or window switch (flip buffers still
+             * hold the previous window's frame — FL Studio tab-stale), and
+             * stretching the present's src_rect over the whole buffer distorts
+             * dirty-rect presents (issue 88 resize).  The DIB is
+             * zero-initialized; the regular dirty-/full-present paths below
+             * fill it from this present's actual content. */
         }
-        else if (swapchain->cs_present_dirty_rect_count > 0)
+        if (swapchain->cs_present_dirty_rect_count > 0)
         {
             /* Dirty rects: accumulate only changed regions into comp buffer.
              * Use alpha-aware copy to preserve existing content under transparent
