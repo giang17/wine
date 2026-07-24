@@ -413,6 +413,32 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_BeginDraw(IDCompositionSurface *i
         return S_OK;
     }
 
+    if (IsEqualGUID(iid, &IID_ID3D11Texture2D))
+    {
+        /* Chromium's DCompSurfaceImageBacking draws through BeginDraw with
+         * IID_ID3D11Texture2D (issue 95).  Hand out the persistent D3D11
+         * render target; EndDraw accumulates the dirty region and the
+         * throttled present reads it back like the DXGI-surface path. */
+        if (!surface->texture)
+        {
+            WARN("Surface has no D3D11 texture.\n");
+            return E_FAIL;
+        }
+        ID3D11Texture2D_AddRef(surface->texture);
+        *object = surface->texture;
+        surface->drawing = TRUE;
+        offset->x = rect ? rect->left : 0;
+        offset->y = rect ? rect->top : 0;
+        /* Temporary REACHED marker (issue 95) — remove after the human render test. */
+        {
+            static unsigned int begindraw_tex_count;
+            if (++begindraw_tex_count <= 10 || !(begindraw_tex_count % 200))
+                FIXME("DCOMP-REACHED begindraw-d3d11-texture #%u: surface %p (%ux%u).\n",
+                        begindraw_tex_count, surface, surface->width, surface->height);
+        }
+        return S_OK;
+    }
+
     FIXME("Unsupported IID %s for BeginDraw.\n", debugstr_guid(iid));
     return E_NOINTERFACE;
 }
@@ -1329,6 +1355,137 @@ static const IDCompositionTextureVtbl dcomp_texture_vtbl =
     dcomp_texture_GetAvailableFence,
 };
 
+/* Dynamic texture (issue 95): a visual-content indirection whose current
+ * composition texture is swapped per frame via SetTexture (Chromium's
+ * Runtime-150 delegated-compositing path enters here right after
+ * CheckCompositionTextureSupport). */
+struct dcomp_dynamic_texture
+{
+    IDCompositionDynamicTexture IDCompositionDynamicTexture_iface;
+    LONG refcount;
+    struct dcomp_texture *texture;    /* current content, holds an interface ref */
+};
+
+static inline struct dcomp_dynamic_texture *impl_from_IDCompositionDynamicTexture(IDCompositionDynamicTexture *iface)
+{
+    return CONTAINING_RECORD(iface, struct dcomp_dynamic_texture, IDCompositionDynamicTexture_iface);
+}
+
+static const IDCompositionDynamicTextureVtbl dcomp_dynamic_texture_vtbl;
+
+/* Type check for SetContent, like unsafe_impl_from_IDCompositionTexture. */
+static struct dcomp_dynamic_texture *unsafe_impl_from_IDCompositionDynamicTexture(IDCompositionDynamicTexture *iface)
+{
+    if (!iface || iface->lpVtbl != &dcomp_dynamic_texture_vtbl)
+        return NULL;
+    return impl_from_IDCompositionDynamicTexture(iface);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_dynamic_texture_QueryInterface(IDCompositionDynamicTexture *iface,
+        REFIID iid, void **out)
+{
+    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IUnknown)
+            || IsEqualGUID(iid, &IID_IDCompositionDynamicTexture))
+    {
+        *out = iface;
+        IDCompositionDynamicTexture_AddRef(iface);
+        return S_OK;
+    }
+
+    FIXME("unsupported iid %s.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_dynamic_texture_AddRef(IDCompositionDynamicTexture *iface)
+{
+    struct dcomp_dynamic_texture *dynamic = impl_from_IDCompositionDynamicTexture(iface);
+    ULONG refcount = InterlockedIncrement(&dynamic->refcount);
+
+    TRACE("%p increasing refcount to %lu.\n", dynamic, refcount);
+    return refcount;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_dynamic_texture_Release(IDCompositionDynamicTexture *iface)
+{
+    struct dcomp_dynamic_texture *dynamic = impl_from_IDCompositionDynamicTexture(iface);
+    ULONG refcount = InterlockedDecrement(&dynamic->refcount);
+
+    TRACE("%p decreasing refcount to %lu.\n", dynamic, refcount);
+    if (!refcount)
+    {
+        if (dynamic->texture)
+            IDCompositionTexture_Release(&dynamic->texture->IDCompositionTexture_iface);
+        free(dynamic);
+    }
+    return refcount;
+}
+
+static HRESULT dcomp_dynamic_texture_set_texture(struct dcomp_dynamic_texture *dynamic,
+        IDCompositionTexture *texture, ULONG_PTR rect_count)
+{
+    struct dcomp_texture *impl = NULL;
+
+    if (texture && !(impl = unsafe_impl_from_IDCompositionTexture(texture)))
+    {
+        FIXME("texture %p is not one of our composition textures.\n", texture);
+        return E_INVALIDARG;
+    }
+
+    if (impl)
+        IDCompositionTexture_AddRef(texture);
+    if (dynamic->texture)
+        IDCompositionTexture_Release(&dynamic->texture->IDCompositionTexture_iface);
+    dynamic->texture = impl;
+
+    /* Force a fresh readback so the next tree composite shows this frame. */
+    if (impl)
+        impl->last_readback_tick = 0;
+
+    /* Temporary REACHED marker (issue 95) — remove after the human render test. */
+    {
+        static unsigned int set_texture_count;
+        if (++set_texture_count <= 10 || !(set_texture_count % 200))
+            FIXME("DCOMP-REACHED dynamic-set-texture #%u (dynamic %p, texture %p %ux%u, rects %Iu).\n",
+                    set_texture_count, dynamic, impl,
+                    impl ? impl->desc.Width : 0, impl ? impl->desc.Height : 0, rect_count);
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_dynamic_texture_SetTexture(IDCompositionDynamicTexture *iface,
+        IDCompositionTexture *texture, const D2D_RECT_L *rects, ULONG_PTR rect_count)
+{
+    struct dcomp_dynamic_texture *dynamic = impl_from_IDCompositionDynamicTexture(iface);
+
+    TRACE("iface %p, texture %p, rects %p, rect_count %Iu.\n", iface, texture, rects, rect_count);
+
+    /* The dirty rects are an optimization only; the readback compositor
+     * refreshes the full texture. */
+    return dcomp_dynamic_texture_set_texture(dynamic, texture, rect_count);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_dynamic_texture_SetTextureFull(IDCompositionDynamicTexture *iface,
+        IDCompositionTexture *texture)
+{
+    struct dcomp_dynamic_texture *dynamic = impl_from_IDCompositionDynamicTexture(iface);
+
+    TRACE("iface %p, texture %p.\n", iface, texture);
+
+    return dcomp_dynamic_texture_set_texture(dynamic, texture, 0);
+}
+
+static const IDCompositionDynamicTextureVtbl dcomp_dynamic_texture_vtbl =
+{
+    dcomp_dynamic_texture_QueryInterface,
+    dcomp_dynamic_texture_AddRef,
+    dcomp_dynamic_texture_Release,
+    dcomp_dynamic_texture_SetTexture,
+    dcomp_dynamic_texture_SetTextureFull,
+};
+
 struct dcomp_visual
 {
     IDCompositionVisual IDCompositionVisual_iface;
@@ -1336,6 +1493,7 @@ struct dcomp_visual
     IUnknown *content;
     struct dcomp_surface *surface_content; /* non-NULL if content is a DComp surface */
     struct dcomp_texture *texture_content; /* non-NULL if content is a composition texture */
+    struct dcomp_dynamic_texture *dynamic_content; /* non-NULL if content is a dynamic texture */
     HWND target_hwnd;
     /* Visual tree */
     float offset_x;
@@ -1349,6 +1507,17 @@ struct dcomp_visual
 static inline struct dcomp_visual *impl_from_IDCompositionVisual(IDCompositionVisual *iface)
 {
     return CONTAINING_RECORD(iface, struct dcomp_visual, IDCompositionVisual_iface);
+}
+
+/* The composition texture a visual currently shows: direct texture content,
+ * or the dynamic texture's current frame (issue 95). */
+static inline struct dcomp_texture *dcomp_visual_effective_texture(struct dcomp_visual *visual)
+{
+    if (visual->texture_content)
+        return visual->texture_content;
+    if (visual->dynamic_content)
+        return visual->dynamic_content->texture;
+    return NULL;
 }
 
 static void dcomp_visual_try_reparent(struct dcomp_visual *visual);
@@ -1599,8 +1768,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
     visual->content = content;
     visual->surface_content = NULL;
     visual->texture_content = NULL;
+    visual->dynamic_content = NULL;
     if (content)
     {
+        IDCompositionDynamicTexture *dynamic_iface;
         IDCompositionTexture *texture_iface;
 
         IUnknown_AddRef(content);
@@ -1627,13 +1798,24 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
                     visual->texture_content ? visual->texture_content->desc.Width : 0,
                     visual->texture_content ? visual->texture_content->desc.Height : 0);
         }
+        /* ... or a dynamic texture (issue 95) */
+        else if (SUCCEEDED(IUnknown_QueryInterface(content, &IID_IDCompositionDynamicTexture,
+                (void **)&dynamic_iface)))
+        {
+            visual->dynamic_content = unsafe_impl_from_IDCompositionDynamicTexture(dynamic_iface);
+            IDCompositionDynamicTexture_Release(dynamic_iface);
+            /* Temporary REACHED marker (issue 95) — remove after the human render test. */
+            FIXME("DCOMP-REACHED setcontent-dynamic: visual %p, dynamic %p (current texture %p).\n",
+                    visual, visual->dynamic_content,
+                    visual->dynamic_content ? visual->dynamic_content->texture : NULL);
+        }
     }
 
     /* Only redirect root visuals (no parent) to target_hwnd.
      * Child visuals keep their hidden comp window; the root's
      * Present composites them via Porter-Duff Over.
      * Surface content does not need swapchain reparenting. */
-    if (visual->surface_content || visual->texture_content)
+    if (visual->surface_content || visual->texture_content || visual->dynamic_content)
     {
         /* Surface/texture content: no swapchain to reparent. The composition
          * integration happens through direct bits in commit_visual_tree. */
@@ -2208,11 +2390,12 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
 
         ++idx;
     }
-    else if (visual->texture_content)
+    else if (dcomp_visual_effective_texture(visual))
     {
-        /* Composition texture (issue 90): serialize the throttled CPU
-         * readback like surface bits — wined3d consumes it unchanged. */
-        struct dcomp_texture *tex = visual->texture_content;
+        /* Composition texture (issue 90) or dynamic texture's current frame
+         * (issue 95): serialize the throttled CPU readback like surface
+         * bits — wined3d consumes it unchanged. */
+        struct dcomp_texture *tex = dcomp_visual_effective_texture(visual);
 
         dcomp_texture_ensure_bits(tex);
         if (tex->bits)
@@ -2521,10 +2704,10 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
                 visual->surface_content->bits, visual->surface_content->width,
                 visual->surface_content->height, vx, vy);
     }
-    else if (visual->texture_content)
+    else if (dcomp_visual_effective_texture(visual))
     {
-        /* Composition texture leaf (issue 90) */
-        struct dcomp_texture *tex = visual->texture_content;
+        /* Composition texture leaf (issue 90) or dynamic texture frame (issue 95) */
+        struct dcomp_texture *tex = dcomp_visual_effective_texture(visual);
 
         dcomp_texture_ensure_bits(tex);
         if (tex->bits)
@@ -4127,13 +4310,32 @@ static HRESULT STDMETHODCALLTYPE dcomp_device4_CreateCompositionTexture(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device5_CreateDynamicTexture(
-        IDCompositionDevice5 *iface, void **texture)
+        IDCompositionDevice5 *iface, IDCompositionDynamicTexture **texture)
 {
-    FIXME("iface %p, texture %p stub!\n", iface, texture);
+    struct dcomp_dynamic_texture *object;
 
-    if (texture)
-        *texture = NULL;
-    return E_NOTIMPL;
+    TRACE("iface %p, texture %p.\n", iface, texture);
+
+    if (!texture)
+        return E_POINTER;
+    *texture = NULL;
+
+    if (!(object = calloc(1, sizeof(*object))))
+        return E_OUTOFMEMORY;
+
+    object->IDCompositionDynamicTexture_iface.lpVtbl = &dcomp_dynamic_texture_vtbl;
+    object->refcount = 1;
+
+    /* Temporary REACHED marker (issue 95) — remove after the human render test. */
+    {
+        static unsigned int create_dynamic_count;
+        if (++create_dynamic_count <= 5 || !(create_dynamic_count % 100))
+            FIXME("DCOMP-REACHED create-dynamic-texture #%u (dynamic %p).\n",
+                    create_dynamic_count, object);
+    }
+
+    *texture = &object->IDCompositionDynamicTexture_iface;
+    return S_OK;
 }
 
 static const IDCompositionDevice5Vtbl dcomp_device5_vtbl =
@@ -4222,6 +4424,23 @@ static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void 
             object, rendering_device, object->d2d1_device);
 
     return IDCompositionDevice_QueryInterface(&object->IDCompositionDevice_iface, iid, device);
+}
+
+HRESULT WINAPI DCompositionCreateSurfaceHandle(DWORD desired_access,
+        SECURITY_ATTRIBUTES *security_attributes, HANDLE *surface_handle)
+{
+    /* Temporary probe (issue 95): the export was a spec stub, so a
+     * GetProcAddress feature check by Chromium failed silently.  Hand out a
+     * plain event handle so caller-side NULL checks pass; the consumers
+     * (CreateSurfaceFromHandle, CreateSwapChainForCompositionSurfaceHandle)
+     * carry their own FIXME markers and still fail visibly. */
+    FIXME("DCOMP-PROBE create-surface-handle: access %#lx, sa %p, out %p.\n",
+            desired_access, security_attributes, surface_handle);
+
+    if (!surface_handle)
+        return E_INVALIDARG;
+    *surface_handle = CreateEventW(security_attributes, FALSE, FALSE, NULL);
+    return *surface_handle ? S_OK : E_FAIL;
 }
 
 HRESULT WINAPI DCompositionCreateDevice(IDXGIDevice *dxgi_device, REFIID iid, void **device)

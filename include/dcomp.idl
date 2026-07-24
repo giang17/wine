@@ -717,15 +717,29 @@ interface IDCompositionDevice4 : IDCompositionDevice3
 
 [
     object,
+    uuid(a1de1d3f-6405-447f-8e95-1383a34b0277),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionDynamicTexture : IUnknown
+{
+    /* Two SetTexture overloads in the SDK; vtbl order follows the MSVC
+     * binary layout (mingw-w64 non-MSVC branch): the rect variant first.
+     * The rect-less slot is named SetTextureFull here since IDL cannot
+     * overload. */
+    HRESULT SetTexture(IDCompositionTexture *texture, const D2D_RECT_L *rects, ULONG_PTR rect_count);
+    HRESULT SetTextureFull(IDCompositionTexture *texture);
+}
+
+[
+    object,
     uuid(2c6bebfe-a603-472f-af34-d2443356e61b),
     local,
     pointer_default(unique)
 ]
 interface IDCompositionDevice5 : IDCompositionDevice4
 {
-    /* IDCompositionDynamicTexture ** in the Windows SDK; the interface is
-     * not defined here yet. */
-    HRESULT CreateDynamicTexture(void **texture);
+    HRESULT CreateDynamicTexture(IDCompositionDynamicTexture **texture);
 }
 
 [
