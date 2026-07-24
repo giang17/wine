@@ -691,6 +691,45 @@ interface IDCompositionDevice3 : IDCompositionDevice2
 
 [
     object,
+    uuid(929bb1aa-725f-433b-abd7-273075a835f2),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionTexture : IUnknown
+{
+    HRESULT SetSourceRect(const D2D_RECT_U *source_rect);
+    HRESULT SetColorSpace(DXGI_COLOR_SPACE_TYPE color_space);
+    HRESULT SetAlphaMode(DXGI_ALPHA_MODE alpha_mode);
+    HRESULT GetAvailableFence(UINT64 *fence_value, REFIID iid, void **available_fence);
+}
+
+[
+    object,
+    uuid(85fc5cca-2da6-494c-86b6-4a775c049b8a),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionDevice4 : IDCompositionDevice3
+{
+    HRESULT CheckCompositionTextureSupport(IUnknown *rendering_device, BOOL *supported);
+    HRESULT CreateCompositionTexture(IUnknown *d3d_texture, IDCompositionTexture **texture);
+}
+
+[
+    object,
+    uuid(2c6bebfe-a603-472f-af34-d2443356e61b),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionDevice5 : IDCompositionDevice4
+{
+    /* IDCompositionDynamicTexture ** in the Windows SDK; the interface is
+     * not defined here yet. */
+    HRESULT CreateDynamicTexture(void **texture);
+}
+
+[
+    object,
     uuid(5f4633fe-1e08-4cb8-8c75-ce24333f5602),
     local,
     pointer_default(unique)
