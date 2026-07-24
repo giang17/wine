@@ -78,6 +78,12 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
         swapchain->surface_valid = FALSE;
     }
 
+    if (swapchain->dcomp_present_event)
+    {
+        CloseHandle(swapchain->dcomp_present_event);
+        swapchain->dcomp_present_event = NULL;
+    }
+
     wined3d_swapchain_state_cleanup(&swapchain->state);
     wined3d_swapchain_set_gamma_ramp(swapchain, 0, &swapchain->orig_gamma);
 
@@ -1045,6 +1051,20 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
             if (!BitBlt(swapchain->dc, dst_rect->left, dst_rect->top, dst_w, dst_h,
                     swapchain->comp_dc, 0, 0, SRCCOPY))
                 WARN("Failed to blit composition buffer to window.\n");
+
+            /* Present-sync for cross-process DComp trees (issue 88 ordering):
+             * wake the dcomp compositor in the content process so its rootless
+             * visual tree is re-composited over this fresh root frame instead
+             * of staying overwritten until the next tree commit. */
+            if (!swapchain->dcomp_present_event)
+            {
+                WCHAR event_name[64];
+                swprintf(event_name, ARRAY_SIZE(event_name), L"__wine_dcomp_present_%I64x",
+                        (UINT64)(UINT_PTR)swapchain->win_handle);
+                swapchain->dcomp_present_event = CreateEventW(NULL, FALSE, FALSE, event_name);
+            }
+            if (swapchain->dcomp_present_event)
+                SetEvent(swapchain->dcomp_present_event);
         }
 
         /* Store comp_dc as window property so WM_PAINT can re-blit. Don't

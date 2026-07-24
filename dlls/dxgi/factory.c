@@ -411,6 +411,22 @@ static void dcomp_reblit_comp_buffer(HWND hwnd, const char *reason)
                         reblit_count, hwnd, w, h, reason);
             BitBlt(hdc, 0, 0, w, h, comp_dc, 0, 0, SRCCOPY);
             ReleaseDC(hwnd, hdc);
+
+            /* Present-sync for cross-process DComp trees (issue 88 ordering):
+             * this re-blit overwrote the window just like a root present, so
+             * wake the dcomp compositor in the content process too. */
+            {
+                WCHAR event_name[64];
+                HANDLE event;
+
+                swprintf(event_name, ARRAY_SIZE(event_name), L"__wine_dcomp_present_%I64x",
+                        (UINT64)(UINT_PTR)hwnd);
+                if ((event = CreateEventW(NULL, FALSE, FALSE, event_name)))
+                {
+                    SetEvent(event);
+                    CloseHandle(event);
+                }
+            }
         }
     }
     else

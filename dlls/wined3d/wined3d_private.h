@@ -4190,6 +4190,11 @@ struct wined3d_swapchain
     unsigned int surface_width;
     unsigned int surface_height;
     BOOL surface_valid;
+
+    /* Present-sync event for cross-process DComp trees (issue 88 ordering):
+     * signaled after every root blit so the dcomp compositor in the content
+     * process can re-composite its visual tree over the fresh frame. */
+    HANDLE dcomp_present_event;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);

@@ -1914,6 +1914,12 @@ struct dcomp_target
     DWORD last_tree_composite_tick;       /* GetTickCount of last hook-driven tree composite (~60 Hz rate limit) */
     /* WndProc subclass for WM_ERASEBKGND / WM_PAINT protection (Phase 5) */
     WNDPROC orig_wndproc;
+    /* Present-sync compositing for foreign targets (issue 88 ordering fix):
+     * the window-owning process signals composite_event after every root
+     * present; composite_thread re-composites the tree over the fresh frame. */
+    HANDLE composite_thread;
+    HANDLE composite_event;
+    volatile LONG composite_stop;
 };
 
 static inline struct dcomp_target *impl_from_IDCompositionTarget(IDCompositionTarget *iface)
@@ -1959,6 +1965,18 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
 
     if (!refcount)
     {
+        /* Stop the present-sync composite thread before tearing anything
+         * down — it dereferences target and target->device. */
+        if (target->composite_thread)
+        {
+            target->composite_stop = 1;
+            SetEvent(target->composite_event);
+            WaitForSingleObject(target->composite_thread, 500);
+            CloseHandle(target->composite_thread);
+        }
+        if (target->composite_event)
+            CloseHandle(target->composite_event);
+
         /* Remove from device's target list */
         if (target->device)
             dcomp_device_remove_target(target->device, target);
@@ -2247,6 +2265,45 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
     return idx;
 }
 
+/* Present-sync compositor thread for foreign-process targets (issue 88
+ * ordering fix): the root window's swapchain present (wined3d, running in
+ * the window-owning process) signals a named auto-reset event after every
+ * blit; this thread re-composites the rootless visual tree over the fresh
+ * root frame so it is not left overwritten until the next tree commit.
+ * Composites only once the root has gone QUIET: painting over the window
+ * between the presents of an actively presenting root (Chromium at ~60 Hz)
+ * ping-pongs the on-screen content between "fresh frame without tree" and
+ * "tree over previous frame" — visible flicker (FL Studio / Memory Rites
+ * regression).  Actively presenting windows are kept current by the
+ * commit-driven composite path instead. */
+static DWORD WINAPI dcomp_target_composite_thread_proc(void *param)
+{
+    struct dcomp_target *target = param;
+
+    while (!target->composite_stop)
+    {
+        if (WaitForSingleObject(target->composite_event, INFINITE) != WAIT_OBJECT_0)
+            break;
+        if (target->composite_stop)
+            break;
+
+        /* Quiescence gate: wait until two frame periods pass without another
+         * present signal, then composite exactly once over the final frame.
+         * Static trees whose root presents rarely (issue 88) get their
+         * composite right after the present that overwrote them. */
+        while (!target->composite_stop
+                && WaitForSingleObject(target->composite_event,
+                        2 * DCOMP_TREE_FRAME_MS) == WAIT_OBJECT_0)
+            ;
+
+        if (target->composite_stop || !target->device)
+            break;
+        target->last_tree_composite_tick = GetTickCount();
+        dcomp_target_composite_tree(target);
+    }
+    return 0;
+}
+
 static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root)
 {
     unsigned int idx = 0;
@@ -2287,6 +2344,26 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
 
         if (target && !target->foreign)
             SetTimer(target_hwnd, DCOMP_TREE_TIMER, DCOMP_TREE_TIMER_MS, NULL);
+        /* Present-sync thread (issue 88 ordering fix) for ALL rootless
+         * targets: foreign windows cannot use SetTimer at all, and even
+         * in-process targets may live on a thread that never dispatches
+         * WM_TIMER (Chromium's D3D window thread has no message pump), so
+         * the timer alone cannot keep the tree composited over the root
+         * swapchain presents. */
+        if (target && !target->composite_thread)
+        {
+            WCHAR event_name[64];
+
+            swprintf(event_name, ARRAY_SIZE(event_name), L"__wine_dcomp_present_%I64x",
+                    (UINT64)(UINT_PTR)target->hwnd);
+            if (!target->composite_event)
+                target->composite_event = CreateEventW(NULL, FALSE, FALSE, event_name);
+            if (target->composite_event)
+                target->composite_thread = CreateThread(NULL, 0,
+                        dcomp_target_composite_thread_proc, target, 0, NULL);
+            FIXME("Present-sync composite thread %p for foreign target %p (hwnd %p).\n",
+                    target->composite_thread, target, target->hwnd);
+        }
         if (target && now - target->last_tree_composite_tick >= DCOMP_TREE_FRAME_MS)
         {
             target->last_tree_composite_tick = now;
@@ -2433,6 +2510,13 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
 
     if (visual->surface_content && visual->surface_content->bits)
     {
+        /* Temporary leaf census (issue 88 ordering diagnosis). */
+        {
+            static unsigned int surface_leaf_count;
+            if (++surface_leaf_count <= 5 || !(surface_leaf_count % 200))
+                FIXME("DCOMP-LEAF surface #%u (%ux%u at %d,%d).\n", surface_leaf_count,
+                        visual->surface_content->width, visual->surface_content->height, vx, vy);
+        }
         dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
                 visual->surface_content->bits, visual->surface_content->width,
                 visual->surface_content->height, vx, vy);
@@ -2465,6 +2549,13 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
         swprintf(prop_name, ARRAY_SIZE(prop_name),
                 L"__wine_dcomp_wnd_%I64x", (UINT_PTR)visual->content);
         comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
+        /* Temporary leaf census (issue 88 ordering diagnosis). */
+        {
+            static unsigned int content_leaf_count;
+            if (++content_leaf_count <= 5 || !(content_leaf_count % 200))
+                FIXME("DCOMP-LEAF content #%u (content %p, comp_wnd %p, at %d,%d).\n",
+                        content_leaf_count, visual->content, comp_wnd, vx, vy);
+        }
         if (comp_wnd)
         {
             bits = (DWORD *)GetPropW(comp_wnd, L"__wine_dcomp_comp_bits");
