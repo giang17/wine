@@ -29,6 +29,7 @@
 #include "objidl.h"
 #include "dxgi.h"
 #include "d3d11.h"
+#include "d3d11_4.h"
 #include "d2d1_1.h"
 #include "dcomp.h"
 #include "wine/debug.h"
@@ -866,12 +867,475 @@ static const IDCompositionSurfaceFactoryVtbl dcomp_surface_factory_vtbl =
  * IDCompositionVisual
  * ===================================================================== */
 
+/* =====================================================================
+ * IDCompositionTexture (issue 90) — raw D3D11 textures as visual content.
+ *
+ * Chromium's viz compositor promotes page content into a delegated-
+ * compositing layer after a few frames and feeds it through composition
+ * textures instead of the root swapchain. The texture object wraps the
+ * app's ID3D11Texture2D and keeps a throttled CPU readback (BGRA,
+ * premultiplied) that the tree-composite and serializer paths consume
+ * exactly like DComp surface bits.
+ * ===================================================================== */
+
+/* Always-signaled ID3D11Fence for IDCompositionTexture::GetAvailableFence.
+ * Wine's d3d11 cannot create real fences (CreateFence is a stub), but
+ * Chromium CHECK-fails on any GetAvailableFence result other than
+ * S_OK + non-NULL fence. Our composition readback is CPU-synchronous,
+ * so the texture is always immediately available: GetCompletedValue()
+ * returns the fence value handed out by GetAvailableFence (0), which
+ * callers interpret as "nothing to wait for". */
+struct dcomp_fence
+{
+    ID3D11Fence ID3D11Fence_iface;
+    LONG refcount;
+    ID3D11Device *device;   /* device of the wrapped texture, for GetDevice */
+};
+
+static inline struct dcomp_fence *impl_from_ID3D11Fence(ID3D11Fence *iface)
+{
+    return CONTAINING_RECORD(iface, struct dcomp_fence, ID3D11Fence_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_fence_QueryInterface(ID3D11Fence *iface,
+        REFIID iid, void **out)
+{
+    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IUnknown)
+            || IsEqualGUID(iid, &IID_ID3D11DeviceChild)
+            || IsEqualGUID(iid, &IID_ID3D11Fence))
+    {
+        *out = iface;
+        ID3D11Fence_AddRef(iface);
+        return S_OK;
+    }
+
+    FIXME("unsupported iid %s.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_fence_AddRef(ID3D11Fence *iface)
+{
+    struct dcomp_fence *fence = impl_from_ID3D11Fence(iface);
+    ULONG refcount = InterlockedIncrement(&fence->refcount);
+
+    TRACE("%p, refcount %lu.\n", iface, refcount);
+    return refcount;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_fence_Release(ID3D11Fence *iface)
+{
+    struct dcomp_fence *fence = impl_from_ID3D11Fence(iface);
+    ULONG refcount = InterlockedDecrement(&fence->refcount);
+
+    TRACE("%p, refcount %lu.\n", iface, refcount);
+
+    if (!refcount)
+    {
+        if (fence->device)
+            ID3D11Device_Release(fence->device);
+        free(fence);
+    }
+    return refcount;
+}
+
+static void STDMETHODCALLTYPE dcomp_fence_GetDevice(ID3D11Fence *iface, ID3D11Device **device)
+{
+    struct dcomp_fence *fence = impl_from_ID3D11Fence(iface);
+
+    TRACE("iface %p, device %p.\n", iface, device);
+
+    *device = fence->device;
+    if (*device)
+        ID3D11Device_AddRef(*device);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_fence_GetPrivateData(ID3D11Fence *iface,
+        REFGUID guid, UINT *data_size, void *data)
+{
+    FIXME("iface %p, guid %s, data_size %p, data %p stub!\n", iface, debugstr_guid(guid),
+            data_size, data);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_fence_SetPrivateData(ID3D11Fence *iface,
+        REFGUID guid, UINT data_size, const void *data)
+{
+    FIXME("iface %p, guid %s, data_size %u, data %p stub!\n", iface, debugstr_guid(guid),
+            data_size, data);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_fence_SetPrivateDataInterface(ID3D11Fence *iface,
+        REFGUID guid, const IUnknown *data)
+{
+    FIXME("iface %p, guid %s, data %p stub!\n", iface, debugstr_guid(guid), data);
+    return E_NOTIMPL;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_fence_CreateSharedHandle(ID3D11Fence *iface,
+        const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle)
+{
+    FIXME("iface %p, attributes %p, access %#lx, name %s, handle %p stub!\n",
+            iface, attributes, access, debugstr_w(name), handle);
+    return E_NOTIMPL;
+}
+
+static UINT64 STDMETHODCALLTYPE dcomp_fence_GetCompletedValue(ID3D11Fence *iface)
+{
+    TRACE("iface %p.\n", iface);
+
+    /* Matches the value GetAvailableFence reports: the texture is always
+     * immediately available (CPU-synchronous composite). */
+    return 0;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_fence_SetEventOnCompletion(ID3D11Fence *iface,
+        UINT64 value, HANDLE event)
+{
+    TRACE("iface %p, value %s, event %p.\n", iface, wine_dbgstr_longlong(value), event);
+
+    if (event)
+        SetEvent(event);
+    return S_OK;
+}
+
+static const ID3D11FenceVtbl dcomp_fence_vtbl =
+{
+    dcomp_fence_QueryInterface,
+    dcomp_fence_AddRef,
+    dcomp_fence_Release,
+    dcomp_fence_GetDevice,
+    dcomp_fence_GetPrivateData,
+    dcomp_fence_SetPrivateData,
+    dcomp_fence_SetPrivateDataInterface,
+    dcomp_fence_CreateSharedHandle,
+    dcomp_fence_GetCompletedValue,
+    dcomp_fence_SetEventOnCompletion,
+};
+
+struct dcomp_texture
+{
+    IDCompositionTexture IDCompositionTexture_iface;
+    LONG refcount;
+    ID3D11Texture2D *texture;         /* wrapped app texture */
+    D3D11_TEXTURE2D_DESC desc;        /* cached at creation */
+    D2D_RECT_U source_rect;
+    BOOL has_source_rect;
+    DXGI_ALPHA_MODE alpha_mode;
+    DXGI_COLOR_SPACE_TYPE color_space;
+    ID3D11Texture2D *staging;         /* cached CPU-readable copy */
+    DWORD *bits;                      /* BGRA premultiplied readback (source_rect window) */
+    UINT bits_width, bits_height;
+    DWORD last_readback_tick;         /* ~60 Hz readback throttle */
+    struct dcomp_fence *fence;        /* lazy, always-signaled */
+    BOOL multithread_set;             /* ID3D11Multithread protection enabled once */
+    BOOL format_warned;
+};
+
+static inline struct dcomp_texture *impl_from_IDCompositionTexture(IDCompositionTexture *iface)
+{
+    return CONTAINING_RECORD(iface, struct dcomp_texture, IDCompositionTexture_iface);
+}
+
+static const IDCompositionTextureVtbl dcomp_texture_vtbl;
+
+/* Type check for SetContent: only objects created by our
+ * CreateCompositionTexture carry dcomp_texture_vtbl. */
+static struct dcomp_texture *unsafe_impl_from_IDCompositionTexture(IDCompositionTexture *iface)
+{
+    if (!iface || iface->lpVtbl != &dcomp_texture_vtbl)
+        return NULL;
+    return impl_from_IDCompositionTexture(iface);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_texture_QueryInterface(IDCompositionTexture *iface,
+        REFIID iid, void **out)
+{
+    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IUnknown)
+            || IsEqualGUID(iid, &IID_IDCompositionTexture))
+    {
+        *out = iface;
+        IDCompositionTexture_AddRef(iface);
+        return S_OK;
+    }
+
+    FIXME("unsupported iid %s.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_texture_AddRef(IDCompositionTexture *iface)
+{
+    struct dcomp_texture *texture = impl_from_IDCompositionTexture(iface);
+    ULONG refcount = InterlockedIncrement(&texture->refcount);
+
+    TRACE("%p, refcount %lu.\n", iface, refcount);
+    return refcount;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_texture_Release(IDCompositionTexture *iface)
+{
+    struct dcomp_texture *texture = impl_from_IDCompositionTexture(iface);
+    ULONG refcount = InterlockedDecrement(&texture->refcount);
+
+    TRACE("%p, refcount %lu.\n", iface, refcount);
+
+    if (!refcount)
+    {
+        if (texture->fence)
+            ID3D11Fence_Release(&texture->fence->ID3D11Fence_iface);
+        if (texture->staging)
+            ID3D11Texture2D_Release(texture->staging);
+        if (texture->texture)
+            ID3D11Texture2D_Release(texture->texture);
+        free(texture->bits);
+        free(texture);
+    }
+    return refcount;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_texture_SetSourceRect(IDCompositionTexture *iface,
+        const D2D_RECT_U *source_rect)
+{
+    struct dcomp_texture *texture = impl_from_IDCompositionTexture(iface);
+
+    if (!source_rect)
+        return E_POINTER;
+
+    TRACE("iface %p, source_rect (%u,%u)-(%u,%u).\n", iface,
+            source_rect->left, source_rect->top, source_rect->right, source_rect->bottom);
+
+    if (!texture->has_source_rect || memcmp(&texture->source_rect, source_rect, sizeof(*source_rect)))
+    {
+        texture->source_rect = *source_rect;
+        texture->has_source_rect = TRUE;
+        texture->last_readback_tick = 0;  /* window changed — force re-readback */
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_texture_SetColorSpace(IDCompositionTexture *iface,
+        DXGI_COLOR_SPACE_TYPE color_space)
+{
+    struct dcomp_texture *texture = impl_from_IDCompositionTexture(iface);
+
+    TRACE("iface %p, color_space %d.\n", iface, color_space);
+
+    texture->color_space = color_space;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_texture_SetAlphaMode(IDCompositionTexture *iface,
+        DXGI_ALPHA_MODE alpha_mode)
+{
+    struct dcomp_texture *texture = impl_from_IDCompositionTexture(iface);
+
+    TRACE("iface %p, alpha_mode %d.\n", iface, alpha_mode);
+
+    texture->alpha_mode = alpha_mode;
+    texture->last_readback_tick = 0;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_texture_GetAvailableFence(IDCompositionTexture *iface,
+        UINT64 *fence_value, REFIID iid, void **available_fence)
+{
+    struct dcomp_texture *texture = impl_from_IDCompositionTexture(iface);
+
+    /* Temporary REACHED marker (issue 90) — remove after the human render test.
+     * Chromium calls this when ending an overlay read access and CHECK-fails
+     * on anything other than S_OK + non-NULL fence. */
+    {
+        static unsigned int fence_count;
+        if (++fence_count <= 5 || !(fence_count % 100))
+            FIXME("DCOMP-REACHED get-available-fence #%u (texture %p, iid %s).\n",
+                    fence_count, iface, debugstr_guid(iid));
+    }
+
+    if (!fence_value || !available_fence)
+        return E_POINTER;
+
+    if (!texture->fence)
+    {
+        struct dcomp_fence *fence;
+
+        if (!(fence = calloc(1, sizeof(*fence))))
+            return E_OUTOFMEMORY;
+        fence->ID3D11Fence_iface.lpVtbl = &dcomp_fence_vtbl;
+        fence->refcount = 1;
+        if (texture->texture)
+            ID3D11Texture2D_GetDevice(texture->texture, &fence->device);
+        texture->fence = fence;
+    }
+
+    *fence_value = 0;
+    return ID3D11Fence_QueryInterface(&texture->fence->ID3D11Fence_iface, iid, available_fence);
+}
+
+/* Throttled CPU readback of the wrapped texture (~60 Hz, like
+ * last_tree_composite_tick). Fills texture->bits with the BGRA
+ * premultiplied source_rect window; both the tree-composite and the
+ * serializer path consume the buffer like DComp surface bits. */
+static void dcomp_texture_ensure_bits(struct dcomp_texture *texture)
+{
+    D3D11_TEXTURE2D_DESC staging_desc;
+    D3D11_MAPPED_SUBRESOURCE map;
+    ID3D11DeviceContext *context;
+    ID3D11Device *device;
+    UINT x, y, w, h, row;
+    BOOL swizzle = FALSE;
+    DWORD now = GetTickCount();
+    HRESULT hr;
+
+    if (texture->bits && now - texture->last_readback_tick < DCOMP_TREE_FRAME_MS)
+        return;
+    texture->last_readback_tick = now;
+
+    switch (texture->desc.Format)
+    {
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            break;
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+            swizzle = TRUE;
+            break;
+        default:
+            if (!texture->format_warned)
+            {
+                texture->format_warned = TRUE;
+                FIXME("Unsupported texture format %#x — leaf skipped.\n", texture->desc.Format);
+            }
+            return;
+    }
+
+    /* source_rect window, clamped to the texture bounds */
+    x = y = 0;
+    w = texture->desc.Width;
+    h = texture->desc.Height;
+    if (texture->has_source_rect)
+    {
+        x = min(texture->source_rect.left, texture->desc.Width);
+        y = min(texture->source_rect.top, texture->desc.Height);
+        w = min(texture->source_rect.right, texture->desc.Width) - x;
+        h = min(texture->source_rect.bottom, texture->desc.Height) - y;
+        if ((int)w <= 0 || (int)h <= 0)
+            return;
+    }
+
+    if (texture->bits && (texture->bits_width != w || texture->bits_height != h))
+    {
+        free(texture->bits);
+        texture->bits = NULL;
+    }
+    if (!texture->bits)
+    {
+        if (!(texture->bits = calloc((SIZE_T)w * h, sizeof(DWORD))))
+            return;
+        texture->bits_width = w;
+        texture->bits_height = h;
+    }
+
+    ID3D11Texture2D_GetDevice(texture->texture, &device);
+    ID3D11Device_GetImmediateContext(device, &context);
+
+    /* Chromium uses the D3D11 device from multiple threads — make the
+     * context calls below safe. (Wine's immediate context only answers
+     * ID3D11Multithread, not ID3D10Multithread.) */
+    if (!texture->multithread_set)
+    {
+        ID3D11Multithread *multithread;
+
+        texture->multithread_set = TRUE;
+        if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(context,
+                &IID_ID3D11Multithread, (void **)&multithread)))
+        {
+            ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+            ID3D11Multithread_Release(multithread);
+        }
+        else
+            WARN("No ID3D11Multithread on the immediate context.\n");
+    }
+
+    if (!texture->staging)
+    {
+        staging_desc = texture->desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_desc.MiscFlags = 0;
+        if (FAILED(hr = ID3D11Device_CreateTexture2D(device, &staging_desc, NULL, &texture->staging)))
+        {
+            WARN("Failed to create staging texture, hr %#lx.\n", hr);
+            goto done;
+        }
+    }
+
+    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)texture->staging,
+            (ID3D11Resource *)texture->texture);
+
+    if (FAILED(hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)texture->staging, 0,
+            D3D11_MAP_READ, 0, &map)))
+    {
+        WARN("Failed to map staging texture, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    for (row = 0; row < h; row++)
+    {
+        const DWORD *src = (const DWORD *)((const BYTE *)map.pData + (SIZE_T)(y + row) * map.RowPitch) + x;
+        DWORD *dst = texture->bits + (SIZE_T)row * w;
+        UINT i;
+
+        if (!swizzle && texture->alpha_mode != DXGI_ALPHA_MODE_IGNORE)
+        {
+            memcpy(dst, src, (SIZE_T)w * sizeof(DWORD));
+            continue;
+        }
+        for (i = 0; i < w; i++)
+        {
+            DWORD s = src[i];
+
+            if (swizzle)  /* RGBA -> BGRA */
+                s = (s & 0xff00ff00) | ((s & 0x00ff0000) >> 16) | ((s & 0x000000ff) << 16);
+            if (texture->alpha_mode == DXGI_ALPHA_MODE_IGNORE)
+                s |= 0xff000000;
+            dst[i] = s;
+        }
+    }
+
+    ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)texture->staging, 0);
+
+done:
+    ID3D11DeviceContext_Release(context);
+    ID3D11Device_Release(device);
+}
+
+static const IDCompositionTextureVtbl dcomp_texture_vtbl =
+{
+    dcomp_texture_QueryInterface,
+    dcomp_texture_AddRef,
+    dcomp_texture_Release,
+    dcomp_texture_SetSourceRect,
+    dcomp_texture_SetColorSpace,
+    dcomp_texture_SetAlphaMode,
+    dcomp_texture_GetAvailableFence,
+};
+
 struct dcomp_visual
 {
     IDCompositionVisual IDCompositionVisual_iface;
     LONG refcount;
     IUnknown *content;
     struct dcomp_surface *surface_content; /* non-NULL if content is a DComp surface */
+    struct dcomp_texture *texture_content; /* non-NULL if content is a composition texture */
     HWND target_hwnd;
     /* Visual tree */
     float offset_x;
@@ -1134,8 +1598,11 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
 
     visual->content = content;
     visual->surface_content = NULL;
+    visual->texture_content = NULL;
     if (content)
     {
+        IDCompositionTexture *texture_iface;
+
         IUnknown_AddRef(content);
 
         /* Check if the content is one of our DComp surfaces */
@@ -1148,15 +1615,27 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
                     visual, visual->surface_content,
                     visual->surface_content->width, visual->surface_content->height);
         }
+        /* ... or one of our composition textures (issue 90) */
+        else if (SUCCEEDED(IUnknown_QueryInterface(content, &IID_IDCompositionTexture,
+                (void **)&texture_iface)))
+        {
+            visual->texture_content = unsafe_impl_from_IDCompositionTexture(texture_iface);
+            IDCompositionTexture_Release(texture_iface);
+            /* Temporary REACHED marker (issue 90) — remove after the human render test. */
+            FIXME("DCOMP-REACHED setcontent-texture: visual %p, texture %p (%ux%u).\n",
+                    visual, visual->texture_content,
+                    visual->texture_content ? visual->texture_content->desc.Width : 0,
+                    visual->texture_content ? visual->texture_content->desc.Height : 0);
+        }
     }
 
     /* Only redirect root visuals (no parent) to target_hwnd.
      * Child visuals keep their hidden comp window; the root's
      * Present composites them via Porter-Duff Over.
      * Surface content does not need swapchain reparenting. */
-    if (visual->surface_content)
+    if (visual->surface_content || visual->texture_content)
     {
-        /* Surface content: no swapchain to reparent. The composition
+        /* Surface/texture content: no swapchain to reparent. The composition
          * integration happens through direct bits in commit_visual_tree. */
     }
     else if (!visual->parent)
@@ -1545,7 +2024,7 @@ struct dcomp_device
 {
     IDCompositionDevice IDCompositionDevice_iface;
     IDCompositionDesktopDevice IDCompositionDesktopDevice_iface;
-    IDCompositionDevice3 IDCompositionDevice3_iface;
+    IDCompositionDevice5 IDCompositionDevice5_iface;  /* also serves Device3/Device4 QIs */
     LONG refcount;
     IUnknown *rendering_device;   /* IDXGIDevice from DCompositionCreateDevice */
     ID3D11Device *d3d11_device;   /* QI from rendering_device, lazy-init */
@@ -1566,9 +2045,9 @@ static inline struct dcomp_device *impl_from_IDCompositionDesktopDevice(IDCompos
     return CONTAINING_RECORD(iface, struct dcomp_device, IDCompositionDesktopDevice_iface);
 }
 
-static inline struct dcomp_device *impl_from_IDCompositionDevice3(IDCompositionDevice3 *iface)
+static inline struct dcomp_device *impl_from_IDCompositionDevice5(IDCompositionDevice5 *iface)
 {
-    return CONTAINING_RECORD(iface, struct dcomp_device, IDCompositionDevice3_iface);
+    return CONTAINING_RECORD(iface, struct dcomp_device, IDCompositionDevice5_iface);
 }
 
 /* Auto-commit from EndDraw with a per-device reentrancy guard.
@@ -1616,10 +2095,20 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_QueryInterface(IDCompositionDevice
         return S_OK;
     }
 
-    if (IsEqualGUID(iid, &IID_IDCompositionDevice3))
+    if (IsEqualGUID(iid, &IID_IDCompositionDevice3)
+            || IsEqualGUID(iid, &IID_IDCompositionDevice4)
+            || IsEqualGUID(iid, &IID_IDCompositionDevice5))
     {
-        *out = &device->IDCompositionDevice3_iface;
-        IDCompositionDevice3_AddRef(*out);
+        /* Temporary REACHED marker (issue 90) — remove after the human render test. */
+        if (!IsEqualGUID(iid, &IID_IDCompositionDevice3))
+        {
+            static unsigned int device4_qi_count;
+            if (++device4_qi_count <= 5 || !(device4_qi_count % 100))
+                FIXME("DCOMP-REACHED device4-qi #%u (iid %s).\n",
+                        device4_qi_count, debugstr_guid(iid));
+        }
+        *out = &device->IDCompositionDevice5_iface;
+        IDCompositionDevice5_AddRef(&device->IDCompositionDevice5_iface);
         return S_OK;
     }
 
@@ -1700,6 +2189,34 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
         SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
 
         ++idx;
+    }
+    else if (visual->texture_content)
+    {
+        /* Composition texture (issue 90): serialize the throttled CPU
+         * readback like surface bits — wined3d consumes it unchanged. */
+        struct dcomp_texture *tex = visual->texture_content;
+
+        dcomp_texture_ensure_bits(tex);
+        if (tex->bits)
+        {
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    L"__wine_dcomp_child_%u_wnd", idx);
+            SetPropW(target_hwnd, prop_name, (HANDLE)0);
+
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    L"__wine_dcomp_child_%u_bits", idx);
+            SetPropW(target_hwnd, prop_name, (HANDLE)tex->bits);
+
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    L"__wine_dcomp_child_%u_size", idx);
+            SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(tex->bits_width, tex->bits_height));
+
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    L"__wine_dcomp_child_%u_offset", idx);
+            SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
+
+            ++idx;
+        }
     }
     else if (visual->content)
     {
@@ -1919,6 +2436,23 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
         dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
                 visual->surface_content->bits, visual->surface_content->width,
                 visual->surface_content->height, vx, vy);
+    }
+    else if (visual->texture_content)
+    {
+        /* Composition texture leaf (issue 90) */
+        struct dcomp_texture *tex = visual->texture_content;
+
+        dcomp_texture_ensure_bits(tex);
+        if (tex->bits)
+        {
+            /* Temporary REACHED marker (issue 90) — remove after the human render test. */
+            static unsigned int texture_leaf_count;
+            if (++texture_leaf_count <= 5 || !(texture_leaf_count % 100))
+                FIXME("DCOMP-REACHED composite-texture-leaf #%u (texture %p, %ux%u at %d,%d).\n",
+                        texture_leaf_count, tex, tex->bits_width, tex->bits_height, vx, vy);
+            dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
+                    tex->bits, tex->bits_width, tex->bits_height, vx, vy);
+        }
     }
     else if (visual->content)
     {
@@ -3103,7 +3637,7 @@ static const IDCompositionDesktopDeviceVtbl dcomp_desktop_device_vtbl =
 };
 
 /* =====================================================================
- * IDCompositionDevice3
+ * IDCompositionDevice3 / IDCompositionDevice4 / IDCompositionDevice5
  *
  * Chromium/WebView2 gates its entire DirectComposition presentation path
  * (ui/gl/direct_composition_support.cc: g_dcomp_device, DCLayerTree,
@@ -3111,198 +3645,204 @@ static const IDCompositionDesktopDeviceVtbl dcomp_desktop_device_vtbl =
  * effect factories themselves are never called there. The Device2-method
  * wrappers delegate to the desktop device; the 13 effect factories are
  * FIXME stubs until a caller actually needs them.
+ *
+ * Runtime 150's delegated-compositing path additionally QIs for
+ * IDCompositionDevice5 (dc_layer_tree.cc) and uses the inherited Device4
+ * methods CheckCompositionTextureSupport/CreateCompositionTexture
+ * (issue 90). One embedded IDCompositionDevice5 iface answers the
+ * Device3/4/5 QIs; the vtbl below carries all inherited slots.
  * ===================================================================== */
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_QueryInterface(
-        IDCompositionDevice3 *iface, REFIID iid, void **out)
+        IDCompositionDevice5 *iface, REFIID iid, void **out)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_device_QueryInterface(&device->IDCompositionDevice_iface, iid, out);
 }
 
-static ULONG STDMETHODCALLTYPE dcomp_device3_AddRef(IDCompositionDevice3 *iface)
+static ULONG STDMETHODCALLTYPE dcomp_device3_AddRef(IDCompositionDevice5 *iface)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_device_AddRef(&device->IDCompositionDevice_iface);
 }
 
-static ULONG STDMETHODCALLTYPE dcomp_device3_Release(IDCompositionDevice3 *iface)
+static ULONG STDMETHODCALLTYPE dcomp_device3_Release(IDCompositionDevice5 *iface)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_device_Release(&device->IDCompositionDevice_iface);
 }
 
-static HRESULT STDMETHODCALLTYPE dcomp_device3_Commit(IDCompositionDevice3 *iface)
+static HRESULT STDMETHODCALLTYPE dcomp_device3_Commit(IDCompositionDevice5 *iface)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_Commit(&device->IDCompositionDesktopDevice_iface);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_WaitForCommitCompletion(
-        IDCompositionDevice3 *iface)
+        IDCompositionDevice5 *iface)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_WaitForCommitCompletion(&device->IDCompositionDesktopDevice_iface);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_GetFrameStatistics(
-        IDCompositionDevice3 *iface, DCOMPOSITION_FRAME_STATISTICS *statistics)
+        IDCompositionDevice5 *iface, DCOMPOSITION_FRAME_STATISTICS *statistics)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_GetFrameStatistics(&device->IDCompositionDesktopDevice_iface,
             statistics);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateVisual(
-        IDCompositionDevice3 *iface, IDCompositionVisual2 **visual)
+        IDCompositionDevice5 *iface, IDCompositionVisual2 **visual)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateVisual(&device->IDCompositionDesktopDevice_iface, visual);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateSurfaceFactory(
-        IDCompositionDevice3 *iface, IUnknown *rendering_device,
+        IDCompositionDevice5 *iface, IUnknown *rendering_device,
         IDCompositionSurfaceFactory **surface_factory)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateSurfaceFactory(&device->IDCompositionDesktopDevice_iface,
             rendering_device, surface_factory);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateSurface(
-        IDCompositionDevice3 *iface, UINT width, UINT height,
+        IDCompositionDevice5 *iface, UINT width, UINT height,
         DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode,
         IDCompositionSurface **surface)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateSurface(&device->IDCompositionDesktopDevice_iface,
             width, height, pixel_format, alpha_mode, surface);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateVirtualSurface(
-        IDCompositionDevice3 *iface, UINT width, UINT height,
+        IDCompositionDevice5 *iface, UINT width, UINT height,
         DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode,
         IDCompositionVirtualSurface **surface)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateVirtualSurface(&device->IDCompositionDesktopDevice_iface,
             width, height, pixel_format, alpha_mode, surface);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateTranslateTransform(
-        IDCompositionDevice3 *iface, IDCompositionTranslateTransform **transform)
+        IDCompositionDevice5 *iface, IDCompositionTranslateTransform **transform)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateTranslateTransform(&device->IDCompositionDesktopDevice_iface,
             transform);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateScaleTransform(
-        IDCompositionDevice3 *iface, IDCompositionScaleTransform **transform)
+        IDCompositionDevice5 *iface, IDCompositionScaleTransform **transform)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateScaleTransform(&device->IDCompositionDesktopDevice_iface,
             transform);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateRotateTransform(
-        IDCompositionDevice3 *iface, IDCompositionRotateTransform **transform)
+        IDCompositionDevice5 *iface, IDCompositionRotateTransform **transform)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateRotateTransform(&device->IDCompositionDesktopDevice_iface,
             transform);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateSkewTransform(
-        IDCompositionDevice3 *iface, IDCompositionSkewTransform **transform)
+        IDCompositionDevice5 *iface, IDCompositionSkewTransform **transform)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateSkewTransform(&device->IDCompositionDesktopDevice_iface,
             transform);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateMatrixTransform(
-        IDCompositionDevice3 *iface, IDCompositionMatrixTransform **transform)
+        IDCompositionDevice5 *iface, IDCompositionMatrixTransform **transform)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateMatrixTransform(&device->IDCompositionDesktopDevice_iface,
             transform);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateTransformGroup(
-        IDCompositionDevice3 *iface, IDCompositionTransform **transforms,
+        IDCompositionDevice5 *iface, IDCompositionTransform **transforms,
         UINT elements, IDCompositionTransform **transform_group)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateTransformGroup(&device->IDCompositionDesktopDevice_iface,
             transforms, elements, transform_group);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateTranslateTransform3D(
-        IDCompositionDevice3 *iface, IDCompositionTranslateTransform3D **transform_3d)
+        IDCompositionDevice5 *iface, IDCompositionTranslateTransform3D **transform_3d)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateTranslateTransform3D(&device->IDCompositionDesktopDevice_iface,
             transform_3d);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateScaleTransform3D(
-        IDCompositionDevice3 *iface, IDCompositionScaleTransform3D **transform_3d)
+        IDCompositionDevice5 *iface, IDCompositionScaleTransform3D **transform_3d)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateScaleTransform3D(&device->IDCompositionDesktopDevice_iface,
             transform_3d);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateRotateTransform3D(
-        IDCompositionDevice3 *iface, IDCompositionRotateTransform3D **transform_3d)
+        IDCompositionDevice5 *iface, IDCompositionRotateTransform3D **transform_3d)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateRotateTransform3D(&device->IDCompositionDesktopDevice_iface,
             transform_3d);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateMatrixTransform3D(
-        IDCompositionDevice3 *iface, IDCompositionMatrixTransform3D **transform_3d)
+        IDCompositionDevice5 *iface, IDCompositionMatrixTransform3D **transform_3d)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateMatrixTransform3D(&device->IDCompositionDesktopDevice_iface,
             transform_3d);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateTransform3DGroup(
-        IDCompositionDevice3 *iface, IDCompositionTransform3D **transforms_3d,
+        IDCompositionDevice5 *iface, IDCompositionTransform3D **transforms_3d,
         UINT elements, IDCompositionTransform3D **transform_3d_group)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateTransform3DGroup(&device->IDCompositionDesktopDevice_iface,
             transforms_3d, elements, transform_3d_group);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateEffectGroup(
-        IDCompositionDevice3 *iface, IDCompositionEffectGroup **effect_group)
+        IDCompositionDevice5 *iface, IDCompositionEffectGroup **effect_group)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateEffectGroup(&device->IDCompositionDesktopDevice_iface,
             effect_group);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateRectangleClip(
-        IDCompositionDevice3 *iface, IDCompositionRectangleClip **clip)
+        IDCompositionDevice5 *iface, IDCompositionRectangleClip **clip)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateRectangleClip(&device->IDCompositionDesktopDevice_iface, clip);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateAnimation(
-        IDCompositionDevice3 *iface, IDCompositionAnimation **animation)
+        IDCompositionDevice5 *iface, IDCompositionAnimation **animation)
 {
-    struct dcomp_device *device = impl_from_IDCompositionDevice3(iface);
+    struct dcomp_device *device = impl_from_IDCompositionDevice5(iface);
     return dcomp_desktop_device_CreateAnimation(&device->IDCompositionDesktopDevice_iface, animation);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateGaussianBlurEffect(
-        IDCompositionDevice3 *iface, IDCompositionGaussianBlurEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionGaussianBlurEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3311,7 +3851,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateGaussianBlurEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateBrightnessEffect(
-        IDCompositionDevice3 *iface, IDCompositionBrightnessEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionBrightnessEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3320,7 +3860,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateBrightnessEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateColorMatrixEffect(
-        IDCompositionDevice3 *iface, IDCompositionColorMatrixEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionColorMatrixEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3329,7 +3869,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateColorMatrixEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateShadowEffect(
-        IDCompositionDevice3 *iface, IDCompositionShadowEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionShadowEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3338,7 +3878,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateShadowEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateHueRotationEffect(
-        IDCompositionDevice3 *iface, IDCompositionHueRotationEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionHueRotationEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3347,7 +3887,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateHueRotationEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateSaturationEffect(
-        IDCompositionDevice3 *iface, IDCompositionSaturationEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionSaturationEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3356,7 +3896,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateSaturationEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateTurbulenceEffect(
-        IDCompositionDevice3 *iface, IDCompositionTurbulenceEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionTurbulenceEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3365,7 +3905,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateTurbulenceEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateLinearTransferEffect(
-        IDCompositionDevice3 *iface, IDCompositionLinearTransferEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionLinearTransferEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3374,7 +3914,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateLinearTransferEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateTableTransferEffect(
-        IDCompositionDevice3 *iface, IDCompositionTableTransferEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionTableTransferEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3383,7 +3923,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateTableTransferEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateCompositeEffect(
-        IDCompositionDevice3 *iface, IDCompositionCompositeEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionCompositeEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3392,7 +3932,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateCompositeEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateBlendEffect(
-        IDCompositionDevice3 *iface, IDCompositionBlendEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionBlendEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3401,7 +3941,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateBlendEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateArithmeticCompositeEffect(
-        IDCompositionDevice3 *iface, IDCompositionArithmeticCompositeEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionArithmeticCompositeEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3410,7 +3950,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateArithmeticCompositeEffect(
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateAffineTransform2DEffect(
-        IDCompositionDevice3 *iface, IDCompositionAffineTransform2DEffect **effect)
+        IDCompositionDevice5 *iface, IDCompositionAffineTransform2DEffect **effect)
 {
     FIXME("iface %p, effect %p stub!\n", iface, effect);
     if (effect)
@@ -3418,7 +3958,94 @@ static HRESULT STDMETHODCALLTYPE dcomp_device3_CreateAffineTransform2DEffect(
     return E_NOTIMPL;
 }
 
-static const IDCompositionDevice3Vtbl dcomp_device3_vtbl =
+static HRESULT STDMETHODCALLTYPE dcomp_device4_CheckCompositionTextureSupport(
+        IDCompositionDevice5 *iface, IUnknown *rendering_device, BOOL *supported)
+{
+    ID3D11Device *d3d11_device;
+
+    TRACE("iface %p, rendering_device %p, supported %p.\n", iface, rendering_device, supported);
+
+    if (!supported)
+        return E_POINTER;
+    *supported = FALSE;
+    if (!rendering_device)
+        return E_INVALIDARG;
+
+    /* Composition textures are supported for D3D11 rendering devices — the
+     * readback compositor only needs CopyResource + Map on the texture's
+     * own device/context. */
+    if (SUCCEEDED(IUnknown_QueryInterface(rendering_device, &IID_ID3D11Device,
+            (void **)&d3d11_device)))
+    {
+        ID3D11Device_Release(d3d11_device);
+        *supported = TRUE;
+    }
+
+    FIXME("rendering_device %p -> supported %d.\n", rendering_device, *supported);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_device4_CreateCompositionTexture(
+        IDCompositionDevice5 *iface, IUnknown *d3d_texture,
+        IDCompositionTexture **composition_texture)
+{
+    struct dcomp_texture *object;
+    ID3D11Texture2D *texture;
+    HRESULT hr;
+
+    TRACE("iface %p, d3d_texture %p, composition_texture %p.\n",
+            iface, d3d_texture, composition_texture);
+
+    if (!composition_texture)
+        return E_POINTER;
+    *composition_texture = NULL;
+    if (!d3d_texture)
+        return E_INVALIDARG;
+
+    if (FAILED(hr = IUnknown_QueryInterface(d3d_texture, &IID_ID3D11Texture2D,
+            (void **)&texture)))
+    {
+        FIXME("d3d_texture %p is not an ID3D11Texture2D, hr %#lx.\n", d3d_texture, hr);
+        return E_INVALIDARG;
+    }
+
+    if (!(object = calloc(1, sizeof(*object))))
+    {
+        ID3D11Texture2D_Release(texture);
+        return E_OUTOFMEMORY;
+    }
+
+    object->IDCompositionTexture_iface.lpVtbl = &dcomp_texture_vtbl;
+    object->refcount = 1;
+    object->texture = texture;  /* keeps the QI reference */
+    ID3D11Texture2D_GetDesc(texture, &object->desc);
+    object->alpha_mode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    object->color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+
+    /* Temporary REACHED marker (issue 90) — remove after the human render test. */
+    {
+        static unsigned int create_texture_count;
+        if (++create_texture_count <= 5 || !(create_texture_count % 100))
+            FIXME("DCOMP-REACHED create-composition-texture #%u (texture %p, %ux%u, format %#x).\n",
+                    create_texture_count, object, object->desc.Width, object->desc.Height,
+                    object->desc.Format);
+    }
+
+    *composition_texture = &object->IDCompositionTexture_iface;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_device5_CreateDynamicTexture(
+        IDCompositionDevice5 *iface, void **texture)
+{
+    FIXME("iface %p, texture %p stub!\n", iface, texture);
+
+    if (texture)
+        *texture = NULL;
+    return E_NOTIMPL;
+}
+
+static const IDCompositionDevice5Vtbl dcomp_device5_vtbl =
 {
     /* IUnknown */
     dcomp_device3_QueryInterface,
@@ -3460,6 +4087,11 @@ static const IDCompositionDevice3Vtbl dcomp_device3_vtbl =
     dcomp_device3_CreateBlendEffect,
     dcomp_device3_CreateArithmeticCompositeEffect,
     dcomp_device3_CreateAffineTransform2DEffect,
+    /* IDCompositionDevice4 */
+    dcomp_device4_CheckCompositionTextureSupport,
+    dcomp_device4_CreateCompositionTexture,
+    /* IDCompositionDevice5 */
+    dcomp_device5_CreateDynamicTexture,
 };
 
 /* =====================================================================
@@ -3476,7 +4108,7 @@ static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void 
 
     object->IDCompositionDevice_iface.lpVtbl = &dcomp_device_vtbl;
     object->IDCompositionDesktopDevice_iface.lpVtbl = &dcomp_desktop_device_vtbl;
-    object->IDCompositionDevice3_iface.lpVtbl = &dcomp_device3_vtbl;
+    object->IDCompositionDevice5_iface.lpVtbl = &dcomp_device5_vtbl;
     object->refcount = 1;
     InitializeCriticalSection(&object->cs);
 
