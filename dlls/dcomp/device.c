@@ -2097,6 +2097,22 @@ struct dcomp_target
     LONGLONG last_present_qpc;            /* QPC of last actual present — drives ~60 Hz coalescing (issue 56) */
     BOOL foreign;                         /* target hwnd belongs to another process — no subclass, hook-driven compositing (issue 88) */
     DWORD last_tree_composite_tick;       /* GetTickCount of last hook-driven tree composite (~60 Hz rate limit) */
+    /* Unchanged-content gate (issue 99): hash over all content-leaf sources
+     * of the current walk vs. the hash of the last frame that actually
+     * reached the window.  The tree timer must only push NEW leaf content —
+     * re-blitting an unchanged composition either does nothing or wallpapers
+     * over the host's own painting (tab-switch race).  Trees with unhashable
+     * leaves (surface/texture content) are never skipped. */
+    DWORD walk_leaf_hash;
+    BOOL walk_leaf_hash_valid;
+    DWORD last_blit_leaf_hash;
+    BOOL last_blit_leaf_valid;
+    RECT last_blit_clip_rc;               /* clip box of the last blit that really painted */
+    /* Host-restore bookkeeping (issue 99): hand areas our blits vacated
+     * (window hidden or resized) back to the host for repaint. */
+    int hide_restore_clip;                /* last present clip verdict (visible->hidden edge) */
+    RECT last_blit_win_rect;              /* screen rect at the last delivered blit */
+    BOOL last_blit_win_valid;
     /* WndProc subclass for WM_ERASEBKGND / WM_PAINT protection (Phase 5) */
     WNDPROC orig_wndproc;
 };
@@ -2333,7 +2349,7 @@ static ULONG STDMETHODCALLTYPE dcomp_device_Release(IDCompositionDevice *iface)
     return refcount;
 }
 
-static void dcomp_target_composite_tree(struct dcomp_target *target);
+static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_timer);
 
 /* Depth-first leaf serialization with accumulated offsets. The visual's own
  * offset positions its whole subtree (DComp semantics), so it is added on
@@ -2476,7 +2492,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
         if (target && now - target->last_tree_composite_tick >= DCOMP_TREE_FRAME_MS)
         {
             target->last_tree_composite_tick = now;
-            dcomp_target_composite_tree(target);
+            dcomp_target_composite_tree(target, FALSE);
         }
     }
     else
@@ -2570,6 +2586,92 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
  * WM_PAINT on the target hwnd.
  */
 
+/* Unchanged-content gate (issue 99): skip TIMER-driven blits when no
+ * content-leaf source changed since the last frame that reached the window.
+ * The host repaints the panel exactly once on a tab switch while the hide is
+ * still in flight through Chromium's IPC — a re-blit of the unchanged (fully
+ * opaque) composition wins that race and wallpapers over the host's
+ * painting.  Exposure repaints stay covered by the WM_PAINT path, which is
+ * never skipped.  Default ON, WINE_DCOMP_SKIP_UNCHANGED=0 opts out. */
+static int dcomp_skip_unchanged_enabled = -1;
+
+static BOOL dcomp_skip_unchanged(void)
+{
+    if (dcomp_skip_unchanged_enabled < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_SKIP_UNCHANGED");
+        dcomp_skip_unchanged_enabled = (!e || atoi(e)) ? 1 : 0;
+    }
+    return dcomp_skip_unchanged_enabled > 0;
+}
+
+/* Host-restore gate (issue 99): when our target window hides or changes
+ * geometry, hand the vacated screen area back to the host for repaint —
+ * child targets share an ancestor's X11 drawable, so pixels we blitted stay
+ * physically behind and nobody else repaints them (the host clips around
+ * what it believes is a self-drawing child; on Windows a hidden child simply
+ * stops being composed).  Default ON, WINE_DCOMP_HOST_RESTORE=0 opts out. */
+static int dcomp_host_restore_enabled = -1;
+
+static BOOL dcomp_host_restore(void)
+{
+    if (dcomp_host_restore_enabled < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_HOST_RESTORE");
+        dcomp_host_restore_enabled = (!e || atoi(e)) ? 1 : 0;
+    }
+    return dcomp_host_restore_enabled > 0;
+}
+
+static BOOL dcomp_wnd_is_chromium(HWND wnd)
+{
+    WCHAR cls[64];
+
+    if (!GetClassNameW(wnd, cls, ARRAY_SIZE(cls)))
+        return FALSE;
+    return !wcsncmp(cls, L"Chrome_", 7)
+            || !wcscmp(cls, L"Intermediate D3D Window");
+}
+
+/* Invalidate a screen-space area on the first visible non-Chromium ancestor
+ * of the target (Chromium windows never GDI-paint, so an invalidation there
+ * would be swallowed).  After a resize the vacated area may no longer belong
+ * to our target's branch of the window tree at all (the panel shrank — the
+ * strip now lies over a SIBLING branch of the host), so repeat the
+ * invalidation from the top-level: RDW_ALLCHILDREN covers every branch.
+ * Asynchronous on purpose (no RDW_UPDATENOW) — this runs in the content
+ * process and the ancestors belong to the host. */
+static void dcomp_restore_area_to_host(struct dcomp_target *target,
+        const RECT *screen_rc, const char *why)
+{
+    HWND owner = GetAncestor(target->hwnd, GA_PARENT);
+    HWND desktop = GetDesktopWindow();
+    HWND top;
+    RECT r = *screen_rc;
+
+    while (owner && owner != desktop
+            && (!IsWindowVisible(owner) || dcomp_wnd_is_chromium(owner)))
+        owner = GetAncestor(owner, GA_PARENT);
+    if (!owner || owner == desktop)
+        return;
+    MapWindowPoints(NULL, owner, (POINT *)&r, 2);
+    RedrawWindow(owner, &r, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+
+    top = GetAncestor(target->hwnd, GA_ROOT);
+    if (top && top != owner)
+    {
+        r = *screen_rc;
+        MapWindowPoints(NULL, top, (POINT *)&r, 2);
+        RedrawWindow(top, &r, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+
+    TRACE("issue-99 restore-%s: gave (%ld,%ld)-(%ld,%ld) back to host ancestor %p top %p "
+            "(target %p hwnd %p).\n", why,
+            (long)screen_rc->left, (long)screen_rc->top,
+            (long)screen_rc->right, (long)screen_rc->bottom,
+            owner, top, target, target->hwnd);
+}
+
 static void dcomp_composite_premul_over(DWORD *dst_bits, UINT dst_w, UINT dst_h,
         const DWORD *src_bits, UINT src_w, UINT src_h, int ox, int oy)
 {
@@ -2619,6 +2721,8 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
 
     if (visual->surface_content && visual->surface_content->bits)
     {
+        /* Not hashed — never skip-unchanged this tree. */
+        target->walk_leaf_hash_valid = FALSE;
         /* Temporary leaf census (issue 88 ordering diagnosis). */
         {
             static unsigned int surface_leaf_count;
@@ -2634,6 +2738,9 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
     {
         /* Composition texture leaf (issue 90) or dynamic texture frame (issue 95) */
         struct dcomp_texture *tex = dcomp_visual_effective_texture(visual);
+
+        /* Not hashed — never skip-unchanged this tree. */
+        target->walk_leaf_hash_valid = FALSE;
 
         dcomp_texture_ensure_bits(tex);
         if (tex->bits)
@@ -2670,8 +2777,27 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
             bits = (DWORD *)GetPropW(comp_wnd, L"__wine_dcomp_comp_bits");
             dims = (ULONG_PTR)GetPropW(comp_wnd, L"__wine_dcomp_comp_size");
             if (bits && dims)
+            {
+                /* Unchanged-content gate: fold this leaf's source pixels and
+                 * placement into the walk hash.  RGB only (alpha carries
+                 * noise); every 4th pixel is plenty to tell a new frame from
+                 * a re-presented one. */
+                if (target->walk_leaf_hash_valid && dcomp_skip_unchanged())
+                {
+                    UINT64 lt = (UINT64)LOWORD(dims) * HIWORD(dims);
+                    DWORD h = target->walk_leaf_hash;
+                    unsigned int i;
+
+                    for (i = 0; i < (unsigned int)lt; i += 4)
+                        h = (h ^ (bits[i] & 0x00ffffff)) * 16777619u;
+                    h = (h ^ (DWORD)(ULONG_PTR)comp_wnd) * 16777619u;
+                    h = (h ^ (DWORD)dims) * 16777619u;
+                    h = (h ^ (DWORD)(vx * 65599 + vy)) * 16777619u;
+                    target->walk_leaf_hash = h;
+                }
                 dcomp_composite_premul_over(target->comp_bits, target->comp_width,
                         target->comp_height, bits, LOWORD(dims), HIWORD(dims), vx, vy);
+            }
         }
     }
 
@@ -2679,7 +2805,7 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
         dcomp_target_composite_leaves(target, child, vx, vy);
 }
 
-static void dcomp_target_composite_tree(struct dcomp_target *target)
+static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_timer)
 {
     struct dcomp_visual *root;
     struct dcomp_visual *child;
@@ -2705,6 +2831,13 @@ static void dcomp_target_composite_tree(struct dcomp_target *target)
         static unsigned int comp_tree_log;
         HDC hdc_win = GetDC(target->hwnd);
 
+        /* Unchanged-content gate: seed the walk hash (FNV-1a) with the
+         * composition size so a window resize always forces a fresh blit. */
+        target->walk_leaf_hash = 2166136261u;
+        target->walk_leaf_hash = (target->walk_leaf_hash ^ (DWORD)rc.right) * 16777619u;
+        target->walk_leaf_hash = (target->walk_leaf_hash ^ (DWORD)rc.bottom) * 16777619u;
+        target->walk_leaf_hash_valid = TRUE;
+
         /* Capture the live window content as backdrop: transparent page
          * areas must show what is behind (loader artwork / host content),
          * not opaque black (issue 88). Falls back to black when the capture
@@ -2727,11 +2860,104 @@ static void dcomp_target_composite_tree(struct dcomp_target *target)
 
     if (target->comp_dc)
     {
+        BOOL skip_same = FALSE, blt_out = FALSE;
+        int clip_out = -1;
+        RECT clip_out_rc = {0};
+
         hdc = GetDC(target->hwnd);
         if (hdc)
         {
-            BitBlt(hdc, 0, 0, rc.right, rc.bottom, target->comp_dc, 0, 0, SRCCOPY);
+            clip_out = GetClipBox(hdc, &clip_out_rc);
+
+            if (from_timer && dcomp_skip_unchanged())
+            {
+                /* Empty clip: the blit cannot paint anything — skip it, and
+                 * above all never record it as delivered (BitBlt still
+                 * returns TRUE on a NULLREGION clip). */
+                if (clip_out == NULLREGION)
+                    skip_same = TRUE;
+                /* Skip only when nothing changed since the last blit that
+                 * really painted: same leaf content AND same clip box — a
+                 * grown clip exposes area the last blit never covered.
+                 * SIMPLEREGION only: with a complex region the bounding box
+                 * cannot prove the visible area is unchanged. */
+                else if (clip_out == SIMPLEREGION
+                        && target->walk_leaf_hash_valid && target->last_blit_leaf_valid
+                        && target->walk_leaf_hash == target->last_blit_leaf_hash
+                        && EqualRect(&clip_out_rc, &target->last_blit_clip_rc))
+                    skip_same = TRUE;
+            }
+
+            if (!skip_same)
+                blt_out = BitBlt(hdc, 0, 0, rc.right, rc.bottom, target->comp_dc, 0, 0, SRCCOPY);
+            else
+                TRACE("issue-99 skip-unchanged: target %p hwnd %p %ux%u clip %d.\n",
+                        target, target->hwnd, target->comp_width, target->comp_height, clip_out);
             ReleaseDC(target->hwnd, hdc);
+        }
+
+        /* Record delivery only when pixels could actually reach the window. */
+        if (blt_out && clip_out >= SIMPLEREGION)
+        {
+            target->last_blit_leaf_hash = target->walk_leaf_hash;
+            target->last_blit_leaf_valid = target->walk_leaf_hash_valid;
+            target->last_blit_clip_rc = clip_out_rc;
+        }
+        else if (clip_out < SIMPLEREGION)
+        {
+            /* Empty or unknown clip: while we could not paint, a sibling
+             * WebView tab may have painted the shared drawable over our
+             * pixels — the delivery record is void, the first composite
+             * after re-exposure must blit again even with unchanged leaves
+             * (hub windows where every tab is a static WebView page). */
+            target->last_blit_leaf_valid = FALSE;
+        }
+
+        /* Hand the area back to the host exactly once per visible->hidden
+         * transition — the pixels we blitted stay behind in the shared
+         * drawable and the host never repaints a "self-drawing" child. */
+        if (clip_out >= 0 && clip_out != target->hide_restore_clip)
+        {
+            if (clip_out == NULLREGION && target->hide_restore_clip != NULLREGION
+                    && dcomp_host_restore())
+            {
+                RECT wr;
+
+                GetWindowRect(target->hwnd, &wr);
+                dcomp_restore_area_to_host(target, &wr, "on-hide");
+            }
+            target->hide_restore_clip = clip_out;
+        }
+
+        /* The hub sidebar resizes per tab (right-anchored: the left edge
+         * moves).  Pixels delivered at the old geometry stay behind in the
+         * shared drawable — hand the vacated remainder back to the host. */
+        if (dcomp_host_restore())
+        {
+            RECT wr;
+
+            GetWindowRect(target->hwnd, &wr);
+            if (target->last_blit_win_valid && !EqualRect(&wr, &target->last_blit_win_rect))
+            {
+                RECT vacated;
+
+                /* SubtractRect keeps the whole old rect when the difference
+                 * is not a single rectangle — a safe superset of the vacated
+                 * area. */
+                if (SubtractRect(&vacated, &target->last_blit_win_rect, &wr))
+                    dcomp_restore_area_to_host(target, &vacated, "vacated");
+                /* Keep tracking at the new geometry even when this composite
+                 * delivers nothing (empty clip / unchanged skip): multi-step
+                 * resizes must hand back every intermediate footprint.
+                 * Over-restoring costs one host repaint; under-restoring
+                 * leaks the stale frame. */
+                target->last_blit_win_rect = wr;
+            }
+            if (blt_out && clip_out >= SIMPLEREGION)
+            {
+                target->last_blit_win_rect = wr;
+                target->last_blit_win_valid = TRUE;
+            }
         }
     }
 }
@@ -3029,7 +3255,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
          * target window periodically. */
         if (wparam == DCOMP_TREE_TIMER)
         {
-            dcomp_target_composite_tree(target);
+            dcomp_target_composite_tree(target, TRUE);
             return 0;
         }
         break;
@@ -3043,7 +3269,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         {
             PAINTSTRUCT ps;
 
-            dcomp_target_composite_tree(target);
+            dcomp_target_composite_tree(target, FALSE);
             BeginPaint(hwnd, &ps);
             EndPaint(hwnd, &ps);
             return 0;
