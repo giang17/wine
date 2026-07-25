@@ -2076,6 +2076,9 @@ static void dcomp_visual_try_reparent(struct dcomp_visual *visual)
 
 /* Property name for storing target pointer on HWND (Phase 5 subclass) */
 static const WCHAR dcomp_target_prop[] = L"__wine_dcomp_target";
+/* The application's own wndproc, stashed on the window when it is first
+ * subclassed so later targets can restore the chain (issue 98). */
+static const WCHAR dcomp_real_wndproc_prop[] = L"__wine_dcomp_real_wndproc";
 
 struct dcomp_target
 {
@@ -3125,14 +3128,22 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         break;
 
     case WM_NCDESTROY:
-        /* Window is being destroyed — clean up subclass and forward */
+        /* Window is being destroyed — clean up subclass and forward.  A target
+         * that inherited the subclass instead of installing it has no original
+         * wndproc of its own; restoring NULL would leave the window without a
+         * procedure at all. */
         KillTimer(hwnd, DCOMP_TREE_TIMER);
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig_wndproc);
+        if (orig_wndproc)
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig_wndproc);
         RemovePropW(hwnd, dcomp_target_prop);
         target->orig_wndproc = NULL;
+        if (!orig_wndproc)
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         return CallWindowProcW(orig_wndproc, hwnd, msg, wparam, lparam);
     }
 
+    if (!orig_wndproc)
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
     return CallWindowProcW(orig_wndproc, hwnd, msg, wparam, lparam);
 }
 
@@ -3208,6 +3219,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_GetFrameStatistics(IDCompositionDe
 static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionDevice *iface,
         HWND hwnd, BOOL topmost, IDCompositionTarget **target)
 {
+    struct dcomp_target *previous;
     struct dcomp_target *object;
 
     TRACE("iface %p, hwnd %p, topmost %d, target %p.\n", iface, hwnd, topmost, target);
@@ -3238,6 +3250,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
      * the class background brush is never painted for this target — we no longer
      * zero the class-wide GCLP_HBRBACKGROUND, which would also affect unrelated
      * windows sharing the class. */
+    previous = (struct dcomp_target *)GetPropW(hwnd, dcomp_target_prop);
     SetPropW(hwnd, dcomp_target_prop, (HANDLE)object);
 
     /* Cross-process targets (e.g. Tauri/WebView2 helper targeting a window
@@ -3261,11 +3274,52 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
         }
     }
 
-    object->orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd,
-            GWLP_WNDPROC, (LONG_PTR)dcomp_target_wndproc);
+    /* Never chain a second subclass onto ourselves.  A window can receive another
+     * composition target - the app recreates them when the plugin window is
+     * resized - and dxgi installs the same wndproc for composition swapchains.
+     * Subclassing again would make SetWindowLongPtrW hand back our own wndproc as
+     * the "original" one, so CallWindowProcW would call us forever; the
+     * WM_NCHITTEST flood of a resize then exhausts the host main thread's 1 MB
+     * stack within a few dozen mouse moves and takes the process down. */
+    if ((WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC) == dcomp_target_wndproc)
+    {
+        /* Inherit the real wndproc from whoever installed the subclass and clear
+         * it there, so its Release neither restores a stale wndproc nor drops the
+         * property this target now owns. */
+        if (previous && previous != object)
+        {
+            object->orig_wndproc = previous->orig_wndproc;
+            previous->orig_wndproc = NULL;
+        }
 
-    FIXME("Created composition target %p for hwnd %p (subclassed, orig_wndproc %p).\n",
-            object, hwnd, object->orig_wndproc);
+        /* Fall back to the procedure stashed by whoever subclassed the window
+         * first.  Without it the application's wndproc drops out of the chain and
+         * the window only ever sees DefWindowProcW: clicks never reach the plugin
+         * and nothing repaints. */
+        if (!object->orig_wndproc)
+            object->orig_wndproc = (WNDPROC)GetPropW(hwnd, dcomp_real_wndproc_prop);
+        if (!object->orig_wndproc)
+            object->orig_wndproc = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+
+        FIXME("Created composition target %p for hwnd %p (already subclassed, inherited orig_wndproc %p).\n",
+                object, hwnd, object->orig_wndproc);
+    }
+    else
+    {
+        object->orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd,
+                GWLP_WNDPROC, (LONG_PTR)dcomp_target_wndproc);
+
+        /* Remember the application's own procedure for the whole lifetime of the
+         * window.  Targets are recreated on resize, and the one that installed the
+         * subclass may be released before its successor appears - without this the
+         * real procedure would be lost and the window would fall back to
+         * DefWindowProcW.  Set once, never overwritten. */
+        if (object->orig_wndproc && !GetPropW(hwnd, dcomp_real_wndproc_prop))
+            SetPropW(hwnd, dcomp_real_wndproc_prop, (HANDLE)object->orig_wndproc);
+
+        FIXME("Created composition target %p for hwnd %p (subclassed, orig_wndproc %p).\n",
+                object, hwnd, object->orig_wndproc);
+    }
 
     *target = &object->IDCompositionTarget_iface;
     return S_OK;

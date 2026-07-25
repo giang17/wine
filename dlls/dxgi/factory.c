@@ -890,6 +890,25 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                     if (dcomp_subclassed_target_count > 0)
                         is_popup_mode = TRUE;
 
+                    /* Never chain a second subclass onto ourselves.  A resize makes
+                     * the app recreate its composition swapchain, so we land here
+                     * again for a window we already subclassed; SetWindowLongPtrW
+                     * would then hand back our own wndproc and we would store it as
+                     * the "original" one, so CallWindowProcW calls us forever.  The
+                     * WM_NCHITTEST flood of a resize exhausts the 1 MB stack of the
+                     * host's main thread within a few dozen mouse moves and kills
+                     * the process. */
+                    {
+                        WNDPROC installed = (WNDPROC)GetWindowLongPtrW(target_hwnd, GWLP_WNDPROC);
+
+                        if (installed == dcomp_popup_wndproc || installed == dcomp_target_wndproc)
+                        {
+                            FIXME("DComp: target %p already subclassed (wndproc %p), not chaining again.\n",
+                                    target_hwnd, installed);
+                            goto dcomp_subclass_done;
+                        }
+                    }
+
                     if (is_popup_mode)
                     {
                         /* Lightweight popup mode: subclass with minimal wndproc
@@ -940,6 +959,9 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                                     target_hwnd, GetLastError());
                         }
                     }
+
+dcomp_subclass_done:
+                    ;
                 }
 
                 /* Prevent black flickering between GL presents.  The subclassed
