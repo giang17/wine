@@ -2079,6 +2079,15 @@ static const WCHAR dcomp_target_prop[] = L"__wine_dcomp_target";
 /* The application's own wndproc, stashed on the window when it is first
  * subclassed so later targets can restore the chain (issue 98). */
 static const WCHAR dcomp_real_wndproc_prop[] = L"__wine_dcomp_real_wndproc";
+/* The composition wndproc currently installed on the window, whichever module
+ * put it there.  dxgi subclasses composition targets too, and its procedure
+ * lives in another DLL, so comparing function pointers only ever recognises
+ * our own.  Both modules publish what they installed here and consult it
+ * before chaining, so neither builds a chain that runs through the other and
+ * back into itself (issue 101). */
+static const WCHAR dcomp_subclass_proc_prop[] = L"__wine_dcomp_subclass_proc";
+
+static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
 struct dcomp_target
 {
@@ -2168,12 +2177,25 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         if (target->hwnd)
             KillTimer(target->hwnd, DCOMP_TREE_TIMER);
 
-        /* Remove WndProc subclass (Phase 5) */
-        if (target->orig_wndproc && target->hwnd && IsWindow(target->hwnd))
+        /* Remove WndProc subclass (Phase 5).  Restore only while the window still
+         * refers to us and our procedure is the installed one: a resize creates a
+         * successor target that takes the window over, and dxgi subclasses on top
+         * of us, so restoring unconditionally would drop either out of the chain
+         * (issue 98, issue 101). */
+        if (target->hwnd && IsWindow(target->hwnd))
         {
-            SetWindowLongPtrW(target->hwnd, GWLP_WNDPROC, (LONG_PTR)target->orig_wndproc);
-            RemovePropW(target->hwnd, dcomp_target_prop);
-            FIXME("Removed WndProc subclass from hwnd %p.\n", target->hwnd);
+            BOOL ours = (struct dcomp_target *)GetPropW(target->hwnd, dcomp_target_prop) == target;
+
+            if (ours && target->orig_wndproc
+                    && (WNDPROC)GetWindowLongPtrW(target->hwnd, GWLP_WNDPROC) == dcomp_target_wndproc)
+            {
+                SetWindowLongPtrW(target->hwnd, GWLP_WNDPROC, (LONG_PTR)target->orig_wndproc);
+                RemovePropW(target->hwnd, dcomp_subclass_proc_prop);
+                FIXME("Removed WndProc subclass from hwnd %p.\n", target->hwnd);
+            }
+            /* Never leave the back-pointer on a window we are about to free. */
+            if (ours)
+                RemovePropW(target->hwnd, dcomp_target_prop);
         }
 
         /* Clean up presentation state */
@@ -3283,7 +3305,10 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
          * procedure at all. */
         KillTimer(hwnd, DCOMP_TREE_TIMER);
         if (orig_wndproc)
+        {
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig_wndproc);
+            RemovePropW(hwnd, dcomp_subclass_proc_prop);
+        }
         RemovePropW(hwnd, dcomp_target_prop);
         target->orig_wndproc = NULL;
         if (!orig_wndproc)
@@ -3370,6 +3395,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
 {
     struct dcomp_target *previous;
     struct dcomp_target *object;
+    WNDPROC installed;
 
     TRACE("iface %p, hwnd %p, topmost %d, target %p.\n", iface, hwnd, topmost, target);
 
@@ -3429,8 +3455,18 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
      * Subclassing again would make SetWindowLongPtrW hand back our own wndproc as
      * the "original" one, so CallWindowProcW would call us forever; the
      * WM_NCHITTEST flood of a resize then exhausts the host main thread's 1 MB
-     * stack within a few dozen mouse moves and takes the process down. */
-    if ((WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC) == dcomp_target_wndproc)
+     * stack within a few dozen mouse moves and takes the process down.
+     *
+     * The same applies once dxgi has subclassed on top of us: its procedure
+     * still calls ours, so chaining onto it would close the ring the other way
+     * round - ours calls dxgi's, dxgi's reads the procedure it saved (ours) and
+     * calls back into us.  Our procedure is already in the chain in that case
+     * and the new target is picked up through dcomp_target_prop, so there is
+     * nothing left to install (issue 101). */
+    installed = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+    if (installed == dcomp_target_wndproc
+            || (installed && installed == (WNDPROC)GetPropW(hwnd, dcomp_subclass_proc_prop)
+                && (previous || GetPropW(hwnd, dcomp_real_wndproc_prop))))
     {
         /* Inherit the real wndproc from whoever installed the subclass and clear
          * it there, so its Release neither restores a stale wndproc nor drops the
@@ -3448,15 +3484,27 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
         if (!object->orig_wndproc)
             object->orig_wndproc = (WNDPROC)GetPropW(hwnd, dcomp_real_wndproc_prop);
         if (!object->orig_wndproc)
-            object->orig_wndproc = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+        {
+            /* The procedure dxgi saved as the "original" one may well be ours,
+             * because it subclassed on top of us; adopting it would make us call
+             * ourselves.  Take it only when it is neither our own procedure nor
+             * the one currently installed. */
+            WNDPROC saved = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
 
-        FIXME("Created composition target %p for hwnd %p (already subclassed, inherited orig_wndproc %p).\n",
-                object, hwnd, object->orig_wndproc);
+            if (saved != dcomp_target_wndproc && saved != installed)
+                object->orig_wndproc = saved;
+        }
+
+        FIXME("Created composition target %p for hwnd %p (already subclassed by %p, inherited orig_wndproc %p).\n",
+                object, hwnd, installed, object->orig_wndproc);
     }
     else
     {
         object->orig_wndproc = (WNDPROC)SetWindowLongPtrW(hwnd,
                 GWLP_WNDPROC, (LONG_PTR)dcomp_target_wndproc);
+
+        /* Publish what we installed so dxgi recognises the subclass as ours. */
+        SetPropW(hwnd, dcomp_subclass_proc_prop, (HANDLE)dcomp_target_wndproc);
 
         /* Remember the application's own procedure for the whole lifetime of the
          * window.  Targets are recreated on resize, and the one that installed the

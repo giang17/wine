@@ -612,6 +612,7 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
             RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
+            RemovePropW(hwnd, L"__wine_dcomp_subclass_proc");
             RemovePropW(hwnd, L"__wine_dcomp_swapchain");
             RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
             RemovePropW(hwnd, L"__wine_dcomp_comp_size");
@@ -743,6 +744,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
             RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
+            RemovePropW(hwnd, L"__wine_dcomp_subclass_proc");
             RemovePropW(hwnd, L"__wine_dcomp_swapchain");
             RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
             RemovePropW(hwnd, L"__wine_dcomp_comp_size");
@@ -885,7 +887,18 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                     {
                         WNDPROC installed = (WNDPROC)GetWindowLongPtrW(target_hwnd, GWLP_WNDPROC);
 
-                        if (installed == dcomp_popup_wndproc || installed == dcomp_target_wndproc)
+                        /* dcomp subclasses composition targets as well, from another
+                         * DLL, so a pointer comparison against our own procedures
+                         * never recognises it.  Both modules publish the procedure
+                         * they installed in __wine_dcomp_subclass_proc; if that is
+                         * what sits on the window and we have already subclassed it
+                         * once, ours is still in the chain and chaining again would
+                         * close a ring - ours would call dcomp's, which calls the
+                         * procedure it saved (ours) right back (issue 101). */
+                        if (installed == dcomp_popup_wndproc || installed == dcomp_target_wndproc
+                                || (installed
+                                    && installed == (WNDPROC)GetPropW(target_hwnd, L"__wine_dcomp_subclass_proc")
+                                    && GetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc")))
                         {
                             FIXME("DComp: target %p already subclassed (wndproc %p), not chaining again.\n",
                                     target_hwnd, installed);
@@ -902,6 +915,9 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                         if (orig)
                         {
                             SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
+                            /* Publish what we installed so dcomp recognises the
+                             * subclass as ours (issue 101). */
+                            SetPropW(target_hwnd, L"__wine_dcomp_subclass_proc", (HANDLE)dcomp_popup_wndproc);
                             SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
                             /* Anchor transient_for at the previously-opened target
                              * (read by winex11 set_style_hints) instead of
@@ -928,6 +944,9 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                         if (orig)
                         {
                             SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
+                            /* Publish what we installed so dcomp recognises the
+                             * subclass as ours (issue 101). */
+                            SetPropW(target_hwnd, L"__wine_dcomp_subclass_proc", (HANDLE)dcomp_target_wndproc);
                             SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
                             SetTimer(target_hwnd, DCOMP_REBLIT_TIMER_ID, 200, NULL);
                             InterlockedIncrement(&dcomp_subclassed_target_count);
