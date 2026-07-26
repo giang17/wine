@@ -3092,14 +3092,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_context_Signal(ID3D11DeviceContext
         return E_NOTIMPL;
     }
 
-    /* Temporary REACHED marker (issue 92) - remove after the human render test. */
-    {
-        static unsigned int signal_count;
-        if (++signal_count <= 5 || !(signal_count % 100))
-            FIXME("D3D11-REACHED fence-signal #%u (fence %p, value %I64u).\n",
-                    signal_count, fence, value);
-    }
-
     /* The fence timeline is CPU-side: flush pending GPU work first, then
      * advance the completed value directly. */
     wined3d_device_context_flush(context->wined3d_context);
@@ -3121,14 +3113,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_context_Wait(ID3D11DeviceContext4 
     {
         FIXME("Wait is not implemented for deferred contexts.\n");
         return E_NOTIMPL;
-    }
-
-    /* Temporary REACHED marker (issue 92) - remove after the human render test. */
-    {
-        static unsigned int wait_count;
-        if (++wait_count <= 5 || !(wait_count % 100))
-            FIXME("D3D11-REACHED fence-wait #%u (fence %p, value %I64u, completed %I64u).\n",
-                    wait_count, fence, value, ID3D11Fence_GetCompletedValue(fence));
     }
 
     return d3d11_fence_wait(fence, value);
@@ -5472,14 +5456,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateFence(ID3D11Device5 *iface, 
 
     if (!fence)
         return E_INVALIDARG;
-
-    /* Temporary REACHED marker (issue 92) - remove after the human render test. */
-    {
-        static unsigned int create_fence_count;
-        if (++create_fence_count <= 5 || !(create_fence_count % 100))
-            FIXME("D3D11-REACHED create-fence #%u (initial %I64u, flags %#x).\n",
-                    create_fence_count, initial_value, flags);
-    }
 
     return d3d11_fence_create(iface, initial_value, flags, iid, fence);
 }

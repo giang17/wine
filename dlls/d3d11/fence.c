@@ -260,14 +260,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_fence_CreateSharedHandle(ID3D11Fence *ifa
     ID3D11Fence_AddRef(iface);
     LeaveCriticalSection(&fence_share_cs);
 
-    /* Temporary REACHED marker (issue 92) - remove after the human render test. */
-    {
-        static unsigned int shared_handle_count;
-        if (++shared_handle_count <= 5 || !(shared_handle_count % 100))
-            FIXME("D3D11-REACHED create-shared-handle #%u (fence %p, access %#lx).\n",
-                    shared_handle_count, iface, access);
-    }
-
     *handle = caller_handle;
     return S_OK;
 }

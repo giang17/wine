@@ -367,13 +367,6 @@ static HRESULT STDMETHODCALLTYPE dxgi_adapter_GetDesc3(IWineDXGIAdapter *iface, 
          * the GetDesc3 path may report this: the DXGI_ADAPTER_FLAG used by
          * GetDesc/GetDesc1/GetDesc2 does not know this flag. */
         desc->Flags |= DXGI_ADAPTER_FLAG3_SUPPORT_MONITORED_FENCES;
-
-        /* Temporary REACHED marker (issue 92) - remove after the human render test. */
-        {
-            static unsigned int monitored_flag_count;
-            if (++monitored_flag_count <= 5 || !(monitored_flag_count % 100))
-                FIXME("D3D11-REACHED monitored-flag #%u.\n", monitored_flag_count);
-        }
     }
 
     return hr;

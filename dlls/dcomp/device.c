@@ -429,13 +429,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_BeginDraw(IDCompositionSurface *i
         surface->drawing = TRUE;
         offset->x = rect ? rect->left : 0;
         offset->y = rect ? rect->top : 0;
-        /* Temporary REACHED marker (issue 95) — remove after the human render test. */
-        {
-            static unsigned int begindraw_tex_count;
-            if (++begindraw_tex_count <= 10 || !(begindraw_tex_count % 200))
-                FIXME("DCOMP-REACHED begindraw-d3d11-texture #%u: surface %p (%ux%u).\n",
-                        begindraw_tex_count, surface, surface->width, surface->height);
-        }
         return S_OK;
     }
 
@@ -1173,16 +1166,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_texture_GetAvailableFence(IDCompositionTe
 {
     struct dcomp_texture *texture = impl_from_IDCompositionTexture(iface);
 
-    /* Temporary REACHED marker (issue 90) — remove after the human render test.
-     * Chromium calls this when ending an overlay read access and CHECK-fails
-     * on anything other than S_OK + non-NULL fence. */
-    {
-        static unsigned int fence_count;
-        if (++fence_count <= 5 || !(fence_count % 100))
-            FIXME("DCOMP-REACHED get-available-fence #%u (texture %p, iid %s).\n",
-                    fence_count, iface, debugstr_guid(iid));
-    }
-
     if (!fence_value || !available_fence)
         return E_POINTER;
 
@@ -1444,14 +1427,6 @@ static HRESULT dcomp_dynamic_texture_set_texture(struct dcomp_dynamic_texture *d
     if (impl)
         impl->last_readback_tick = 0;
 
-    /* Temporary REACHED marker (issue 95) — remove after the human render test. */
-    {
-        static unsigned int set_texture_count;
-        if (++set_texture_count <= 10 || !(set_texture_count % 200))
-            FIXME("DCOMP-REACHED dynamic-set-texture #%u (dynamic %p, texture %p %ux%u, rects %Iu).\n",
-                    set_texture_count, dynamic, impl,
-                    impl ? impl->desc.Width : 0, impl ? impl->desc.Height : 0, rect_count);
-    }
     return S_OK;
 }
 
@@ -1792,11 +1767,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
         {
             visual->texture_content = unsafe_impl_from_IDCompositionTexture(texture_iface);
             IDCompositionTexture_Release(texture_iface);
-            /* Temporary REACHED marker (issue 90) — remove after the human render test. */
-            FIXME("DCOMP-REACHED setcontent-texture: visual %p, texture %p (%ux%u).\n",
-                    visual, visual->texture_content,
-                    visual->texture_content ? visual->texture_content->desc.Width : 0,
-                    visual->texture_content ? visual->texture_content->desc.Height : 0);
         }
         /* ... or a dynamic texture (issue 95) */
         else if (SUCCEEDED(IUnknown_QueryInterface(content, &IID_IDCompositionDynamicTexture,
@@ -1804,10 +1774,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
         {
             visual->dynamic_content = unsafe_impl_from_IDCompositionDynamicTexture(dynamic_iface);
             IDCompositionDynamicTexture_Release(dynamic_iface);
-            /* Temporary REACHED marker (issue 95) — remove after the human render test. */
-            FIXME("DCOMP-REACHED setcontent-dynamic: visual %p, dynamic %p (current texture %p).\n",
-                    visual, visual->dynamic_content,
-                    visual->dynamic_content ? visual->dynamic_content->texture : NULL);
         }
     }
 
@@ -2322,14 +2288,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_QueryInterface(IDCompositionDevice
             || IsEqualGUID(iid, &IID_IDCompositionDevice4)
             || IsEqualGUID(iid, &IID_IDCompositionDevice5))
     {
-        /* Temporary REACHED marker (issue 90) — remove after the human render test. */
-        if (!IsEqualGUID(iid, &IID_IDCompositionDevice3))
-        {
-            static unsigned int device4_qi_count;
-            if (++device4_qi_count <= 5 || !(device4_qi_count % 100))
-                FIXME("DCOMP-REACHED device4-qi #%u (iid %s).\n",
-                        device4_qi_count, debugstr_guid(iid));
-        }
         *out = &device->IDCompositionDevice5_iface;
         IDCompositionDevice5_AddRef(&device->IDCompositionDevice5_iface);
         return S_OK;
@@ -2745,13 +2703,6 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
     {
         /* Not hashed — never skip-unchanged this tree. */
         target->walk_leaf_hash_valid = FALSE;
-        /* Temporary leaf census (issue 88 ordering diagnosis). */
-        {
-            static unsigned int surface_leaf_count;
-            if (++surface_leaf_count <= 5 || !(surface_leaf_count % 200))
-                FIXME("DCOMP-LEAF surface #%u (%ux%u at %d,%d).\n", surface_leaf_count,
-                        visual->surface_content->width, visual->surface_content->height, vx, vy);
-        }
         dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
                 visual->surface_content->bits, visual->surface_content->width,
                 visual->surface_content->height, vx, vy);
@@ -2767,11 +2718,6 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
         dcomp_texture_ensure_bits(tex);
         if (tex->bits)
         {
-            /* Temporary REACHED marker (issue 90) — remove after the human render test. */
-            static unsigned int texture_leaf_count;
-            if (++texture_leaf_count <= 5 || !(texture_leaf_count % 100))
-                FIXME("DCOMP-REACHED composite-texture-leaf #%u (texture %p, %ux%u at %d,%d).\n",
-                        texture_leaf_count, tex, tex->bits_width, tex->bits_height, vx, vy);
             dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
                     tex->bits, tex->bits_width, tex->bits_height, vx, vy);
         }
@@ -2787,13 +2733,6 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
         swprintf(prop_name, ARRAY_SIZE(prop_name),
                 L"__wine_dcomp_wnd_%I64x", (UINT_PTR)visual->content);
         comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
-        /* Temporary leaf census (issue 88 ordering diagnosis). */
-        {
-            static unsigned int content_leaf_count;
-            if (++content_leaf_count <= 5 || !(content_leaf_count % 200))
-                FIXME("DCOMP-LEAF content #%u (content %p, comp_wnd %p, at %d,%d).\n",
-                        content_leaf_count, visual->content, comp_wnd, vx, vy);
-        }
         if (comp_wnd)
         {
             bits = (DWORD *)GetPropW(comp_wnd, L"__wine_dcomp_comp_bits");
@@ -4547,15 +4486,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_device4_CreateCompositionTexture(
     object->alpha_mode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     object->color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 
-    /* Temporary REACHED marker (issue 90) — remove after the human render test. */
-    {
-        static unsigned int create_texture_count;
-        if (++create_texture_count <= 5 || !(create_texture_count % 100))
-            FIXME("DCOMP-REACHED create-composition-texture #%u (texture %p, %ux%u, format %#x).\n",
-                    create_texture_count, object, object->desc.Width, object->desc.Height,
-                    object->desc.Format);
-    }
-
     *composition_texture = &object->IDCompositionTexture_iface;
     return S_OK;
 }
@@ -4576,14 +4506,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_device5_CreateDynamicTexture(
 
     object->IDCompositionDynamicTexture_iface.lpVtbl = &dcomp_dynamic_texture_vtbl;
     object->refcount = 1;
-
-    /* Temporary REACHED marker (issue 95) — remove after the human render test. */
-    {
-        static unsigned int create_dynamic_count;
-        if (++create_dynamic_count <= 5 || !(create_dynamic_count % 100))
-            FIXME("DCOMP-REACHED create-dynamic-texture #%u (dynamic %p).\n",
-                    create_dynamic_count, object);
-    }
 
     *texture = &object->IDCompositionDynamicTexture_iface;
     return S_OK;
@@ -4680,14 +4602,11 @@ static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void 
 HRESULT WINAPI DCompositionCreateSurfaceHandle(DWORD desired_access,
         SECURITY_ATTRIBUTES *security_attributes, HANDLE *surface_handle)
 {
-    /* Temporary probe (issue 95): the export was a spec stub, so a
-     * GetProcAddress feature check by Chromium failed silently.  Hand out a
-     * plain event handle so caller-side NULL checks pass; the consumers
-     * (CreateSurfaceFromHandle, CreateSwapChainForCompositionSurfaceHandle)
-     * carry their own FIXME markers and still fail visibly. */
-    FIXME("DCOMP-PROBE create-surface-handle: access %#lx, sa %p, out %p.\n",
-            desired_access, security_attributes, surface_handle);
-
+    /* This export was previously a spec stub, so a GetProcAddress feature
+     * check by Chromium failed silently.  Hand out a plain event handle so
+     * caller-side NULL checks pass; the consumers (CreateSurfaceFromHandle,
+     * CreateSwapChainForCompositionSurfaceHandle) carry their own FIXME
+     * markers and still fail visibly. */
     if (!surface_handle)
         return E_INVALIDARG;
     *surface_handle = CreateEventW(security_attributes, FALSE, FALSE, NULL);
