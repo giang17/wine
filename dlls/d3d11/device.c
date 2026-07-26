@@ -719,104 +719,11 @@ static void STDMETHODCALLTYPE d3d11_device_context_VSSetConstantBuffers(ID3D11De
             buffer_count, buffers, NULL, NULL);
 }
 
-/* Temporary draw-level census state (issue 95): pointers are for log
- * correlation only, never dereferenced after release.  Remove with the
- * other markers. */
-static ID3D11Resource *debug_last_big_srv;
-static ID3D11Resource *debug_current_rt;
-static UINT debug_current_rt_w, debug_current_rt_h;
-
-/* Log big-texture SRV binds (panel/atlas sized) so pass-level sampling of
- * the panel texture becomes visible. */
-static void debug_census_big_srvs(const char *stage, UINT start_slot, UINT view_count,
-        ID3D11ShaderResourceView *const *views)
-{
-    UINT i;
-
-    for (i = 0; views && i < view_count; ++i)
-    {
-        ID3D11Resource *res;
-        ID3D11Texture2D *tex;
-
-        if (!views[i])
-            continue;
-        ID3D11ShaderResourceView_GetResource(views[i], &res);
-        if (SUCCEEDED(ID3D11Resource_QueryInterface(res, &IID_ID3D11Texture2D, (void **)&tex)))
-        {
-            D3D11_TEXTURE2D_DESC desc;
-
-            ID3D11Texture2D_GetDesc(tex, &desc);
-            if (desc.Width >= 600 && desc.Height >= 150)
-            {
-                static unsigned int bigsrv_count;
-
-                debug_last_big_srv = res;
-                if (++bigsrv_count <= 30 || !(bigsrv_count % 200))
-                    FIXME("D3D11-%sSRV #%u: slot %u res %p %ux%u fmt=%u (rt %p %ux%u).\n",
-                            stage, bigsrv_count, start_slot + i, res, desc.Width, desc.Height,
-                            desc.Format, debug_current_rt, debug_current_rt_w, debug_current_rt_h);
-            }
-            ID3D11Texture2D_Release(tex);
-        }
-        ID3D11Resource_Release(res);
-    }
-}
-
-/* Log a draw/dispatch issued while a big SRV is bound. */
-static void debug_census_big_draw(const char *what, UINT count)
-{
-    if (debug_last_big_srv)
-    {
-        static unsigned int bigdraw_count;
-
-        if (++bigdraw_count <= 30 || !(bigdraw_count % 200))
-            FIXME("D3D11-DRAW(%s) #%u: %u with big SRV %p -> rt %p %ux%u.\n",
-                    what, bigdraw_count, count, debug_last_big_srv,
-                    debug_current_rt, debug_current_rt_w, debug_current_rt_h);
-        debug_last_big_srv = NULL;
-    }
-}
-
-/* Track the current render target so SRV/draw logs can attribute the pass. */
-static void debug_census_track_rt(UINT rtv_count, ID3D11RenderTargetView *const *rtvs)
-{
-    debug_current_rt = NULL;
-    debug_current_rt_w = debug_current_rt_h = 0;
-    if (rtv_count && rtvs && rtvs[0])
-    {
-        ID3D11Resource *res;
-        ID3D11Texture2D *tex;
-
-        ID3D11RenderTargetView_GetResource(rtvs[0], &res);
-        if (SUCCEEDED(ID3D11Resource_QueryInterface(res, &IID_ID3D11Texture2D, (void **)&tex)))
-        {
-            D3D11_TEXTURE2D_DESC desc;
-
-            ID3D11Texture2D_GetDesc(tex, &desc);
-            debug_current_rt = res;
-            debug_current_rt_w = desc.Width;
-            debug_current_rt_h = desc.Height;
-            ID3D11Texture2D_Release(tex);
-        }
-        ID3D11Resource_Release(res);
-        {
-            static unsigned int omrt_count;
-
-            if (++omrt_count <= 40 || !(omrt_count % 500))
-                FIXME("D3D11-OMRT #%u: rt %p %ux%u.\n", omrt_count,
-                        debug_current_rt, debug_current_rt_w, debug_current_rt_h);
-        }
-    }
-}
-
 static void STDMETHODCALLTYPE d3d11_device_context_PSSetShaderResources(ID3D11DeviceContext4 *iface,
         UINT start_slot, UINT view_count, ID3D11ShaderResourceView *const *views)
 {
     TRACE("iface %p, start_slot %u, view_count %u, views %p.\n",
             iface, start_slot, view_count, views);
-
-    /* Temporary draw-level census (issue 95). */
-    debug_census_big_srvs("PS", start_slot, view_count, views);
 
     d3d11_device_context_set_shader_resource_views(iface, WINED3D_SHADER_TYPE_PIXEL, start_slot, view_count, views);
 }
@@ -870,9 +777,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_DrawIndexed(ID3D11DeviceConte
     TRACE("iface %p, index_count %u, start_index_location %u, base_vertex_location %d.\n",
             iface, index_count, start_index_location, base_vertex_location);
 
-    /* Temporary draw-level census (issue 95). */
-    debug_census_big_draw("drawidx", index_count);
-
     wined3d_device_context_draw_indexed(context->wined3d_context,
             base_vertex_location, start_index_location, index_count, 0, 0);
 }
@@ -884,9 +788,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_Draw(ID3D11DeviceContext4 *if
 
     TRACE("iface %p, vertex_count %u, start_vertex_location %u.\n",
             iface, vertex_count, start_vertex_location);
-
-    /* Temporary draw-level census (issue 95). */
-    debug_census_big_draw("draw", vertex_count);
 
     wined3d_device_context_draw(context->wined3d_context, start_vertex_location, vertex_count, 0, 0);
 }
@@ -901,21 +802,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_context_Map(ID3D11DeviceContext4 *
 
     TRACE("iface %p, resource %p, subresource_idx %u, map_type %u, map_flags %#x, mapped_subresource %p.\n",
             iface, resource, subresource_idx, map_type, map_flags, mapped_subresource);
-
-    /* Temporary upload census (issue 95), textures only - buffers map every
-     * frame and would flood the log.  Remove with the other markers. */
-    {
-        D3D11_RESOURCE_DIMENSION dim;
-
-        ID3D11Resource_GetType(resource, &dim);
-        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        {
-            static unsigned int texmap_count;
-            if (++texmap_count <= 10 || !(texmap_count % 200))
-                FIXME("D3D11-TEXMAP #%u: res %p sub %u type %u.\n", texmap_count,
-                        resource, subresource_idx, map_type);
-        }
-    }
 
     if (map_flags)
         FIXME("Ignoring map_flags %#x.\n", map_flags);
@@ -1028,9 +914,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_DrawIndexedInstanced(ID3D11De
             iface, instance_index_count, instance_count, start_index_location,
             base_vertex_location, start_instance_location);
 
-    /* Temporary draw-level census (issue 95). */
-    debug_census_big_draw("drawidxinst", instance_index_count * instance_count);
-
     wined3d_device_context_draw_indexed(context->wined3d_context, base_vertex_location,
             start_index_location, instance_index_count, start_instance_location, instance_count);
 }
@@ -1044,9 +927,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_DrawInstanced(ID3D11DeviceCon
             "start_instance_location %u.\n",
             iface, instance_vertex_count, instance_count, start_vertex_location,
             start_instance_location);
-
-    /* Temporary draw-level census (issue 95). */
-    debug_census_big_draw("drawinst", instance_vertex_count * instance_count);
 
     wined3d_device_context_draw(context->wined3d_context, start_vertex_location,
             instance_vertex_count, start_instance_location, instance_count);
@@ -1096,9 +976,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_VSSetShaderResources(ID3D11De
         UINT start_slot, UINT view_count, ID3D11ShaderResourceView *const *views)
 {
     TRACE("iface %p, start_slot %u, view_count %u, views %p.\n", iface, start_slot, view_count, views);
-
-    /* Temporary draw-level census (issue 95). */
-    debug_census_big_srvs("VS", start_slot, view_count, views);
 
     d3d11_device_context_set_shader_resource_views(iface, WINED3D_SHADER_TYPE_VERTEX, start_slot, view_count, views);
 }
@@ -1210,9 +1087,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_OMSetRenderTargets(ID3D11Devi
 
     TRACE("iface %p, rtv_count %u, rtvs %p, depth_stencil_view %p.\n", iface, rtv_count, rtvs, depth_stencil_view);
 
-    /* Temporary draw-level census (issue 95). */
-    debug_census_track_rt(rtv_count, rtvs);
-
     if (rtv_count > ARRAY_SIZE(wined3d_rtvs))
     {
         WARN("View count %u exceeds limit.\n", rtv_count);
@@ -1243,10 +1117,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_OMSetRenderTargetsAndUnordere
     struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
     unsigned int wined3d_initial_counts[D3D11_PS_CS_UAV_REGISTER_COUNT];
     unsigned int i;
-
-    /* Temporary draw-level census (issue 95). */
-    if (render_target_view_count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
-        debug_census_track_rt(render_target_view_count, render_target_views);
 
     TRACE("iface %p, render_target_view_count %u, render_target_views %p, depth_stencil_view %p, "
             "uav_start_idx %u, uav_count %u, uavs %p, initial_counts %p.\n",
@@ -1398,9 +1268,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_Dispatch(ID3D11DeviceContext4
     TRACE("iface %p, thread_group_count_x %u, thread_group_count_y %u, thread_group_count_z %u.\n",
             iface, thread_group_count_x, thread_group_count_y, thread_group_count_z);
 
-    /* Temporary draw-level census (issue 95). */
-    debug_census_big_draw("dispatch", thread_group_count_x * thread_group_count_y);
-
     wined3d_device_context_dispatch(context->wined3d_context,
             thread_group_count_x, thread_group_count_y, thread_group_count_z);
 }
@@ -1485,109 +1352,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_CopySubresourceRegion(ID3D11D
     if (!dst_resource || !src_resource)
         return;
 
-    /* Temporary upload census (issue 95), textures only - tracks whether the
-     * staging maps ever get copied to default textures.  Remove with the
-     * other markers. */
-    {
-        D3D11_RESOURCE_DIMENSION dim;
-
-        ID3D11Resource_GetType(dst_resource, &dim);
-        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        {
-            static unsigned int texcopy_count;
-            if (++texcopy_count <= 20 || !(texcopy_count % 200))
-                FIXME("D3D11-TEXCOPY #%u: dst %p(%u) at %u,%u src %p(%u) box %s.\n",
-                        texcopy_count, dst_resource, dst_subresource_idx, dst_x, dst_y,
-                        src_resource, src_subresource_idx,
-                        src_box ? wine_dbg_sprintf("%ldx%ld", (long)(src_box->right - src_box->left),
-                        (long)(src_box->bottom - src_box->top)) : "full");
-        }
-    }
-
-    /* Temporary TEXSTAT probe (issue 95): CPU-read the SOURCE of the first
-     * large texture copies (the 1100x1112 panel handoff) to see whether the
-     * GPU-rastered content already lacks the DOM bitmaps or loses them in
-     * later compositing.  Forces a GPU sync - first few copies only.
-     * Remove with the other markers. */
-    {
-        static unsigned int texstat_count;
-        UINT box_w = src_box ? src_box->right - src_box->left : 0;
-        UINT box_h = src_box ? src_box->bottom - src_box->top : 0;
-
-        if (texstat_count < 10 && (UINT64)box_w * box_h >= 500 * 500
-                && context->type == D3D11_DEVICE_CONTEXT_IMMEDIATE)
-        {
-            ID3D11Texture2D *src_tex;
-
-            if (SUCCEEDED(ID3D11Resource_QueryInterface(src_resource, &IID_ID3D11Texture2D, (void **)&src_tex)))
-            {
-                D3D11_TEXTURE2D_DESC desc;
-
-                ID3D11Texture2D_GetDesc(src_tex, &desc);
-                if ((desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM)
-                        && desc.MipLevels == 1 && desc.ArraySize == 1)
-                {
-                    D3D11_TEXTURE2D_DESC sdesc = desc;
-                    ID3D11Texture2D *staging = NULL;
-                    ID3D11Device *dev = NULL;
-
-                    ++texstat_count;
-                    sdesc.Usage = D3D11_USAGE_STAGING;
-                    sdesc.BindFlags = 0;
-                    sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                    sdesc.MiscFlags = 0;
-                    sdesc.SampleDesc.Count = 1;
-                    sdesc.SampleDesc.Quality = 0;
-
-                    ID3D11Resource_GetDevice(src_resource, &dev);
-                    if (dev && SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &sdesc, NULL, &staging)))
-                    {
-                        D3D11_MAPPED_SUBRESOURCE map;
-
-                        ID3D11DeviceContext4_CopyResource(iface, (ID3D11Resource *)staging, src_resource);
-                        if (SUCCEEDED(ID3D11DeviceContext4_Map(iface, (ID3D11Resource *)staging, 0,
-                                D3D11_MAP_READ, 0, &map)))
-                        {
-                            UINT64 rs = 0, gs = 0, bs = 0, as = 0, total = (UINT64)desc.Width * desc.Height;
-                            unsigned int x, y, nonblack = 0;
-
-                            for (y = 0; y < desc.Height; ++y)
-                            {
-                                const DWORD *row = (const DWORD *)((const BYTE *)map.pData + (SIZE_T)y * map.RowPitch);
-                                for (x = 0; x < desc.Width; ++x)
-                                {
-                                    DWORD px = row[x];
-                                    if (px & 0x00ffffff) ++nonblack;
-                                    rs += (px >> 16) & 0xff;
-                                    gs += (px >> 8) & 0xff;
-                                    bs += px & 0xff;
-                                    as += px >> 24;
-                                }
-                            }
-                            FIXME("D3D11-TEXSTAT #%u: src %p %ux%u fmt=%u nonblack %u%% avg-rgba(%u,%u,%u,%u).\n",
-                                    texstat_count, src_resource, desc.Width, desc.Height, desc.Format,
-                                    total ? (unsigned int)(nonblack * 100 / total) : 0,
-                                    total ? (unsigned int)(rs / total) : 0,
-                                    total ? (unsigned int)(gs / total) : 0,
-                                    total ? (unsigned int)(bs / total) : 0,
-                                    total ? (unsigned int)(as / total) : 0);
-                            ID3D11DeviceContext4_Unmap(iface, (ID3D11Resource *)staging, 0);
-                        }
-                        else
-                            FIXME("D3D11-TEXSTAT #%u: map failed for src %p.\n", texstat_count, src_resource);
-                    }
-                    else
-                        FIXME("D3D11-TEXSTAT #%u: staging create failed for src %p.\n", texstat_count, src_resource);
-                    if (staging)
-                        ID3D11Texture2D_Release(staging);
-                    if (dev)
-                        ID3D11Device_Release(dev);
-                }
-                ID3D11Texture2D_Release(src_tex);
-            }
-        }
-    }
-
     if (src_box)
         wined3d_box_set(&wined3d_src_box, src_box->left, src_box->top,
                 src_box->right, src_box->bottom, src_box->front, src_box->back);
@@ -1606,22 +1370,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_CopyResource(ID3D11DeviceCont
 
     TRACE("iface %p, dst_resource %p, src_resource %p.\n", iface, dst_resource, src_resource);
 
-    /* Temporary upload census (issue 95), textures only - remove with the
-     * other markers. */
-    if (dst_resource && src_resource)
-    {
-        D3D11_RESOURCE_DIMENSION dim;
-
-        ID3D11Resource_GetType(dst_resource, &dim);
-        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        {
-            static unsigned int texcopyres_count;
-            if (++texcopyres_count <= 20 || !(texcopyres_count % 200))
-                FIXME("D3D11-TEXCOPYRES #%u: dst %p src %p.\n", texcopyres_count,
-                        dst_resource, src_resource);
-        }
-    }
-
     wined3d_dst_resource = wined3d_resource_from_d3d11_resource(dst_resource);
     wined3d_src_resource = wined3d_resource_from_d3d11_resource(src_resource);
     wined3d_device_context_copy_resource(context->wined3d_context, wined3d_dst_resource, wined3d_src_resource);
@@ -1637,16 +1385,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_UpdateSubresource(ID3D11Devic
 
     TRACE("iface %p, resource %p, subresource_idx %u, box %p, data %p, row_pitch %u, depth_pitch %u.\n",
             iface, resource, subresource_idx, box, data, row_pitch, depth_pitch);
-
-    /* Temporary upload census (issue 95) - remove with the other markers. */
-    {
-        static unsigned int updsub_count;
-        if (++updsub_count <= 10 || !(updsub_count % 200))
-            FIXME("D3D11-UPDSUB #%u: res %p sub %u box %s pitch %u.\n", updsub_count, resource,
-                    subresource_idx, box ? wine_dbg_sprintf("%ldx%ld",
-                    (long)(box->right - box->left), (long)(box->bottom - box->top)) : "full",
-                    row_pitch);
-    }
 
     if (box)
         wined3d_box_set(&wined3d_box, box->left, box->top, box->right, box->bottom, box->front, box->back);
@@ -1892,9 +1630,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_CSSetShaderResources(ID3D11De
 {
     TRACE("iface %p, start_slot %u, view_count %u, views %p.\n",
             iface, start_slot, view_count, views);
-
-    /* Temporary draw-level census (issue 95). */
-    debug_census_big_srvs("CS", start_slot, view_count, views);
 
     d3d11_device_context_set_shader_resource_views(iface, WINED3D_SHADER_TYPE_COMPUTE, start_slot, view_count, views);
 }
@@ -3016,24 +2751,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_CopySubresourceRegion1(ID3D11
     if (!dst_resource || !src_resource)
         return;
 
-    /* Temporary upload census (issue 95), textures only - remove with the
-     * other markers. */
-    {
-        D3D11_RESOURCE_DIMENSION dim;
-
-        ID3D11Resource_GetType(dst_resource, &dim);
-        if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
-        {
-            static unsigned int texcopy1_count;
-            if (++texcopy1_count <= 20 || !(texcopy1_count % 200))
-                FIXME("D3D11-TEXCOPY1 #%u: dst %p(%u) at %u,%u src %p(%u) box %s flags %#x.\n",
-                        texcopy1_count, dst_resource, dst_subresource_idx, dst_x, dst_y,
-                        src_resource, src_subresource_idx,
-                        src_box ? wine_dbg_sprintf("%ldx%ld", (long)(src_box->right - src_box->left),
-                        (long)(src_box->bottom - src_box->top)) : "full", flags);
-        }
-    }
-
     if (src_box)
         wined3d_box_set(&wined3d_src_box, src_box->left, src_box->top,
                 src_box->right, src_box->bottom, src_box->front, src_box->back);
@@ -3054,16 +2771,6 @@ static void STDMETHODCALLTYPE d3d11_device_context_UpdateSubresource1(ID3D11Devi
 
     TRACE("iface %p, resource %p, subresource_idx %u, box %p, data %p, row_pitch %u, depth_pitch %u, flags %#x.\n",
             iface, resource, subresource_idx, box, data, row_pitch, depth_pitch, flags);
-
-    /* Temporary upload census (issue 95) - remove with the other markers. */
-    {
-        static unsigned int updsub1_count;
-        if (++updsub1_count <= 10 || !(updsub1_count % 200))
-            FIXME("D3D11-UPDSUB1 #%u: res %p sub %u box %s pitch %u flags %#x.\n", updsub1_count,
-                    resource, subresource_idx, box ? wine_dbg_sprintf("%ldx%ld",
-                    (long)(box->right - box->left), (long)(box->bottom - box->top)) : "full",
-                    row_pitch, flags);
-    }
 
     if (box)
         wined3d_box_set(&wined3d_box, box->left, box->top, box->right, box->bottom,
@@ -4431,29 +4138,18 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateTexture2D(ID3D11Device5 *ifa
                 && desc->CPUAccessFlags == 0
                 && desc->MiscFlags == (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
 
-        FIXME("D3D11-TEXDESC #%u: %ux%u fmt=%u mip=%u arr=%u samp=%u/%u usage=%u bind=%#x cpu=%#x misc=%#x init=%d%s\n",
+        FIXME("D3D11-TEXDESC #%u: %ux%u fmt=%u mip=%u arr=%u samp=%u/%u usage=%u bind=%#x cpu=%#x misc=%#x%s\n",
                 ++texdesc_count, desc ? desc->Width : 0, desc ? desc->Height : 0,
                 desc ? desc->Format : 0, desc ? desc->MipLevels : 0, desc ? desc->ArraySize : 0,
                 desc ? desc->SampleDesc.Count : 0, desc ? desc->SampleDesc.Quality : 0,
                 desc ? desc->Usage : 0, desc ? desc->BindFlags : 0, desc ? desc->CPUAccessFlags : 0,
-                desc ? desc->MiscFlags : 0, !!data, dcomp_candidate ? " DCOMP-CANDIDATE" : "");
+                desc ? desc->MiscFlags : 0, dcomp_candidate ? " DCOMP-CANDIDATE" : "");
     }
 
     if (FAILED(hr = d3d_texture2d_create(device, desc, NULL, data, &object)))
         return hr;
 
     *texture = &object->ID3D11Texture2D_iface;
-
-    /* Temporary texture-pointer census (issue 95): logs the resource pointer
-     * so TEXCOPY/TEXMAP chains can be correlated with the create flags.
-     * Remove with the other markers. */
-    {
-        static unsigned int texptr_count;
-        if (++texptr_count <= 60 || !(texptr_count % 200))
-            FIXME("D3D11-TEXPTR #%u: %p = %ux%u fmt=%u usage=%u bind=%#x cpu=%#x misc=%#x.\n",
-                    texptr_count, *texture, desc->Width, desc->Height, desc->Format,
-                    desc->Usage, desc->BindFlags, desc->CPUAccessFlags, desc->MiscFlags);
-    }
 
     return S_OK;
 }
@@ -5013,8 +4709,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFormatSupport(ID3D11Device5 *
     if (format && !wined3d_format)
     {
         WARN("Invalid format %#x.\n", format);
-        /* Temporary caps census (issue 95) - remove with the other markers. */
-        FIXME("D3D11-FMTSUP: fmt %u INVALID -> E_FAIL.\n", format);
         *format_support = 0;
         return E_FAIL;
     }
@@ -5076,16 +4770,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFormatSupport(ID3D11Device5 *
         *format_support |= D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE
                 | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET
                 | D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
-    }
-
-    /* Temporary caps census (issue 95): what Skia/ANGLE sees when it decides
-     * whether GPU image upload is allowed per format.  Remove with the other
-     * markers. */
-    {
-        static unsigned int fmtsup_count;
-        if (++fmtsup_count <= 100 || !(fmtsup_count % 200))
-            FIXME("D3D11-FMTSUP #%u: fmt %u -> support %#x%s\n", fmtsup_count, format,
-                    *format_support, *format_support ? "" : " -> E_FAIL");
     }
 
     return *format_support ? S_OK : E_FAIL;
@@ -5159,15 +4843,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFeatureSupport(ID3D11Device5 
 
     TRACE("iface %p, feature %u, feature_support_data %p, feature_support_data_size %u.\n",
             iface, feature, feature_support_data, feature_support_data_size);
-
-    /* Temporary caps census (issue 95): also logs the HANDLED features that
-     * the TRACE above hides in +fixme runs.  Remove with the other markers. */
-    {
-        static unsigned int featsup_count;
-        if (++featsup_count <= 100 || !(featsup_count % 200))
-            FIXME("D3D11-FEATSUP #%u: feature %u size %u.\n", featsup_count, feature,
-                    feature_support_data_size);
-    }
 
     switch (feature)
     {

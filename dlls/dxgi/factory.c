@@ -51,17 +51,6 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_QueryInterface(IWineDXGIFactory *i
 
     WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
 
-    /* Temporary caps-probe census (issue 95): unknown factory QIs are
-     * feature probes (e.g. IDXGIFactoryMedia gates Chromium's
-     * composition-surface-handle swapchains).  Remove with the other
-     * markers. */
-    {
-        static unsigned int factory_qi_count;
-        if (++factory_qi_count <= 20 || !(factory_qi_count % 200))
-            FIXME("DXGI-PROBE factory-qi #%u: %s -> E_NOINTERFACE.\n",
-                    factory_qi_count, debugstr_guid(iid));
-    }
-
     *out = NULL;
     return E_NOINTERFACE;
 }

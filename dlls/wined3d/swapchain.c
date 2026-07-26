@@ -747,42 +747,6 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
     wined3d_texture_load_location(back_buffer, 0, context, WINED3D_LOCATION_SYSMEM);
     wined3d_texture_get_pitch(back_buffer, 0, &row_pitch, &slice_pitch);
 
-    /* Temporary BACKBUF census (issue 95): does the presented backbuffer
-     * already lack the DOM bitmaps (large nonblack areas), or are they lost
-     * later in our comp-buffer blit?  Remove with the other markers. */
-    if (format->byte_count == 4 && back_buffer->resource.heap_memory)
-    {
-        static unsigned int backbuf_count;
-
-        if (++backbuf_count <= 8 || !(backbuf_count % 100))
-        {
-            unsigned int w = wined3d_texture_get_level_width(back_buffer, 0);
-            unsigned int h = wined3d_texture_get_level_height(back_buffer, 0);
-            const BYTE *base = back_buffer->resource.heap_memory;
-            UINT64 rs = 0, gs = 0, bs = 0, total = (UINT64)w * h;
-            unsigned int x, y, nonblack = 0;
-
-            for (y = 0; y < h; ++y)
-            {
-                const DWORD *row = (const DWORD *)(base + (SIZE_T)y * row_pitch);
-                for (x = 0; x < w; ++x)
-                {
-                    DWORD px = row[x];
-                    if (px & 0x00ffffff) ++nonblack;
-                    rs += (px >> 16) & 0xff;
-                    gs += (px >> 8) & 0xff;
-                    bs += px & 0xff;
-                }
-            }
-            FIXME("BACKBUF #%u: win %p %ux%u nonblack %u%% avg-rgb(%u,%u,%u).\n",
-                    backbuf_count, swapchain->win_handle, w, h,
-                    total ? (unsigned int)(nonblack * 100 / total) : 0,
-                    total ? (unsigned int)(rs / total) : 0,
-                    total ? (unsigned int)(gs / total) : 0,
-                    total ? (unsigned int)(bs / total) : 0);
-        }
-    }
-
     create_desc.pMemory = back_buffer->resource.heap_memory;
     create_desc.Format = format->ddi_format;
     create_desc.Width = wined3d_texture_get_level_width(back_buffer, 0);
@@ -1069,39 +1033,6 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         }
         else
         {
-            /* Temporary COMPBITS census (issue 95): state of the composed
-             * buffer right before it hits the window - compare against the
-             * BACKBUF census of the same present to locate bitmap loss.
-             * Remove with the other markers. */
-            if (swapchain->comp_bits)
-            {
-                static unsigned int compbits_count;
-
-                if (++compbits_count <= 8 || !(compbits_count % 100))
-                {
-                    UINT64 rs = 0, gs = 0, bs = 0,
-                           total = (UINT64)swapchain->comp_width * swapchain->comp_height;
-                    unsigned int i, nonblack = 0;
-
-                    GdiFlush();
-                    for (i = 0; i < (unsigned int)total; ++i)
-                    {
-                        DWORD px = swapchain->comp_bits[i];
-                        if (px & 0x00ffffff) ++nonblack;
-                        rs += (px >> 16) & 0xff;
-                        gs += (px >> 8) & 0xff;
-                        bs += px & 0xff;
-                    }
-                    FIXME("COMPBITS #%u: win %p %ux%u nonblack %u%% avg-rgb(%u,%u,%u).\n",
-                            compbits_count, swapchain->win_handle,
-                            swapchain->comp_width, swapchain->comp_height,
-                            total ? (unsigned int)(nonblack * 100 / total) : 0,
-                            total ? (unsigned int)(rs / total) : 0,
-                            total ? (unsigned int)(gs / total) : 0,
-                            total ? (unsigned int)(bs / total) : 0);
-                }
-            }
-
             /* Always BitBlt full comp buffer to window — survives any surface reset. */
             if (!BitBlt(swapchain->dc, dst_rect->left, dst_rect->top, dst_w, dst_h,
                     swapchain->comp_dc, 0, 0, SRCCOPY))
