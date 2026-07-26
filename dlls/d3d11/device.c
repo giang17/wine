@@ -4121,31 +4121,6 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CreateTexture2D(ID3D11Device5 *ifa
 
     TRACE("iface %p, desc %p, data %p, texture %p.\n", iface, desc, data, texture);
 
-    /* Temporary texture-desc diagnostic (issue 94) - remove after the gate analysis.
-     * Mirrors Chromium's DCompTextureIsSupported() desc checks (minus
-     * DirectCompositionTextureSupported(), which has its own marker) so the log
-     * shows whether any created texture would qualify as a composition texture. */
-    {
-        static unsigned int texdesc_count;
-        BOOL dcomp_candidate = desc && desc->MipLevels == 1 && desc->ArraySize == 1
-                && (desc->Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc->Format == DXGI_FORMAT_R8G8B8A8_UNORM
-                        || desc->Format == DXGI_FORMAT_R16G16B16A16_FLOAT
-                        || desc->Format == DXGI_FORMAT_R10G10B10A2_UNORM || desc->Format == DXGI_FORMAT_NV12
-                        || desc->Format == DXGI_FORMAT_YUY2 || desc->Format == DXGI_FORMAT_420_OPAQUE
-                        || desc->Format == DXGI_FORMAT_P010)
-                && desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0
-                && desc->Usage == D3D11_USAGE_DEFAULT && (desc->BindFlags & D3D11_BIND_SHADER_RESOURCE)
-                && desc->CPUAccessFlags == 0
-                && desc->MiscFlags == (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
-
-        FIXME("D3D11-TEXDESC #%u: %ux%u fmt=%u mip=%u arr=%u samp=%u/%u usage=%u bind=%#x cpu=%#x misc=%#x%s\n",
-                ++texdesc_count, desc ? desc->Width : 0, desc ? desc->Height : 0,
-                desc ? desc->Format : 0, desc ? desc->MipLevels : 0, desc ? desc->ArraySize : 0,
-                desc ? desc->SampleDesc.Count : 0, desc ? desc->SampleDesc.Quality : 0,
-                desc ? desc->Usage : 0, desc ? desc->BindFlags : 0, desc ? desc->CPUAccessFlags : 0,
-                desc ? desc->MiscFlags : 0, dcomp_candidate ? " DCOMP-CANDIDATE" : "");
-    }
-
     if (FAILED(hr = d3d_texture2d_create(device, desc, NULL, data, &object)))
         return hr;
 
