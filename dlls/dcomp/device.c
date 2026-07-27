@@ -2088,6 +2088,7 @@ struct dcomp_target
     int hide_restore_clip;                /* last present clip verdict (visible->hidden edge) */
     RECT last_blit_win_rect;              /* screen rect at the last delivered blit */
     BOOL last_blit_win_valid;
+    RECT last_blit_top_rect;              /* toplevel screen rect at that moment */
     /* WndProc subclass for WM_ERASEBKGND / WM_PAINT protection (Phase 5) */
     WNDPROC orig_wndproc;
 };
@@ -2895,17 +2896,35 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
          * shared drawable — hand the vacated remainder back to the host. */
         if (dcomp_host_restore())
         {
-            RECT wr;
+            HWND top = GetAncestor(target->hwnd, GA_ROOT);
+            RECT wr, tr = {0};
 
             GetWindowRect(target->hwnd, &wr);
+            if (top)
+                GetWindowRect(top, &tr);
             if (target->last_blit_win_valid && !EqualRect(&wr, &target->last_blit_win_rect))
             {
+                const RECT *last = &target->last_blit_win_rect;
+                BOOL resized = (wr.right - wr.left) != (last->right - last->left)
+                        || (wr.bottom - wr.top) != (last->bottom - last->top);
+                BOOL top_moved = !EqualRect(&tr, &target->last_blit_top_rect);
                 RECT vacated;
 
-                /* SubtractRect keeps the whole old rect when the difference
-                 * is not a single rectangle — a safe superset of the vacated
-                 * area. */
-                if (SubtractRect(&vacated, &target->last_blit_win_rect, &wr))
+                /* Only area we truly vacated relative to the host may be handed
+                 * back.  Dragging the window moves toplevel and target together:
+                 * our screen rect changes at every 100 ms tick, yet nothing is
+                 * left behind — the host travels along.  Restoring then runs
+                 * RDW_ERASE over the live composition ten times a second, and
+                 * the class brush paints it white; that is the flicker seen
+                 * while moving a plugin editor.  A size change (the hub sidebar
+                 * case that motivated the restore) or a target that moved while
+                 * its toplevel stood still is a genuine vacate and still
+                 * restores.
+                 *
+                 * SubtractRect keeps the whole old rect when the difference is
+                 * not a single rectangle — a safe superset of the vacated area. */
+                if ((resized || !top_moved)
+                        && SubtractRect(&vacated, &target->last_blit_win_rect, &wr))
                     dcomp_restore_area_to_host(target, &vacated, "vacated");
                 /* Keep tracking at the new geometry even when this composite
                  * delivers nothing (empty clip / unchanged skip): multi-step
@@ -2913,10 +2932,12 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
                  * Over-restoring costs one host repaint; under-restoring
                  * leaks the stale frame. */
                 target->last_blit_win_rect = wr;
+                target->last_blit_top_rect = tr;
             }
             if (blt_out && clip_out >= SIMPLEREGION)
             {
                 target->last_blit_win_rect = wr;
+                target->last_blit_top_rect = tr;
                 target->last_blit_win_valid = TRUE;
             }
         }
