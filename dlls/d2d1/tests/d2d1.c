@@ -13723,6 +13723,124 @@ static void test_effect_grayscale(BOOL d3d11)
     release_test_context(&ctx);
 }
 
+static void test_effect_color_management(BOOL d3d11)
+{
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    DWORD colour, expected_colour;
+    struct d2d1_test_context ctx;
+    struct resource_readback rb;
+    ID2D1DeviceContext *context;
+    D2D1_SIZE_U input_size;
+    ID2D1Bitmap1 *bitmap;
+    ID2D1Effect *effect;
+    ID2D1Image *output;
+    DWORD srgb_pixel;
+    unsigned int i;
+    WORD pixel[4];
+    HRESULT hr;
+
+    /* Half precision floating point encodings of linear (scRGB) grey levels,
+     * with the corresponding sRGB encoded value:
+     * srgb(c) = c <= 0.0031308 ? 12.92 * c : 1.055 * c^(1/2.4) - 0.055 */
+    static const struct
+    {
+        WORD linear;
+        BYTE srgb;
+    }
+    tests[] =
+    {
+        {0x0000,   0}, /* 0.0  -> 0.0    */
+        {0x3400, 137}, /* 0.25 -> 0.5372 */
+        {0x3800, 188}, /* 0.5  -> 0.7354 */
+        {0x3a00, 225}, /* 0.75 -> 0.8808 */
+        {0x3c00, 255}, /* 1.0  -> 1.0    */
+    };
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    context = ctx.context;
+
+    hr = ID2D1DeviceContext_CreateEffect(context, &CLSID_D2D1ColorManagement, &effect);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* A floating point source is scRGB, i.e. linear. Drawing it to the 8 bits
+     * per channel unsigned normalised target encodes it as sRGB. */
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("Test %u", i);
+
+        pixel[0] = pixel[1] = pixel[2] = tests[i].linear;
+        pixel[3] = 0x3c00;
+
+        set_size_u(&input_size, 1, 1);
+        bitmap_desc.pixelFormat.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+        bitmap_desc.dpiX = 96.0f;
+        bitmap_desc.dpiY = 96.0f;
+        bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+        bitmap_desc.colorContext = NULL;
+        hr = ID2D1DeviceContext_CreateBitmap(context, input_size, pixel, sizeof(pixel), &bitmap_desc, &bitmap);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        ID2D1Effect_SetInput(effect, 0, (ID2D1Image *)bitmap, FALSE);
+        ID2D1Effect_GetOutput(effect, &output);
+
+        ID2D1DeviceContext_BeginDraw(context);
+        ID2D1DeviceContext_Clear(context, 0);
+        ID2D1DeviceContext_DrawImage(context, output, NULL, NULL, 0, 0);
+        hr = ID2D1DeviceContext_EndDraw(context, NULL, NULL);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        get_surface_readback(&ctx, &rb);
+        colour = get_readback_colour(&rb, 0, 0);
+        expected_colour = 0xff000000 | (tests[i].srgb << 16) | (tests[i].srgb << 8) | tests[i].srgb;
+        ok(compare_colour(colour, expected_colour, 1),
+                "Got unexpected colour %#lx, expected %#lx.\n", colour, expected_colour);
+        release_resource_readback(&rb);
+
+        ID2D1Image_Release(output);
+        ID2D1Bitmap1_Release(bitmap);
+        winetest_pop_context();
+    }
+
+    /* An 8 bits per channel unsigned normalised source is already sRGB encoded
+     * and has to be passed through unchanged. */
+    srgb_pixel = 0xff804020;
+
+    set_size_u(&input_size, 1, 1);
+    bitmap_desc.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bitmap_desc.dpiX = 96.0f;
+    bitmap_desc.dpiY = 96.0f;
+    bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+    bitmap_desc.colorContext = NULL;
+    hr = ID2D1DeviceContext_CreateBitmap(context, input_size, &srgb_pixel,
+            sizeof(srgb_pixel), &bitmap_desc, &bitmap);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    ID2D1Effect_SetInput(effect, 0, (ID2D1Image *)bitmap, FALSE);
+    ID2D1Effect_GetOutput(effect, &output);
+
+    ID2D1DeviceContext_BeginDraw(context);
+    ID2D1DeviceContext_Clear(context, 0);
+    ID2D1DeviceContext_DrawImage(context, output, NULL, NULL, 0, 0);
+    hr = ID2D1DeviceContext_EndDraw(context, NULL, NULL);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 0, 0);
+    ok(compare_colour(colour, srgb_pixel, 1),
+            "Got unexpected colour %#lx, expected %#lx.\n", colour, srgb_pixel);
+    release_resource_readback(&rb);
+
+    ID2D1Image_Release(output);
+    ID2D1Bitmap1_Release(bitmap);
+
+    ID2D1Effect_Release(effect);
+    release_test_context(&ctx);
+}
+
 static void test_effect_gaussian_blur(BOOL d3d11)
 {
     static const struct effect_property properties[] =
@@ -18090,6 +18208,7 @@ START_TEST(d2d1)
     queue_test(test_effect_2d_affine);
     queue_test(test_effect_crop);
     queue_test(test_effect_grayscale);
+    queue_test(test_effect_color_management);
     queue_d3d10_test(test_registered_effects);
     queue_d3d10_test(test_effect_gaussian_blur);
     queue_d3d10_test(test_effect_point_specular);

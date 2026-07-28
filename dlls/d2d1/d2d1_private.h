@@ -193,7 +193,7 @@ struct d2d_ps_cb
     BOOL outline;
     BOOL is_arc;
     BOOL aa_mode;
-    BOOL pad[1];
+    BOOL srgb_encode;
     struct d2d_brush_cb colour_brush;
     struct d2d_brush_cb opacity_brush;
 };
@@ -289,6 +289,11 @@ struct d2d_device_context
     ID3D11Buffer *vb;
     ID3D11RasterizerState *rs;
     ID3D11BlendState *bs;
+    /* Set for the duration of a single draw to make the shape pixel shader
+     * apply the sRGB transfer function to the sampled colour. Used by the
+     * ColorManagement effect to encode a linear (scRGB) source for an
+     * unsigned-normalised, non-sRGB target. */
+    BOOL srgb_encode;
     struct d2d_scratch_buffer scratch_vb[D2D_SHAPE_TYPE_COUNT];
     struct d2d_scratch_buffer scratch_ib[D2D_SHAPE_TYPE_COUNT];
     /* Session 6 (C1): persistent scratch rectangle geometry for FillRectangle.

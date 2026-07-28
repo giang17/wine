@@ -1058,7 +1058,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
     new_cb.outline = outline;
     new_cb.is_arc = is_arc;
     new_cb.aa_mode = (context->drawing_state.antialiasMode == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    new_cb.pad[0] = 0;
+    new_cb.srgb_encode = context->srgb_encode;
     if (!d2d_brush_fill_cb(brush, &new_cb.colour_brush))
         WARN("Failed to initialize colour brush buffer.\n");
     if (!d2d_brush_fill_cb(opacity_brush, &new_cb.opacity_brush))
@@ -4123,6 +4123,78 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_DrawGlyphRun
     d2d_device_context_draw_glyph_run(context, baseline_origin, glyph_run, glyph_run_desc, brush, measuring_mode);
 }
 
+static BOOL d2d_format_is_float(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+static BOOL d2d_format_is_srgb(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+/* The ColorManagement effect converts its input from the source colour space to
+ * the destination colour space. CreateColorContext() is a stub here, so the
+ * effect's colour context properties are always NULL and the colour spaces have
+ * to be derived from the pixel formats instead. D2D treats floating point
+ * buffers as scRGB (linear) and 8 bits per channel unsigned normalised buffers
+ * as sRGB, so a linear source drawn to a plain UNORM target is the one case
+ * that needs the sRGB transfer function applied. Everything else keeps passing
+ * the source through unconverted.
+ *
+ * The encoding happens in the shape pixel shader; the effect is drawn hundreds
+ * of times per frame, which rules out a CPU side conversion like the one
+ * ConvolveMatrix uses. */
+static void d2d_device_context_draw_color_management(struct d2d_device_context *context, ID2D1Effect *effect,
+        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
+        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
+{
+    struct d2d_bitmap *bitmap_impl;
+    ID2D1Bitmap *bitmap;
+    ID2D1Image *input;
+    BOOL prev_encode;
+
+    ID2D1Effect_GetInput(effect, 0, &input);
+    if (!input)
+        return;
+
+    if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
+    {
+        prev_encode = context->srgb_encode;
+        if ((bitmap_impl = unsafe_impl_from_ID2D1Bitmap(bitmap))
+                && context->target.type == D2D_TARGET_BITMAP && context->target.bitmap)
+        {
+            DXGI_FORMAT target_format = context->target.bitmap->format.format;
+
+            context->srgb_encode = d2d_format_is_float(bitmap_impl->format.format)
+                    && !d2d_format_is_float(target_format) && !d2d_format_is_srgb(target_format);
+        }
+
+        d2d_device_context_draw_effect_bitmap(context, bitmap, 1.0f,
+                interpolation_mode, image_rect, target_offset, composite_mode);
+
+        context->srgb_encode = prev_encode;
+        ID2D1Bitmap_Release(bitmap);
+    }
+
+    ID2D1Image_Release(input);
+}
+
 static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *iface, ID2D1Image *image,
         const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect, D2D1_INTERPOLATION_MODE interpolation_mode,
         D2D1_COMPOSITE_MODE composite_mode)
@@ -4207,22 +4279,8 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
                 }
                 else if (IsEqualGUID(&clsid, &CLSID_D2D1ColorManagement))
                 {
-                    ID2D1Image *input = NULL;
-
-                    /* Colour space conversion is not implemented. Pass the source
-                     * through unconverted, so that applications drawing their output
-                     * through this effect still get an image. */
-                    ID2D1Effect_GetInput(effect, 0, &input);
-                    if (input)
-                    {
-                        if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
-                        {
-                            d2d_device_context_draw_effect_bitmap(context, bitmap, 1.0f,
-                                    interpolation_mode, image_rect, target_offset, composite_mode);
-                            ID2D1Bitmap_Release(bitmap);
-                        }
-                        ID2D1Image_Release(input);
-                    }
+                    d2d_device_context_draw_color_management(context, effect,
+                            target_offset, image_rect, interpolation_mode, composite_mode);
                 }
                 else
                 {
@@ -5750,6 +5808,7 @@ static const char shape_ps_code[] =
     "bool outline;\n"
     "bool is_arc;\n"
     "bool aa_mode;\n"
+    "bool srgb_encode;\n"
     "struct brush\n"
     "{\n"
     "    uint type;\n"
@@ -5875,6 +5934,21 @@ static const char shape_ps_code[] =
     "    return colour;\n"
     "}\n"
     "\n"
+    "/* scRGB (linear) -> sRGB transfer function, applied to a premultiplied\n"
+    " * colour: the curve is non-linear, so the colour has to be divided by\n"
+    " * alpha before encoding and multiplied by it again afterwards. */\n"
+    "float4 srgb_encode_colour(float4 colour)\n"
+    "{\n"
+    "    float3 c, lo, hi;\n"
+    "\n"
+    "    c = saturate(colour.a > 0.0f ? colour.rgb / colour.a : colour.rgb);\n"
+    "    lo = c * 12.92f;\n"
+    "    hi = 1.055f * pow(max(c, 1.0e-8f), 1.0f / 2.4f) - 0.055f;\n"
+    "    c = lerp(lo, hi, step(0.0031308f, c));\n"
+    "\n"
+    "    return float4(c * colour.a, colour.a);\n"
+    "}\n"
+    "\n"
     "float4 sample_brush(struct brush brush, Texture2D t, SamplerState s, Buffer<float4> b, float2 position)\n"
     "{\n"
     "    if (brush.type == BRUSH_TYPE_SOLID)\n"
@@ -5894,6 +5968,8 @@ static const char shape_ps_code[] =
     "    float4 src_rect;\n"
     "\n"
     "    colour = sample_brush(colour_brush, t0, s0, b0, i.p);\n"
+    "    if (srgb_encode)\n"
+    "        colour = srgb_encode_colour(colour);\n"
     "    if (opacity_brush.type < BRUSH_TYPE_COUNT)\n"
     "        colour *= sample_brush(opacity_brush, t1, s1, b1, i.p).a;\n"
     "\n"
