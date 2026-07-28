@@ -711,9 +711,14 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateGradientStopCollection
     TRACE("iface %p, stops %p, stop_count %u, gamma %#x, extend_mode %#x, gradient %p.\n",
             iface, stops, stop_count, gamma, extend_mode, gradient);
 
+    /* The ID2D1RenderTarget flavour interpolates in the colour space implied by
+     * the gamma setting, at 8bpc precision, with premultiplied alpha. */
     if (SUCCEEDED(hr = d2d_gradient_create(render_target->factory, render_target->d3d_device,
-            stops, stop_count, gamma, extend_mode, &object)))
-        *gradient = &object->ID2D1GradientStopCollection_iface;
+            stops, stop_count, gamma, extend_mode,
+            gamma == D2D1_GAMMA_1_0 ? D2D1_COLOR_SPACE_SCRGB : D2D1_COLOR_SPACE_SRGB,
+            gamma == D2D1_GAMMA_1_0 ? D2D1_COLOR_SPACE_SCRGB : D2D1_COLOR_SPACE_SRGB,
+            D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED, &object)))
+        *gradient = d2d_gradient_iface(object);
 
     return hr;
 }
@@ -3365,12 +3370,22 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_CreateGra
         D2D1_BUFFER_PRECISION buffer_precision, D2D1_EXTEND_MODE extend_mode,
         D2D1_COLOR_INTERPOLATION_MODE color_interpolation_mode, ID2D1GradientStopCollection1 **gradient)
 {
-    FIXME("iface %p, stops %p, stop_count %u, preinterpolation_space %#x, postinterpolation_space %#x, "
-            "buffer_precision %#x, extend_mode %#x, color_interpolation_mode %#x, gradient %p stub!\n",
+    struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
+    struct d2d_gradient *object;
+    HRESULT hr;
+
+    TRACE("iface %p, stops %p, stop_count %u, preinterpolation_space %#x, postinterpolation_space %#x, "
+            "buffer_precision %#x, extend_mode %#x, color_interpolation_mode %#x, gradient %p.\n",
             iface, stops, stop_count, preinterpolation_space, postinterpolation_space,
             buffer_precision, extend_mode, color_interpolation_mode, gradient);
 
-    return E_NOTIMPL;
+    if (SUCCEEDED(hr = d2d_gradient_create(render_target->factory, render_target->d3d_device,
+            stops, stop_count, preinterpolation_space == D2D1_COLOR_SPACE_SCRGB ? D2D1_GAMMA_1_0 : D2D1_GAMMA_2_2,
+            extend_mode, preinterpolation_space, postinterpolation_space, buffer_precision,
+            color_interpolation_mode, &object)))
+        *gradient = &object->ID2D1GradientStopCollection1_iface;
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateImageBrush(ID2D1DeviceContext6 *iface,

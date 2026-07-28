@@ -408,17 +408,30 @@ HRESULT d2d_bitmap_render_target_init(struct d2d_bitmap_render_target *render_ta
 
 struct d2d_gradient
 {
-    ID2D1GradientStopCollection ID2D1GradientStopCollection_iface;
+    ID2D1GradientStopCollection1 ID2D1GradientStopCollection1_iface;
     LONG refcount;
 
     ID2D1Factory *factory;
     ID3D11ShaderResourceView *view;
     D2D1_GRADIENT_STOP *stops;
     UINT32 stop_count;
+    D2D1_GAMMA gamma;
+    D2D1_EXTEND_MODE extend_mode;
+    D2D1_COLOR_SPACE preinterpolation_space;
+    D2D1_COLOR_SPACE postinterpolation_space;
+    D2D1_BUFFER_PRECISION buffer_precision;
+    D2D1_COLOR_INTERPOLATION_MODE color_interpolation_mode;
 };
+
+static inline ID2D1GradientStopCollection *d2d_gradient_iface(struct d2d_gradient *gradient)
+{
+    return (ID2D1GradientStopCollection *)&gradient->ID2D1GradientStopCollection1_iface;
+}
 
 HRESULT d2d_gradient_create(ID2D1Factory *factory, ID3D11Device1 *device, const D2D1_GRADIENT_STOP *stops,
         UINT32 stop_count, D2D1_GAMMA gamma, D2D1_EXTEND_MODE extend_mode,
+        D2D1_COLOR_SPACE preinterpolation_space, D2D1_COLOR_SPACE postinterpolation_space,
+        D2D1_BUFFER_PRECISION buffer_precision, D2D1_COLOR_INTERPOLATION_MODE color_interpolation_mode,
         struct d2d_gradient **gradient);
 
 struct d2d_brush

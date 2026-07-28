@@ -572,7 +572,7 @@ static HRESULT d2d_command_list_create_brush(struct d2d_command_list *command_li
             linear_properties.startPoint = brush->u.linear.start;
             linear_properties.endPoint = brush->u.linear.end;
             hr = ID2D1DeviceContext_CreateLinearGradientBrush(context, &linear_properties,
-                    &properties, &brush->u.linear.gradient->ID2D1GradientStopCollection_iface,
+                    &properties, d2d_gradient_iface(brush->u.linear.gradient),
                     (ID2D1LinearGradientBrush **)ret);
             break;
         case D2D_BRUSH_TYPE_RADIAL:
@@ -581,7 +581,7 @@ static HRESULT d2d_command_list_create_brush(struct d2d_command_list *command_li
             radial_properties.radiusX = brush->u.radial.radius.x;
             radial_properties.radiusY = brush->u.radial.radius.y;
             hr = ID2D1DeviceContext_CreateRadialGradientBrush(context, &radial_properties,
-                    &properties, &brush->u.radial.gradient->ID2D1GradientStopCollection_iface,
+                    &properties, d2d_gradient_iface(brush->u.radial.gradient),
                     (ID2D1RadialGradientBrush **)ret);
             break;
         case D2D_BRUSH_TYPE_BITMAP:
