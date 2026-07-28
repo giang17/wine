@@ -3202,7 +3202,28 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
     WNDPROC orig_wndproc;
 
     if (!target)
+    {
+        /* Orphaned subclass: the last target for this window is gone — its
+         * Release drops the property, but cannot unhook while e.g. dxgi is
+         * subclassed on top of us (its procedure keeps calling ours as the
+         * saved "original").  Swallowing into DefWindowProc here drops the
+         * application's own procedure out of the chain: the window keeps
+         * painting (the composite path runs independently of the WndProc)
+         * but all input is dead.  Forward to the application's procedure
+         * preserved for the window's lifetime instead. */
+        WNDPROC real = (WNDPROC)GetPropW(hwnd, dcomp_real_wndproc_prop);
+
+        if (real && real != dcomp_target_wndproc)
+        {
+            static unsigned int orphan_forward_count;
+
+            if (++orphan_forward_count <= 3 || !(orphan_forward_count % 1000))
+                FIXME("Forwarding message %#x for orphaned subclass on hwnd %p to %p #%u.\n",
+                        msg, hwnd, real, orphan_forward_count);
+            return CallWindowProcW(real, hwnd, msg, wparam, lparam);
+        }
         return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
 
     orig_wndproc = target->orig_wndproc;
 
