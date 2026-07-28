@@ -4205,6 +4205,25 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
                         FIXME("Failed to draw ConvolveMatrix effect, hr %#lx.\n", hr);
                     }
                 }
+                else if (IsEqualGUID(&clsid, &CLSID_D2D1ColorManagement))
+                {
+                    ID2D1Image *input = NULL;
+
+                    /* Colour space conversion is not implemented. Pass the source
+                     * through unconverted, so that applications drawing their output
+                     * through this effect still get an image. */
+                    ID2D1Effect_GetInput(effect, 0, &input);
+                    if (input)
+                    {
+                        if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
+                        {
+                            d2d_device_context_draw_effect_bitmap(context, bitmap, 1.0f,
+                                    interpolation_mode, image_rect, target_offset, composite_mode);
+                            ID2D1Bitmap_Release(bitmap);
+                        }
+                        ID2D1Image_Release(input);
+                    }
+                }
                 else
                 {
                     FIXME("Unhandled effect %s.\n", debugstr_guid(&clsid));
