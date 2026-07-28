@@ -2,9 +2,10 @@
 
 This fork contains patches for Wine's Direct2D (d2d1), DirectComposition (dcomp),
 DirectWrite (dwrite), and related subsystems. The patches fix rendering and
-performance issues that prevented modern JUCE 8 and VSTGUI-based Windows
-applications from running correctly under Wine — particularly audio plugins
-(Serum2, Korg Trinity, Korg Prophecy, Pianoteq 9) in DAWs like Reaper.
+performance issues that prevented modern JUCE 8, VSTGUI and SynthEdit/GMPI based
+Windows applications from running correctly under Wine — particularly audio
+plugins (Serum2, Korg Trinity, Korg Prophecy, Pianoteq 9, VProm3) in DAWs like
+Reaper.
 
 These newer plugin frameworks rely on DirectComposition for window management
 and D2D1 for GPU-accelerated 2D rendering — APIs that were largely unimplemented
@@ -26,18 +27,34 @@ and run stable in production use.
 This is the recommended branch. It includes all 15 D2D1 patches plus:
 
 - **DComp**: IDCompositionDesktopDevice implementation with D2D1 bitmap rendering path,
-  dirty-rect clipping, DIB+BitBlt presentation (9 phases)
+  dirty-rect clipping, DIB+BitBlt presentation (9 phases); IDCompositionDevice3/4/5,
+  composition and dynamic textures, D3D11 BeginDraw and surface handle export;
+  rootless visual trees composited onto the target window, cross-process targets,
+  backdrop capture
+- **D2D1 effects and colour**: Color Management effect (registration plus the
+  scRGB → sRGB transfer function applied in the shape pixel shader),
+  ID2D1GradientStopCollection1, sRGB pixel formats for WIC-sourced bitmaps.
+  Required by GMPI/SynthEdit plugins, which render linearly in 16-bit float and
+  composite their GUI through the Color Management effect
 - **DWrite**: Rendering mode 5 fix, IDWriteFontSet::GetMatchingFonts implementation,
   font fallback mapping for Miscellaneous Symbols and Arrows (U+2B00-2BFF, fixes star
   rating display in Serum2)
 - **DXGI**: Composition swapchain, FLIP_SEQUENTIAL preservation, DComp popup handling,
-  micro-resize for stale UI
+  micro-resize for stale UI, monitored fence support
+- **D3D11**: ID3D11Fence with CPU timeline semantics
 - **WineD3D**: Composition buffer with dirty rect accumulation, GL buffer recycling pool
   (70% RSS reduction), scratch buffer reuse (98.6% fewer allocs), constant buffer
   dirty-check (23% fewer DISCARDs), private heap to isolate alloc churn
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behavior)
 - **D2D1 private heap**: Isolates high-frequency geometry alloc/free from process heap
-- **winex11**: DComp window support, backing store, micro-resize suppression
+- **winex11**: DComp window support, backing store, micro-resize suppression;
+  ownerless TOOLWINDOW popups are no longer folded into the active window's group,
+  given a transient_for owner, or mapped as UTILITY — this fixes sticky, wrongly
+  decorated and always-on-top plugin menus on KDE
+- **win32u**: transparent (0x00) surface init for ARGB popups; the system arrow is
+  shown again when an application hides the cursor and sets none
+- **ole32**: RevokeDragDrop no longer touches drop targets owned by other processes
+  (fixes a use-after-free crash when closing plugin windows)
 - **shell32**: VirtualDesktopManager COM stub
 
 ### Building
@@ -91,11 +108,21 @@ composite for offscreen-redirected child windows. The fix marks the HWND so
 `needs_offscreen_rendering()` returns FALSE, attaching the plugin's X11 child
 directly to the host's toplevel.
 
+**SynthEdit / GMPI plugins**: Plugins built with SynthEdit — recognisable by the
+`.sem` modules inside the bundle — render through GMPI's DirectX backend, which
+maps straight onto the modern, colour-space aware D2D1 interfaces
+(`ID2D1GradientStopCollection1`, the Color Management effect, sRGB bitmaps).
+Without those patches such a plugin crashes on load, or comes up with a black
+window, or draws its GUI far too dark. No configuration is required — the fixes
+apply automatically. VProm3 is the plugin these were developed against, but they
+are not specific to it.
+
 ## Tested Applications
 
 | Application | Framework | Status |
 |-------------|-----------|--------|
 | Serum2 (VST3 in Reaper) | VSTGUI + DComp | Fully functional, all waveform views + envelopes + presets |
+| VProm3 (VST3 in Reaper) | SynthEdit/GMPI + D2D1 | Fully functional, correct colours (needs the Color Management effect patches) |
 | Korg Trinity (VST3 in Reaper) | JUCE 8 + DComp | Fully functional, DComp rendering path |
 | Korg Prophecy (VST3 in Reaper) | JUCE 8 + DComp | Fully functional |
 | Pianoteq 9 (standalone + VST3) | JUCE 8 + DComp | Fully functional |
