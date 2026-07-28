@@ -2993,15 +2993,6 @@ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *ifac
     if (context->layer_stack.count > 0)
         context->layer_stack.stack[context->layer_stack.count - 1].clear_called = TRUE;
 
-    {
-        static unsigned int clear_count;
-        ++clear_count;
-        if (clear_count <= 5 || !(clear_count % 100))
-            FIXME("Clear() #%u: colour {%.3f, %.3f, %.3f, a=%.3f}, target type %d.\n",
-                    clear_count, colour ? colour->r : 0.0f, colour ? colour->g : 0.0f,
-                    colour ? colour->b : 0.0f, colour ? colour->a : 0.0f, context->target.type);
-    }
-
     if (FAILED(context->error.code))
         return;
 
