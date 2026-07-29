@@ -831,6 +831,40 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                 if (swapchain->alpha_mode == DXGI_ALPHA_MODE_PREMULTIPLIED)
                     wined3d_swapchain_set_premultiplied_alpha(swapchain->wined3d_swapchain, TRUE);
 
+                /* Chromium binds composition swapchains to its "Intermediate D3D Window"
+                 * (WS_EX_LAYERED|WS_EX_NOREDIRECTIONBITMAP|WS_EX_TRANSPARENT) without ever
+                 * calling SetLayeredWindowAttributes or UpdateLayeredWindow.  On Windows the
+                 * DWM shows the composition visual directly and such a window needs no GDI
+                 * surface at all; here the composition buffer arrives by GDI blit, and an
+                 * unattributed layered window has no working GDI display path (winex11 defers
+                 * mapping layered windows until attributes arrive, and their redraws stay
+                 * suppressed) — presents would execute and never reach the screen.  An opaque
+                 * LWA_ALPHA is a no-op for a NOREDIRECTIONBITMAP window under Windows
+                 * semantics and makes the window an ordinary opaque surface here.  Targets
+                 * that already carry attributes (JUCE's DropShadower, UpdateLayeredWindow
+                 * users) have a working path already and keep their alpha semantics.
+                 *
+                 * From shibco/ableton-linux patch 0041, written by shibco, where it fixes
+                 * Ableton Live's Learn View.  Measured inert for Reaper/FL hosting here —
+                 * Chromium's composition swapchains never reach this bind at all — and kept
+                 * as cover for hosts that do bind them. */
+                {
+                    DWORD target_exstyle = GetWindowLongW(target_hwnd, GWL_EXSTYLE);
+
+                    if ((target_exstyle & WS_EX_NOREDIRECTIONBITMAP)
+                            || ((target_exstyle & WS_EX_LAYERED)
+                                && !GetLayeredWindowAttributes(target_hwnd, NULL, NULL, NULL)))
+                    {
+                        if (SetLayeredWindowAttributes(target_hwnd, 0, 255, LWA_ALPHA))
+                            TRACE("DComp: target %p exstyle %#lx was layered without attributes, "
+                                    "set opaque LWA_ALPHA so composition blits are visible.\n",
+                                    target_hwnd, target_exstyle);
+                        else
+                            WARN("DComp: SetLayeredWindowAttributes failed for target %p, error %lu.\n",
+                                    target_hwnd, GetLastError());
+                    }
+                }
+
                 ShowWindow(hwnd, SW_HIDE);
 
                 /* Detect popup mode via subclassed target count.
