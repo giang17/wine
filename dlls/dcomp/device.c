@@ -84,6 +84,15 @@ static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp
 #define DCOMP_TREE_TIMER     ((UINT_PTR)0xDC0FFEE2)
 #define DCOMP_TREE_TIMER_MS  100
 #define DCOMP_TREE_FRAME_MS  16   /* ~60 Hz rate limit for hook-driven composites */
+/* How long the target window may show something other than what we delivered
+ * before we re-deliver it.  A tab switch legitimately repaints the panel while
+ * Chromium's hide is still in flight (~100-500 ms), and re-blitting into that
+ * race is exactly the tab bleed the unchanged-content gate prevents.  A window
+ * that lost our pixels to an unrelated sibling stays wrong indefinitely
+ * (measured: phases of 8-19 s).  Both look identical pixel-wise, so the
+ * duration is what separates them; measured phase lengths cluster below 620 ms
+ * and above 790 ms, and this sits in that gap. */
+#define DCOMP_TARGET_REPAIR_MS 700
 
 static void dcomp_send_child_mode(IUnknown *content)
 {
@@ -2084,6 +2093,11 @@ struct dcomp_target
     BOOL last_blit_leaf_valid;
     RECT last_blit_clip_rc;               /* clip box of the last blit that really painted */
     HWND last_foreground;                 /* foreground window at the last timer composite */
+    /* Target-side verification: the leaf hash proves our source is unchanged,
+     * never that the window still shows what we delivered (issue 107). */
+    DWORD last_delivered_hash;            /* sampled hash of the last frame we blitted */
+    BOOL last_delivered_valid;
+    DWORD target_diverged_tick;           /* GetTickCount when the window stopped matching, 0 = matches */
     /* Host-restore bookkeeping (issue 99): hand areas our blits vacated
      * (window hidden or resized) back to the host for repaint. */
     int hide_restore_clip;                /* last present clip verdict (visible->hidden edge) */
@@ -2587,6 +2601,19 @@ static BOOL dcomp_skip_unchanged(void)
     return dcomp_skip_unchanged_enabled > 0;
 }
 
+/* Sparse FNV-1a over a composition buffer, RGB only (alpha carries noise).
+ * Used to tell whether the window still shows the frame we delivered, so it
+ * must sample the same way on both sides of the comparison. */
+static DWORD dcomp_surface_hash(const DWORD *bits, unsigned int count)
+{
+    DWORD h = 2166136261u;
+    unsigned int i;
+
+    for (i = 0; i < count; i += 64)
+        h = (h ^ (bits[i] & 0x00ffffff)) * 16777619u;
+    return h;
+}
+
 /* Host-restore gate (issue 99): when our target window hides or changes
  * geometry, hand the vacated screen area back to the host for repaint —
  * child targets share an ancestor's X11 drawable, so pixels we blitted stay
@@ -2811,6 +2838,32 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
         if (hdc_win)
             ReleaseDC(target->hwnd, hdc_win);
 
+        /* The backdrop we just read back IS the window's current content, so it
+         * also answers the question the leaf hash cannot: does the target still
+         * show the frame we delivered?  A sibling window painting over our area
+         * leaves it wrong indefinitely, while the unchanged-content gate keeps
+         * skipping because our leaves did not change (issue 107: the tab went
+         * black when an unrelated FL window was opened or moved).
+         *
+         * Re-deliver only once the mismatch has persisted past
+         * DCOMP_TARGET_REPAIR_MS, so the tab-switch repaint from issue 99 --
+         * which resolves within a few hundred ms -- never triggers it. */
+        if (target->last_delivered_valid && from_timer)
+        {
+            DWORD now = GetTickCount();
+
+            if (dcomp_surface_hash(target->comp_bits,
+                    (unsigned int)(rc.right * rc.bottom)) == target->last_delivered_hash)
+                target->target_diverged_tick = 0;
+            else if (!target->target_diverged_tick)
+                target->target_diverged_tick = now | 1;
+            else if (now - target->target_diverged_tick >= DCOMP_TARGET_REPAIR_MS)
+            {
+                target->last_blit_leaf_valid = FALSE;
+                target->target_diverged_tick = 0;
+            }
+        }
+
         for (child = root->children; child; child = child->next_sibling)
             dcomp_target_composite_leaves(target, child,
                     (int)root->offset_x, (int)root->offset_y);
@@ -2886,6 +2939,15 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
             target->last_blit_leaf_hash = target->walk_leaf_hash;
             target->last_blit_leaf_valid = target->walk_leaf_hash_valid;
             target->last_blit_clip_rc = clip_out_rc;
+            /* Remember what the window should show from now on, so the next
+             * backdrop readback can tell whether it still does. */
+            if (target->comp_bits)
+            {
+                target->last_delivered_hash = dcomp_surface_hash(target->comp_bits,
+                        (unsigned int)(rc.right * rc.bottom));
+                target->last_delivered_valid = TRUE;
+            }
+            target->target_diverged_tick = 0;
         }
         else if (clip_out < SIMPLEREGION)
         {
