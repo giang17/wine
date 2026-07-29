@@ -1887,6 +1887,30 @@ static void window_set_managed( struct x11drv_win_data *data, BOOL new_managed )
         return;
     }
 
+    /* Flipping to managed can only go through a WM_STATE unmap/remap round-trip,
+     * which yanks a mapped window off the screen and hands it to the window manager
+     * mid-use.  An app that pokes its open dropdown with an activating no-op
+     * SetWindowPos (NOSIZE|NOMOVE|NOZORDER without NOACTIVATE, a no-op on Windows)
+     * thereby turns the popup into a WM-managed dialog under the pointer: it flashes,
+     * eats the first click, and grows WM decorations.  The managed decision belongs to
+     * map time — a mapped window keeps its mode until it is withdrawn, and the next
+     * map re-evaluates it.
+     *
+     * data->managed deliberately stays FALSE, so a later WindowPosChanged on the same
+     * mapped window asks again and is refused again; that is cheaper than the
+     * unmap/remap round-trip it replaces.
+     *
+     * The legitimate flip paths are unaffected: make_window_embedded withdraws
+     * explicitly before flipping, and create_desktop_win_data runs on freshly
+     * allocated data — only X11DRV_WindowPosChanged reaches this with a mapped window.
+     *
+     * From shibco/ableton-linux patch 0039, written by shibco. */
+    if (data->desired_state.wm_state != WithdrawnState)
+    {
+        WARN( "window %p/%lx is mapped, refusing to make it managed\n", data->hwnd, data->whole_window );
+        return;
+    }
+
     window_set_wm_state( data, WithdrawnState, FALSE ); /* no WM_STATE is pending, requested immediately */
 
     data->managed = new_managed;
