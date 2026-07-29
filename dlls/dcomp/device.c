@@ -2083,6 +2083,7 @@ struct dcomp_target
     DWORD last_blit_leaf_hash;
     BOOL last_blit_leaf_valid;
     RECT last_blit_clip_rc;               /* clip box of the last blit that really painted */
+    HWND last_foreground;                 /* foreground window at the last timer composite */
     /* Host-restore bookkeeping (issue 99): hand areas our blits vacated
      * (window hidden or resized) back to the host for repaint. */
     int hide_restore_clip;                /* last present clip verdict (visible->hidden edge) */
@@ -2830,6 +2831,27 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
         if (hdc)
         {
             clip_out = GetClipBox(hdc, &clip_out_rc);
+
+            /* Switching to another application can cost us the pixels we
+             * blitted into the shared drawable, while none of our source
+             * leaves change.  The content hash only proves that our source is
+             * unchanged — it cannot prove the target still carries our pixels,
+             * so the gate below would skip forever and the tab stays blank
+             * until something happens to alter a leaf (issue 115: mouse-over
+             * or a tab round-trip was needed to bring the content back).
+             * Void the delivery record once per foreground change; a tab
+             * switch keeps the same foreground window and is unaffected, so
+             * the issue 99 tab-bleed guard keeps working as before. */
+            if (from_timer)
+            {
+                HWND fg = GetForegroundWindow();
+
+                if (fg != target->last_foreground)
+                {
+                    target->last_foreground = fg;
+                    target->last_blit_leaf_valid = FALSE;
+                }
+            }
 
             if (from_timer && dcomp_skip_unchanged())
             {
