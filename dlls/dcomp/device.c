@@ -2925,6 +2925,21 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
         {
             clip_out = GetClipBox(hdc, &clip_out_rc);
 
+            /* Parked targets must not be painted: WebView2 keeps the target
+             * window WS_VISIBLE when the host app parks the pane under a
+             * hidden helper toplevel (Ableton Live's Learn View close), and
+             * the DCE clip region cannot be trusted to go empty — it stays
+             * stale for SetParent'ed non-WS_CHILD windows (issue 121,
+             * reproduced app-free). IsWindowVisible() walks the real ancestor
+             * styles and is not affected, so gate the blit on it; void the
+             * delivery record so the first composite after re-exposure paints
+             * fresh. Same pattern as the reblit gate from shibco's issue 57. */
+            if (!IsWindowVisible(target->hwnd))
+            {
+                skip_same = TRUE;
+                target->last_blit_leaf_valid = FALSE;
+            }
+
             /* Switching to another application can cost us the pixels we
              * blitted into the shared drawable, while none of our source
              * leaves change.  The content hash only proves that our source is
