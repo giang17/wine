@@ -565,6 +565,7 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
         TRACE( "using None background_pixmap + Always backing_store for DComp window %p\n", data->hwnd );
         attr->background_pixmap = None;
         attr->backing_store = Always;
+        data->black_expose_bg = 0;
         return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixmap |
                 CWEventMask | CWBitGravity | CWBackingStore);
     }
@@ -592,15 +593,18 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
         if (data->use_alpha)
         {
             attr->background_pixel = 0;  /* ARGB32: pixel 0 == transparent */
+            data->black_expose_bg = 0;
             return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
                     CWEventMask | CWBitGravity | CWBackingStore);
         }
         attr->background_pixmap = None;
+        data->black_expose_bg = 0;
         return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixmap |
                 CWEventMask | CWBitGravity | CWBackingStore);
     }
 
     attr->background_pixel  = 0;
+    data->black_expose_bg = 1;
     return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
             CWEventMask | CWBitGravity | CWBackingStore);
 }
@@ -2555,6 +2559,42 @@ static void client_window_events_disable( struct x11drv_win_data *data, Window c
 }
 
 /**********************************************************************
+ *		set_expose_background_suppressed
+ *
+ * Temporarily stop the X server from painting the window background over
+ * areas that get exposed in a top-level's X window.
+ *
+ * Windows taking the default path in get_window_attributes() have
+ * background_pixel = 0, i.e. opaque black, and the server fills any exposed
+ * area with it before the client can repaint.  Taking a client window off the
+ * screen exposes everything it covered - for a GL/D3D top-level that is the
+ * entire client area - so the whole window flashes black for a frame until the
+ * new content arrives.  Callers wrap the requests that do this, so that the
+ * server leaves the previously drawn content in place instead.
+ *
+ * This must stay a short bracket around those requests, never a permanent
+ * state: the background is what keeps a window that is being resized larger
+ * from showing stale screen content in the newly revealed area.
+ */
+void set_expose_background_suppressed( HWND hwnd, BOOL suppress )
+{
+    struct x11drv_win_data *data;
+
+    if (!(data = get_win_data( hwnd ))) return;
+
+    if (data->whole_window && data->black_expose_bg)
+    {
+        TRACE( "%p/%lx %s expose background\n", hwnd, data->whole_window,
+               suppress ? "suppressing" : "restoring" );
+        if (suppress) XSetWindowBackgroundPixmap( gdi_display, data->whole_window, None );
+        else XSetWindowBackground( gdi_display, data->whole_window, 0 );
+    }
+
+    release_win_data( data );
+}
+
+
+/**********************************************************************
  *		detach_client_window
  */
 void detach_client_window( struct x11drv_win_data *data, Window client_window )
@@ -2566,7 +2606,20 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
     if (data->whole_window)
     {
         client_window_events_disable( data, client_window );
+
+        /* Reparenting the client window away exposes its rectangle in whole_window,
+         * and the server fills the exposed area with the black window background
+         * before anybody repaints it.  Drop the background for this request so it
+         * leaves the previously drawn content in place instead, and restore it right
+         * after - a window resized larger needs the background, its newly revealed
+         * area has never held any content.
+         *
+         * client_surface_update_offscreen() already brackets its whole transition,
+         * but that bracket alone measurably does not cover this reparent, so keep
+         * this one: without it the black frame comes back (issue 128). */
+        if (data->black_expose_bg) XSetWindowBackgroundPixmap( gdi_display, data->whole_window, None );
         XReparentWindow( gdi_display, client_window, get_dummy_parent(), 0, 0 );
+        if (data->black_expose_bg) XSetWindowBackground( gdi_display, data->whole_window, 0 );
     }
 
     data->client_window = 0;

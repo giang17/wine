@@ -401,6 +401,16 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         return;
     }
 
+    /* Going offscreen takes the client window off the screen twice: the composite
+     * redirect below removes it from the parent's rendering, and detach_client_window()
+     * then reparents it away.  Both expose the area it covered in the top-level's X
+     * window, which the server fills with the opaque black window background before
+     * the offscreen content is blitted in - a black flash over the whole client area
+     * for a GL/D3D top-level (issue 128: Ableton Live 12 switching the Learn View
+     * panel on makes the window need offscreen rendering and lands here).  Suppress
+     * the background across both requests and restore it right after. */
+    if (offscreen) set_expose_background_suppressed( hwnd, TRUE );
+
     if (!offscreen)
     {
 #ifdef SONAME_LIBXCOMPOSITE
@@ -435,6 +445,8 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         else attach_client_window( data, surface->window );
         release_win_data( data );
     }
+
+    if (offscreen) set_expose_background_suppressed( hwnd, FALSE );
 }
 
 static void x11drv_client_surface_update( struct client_surface *client )

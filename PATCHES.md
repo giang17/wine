@@ -51,9 +51,9 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   ownerless TOOLWINDOW popups are no longer folded into the active window's group,
   given a transient_for owner, or mapped as UTILITY — this fixes sticky, wrongly
   decorated and always-on-top plugin menus on KDE; the opaque black X expose
-  background is dropped once a window has been mapped, so recreating a GL/D3D
-  client window no longer flashes the whole client area black for a frame
-  (visible in Ableton Live 12 when toggling the Learn View panel)
+  background is suppressed while a GL/D3D client window is taken off the screen
+  for offscreen rendering, so the client area no longer flashes black for a
+  frame (visible in Ableton Live 12 when toggling the Learn View panel)
 - **win32u**: transparent (0x00) surface init for ARGB popups; the system arrow is
   shown again when an application hides the cursor and sets none
 - **ole32**: RevokeDragDrop no longer touches drop targets owned by other processes
