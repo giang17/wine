@@ -606,42 +606,6 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
 }
 
 /***********************************************************************
- *              clear_window_background
- *
- * Stop the X server from painting a window background on expose.
- *
- * Windows taking the default path in get_window_attributes() get
- * background_pixel = 0, i.e. opaque BLACK (this is stock Wine behaviour, not
- * something this tree introduces).  Whenever such a window is exposed the X
- * server fills the exposed area black before the client gets a chance to
- * repaint, which is visible as a one-frame black flash.  The most prominent
- * case is a window that renders through a client_window (GL/D3D): recreating
- * that child reparents the old one away, which exposes exactly its rectangle
- * in the parent, so the whole client area flashes black while decorations
- * drawn outside the child (e.g. a menu bar) stay put (issue 128).
- *
- * The background is only needed for the very first map: without it the X
- * server would show undefined buffer content the first time the window
- * appears.  Once the window has been mapped, the server has painted that
- * background at least once, and from then on the last painted content is a
- * better expose filler than black - so drop the background entirely.
- *
- * Not applied to the DComp and layered paths above: those already ask for
- * background_pixmap = None, except per-pixel-alpha layered windows where
- * background_pixel = 0 means fully TRANSPARENT and is deliberate.
- */
-static void clear_window_background( struct x11drv_win_data *data )
-{
-    if (!data->whole_window || data->whole_window == root_window || data->embedded) return;
-    if (NtUserGetProp( data->hwnd, dcomp_swapchain_prop )) return;
-    if (NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE ) & WS_EX_LAYERED) return;
-
-    TRACE( "window %p/%lx dropping expose background\n", data->hwnd, data->whole_window );
-    XSetWindowBackgroundPixmap( data->display, data->whole_window, None );
-    data->background_cleared = 1;
-}
-
-/***********************************************************************
  *              sync_window_input_shape
  *
  * Update the X11 window input shape for WS_EX_TRANSPARENT windows.
@@ -689,8 +653,6 @@ static void sync_window_style( struct x11drv_win_data *data )
         TRACE( "window %p/%lx changing attributes mask %#x, serial %lu\n", data->hwnd,
                data->whole_window, mask, NextRequest( data->display ) );
         XChangeWindowAttributes( data->display, data->whole_window, mask, &attr );
-        /* CWBackPixel above restores the black expose background, drop it again */
-        if (data->background_cleared) clear_window_background( data );
         x11drv_xinput2_enable( data->display, data->whole_window );
         sync_window_input_shape( data );
     }
@@ -1875,13 +1837,7 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     case MAKELONG(WithdrawnState, NormalState):
     case MAKELONG(IconicState, NormalState):
         if (data->embedded) set_xembed_flags( data, XEMBED_MAPPED );
-        else
-        {
-            XMapWindow( data->display, data->whole_window );
-            /* the server has now painted the background once for this map, it
-             * is no longer needed and would only flash black on later exposes */
-            clear_window_background( data );
-        }
+        else XMapWindow( data->display, data->whole_window );
         break;
     case MAKELONG(NormalState, WithdrawnState):
     case MAKELONG(IconicState, WithdrawnState):
@@ -2750,7 +2706,6 @@ static void create_whole_window( struct x11drv_win_data *data )
                                         cx, cy, 0, data->vis.depth, InputOutput,
                                         data->vis.visual, mask, &attr );
     if (!data->whole_window) goto done;
-    data->background_cleared = 0;  /* fresh X window, it has the black background again */
     SetRect( &data->current_state.rect, pos.x, pos.y, pos.x + cx, pos.y + cy );
     data->pending_state.rect = data->current_state.rect;
     data->desired_state.rect = data->current_state.rect;
