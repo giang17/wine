@@ -1591,14 +1591,9 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     XWindowChanges changes;
     RECT *new_rect = &rect;
 
-    /* The window manager owns position and size of a maximized managed window
-     * (it places it below the title bar).  Clamp the position in addition to the
-     * size so Wine does not propose a placement that conflicts with the WM.
-     * Without this, a custom-NC application whose visible rect still carries a
-     * present-rect offset drives a configure-notify feedback loop. */
+    /* resizing a managed maximized window is not allowed */
     if ((style & WS_MAXIMIZE) && data->managed)
     {
-        OffsetRect( new_rect, old_rect->left - new_rect->left, old_rect->top - new_rect->top );
         new_rect->right = new_rect->left + old_rect->right - old_rect->left;
         new_rect->bottom = new_rect->top + old_rect->bottom - old_rect->top;
     }
