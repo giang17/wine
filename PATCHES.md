@@ -95,6 +95,17 @@ through a bitmap+BitBlt path, not the DXGI swapchain, so WineD3D performs equall
 well. The simplest, recommended setup is to **not install DXVK at all**, so the
 builtin DComp path is always used and no overrides are needed.
 
+**GL present for top-level windows** (default ON): D3D11 swapchains on top-level
+windows present through `glXSwapBuffers` directly from the GPU instead of the
+GDI readback path — this removes a large per-frame GPU→CPU copy (order of
+650 MB/s display-server traffic during continuous UI activity in Ableton Live)
+and fixes main-window flicker when an app hosts WebView2 content (Ableton
+Live's Learn View). `WS_CHILD` and `WS_POPUP` windows keep the GDI path.
+Adopted from shibco/ableton-linux patch 0055 (diagnosis: ClickSentinel).
+If you see misplaced frames (reported once on niri/Wayland: content shifted
+down, black band on top), set `WINE_DISABLE_GL_PRESENT=1` to restore the old
+GDI path for every window.
+
 **Serum2 settings** (recommended — DComp gives the best performance):
 - `"Disable DirectComposition": false`
 - `"Disable Partial Redraw": false`
