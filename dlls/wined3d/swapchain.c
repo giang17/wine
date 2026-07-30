@@ -27,6 +27,28 @@
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
 WINE_DECLARE_DEBUG_CHANNEL(d3d_perf);
 
+/* Route top-level window presents through glXSwapBuffers instead of the GDI
+ * blit: the GDI path reads the whole backbuffer off the GPU into system
+ * memory every present (~650 MB/s of display-server traffic and more than a
+ * core during continuous UI activity in Ableton Live), and as a 60 Hz GDI
+ * painter it fights every other painter sharing the top level's drawable —
+ * the dcomp tree timer's WebView2 composite in particular (issue 121).
+ * WINE_DISABLE_GL_PRESENT=1 restores the GDI path for every window; the
+ * value is read, not just the presence, so =0 keeps the GL path.
+ * Adopted from shibco/ableton-linux patch 0055 (diagnosis and measurements:
+ * Lucas Gillingham/ClickSentinel, their issue 91). */
+static BOOL wined3d_gl_present_disabled(void)
+{
+    static int disabled = -1;
+
+    if (disabled < 0)
+    {
+        const char *e = getenv("WINE_DISABLE_GL_PRESENT");
+        disabled = (e && e[0] != '0') ? 1 : 0;
+    }
+    return disabled > 0;
+}
+
 struct dcomp_child_exclude_ctx
 {
     HDC dc;
@@ -2245,6 +2267,24 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
     swapchain->win_handle = window;
     swapchain->swap_interval = WINED3D_SWAP_INTERVAL_DEFAULT;
     swapchain_set_max_frame_latency(swapchain, device);
+
+    /* WS_CHILD and WS_POPUP swapchains keep the GDI path: dcomp composition
+     * windows depend on it, and WS_POPUP windows (settings dialogs, context
+     * menus) paint black on the GL path until first interaction (empirical,
+     * shibco patch 0055). A swapchain that dxgi later marks FORCE_GDI_PRESENT
+     * still takes the GDI branch at present time — swapchain_gl_present()
+     * checks that flag first. Swapchains are routinely created before the
+     * first ShowWindow(), so visibility is not part of the test. */
+    if (!wined3d_gl_present_disabled() && window)
+    {
+        LONG style = GetWindowLongW(window, GWL_STYLE);
+
+        if (!(style & (WS_CHILD | WS_POPUP)))
+        {
+            swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
+            TRACE("Preferring GL present for top-level window %p (style %#lx).\n", window, style);
+        }
+    }
 
     if (!(swapchain->dc = GetDCEx(swapchain->win_handle, 0, DCX_USESTYLE | DCX_CACHE)))
         WARN("Failed to retrieve device context, trying swapchain backup.\n");
