@@ -55,6 +55,9 @@ static void *client_objects[MAX_USER_HANDLES];
 
 static volatile unsigned int startup_info_flags;
 static unsigned int startup_show_window;
+static DWORD reentrant_wpchanged_thread;
+static HWND reentrant_wpchanged_hwnd;
+static UINT reentrant_wpchanged_depth;
 
 static unsigned int set_startup_info_flags( unsigned int mask, unsigned int flags )
 {
@@ -3992,6 +3995,17 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     if (((winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE)
             && !((orig_flags & SWP_AGG_NOCLIENTCHANGE) && (orig_flags & SWP_SHOWWINDOW)))
     {
+        static const UINT reentrant_resize_flags =
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        DWORD style = get_window_long( winpos->hwnd, GWL_STYLE );
+        DWORD tid = GetCurrentThreadId();
+        BOOL suppress_reentrant_wpch =
+            !(style & WS_CHILD) &&
+            reentrant_wpchanged_depth &&
+            reentrant_wpchanged_thread == tid &&
+            reentrant_wpchanged_hwnd == winpos->hwnd &&
+            (orig_flags & reentrant_resize_flags) == reentrant_resize_flags &&
+            !(orig_flags & (SWP_NOSIZE | SWP_SHOWWINDOW | SWP_HIDEWINDOW));
         /* WM_WINDOWPOSCHANGED is sent even if SWP_NOSENDCHANGING is set
            and always contains final window position.
          */
@@ -3999,7 +4013,24 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         winpos->y  = new_rects.window.top;
         winpos->cx = new_rects.window.right - new_rects.window.left;
         winpos->cy = new_rects.window.bottom - new_rects.window.top;
-        send_message( winpos->hwnd, WM_WINDOWPOSCHANGED, 0, (LPARAM)winpos );
+        /* Avoid re-entering the same top-level window with a nested
+         * size-only WM_WINDOWPOSCHANGED update.  This breaks the
+         * configure feedback loop that drives per-frame geometry
+         * oscillation for custom-NC windows (e.g. Ableton Live). */
+        if (!suppress_reentrant_wpch)
+        {
+            DWORD prev_thread = reentrant_wpchanged_thread;
+            HWND prev_hwnd = reentrant_wpchanged_hwnd;
+            UINT prev_depth = reentrant_wpchanged_depth;
+
+            reentrant_wpchanged_thread = tid;
+            reentrant_wpchanged_hwnd = winpos->hwnd;
+            reentrant_wpchanged_depth = prev_depth + 1;
+            send_message( winpos->hwnd, WM_WINDOWPOSCHANGED, 0, (LPARAM)winpos );
+            reentrant_wpchanged_thread = prev_thread;
+            reentrant_wpchanged_hwnd = prev_hwnd;
+            reentrant_wpchanged_depth = prev_depth;
+        }
     }
 
     if ((winpos->flags & (SWP_NOSIZE|SWP_NOMOVE|SWP_FRAMECHANGED)) != (SWP_NOSIZE|SWP_NOMOVE))
