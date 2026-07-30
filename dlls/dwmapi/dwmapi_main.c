@@ -284,7 +284,11 @@ HRESULT WINAPI DwmGetCompositionTimingInfo(HWND hwnd, DWM_TIMING_INFO *info)
     info->qpcRefreshPeriod = performance_frequency.QuadPart / display_frequency;
 
     QueryPerformanceCounter(&qpc);
-    info->qpcVBlank = (qpc.QuadPart / info->qpcRefreshPeriod) * info->qpcRefreshPeriod;
+    /* The DWM composes a frame ahead of scanout, so qpcVBlank denotes the
+     * upcoming vblank, not the last one. Frame pacing code (e.g. Ableton
+     * Live's compositor timer) rejects timing info whose vblank lies in
+     * the past. */
+    info->qpcVBlank = (qpc.QuadPart / info->qpcRefreshPeriod + 1) * info->qpcRefreshPeriod;
 
     return S_OK;
 }
