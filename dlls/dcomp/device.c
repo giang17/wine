@@ -2051,6 +2051,43 @@ static void dcomp_visual_try_reparent(struct dcomp_visual *visual)
 
 /* Property name for storing target pointer on HWND (Phase 5 subclass) */
 static const WCHAR dcomp_target_prop[] = L"__wine_dcomp_target";
+
+/* Global composition-target registry on the desktop window, so presenters in
+ * other modules/processes (wined3d) can exclude target areas from their window
+ * blits without knowing the window hierarchy — WebView2 reparents its target
+ * between top levels at runtime (issue 121). Slots stale after window death
+ * are skipped by readers via IsWindow(). */
+#define DCOMP_TARGET_REGISTRY_SLOTS 16
+
+static void dcomp_target_registry_set(HWND hwnd, BOOL add)
+{
+    HWND desktop = GetDesktopWindow();
+    WCHAR prop[32];
+    unsigned int i;
+    int free_slot = -1;
+
+    for (i = 0; i < DCOMP_TARGET_REGISTRY_SLOTS; ++i)
+    {
+        HWND cur;
+
+        swprintf(prop, ARRAY_SIZE(prop), L"__wine_dcomp_target_%u", i);
+        cur = (HWND)GetPropW(desktop, prop);
+        if (cur == hwnd)
+        {
+            if (!add)
+                RemovePropW(desktop, prop);
+            return;
+        }
+        if (add && free_slot < 0 && (!cur || !IsWindow(cur)))
+            free_slot = (int)i;
+    }
+    if (add && free_slot >= 0)
+    {
+        swprintf(prop, ARRAY_SIZE(prop), L"__wine_dcomp_target_%u", free_slot);
+        SetPropW(desktop, prop, (HANDLE)hwnd);
+    }
+}
+
 /* The application's own wndproc, stashed on the window when it is first
  * subclassed so later targets can restore the chain (issue 98). */
 static const WCHAR dcomp_real_wndproc_prop[] = L"__wine_dcomp_real_wndproc";
@@ -2177,7 +2214,10 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
             }
             /* Never leave the back-pointer on a window we are about to free. */
             if (ours)
+            {
                 RemovePropW(target->hwnd, dcomp_target_prop);
+                dcomp_target_registry_set(target->hwnd, FALSE);
+            }
         }
 
         /* Clean up presentation state */
@@ -3492,6 +3532,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
      * windows sharing the class. */
     previous = (struct dcomp_target *)GetPropW(hwnd, dcomp_target_prop);
     SetPropW(hwnd, dcomp_target_prop, (HANDLE)object);
+    dcomp_target_registry_set(hwnd, TRUE);
 
     /* Cross-process targets (e.g. Tauri/WebView2 helper targeting a window
      * owned by the main process, issue 88): do NOT subclass. The installed

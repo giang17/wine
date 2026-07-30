@@ -27,6 +27,28 @@
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
 WINE_DECLARE_DEBUG_CHANNEL(d3d_perf);
 
+struct dcomp_child_exclude_ctx
+{
+    HDC dc;
+    HWND parent;
+    unsigned int excluded;
+};
+
+static BOOL CALLBACK wined3d_exclude_dcomp_children_proc(HWND child, LPARAM lp)
+{
+    struct dcomp_child_exclude_ctx *ctx = (struct dcomp_child_exclude_ctx *)lp;
+    RECT r;
+
+    if (IsWindowVisible(child) && GetPropW(child, L"__wine_dcomp_child_count")
+            && GetWindowRect(child, &r))
+    {
+        MapWindowPoints(NULL, ctx->parent, (POINT *)&r, 2);
+        ExcludeClipRect(ctx->dc, r.left, r.top, r.right, r.bottom);
+        ctx->excluded++;
+    }
+    return TRUE;
+}
+
 static BOOL set_window_present_rect(HWND hwnd, UINT x, UINT y, UINT width, UINT height)
 {
     RECT rect = {x, y, x + width, y + height};
@@ -1033,10 +1055,37 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         }
         else
         {
+            /* A DComp composition target (WebView2) owns its window area: on
+             * Windows it renders into its own redirection surface and the DWM
+             * composes it above everything else, so no present ever paints
+             * there. Our GDI blit shares the drawable with all windows of the
+             * top level — including sibling branches (Ableton Live hosts the
+             * WebView2 tree next to, not under, its D3D window, and WebView2
+             * reparents it at runtime). Exclude every target from the dcomp
+             * desktop-window registry, or this present overpaints its content
+             * at 60 Hz while the dcomp tree timer paints it back at 10 Hz:
+             * visible flicker (issue 121). Rects outside our window map to
+             * empty clip areas and are harmless. */
+            struct dcomp_child_exclude_ctx ctx = { swapchain->dc, swapchain->win_handle, 0 };
+            HWND desktop_wnd = GetDesktopWindow();
+            WCHAR treg[32];
+            unsigned int ti;
+
+            for (ti = 0; ti < 16; ++ti)
+            {
+                HWND t;
+
+                swprintf(treg, ARRAY_SIZE(treg), L"__wine_dcomp_target_%u", ti);
+                t = (HWND)GetPropW(desktop_wnd, treg);
+                if (t && t != swapchain->win_handle && IsWindow(t))
+                    wined3d_exclude_dcomp_children_proc(t, (LPARAM)&ctx);
+            }
             /* Always BitBlt full comp buffer to window — survives any surface reset. */
             if (!BitBlt(swapchain->dc, dst_rect->left, dst_rect->top, dst_w, dst_h,
                     swapchain->comp_dc, 0, 0, SRCCOPY))
                 WARN("Failed to blit composition buffer to window.\n");
+            if (ctx.excluded)
+                SelectClipRgn(swapchain->dc, NULL);
         }
 
         /* Store comp_dc as window property so WM_PAINT can re-blit. Don't
