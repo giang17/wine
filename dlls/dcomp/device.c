@@ -2115,6 +2115,7 @@ struct dcomp_target
     DWORD *comp_bits;                     /* DIB section pixel buffer */
     UINT comp_width, comp_height;
     BOOL comp_needs_full_present;         /* force a full BitBlt on first present after DIB (re)create */
+    BOOL comp_backdrop_valid;             /* comp_bits holds a backdrop captured successfully at the current size (issue 116) */
     LONGLONG last_present_qpc;            /* QPC of last actual present — drives ~60 Hz coalescing (issue 56) */
     BOOL foreign;                         /* target hwnd belongs to another process — no subclass, hook-driven compositing (issue 88) */
     DWORD last_tree_composite_tick;       /* GetTickCount of last hook-driven tree composite (~60 Hz rate limit) */
@@ -2604,6 +2605,9 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
     target->comp_width = width;
     target->comp_height = height;
     target->comp_needs_full_present = TRUE;
+    /* Fresh DIB section: zero-initialised, so it holds no usable backdrop yet
+     * and must not be kept as one when the next capture fails (issue 116). */
+    target->comp_backdrop_valid = FALSE;
 
     FIXME("Created comp DC %p with %ux%u DIB for target hwnd %p.\n",
             target->comp_dc, width, height, target->hwnd);
@@ -2870,11 +2874,25 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
 
         /* Capture the live window content as backdrop: transparent page
          * areas must show what is behind (loader artwork / host content),
-         * not opaque black (issue 88). Falls back to black when the capture
-         * fails (e.g. unreadable foreign window DC). */
+         * not opaque black (issue 88).
+         *
+         * The capture fails regularly while the target is being resized — the
+         * BitBlt reads the window through X GetImage, which answers BadMatch
+         * whenever the window is not fully viewable.  Measured in FL Studio's
+         * Hub: 266 failures in one short session, every one of them a black
+         * frame on screen (issue 116, proven with a colour marker).
+         *
+         * Keep the previous backdrop instead: a slightly stale frame is a far
+         * better filler than opaque black.  Only clear when no valid backdrop
+         * was ever captured at this size, so a freshly allocated DIB still
+         * shows black rather than uninitialised memory. */
         if (!hdc_win || !BitBlt(target->comp_dc, 0, 0, rc.right, rc.bottom,
                 hdc_win, 0, 0, SRCCOPY))
-            memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
+        {
+            if (!target->comp_backdrop_valid)
+                memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
+        }
+        else target->comp_backdrop_valid = TRUE;
         if (hdc_win)
             ReleaseDC(target->hwnd, hdc_win);
 
