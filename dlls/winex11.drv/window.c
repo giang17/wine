@@ -520,7 +520,11 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
  */
 static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD style, DWORD ex_style )
 {
-    if (EqualRect( &data->rects.window, &data->rects.visible )) return 0;
+    /* Do not gate the decoration hints on window == visible.  The visible rect may not
+     * reflect the decoration offset yet (window bootstrap, visual change), and the window
+     * manager would then never see a decoration hint at all.  The style check is
+     * authoritative. */
+    if (!data->managed) return 0;
     return get_mwm_decorations_for_style( style, ex_style );
 }
 
