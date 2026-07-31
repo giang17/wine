@@ -3598,6 +3598,26 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     TRACE( "win %p/%lx new_rects %s style %08x flags %08x\n", hwnd, data->whole_window,
            debugstr_window_rects(new_rects), new_style, swp_flags );
 
+    /* A window manager is free to silently ignore a _NET_WM_STATE request: KWin
+     * for instance keeps _NET_WM_STATE_MAXIMIZED_VERT/HORZ set while a window is
+     * fullscreen, so the request to remove it that we send when entering
+     * fullscreen never changes the property and no PropertyNotify is generated.
+     * The request then stays pending forever and net_wm_state_serial blocks every
+     * later _NET_WM_STATE, config and _MOTIF_WM_HINTS update, leaving the window
+     * fullscreen-sized and undecorated when the application leaves fullscreen
+     * again (e.g. Ableton Live 12 on the second F11).  A fullscreen transition
+     * makes the pending request obsolete, so drop it and resync from the state
+     * the window manager actually reports. */
+    if (data->net_wm_state_serial && was_fullscreen != data->is_fullscreen &&
+        data->pending_state.net_wm_state != data->current_state.net_wm_state)
+    {
+        WARN( "win %p/%lx dropping unacknowledged _NET_WM_STATE %#x/%lu, resyncing to %#x\n",
+              hwnd, data->whole_window, data->pending_state.net_wm_state,
+              data->net_wm_state_serial, data->current_state.net_wm_state );
+        data->net_wm_state_serial = 0;
+        data->pending_state.net_wm_state = data->current_state.net_wm_state;
+    }
+
     /* visible windows are only hidden after SWP_HIDEWINDOW is used */
     if (data->pending_state.wm_state != WithdrawnState && !(new_style & WS_VISIBLE) &&
         !(swp_flags & SWP_HIDEWINDOW))
