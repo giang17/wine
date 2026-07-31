@@ -142,6 +142,7 @@ are not specific to it.
 | Pianoteq 9 (standalone + VST3) | JUCE 8 + DComp | Fully functional |
 | FL Studio (Wine + ntsync) | Custom | Runs without xruns at 64 samples / 48 kHz |
 | WineSynth (custom VSTGUI plugin) | VSTGUI + DComp | 18k+ partial redraws without crash |
+| Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing. See *Ableton Live 12 Setup* below |
 
 ## Font Setup
 
@@ -154,6 +155,41 @@ for a step-by-step guide covering:
 - Installing `NotoSansSymbols2` and `DejaVuSans` into the Wine prefix
 - Setting GDI `FontLink` registry entries for correct menu symbol rendering
 - Working around the missing `BitPDisp-10` tooltip font in Serum2
+
+## Ableton Live 12 Setup
+
+Live runs its content indexer as a separate process (`Ableton Index.exe`). On
+Wine's built-in `msvcp140` that process dies immediately and Live restarts it in
+a loop, which leaves the browser without content and pops up an error dialog.
+This is a prefix setup issue, not something the patches in this branch address.
+
+Two steps are needed, and the second one is easy to miss:
+
+1. Prefer the native runtime **for that executable only**, so the rest of the
+   prefix keeps using Wine's builtins. Under
+   `HKCU\Software\Wine\AppDefaults\Ableton Index.exe\DllOverrides`, set
+   `concrt140`, `msvcp140`, `msvcp140_1`, `msvcp140_2`, `msvcp140_atomic_wait`,
+   `msvcp140_codecvt_ids`, `vcruntime140` and `vcruntime140_1` to
+   `native,builtin`.
+2. **Install the native runtime itself** (e.g. `winetricks vcrun2019`).
+   `native,builtin` silently falls back to the built-in DLL when no native one
+   is present — the override looks correct in the registry and the indexer still
+   crashes.
+
+Symptom to look for in `Preferences/Log.txt`:
+
+```
+Indexer: process stopped prematurely [1]. Restart
+```
+
+When checking which DLL a prefix actually has, **do not compare file sizes**:
+Wine's built-in PE carries debug symbols and is roughly 5 MB, i.e. *larger* than
+the native DLL (~550 KB). Check the origin instead:
+
+```bash
+strings -a "$WINEPREFIX/drive_c/windows/system32/msvcp140.dll" \
+    | grep -m1 -E "Wine builtin DLL|Microsoft Corporation"
+```
 
 ## D2D1 Patches Only (Branch: `d2d1-v6`) — DEPRECATED
 
