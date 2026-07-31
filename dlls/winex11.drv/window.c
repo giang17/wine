@@ -1997,14 +1997,28 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
     RECT rect, old_rect = data->rects.window, new_rect;
     unsigned int old_generation, generation;
     long old_monitors[4], monitors[4];
+    BOOL was_moved;
     UINT flags;
 
     if (!data->managed) return 0; /* unmanaged windows are managed by the Win32 side */
     if (is_virtual_desktop()) return 0; /* ignore window manager config changes in virtual desktop mode */
     if (data->desired_state.wm_state != NormalState) return 0; /* ignore config changes on invisible/minimized windows */
 
+    /* A window manager moves a fullscreen window to the monitor origin, whatever position we
+     * requested. An application that asks for a fullscreen rect sticking out of the monitor, to
+     * keep its own non-client area off-screen, then ends up with win32 rects that no longer match
+     * the X window: it is drawn where the window manager put it, but hit testing still uses the
+     * position we recorded, and everything the application draws relative to its window origin is
+     * offset by the difference (e.g. Ableton Live 12's menu bar is visible but not clickable). */
+    was_moved = data->is_fullscreen && (data->current_state.rect.left != data->rects.visible.left ||
+                                        data->current_state.rect.top != data->rects.visible.top);
+
     if (data->wm_state_serial) return 0; /* another WM_STATE update is pending, wait for it to complete */
-    if (data->net_wm_state_serial) return 0; /* another _NET_WM_STATE update is pending, wait for it to complete */
+    /* A window manager may keep _NET_WM_STATE bits we asked it to clear: KWin keeps
+     * _NET_WM_STATE_MAXIMIZED_VERT/HORZ set on a fullscreen window, so the request is never
+     * acknowledged and its serial would block config updates for as long as the window stays
+     * fullscreen. A move the window manager has already performed is final, apply it regardless. */
+    if (data->net_wm_state_serial && !was_moved) return 0; /* another _NET_WM_STATE update is pending, wait for it to complete */
     if (data->mwm_hints_serial) return 0; /* another MWM_HINT update is pending, wait for it to complete */
     if (data->configure_serial) return 0; /* another config update is pending, wait for it to complete */
 
@@ -2012,8 +2026,10 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
      * adding __NET_WM_STATE_FULLSCREEN will make WMs move the window to cover exactly the monitor
      * rect. If the application sets a visible rect slightly larger than the monitor rect and insists
      * on changing to the rect that it previously set when the rect is changed by the WM, then the
-     * window rect will be repeatedly changed by the WM and the application, causing a flickering effect */
-    if (data->is_fullscreen)
+     * window rect will be repeatedly changed by the WM and the application, causing a flickering effect.
+     * Only the size may differ that way: a window the window manager has moved needs to be synced,
+     * or the win32 rects keep an origin the X window doesn't have. */
+    if (data->is_fullscreen && !was_moved)
     {
         if (xinerama_get_fullscreen_monitors( &data->rects.visible, &old_generation, old_monitors )
             && xinerama_get_fullscreen_monitors( &data->current_state.rect, &generation, monitors )
