@@ -163,7 +163,19 @@ Wine's built-in `msvcp140` that process dies immediately and Live restarts it in
 a loop, which leaves the browser without content and pops up an error dialog.
 This is a prefix setup issue, not something the patches in this branch address.
 
-Two steps are needed, and the second one is easy to miss:
+**[documentation/ableton-live-12-setup.sh](documentation/ableton-live-12-setup.sh)**
+does both checks and applies the override:
+
+```bash
+documentation/ableton-live-12-setup.sh --prefix ~/.wine-ableton
+documentation/ableton-live-12-setup.sh --prefix ~/.wine-ableton --check  # report only
+```
+
+It installs nothing by itself: if the native runtime is missing it prints the
+`winetricks` command and stops, and `--check` reads the prefix without starting
+Wine. Use `--wine /path/to/wine` if this fork is not the `wine` in your `PATH`.
+
+The two steps it performs, in case you prefer doing it by hand:
 
 1. Prefer the native runtime **for that executable only**, so the rest of the
    prefix keeps using Wine's builtins. Under
