@@ -149,12 +149,36 @@ are not specific to it.
 The DWrite patches fix font rendering in VSTGUI-based plugins, but some applications
 also require system fonts to be configured correctly (Unicode symbols, GDI menus).
 
-See **[documentation/wine-font-setup-guide.md](documentation/wine-font-setup-guide.md)**
-for a step-by-step guide covering:
+**[documentation/wine-font-setup.sh](documentation/wine-font-setup.sh)** does the
+host part for you:
 
-- Installing `NotoSansSymbols2` and `DejaVuSans` into the Wine prefix
-- Setting GDI `FontLink` registry entries for correct menu symbol rendering
-- Working around the missing `BitPDisp-10` tooltip font in Serum2
+```bash
+documentation/wine-font-setup.sh --prefix ~/.wine
+documentation/wine-font-setup.sh --prefix ~/.wine --check   # report only
+```
+
+It locates the fonts through fontconfig (so distribution paths do not matter),
+copies them into the prefix, registers the MS Core Fonts for GDI and writes the
+`FontLink` fallback chain. Re-run it after `wineboot -u`, which resets those
+entries to Wine's defaults — the script is idempotent.
+
+Two of those steps matter more than they look:
+
+- **MS Core Fonts** are not cosmetic. Some plugins open font *files* directly
+  during DLL initialisation — FL Studio's "Fruity Delay 3" opens
+  `C:\windows\Fonts\Arialbd.ttf` — and crash with an access violation and no
+  usable error message when they are missing.
+- **FontLink** is what makes symbol glyphs resolve; without it Serum 2's star
+  ratings render as tofu boxes.
+
+See **[documentation/wine-font-setup-guide.md](documentation/wine-font-setup-guide.md)**
+for the full guide, including the container setup and working around the missing
+`BitPDisp-10` tooltip font in Serum 2, which the script deliberately leaves out.
+
+Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
+flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
+fallback through `GetGlyphIndices`. That one has its own project:
+[giang17/flstudio-wine-font-fix](https://github.com/giang17/flstudio-wine-font-fix).
 
 ## Ableton Live 12 Setup
 
