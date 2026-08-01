@@ -56,6 +56,18 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   frame (visible in Ableton Live 12 when toggling the Learn View panel)
 - **win32u**: transparent (0x00) surface init for ARGB popups; the system arrow is
   shown again when an application hides the cursor and sets none
+- **wineserver**: a top-level's surface flush no longer overwrites child windows that
+  belong to a *different process*. Such a child never gets a window surface of its own
+  and draws straight into the top-level's drawable, while the owner collects into its
+  surface and flushes over it with a delay — the result is a black one-frame flash over
+  embedded panels whenever the two overlap. Its client rect is now subtracted from the
+  surface region, exactly the treatment GL and Vulkan children already receive. Affects
+  any application that embeds out-of-process content: FL Studio's hub and Ableton
+  Live 12 (WebView2), CEF-based plugin GUIs. Trade-off: an area the owner no longer
+  flushes keeps its last frame, so a foreign child that stops painting without a
+  geometry change leaves that frame on screen until something moves — the same exposure
+  GL children have today. `WINE_DISABLE_FOREIGN_CHILD_CLIP=1` restores the previous
+  behaviour
 - **ole32**: RevokeDragDrop no longer touches drop targets owned by other processes
   (fixes a use-after-free crash when closing plugin windows)
 - **shell32**: VirtualDesktopManager COM stub
