@@ -2314,9 +2314,21 @@ void set_net_active_window( HWND hwnd, HWND previous )
     BOOL withdrawn = FALSE;
     Window window;
     XEvent xev;
+    Time time = CurrentTime;
 
     if (!is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) )) return;
     if (!(window = X11DRV_get_whole_window( hwnd ))) return;
+
+    /* Send an approximate timestamp of the last processed message instead of 0:
+     * mutter's focus-stealing prevention silently drops activation requests with
+     * timestamp 0 (GNOME 50), which deadlocked the request state machine for the
+     * rest of the session.  KWin does not filter on the timestamp, so this is
+     * neutral there.  (The upstream patch additionally relaxes the early-return
+     * to retry on a newer timestamp, but that triggers an activation ping-pong
+     * under KWin that leaves windows unmovable, so the retry is omitted here.) */
+    if (EVENT_x11_time_to_win32_time( 0 ))
+        time = NtUserGetThreadState( UserThreadStateMessageTime ) - EVENT_x11_time_to_win32_time( 0 );
+
     if (data->pending_state.net_active_window == window) return;
     if (window_set_pending_activate( hwnd, &withdrawn )) return;
 
@@ -2328,7 +2340,7 @@ void set_net_active_window( HWND hwnd, HWND previous )
     xev.xclient.send_event = True;
     xev.xclient.format = 32;
     xev.xclient.data.l[0] = 2; /* source: pager */
-    xev.xclient.data.l[1] = 0; /* timestamp */
+    xev.xclient.data.l[1] = time;
     xev.xclient.data.l[2] = X11DRV_get_whole_window( previous ); /* current active */
     xev.xclient.data.l[3] = 0;
     xev.xclient.data.l[4] = 0;
@@ -2344,7 +2356,7 @@ void set_net_active_window( HWND hwnd, HWND previous )
         return;
     }
 
-    TRACE( "requesting _NET_ACTIVE_WINDOW %p/%lx serial %lu\n", hwnd, window, data->net_active_window_serial );
+    TRACE( "requesting _NET_ACTIVE_WINDOW %p/%lx serial %lu time %lu\n", hwnd, window, data->net_active_window_serial, time );
     XSendEvent( data->display, DefaultRootWindow( data->display ), False,
                 SubstructureRedirectMask | SubstructureNotifyMask, &xev );
 }
