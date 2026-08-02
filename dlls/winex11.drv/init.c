@@ -276,6 +276,30 @@ void set_dc_drawable( HDC hdc, Drawable drawable, const RECT *rect, int mode )
         .dc_rect = *rect,
         .mode = mode,
     };
+    XWindowAttributes attr;
+
+    /* Report the drawable's visual so xrenderdrv_ExtEscape can pick an XRender
+     * picture format matching the drawable's depth.  Without it the DC keeps the
+     * root window's depth-24 format (a display DC opened via NtGdiOpenDCW starts
+     * on the root format); binding that DC to a depth-32 drawable - e.g. a
+     * layered top-level window that hosts an OpenGL plugin editor being presented
+     * via X11DRV_client_surface_present - makes XRenderCreatePicture fail with
+     * BadMatch, a fatal X error that takes the whole host down.  XGetWindowAttributes
+     * fails for non-window drawables such as GLX pbuffers; leave the visual zeroed
+     * in that case so xrender keeps the current format. */
+    if (XGetWindowAttributes( gdi_display, drawable, &attr ) && attr.class != InputOnly)
+    {
+        escape.visual.visual        = attr.visual;
+        escape.visual.visualid      = XVisualIDFromVisual( attr.visual );
+        escape.visual.screen        = XScreenNumberOfScreen( attr.screen );
+        escape.visual.depth         = attr.depth;
+        escape.visual.class         = attr.visual->class;
+        escape.visual.red_mask      = attr.visual->red_mask;
+        escape.visual.green_mask    = attr.visual->green_mask;
+        escape.visual.blue_mask     = attr.visual->blue_mask;
+        escape.visual.colormap_size = attr.visual->map_entries;
+        escape.visual.bits_per_rgb  = attr.visual->bits_per_rgb;
+    }
     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
 }
 

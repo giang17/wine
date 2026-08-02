@@ -3406,6 +3406,13 @@ void X11DRV_ReleaseDC( HWND hwnd, HDC hdc )
     escape.mode = IncludeInferiors;
     escape.dc_rect = NtUserGetVirtualScreenRect( MDT_DEFAULT );
     OffsetRect( &escape.dc_rect, -2 * escape.dc_rect.left, -2 * escape.dc_rect.top );
+    /* The DC is parked on the root window, which uses the default (depth-24)
+     * visual.  Set it explicitly: escape.visual is otherwise left uninitialized
+     * (stack garbage), and xrenderdrv_ExtEscape treats a non-NULL visual as a
+     * real format to match.  Garbage that still matches the previous (possibly
+     * depth-32) format would make the next XRenderCreatePicture on the root
+     * drawable fail with BadMatch, a fatal X error. */
+    escape.visual = default_visual;
     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
 }
 
