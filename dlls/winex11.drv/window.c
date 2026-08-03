@@ -1461,6 +1461,13 @@ void window_set_user_time( struct x11drv_win_data *data, Time time, BOOL init )
     if (!init && data->user_time == time) return;
     data->user_time = time;
 
+    /* A window can legitimately have no X window of its own, the desktop window
+     * in virtual desktop mode among them.  Setting a property on window 0 is a
+     * BadWindow that none of the ignore_error() cases covers, so it reaches the
+     * default handler and takes the whole process down -- a click on the desktop
+     * background was enough to end the session. */
+    if (!data->whole_window) return;
+
     TRACE( "window %p/%lx, requesting _NET_WM_USER_TIME %ld serial %lu\n", data->hwnd, data->whole_window,
            data->user_time, NextRequest( data->display ) );
     if (init && time) XDeleteProperty( data->display, data->whole_window, x11drv_atom(_NET_WM_USER_TIME) );
