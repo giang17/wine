@@ -1433,11 +1433,17 @@ static void set_wm_hints( struct x11drv_win_data *data )
 Window init_clip_window(void)
 {
     struct x11drv_thread_data *data = x11drv_init_thread_data();
+    Window clip_window = (Window)NtUserGetProp( NtUserGetDesktopWindow(), clip_window_prop );
 
-    if (!data->clip_window &&
-        (data->clip_window = (Window)NtUserGetProp( NtUserGetDesktopWindow(), clip_window_prop )))
+    /* Follow the property instead of caching its first value for good: the
+     * desktop window that carries it can be torn down and replaced -- switching
+     * desktops in virtual desktop mode does exactly that -- and keeping the old
+     * id would leave us grabbing and unmapping a window the server has already
+     * destroyed, which is a fatal BadWindow. */
+    if (clip_window && clip_window != data->clip_window)
     {
-        XSelectInput( data->display, data->clip_window, StructureNotifyMask );
+        data->clip_window = clip_window;
+        XSelectInput( data->display, clip_window, StructureNotifyMask );
     }
     return data->clip_window;
 }

@@ -347,8 +347,12 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
-    if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
+    /* destroy the window before its colormap: freeing a colormap that is still
+     * installed in a live window leaves the server holding it until the window
+     * goes away, and the id is then already invalid by the time anything else
+     * touches it -- a BadColor from the default error handler would be fatal */
     if (surface->window) destroy_client_window( hwnd, surface->window );
+    if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
 }
