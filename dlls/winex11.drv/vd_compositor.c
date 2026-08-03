@@ -120,7 +120,9 @@ struct vd_root_state
     Display *display;     /* connection owning the root's events and damage objects */
     Window vd_root;       /* the RGB24 virtual-desktop root */
     Window overlay;       /* opaque overlay window, a child of the VD root */
-    Picture overlay_pict; /* picture over the overlay window */
+    Pixmap back_pixmap;   /* off-screen buffer a frame is assembled in */
+    Picture back_pict;    /* picture over that buffer -- the composit target */
+    int back_width, back_height;
     BOOL overlay_mapped;  /* overlay is mapped (only while the VD root is viewable) */
     Pixmap bg_pixmap;     /* the VD root's own painted background, captured while visible */
     GC bg_gc;             /* for blitting that background, kept to avoid a GC per frame */
@@ -366,7 +368,8 @@ static void vd_teardown_root( struct vd_root_state *r )
     r->children = NULL;
     r->children_size = 0;
 
-    if (r->overlay_pict) pvd_XRenderFreePicture( gdi_display, r->overlay_pict );
+    if (r->back_pict) pvd_XRenderFreePicture( gdi_display, r->back_pict );
+    if (r->back_pixmap) XFreePixmap( gdi_display, r->back_pixmap );
     if (r->bg_gc) XFreeGC( gdi_display, r->bg_gc );
     if (r->bg_pixmap) XFreePixmap( gdi_display, r->bg_pixmap );
     if (r->overlay) XDestroyWindow( gdi_display, r->overlay );
@@ -375,7 +378,9 @@ static void vd_teardown_root( struct vd_root_state *r )
     r->display = NULL;
     r->vd_root = 0;
     r->overlay = 0;
-    r->overlay_pict = 0;
+    r->back_pixmap = 0;
+    r->back_pict = 0;
+    r->back_width = r->back_height = 0;
     r->overlay_mapped = FALSE;
     r->bg_pixmap = 0;
     r->bg_gc = 0;
@@ -444,7 +449,39 @@ static void vd_overlay_follow_root( struct vd_root_state *r )
     }
 }
 
-/* Composite one child onto the overlay at its current geometry.  ARGB32
+/* The overlay is an ordinary window now, so anything drawn into it is on screen
+ * immediately -- and a frame is not one drawing operation but many: the
+ * background first, then every child on top.  Painting that directly into the
+ * overlay lets a screen refresh fall between the steps, which shows up as the
+ * window content flickering while a window is being moved (the configure events
+ * arrive in quick succession, so it repaints often).  Assemble the frame in an
+ * off-screen pixmap instead and blit it in one operation; the screen then only
+ * ever sees finished frames. */
+static Bool ensure_back_buffer( struct vd_root_state *r, int width, int height )
+{
+    XRenderPictFormat *fmt;
+
+    if (r->back_pixmap && (r->back_width != width || r->back_height != height))
+    {
+        if (r->back_pict) pvd_XRenderFreePicture( gdi_display, r->back_pict );
+        XFreePixmap( gdi_display, r->back_pixmap );
+        r->back_pixmap = 0;
+        r->back_pict = 0;
+    }
+    if (r->back_pixmap) return TRUE;
+
+    r->back_pixmap = XCreatePixmap( gdi_display, r->overlay, width, height, default_visual.depth );
+    if (!r->back_pixmap) return FALSE;
+    fmt = pvd_XRenderFindVisualFormat( gdi_display, default_visual.visual );
+    if (!fmt) return FALSE;
+    r->back_pict = pvd_XRenderCreatePicture( gdi_display, r->back_pixmap, fmt, 0, NULL );
+    if (!r->back_pict) return FALSE;
+    r->back_width = width;
+    r->back_height = height;
+    return TRUE;
+}
+
+/* Composite one child onto the frame under construction at its current geometry.  ARGB32
  * children blend with their alpha (PictOpOver), opaque children just paint. */
 static void composite_child( struct vd_root_state *r, struct vd_child *c )
 {
@@ -467,7 +504,7 @@ static void composite_child( struct vd_root_state *r, struct vd_child *c )
     {
         /* child geometry is relative to the VD root; the overlay shares the
          * VD root's geometry, so the same coordinates place it correctly. */
-        pvd_XRenderComposite( gdi_display, PictOpOver, pict, None, r->overlay_pict,
+        pvd_XRenderComposite( gdi_display, PictOpOver, pict, None, r->back_pict,
                               0, 0, 0, 0, c->x, c->y, c->width, c->height );
         pvd_XRenderFreePicture( gdi_display, pict );
     }
@@ -540,14 +577,21 @@ void vd_compositor_paint( Display *display )
          * X11DRV_expect_error serialises on a plain mutex. */
         vd_sync_children( r, children, count );
 
+        if (!ensure_back_buffer( r, oa.width, oa.height ))
+        {
+            WARN( "no back buffer for overlay %lx\n", r->overlay );
+            if (children) XFree( children );
+            continue;
+        }
+
         /* Start each frame from the captured root background, so the composit is
          * opaque -- the host does not have to blend anything -- and nothing from
          * the previous frame ghosts through where a child moved or vanished. */
         if (r->bg_valid)
-            XCopyArea( gdi_display, r->bg_pixmap, r->overlay, r->bg_gc, 0, 0,
+            XCopyArea( gdi_display, r->bg_pixmap, r->back_pixmap, r->bg_gc, 0, 0,
                        min( r->bg_width, oa.width ), min( r->bg_height, oa.height ), 0, 0 );
         else
-            pvd_XRenderFillRectangle( gdi_display, PictOpSrc, r->overlay_pict, &clear,
+            pvd_XRenderFillRectangle( gdi_display, PictOpSrc, r->back_pict, &clear,
                                       0, 0, oa.width, oa.height );
 
         /* XQueryTree returns children in bottom-to-top stacking order;
@@ -568,6 +612,10 @@ void vd_compositor_paint( Display *display )
         }
         XSync( gdi_display, False );
         X11DRV_check_error();
+
+        /* one blit, so the screen never shows a half-assembled frame */
+        XCopyArea( gdi_display, r->back_pixmap, r->overlay, r->bg_gc,
+                   0, 0, oa.width, oa.height, 0, 0 );
 
         if (children) XFree( children );
     }
@@ -787,7 +835,6 @@ static Bool create_overlay( struct vd_root_state *r )
 {
     XSetWindowAttributes attr;
     XWindowAttributes ra;
-    XRenderPictFormat *fmt;
     unsigned long mask;
 
     if (!XGetWindowAttributes( gdi_display, r->vd_root, &ra )) return FALSE;
@@ -803,10 +850,8 @@ static Bool create_overlay( struct vd_root_state *r )
                                 mask, &attr );
     if (!r->overlay) return FALSE;
 
-    fmt = pvd_XRenderFindVisualFormat( gdi_display, default_visual.visual );
-    if (!fmt) return FALSE;
-    r->overlay_pict = pvd_XRenderCreatePicture( gdi_display, r->overlay, fmt, 0, NULL );
-    if (!r->overlay_pict) return FALSE;
+    /* nothing is ever drawn into the overlay directly: a frame is assembled in
+     * the back buffer and blitted in one go (see vd_compositor_paint). */
 
     /* left unmapped: it is mapped once the background has been captured, so it
      * never shows a frame of uninitialised content. */
@@ -927,7 +972,8 @@ void vd_compositor_init( Display *display, Window vd_root )
     r->display = display;
     r->vd_root = vd_root;
     r->overlay = 0;
-    r->overlay_pict = 0;
+    r->back_pixmap = 0;
+    r->back_pict = 0;
     r->overlay_mapped = FALSE;
     r->dirty = FALSE;
     r->children = NULL;
