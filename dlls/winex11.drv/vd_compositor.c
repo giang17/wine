@@ -22,10 +22,11 @@
  * Phase 1 is brute-force: the whole child set is recomposited on every
  * relevant event, with no XDamage tracking (phase 2).
  *
- * Known limitation: Wine creates several transient VD roots during startup
- * (explorer/wineboot phases); this module tracks only the most recently
- * initialised one via a single global state.  Per-root state and damage-driven
- * incremental updates are phase 2/3.
+ * Multi-root: Wine creates several VD roots during startup (transient
+ * explorer/wineboot phases plus the final desktop root).  Each gets its own
+ * redirect + overlay tracked in a per-root slot; init is idempotent (the same
+ * root re-initialised across phases does not leak a second overlay), and
+ * paint() self-heals slots whose VD root has been destroyed.
  */
 
 #if 0
@@ -50,6 +51,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 #include <X11/extensions/shape.h>
 #endif
 
+#define MAX_VD_ROOTS 8  /* Wine creates a handful of transient VD roots during setup */
+
 #define MAKE_FUNCPTR(f) static typeof(f) * pvd_##f;
 MAKE_FUNCPTR(XCompositeQueryExtension)
 MAKE_FUNCPTR(XCompositeRedirectSubwindows)
@@ -65,14 +68,17 @@ MAKE_FUNCPTR(XRenderComposite)
 static typeof(XShapeCombineRectangles) * pvd_XShapeCombineRectangles;
 #endif
 
-static struct
+struct vd_root_state
 {
-    BOOL active;
+    BOOL active;          /* this slot is compositing a live VD root */
     Window vd_root;       /* the RGB24 virtual-desktop root */
     Window overlay;       /* ARGB32 overlay window covering the VD root */
     Picture overlay_pict; /* ARGB32 picture over the overlay window */
-    BOOL dirty;           /* a recomposit of the whole child set is pending */
-} vd_comp;
+    BOOL dirty;           /* a recomposit of this root's child set is pending */
+};
+
+static struct vd_root_state vd_roots[MAX_VD_ROOTS];
+static BOOL vd_ready;     /* one-time: extensions loaded + queried + VD mode active */
 
 static Bool load_functions(void)
 {
@@ -101,9 +107,53 @@ static Bool load_functions(void)
     return TRUE;
 }
 
+/* One-time readiness: VD mode + extensions loaded + queried.  Cheap after the
+ * first call (cached in vd_ready). */
+static Bool vd_ensure_ready(void)
+{
+    int ev, er;
+    if (vd_ready) return TRUE;
+    if (!is_virtual_desktop()) return FALSE;
+    if (!usexcomposite) return FALSE;
+    if (!load_functions()) return FALSE;
+    if (!pvd_XCompositeQueryExtension( gdi_display, &ev, &er )) return FALSE;
+    if (!pvd_XRenderQueryExtension( gdi_display, &ev, &er )) return FALSE;
+    vd_ready = TRUE;
+    return TRUE;
+}
+
+static struct vd_root_state *vd_find_root( Window vd_root )
+{
+    int i;
+    for (i = 0; i < MAX_VD_ROOTS; i++)
+        if (vd_roots[i].active && vd_roots[i].vd_root == vd_root) return &vd_roots[i];
+    return NULL;
+}
+
+static struct vd_root_state *vd_alloc_root( void )
+{
+    int i;
+    for (i = 0; i < MAX_VD_ROOTS; i++)
+        if (!vd_roots[i].active) return &vd_roots[i];
+    return NULL;
+}
+
+/* Free a slot's overlay resources and mark it reusable.  Used both on fatal
+ * init failure and on self-heal when the VD root disappears. */
+static void vd_teardown_root( struct vd_root_state *r )
+{
+    if (r->overlay_pict) pvd_XRenderFreePicture( gdi_display, r->overlay_pict );
+    if (r->overlay) XDestroyWindow( gdi_display, r->overlay );
+    r->active = FALSE;
+    r->vd_root = 0;
+    r->overlay = 0;
+    r->overlay_pict = 0;
+    r->dirty = FALSE;
+}
+
 /* Composite one child onto the overlay at its current geometry.  ARGB32
  * children blend with their alpha (PictOpOver), opaque children just paint. */
-static void composite_child( Window child )
+static void composite_child( struct vd_root_state *r, Window child )
 {
     XWindowAttributes attr;
     XRenderPictFormat *fmt;
@@ -125,7 +175,7 @@ static void composite_child( Window child )
     {
         /* child geometry is relative to the VD root; the overlay shares the
          * VD root's geometry, so the same coordinates place it correctly. */
-        pvd_XRenderComposite( gdi_display, PictOpOver, pict, None, vd_comp.overlay_pict,
+        pvd_XRenderComposite( gdi_display, PictOpOver, pict, None, r->overlay_pict,
                               0, 0, 0, 0, attr.x, attr.y, attr.width, attr.height );
         pvd_XRenderFreePicture( gdi_display, pict );
     }
@@ -134,40 +184,63 @@ static void composite_child( Window child )
 
 void vd_compositor_paint( void )
 {
-    Window root, parent, *children;
-    unsigned int count, i;
-    XWindowAttributes attr;
-    XRenderColor clear = { 0, 0, 0, 0 };
+    int i;
+    if (!vd_ready) return;
 
-    if (!vd_comp.active || !vd_comp.dirty) return;
-    vd_comp.dirty = FALSE;
+    for (i = 0; i < MAX_VD_ROOTS; i++)
+    {
+        struct vd_root_state *r = &vd_roots[i];
+        XWindowAttributes ra, oa;
+        Window root, parent, *children;
+        unsigned int count, j;
+        XRenderColor clear = { 0, 0, 0, 0 };
 
-    if (!XGetWindowAttributes( gdi_display, vd_comp.overlay, &attr )) return;
+        if (!r->active || !r->dirty) continue;
+        r->dirty = FALSE;
 
-    /* clear the overlay to fully transparent so each frame is rendered from
-     * scratch -- no ghosting from moved or removed children. */
-    pvd_XRenderFillRectangle( gdi_display, PictOpSrc, vd_comp.overlay_pict, &clear,
-                              0, 0, attr.width, attr.height );
+        /* self-heal: transient VD roots are destroyed during wineboot/explorer
+         * setup; if ours is gone, tear the slot down (the redirect dies with
+         * the root).  An orphaned overlay on a dead root would otherwise leak
+         * and composite against a stale window. */
+        if (!XGetWindowAttributes( gdi_display, r->vd_root, &ra ))
+        {
+            WARN( "VD root %lx gone, tearing down compositor slot\n", r->vd_root );
+            vd_teardown_root( r );
+            continue;
+        }
+        if (!XGetWindowAttributes( gdi_display, r->overlay, &oa ))
+        {
+            WARN( "overlay %lx gone, tearing down compositor slot\n", r->overlay );
+            vd_teardown_root( r );
+            continue;
+        }
 
-    if (!XQueryTree( gdi_display, vd_comp.vd_root, &root, &parent, &children, &count ))
-        return;
-    /* XQueryTree returns children in bottom-to-top stacking order; compositing
-     * them in that order with PictOpOver preserves the Z order. */
-    for (i = 0; i < count; i++) composite_child( children[i] );
-    if (children) XFree( children );
+        /* clear the overlay to fully transparent so each frame is rendered
+         * from scratch -- no ghosting from moved or removed children. */
+        pvd_XRenderFillRectangle( gdi_display, PictOpSrc, r->overlay_pict, &clear,
+                                  0, 0, oa.width, oa.height );
 
+        if (XQueryTree( gdi_display, r->vd_root, &root, &parent, &children, &count ))
+        {
+            /* XQueryTree returns children in bottom-to-top stacking order;
+             * compositing them in that order with PictOpOver preserves Z. */
+            for (j = 0; j < count; j++) composite_child( r, children[j] );
+            if (children) XFree( children );
+        }
+    }
     XFlush( gdi_display );
 }
 
 void vd_compositor_notify( XEvent *event )
 {
-    if (!vd_comp.active) return;
+    int i;
+    if (!vd_ready) return;
 
     switch (event->type)
     {
     /* anything that can change the pixels or stacking of a redirected child,
      * plus NoExpose/GraphicsExpose for the XPutImage/XCopyArea that draw child
-     * content.  paint() is deduped (runs at most once per ProcessEvents call). */
+     * content.  paint() is deduped (runs at most once per root per ProcessEvents). */
     case Expose:
     case GraphicsExpose:
     case NoExpose:
@@ -178,14 +251,29 @@ void vd_compositor_notify( XEvent *event )
     case ReparentNotify:
     case DestroyNotify:
     case VisibilityNotify:
-        vd_comp.dirty = TRUE;
         break;
     default:
-        break;
+        return;
     }
+
+    /* Attribute the event to a specific root first: the VD root receives the
+     * SubstructureNotify of its override-redirect children plus its own Expose. */
+    for (i = 0; i < MAX_VD_ROOTS; i++)
+    {
+        if (!vd_roots[i].active) continue;
+        if (event->xany.window == vd_roots[i].vd_root)
+        {
+            vd_roots[i].dirty = TRUE;
+            return;
+        }
+    }
+    /* Event is for a child or an unknown window: mark all active roots dirty
+     * (brute-force safety; phase 2 Damage makes this precise per child). */
+    for (i = 0; i < MAX_VD_ROOTS; i++)
+        if (vd_roots[i].active) vd_roots[i].dirty = TRUE;
 }
 
-static Bool create_overlay( void )
+static Bool create_overlay( struct vd_root_state *r )
 {
     XSetWindowAttributes attr;
     XWindowAttributes ra;
@@ -194,7 +282,7 @@ static Bool create_overlay( void )
     unsigned long mask;
 
     if (!argb_visual.visual) return FALSE;
-    if (!XGetWindowAttributes( gdi_display, vd_comp.vd_root, &ra )) return FALSE;
+    if (!XGetWindowAttributes( gdi_display, r->vd_root, &ra )) return FALSE;
 
     cmap = XCreateColormap( gdi_display, DefaultRootWindow(gdi_display), argb_visual.visual, AllocNone );
     attr.override_redirect = True;
@@ -205,51 +293,66 @@ static Bool create_overlay( void )
     attr.save_under = True;
     mask = CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWColormap | CWEventMask | CWSaveUnder;
 
-    vd_comp.overlay = XCreateWindow( gdi_display, DefaultRootWindow(gdi_display),
-                                     ra.x, ra.y, ra.width, ra.height, 0, 32, InputOutput,
-                                     argb_visual.visual, mask, &attr );
-    if (!vd_comp.overlay) return FALSE;
+    r->overlay = XCreateWindow( gdi_display, DefaultRootWindow(gdi_display),
+                                ra.x, ra.y, ra.width, ra.height, 0, 32, InputOutput,
+                                argb_visual.visual, mask, &attr );
+    if (!r->overlay) return FALSE;
 
     fmt = pvd_XRenderFindVisualFormat( gdi_display, argb_visual.visual );
     if (!fmt) return FALSE;
-    vd_comp.overlay_pict = pvd_XRenderCreatePicture( gdi_display, vd_comp.overlay, fmt, 0, NULL );
-    if (!vd_comp.overlay_pict) return FALSE;
+    r->overlay_pict = pvd_XRenderCreatePicture( gdi_display, r->overlay, fmt, 0, NULL );
+    if (!r->overlay_pict) return FALSE;
 
-    XMapWindow( gdi_display, vd_comp.overlay );
-    XRaiseWindow( gdi_display, vd_comp.overlay );
+    XMapWindow( gdi_display, r->overlay );
+    XRaiseWindow( gdi_display, r->overlay );
 
 #ifdef SONAME_LIBXEXT
     /* empty input shape: the overlay never absorbs pointer/keyboard input,
      * everything falls through to the VD root beneath it. */
     if (pvd_XShapeCombineRectangles)
-        pvd_XShapeCombineRectangles( gdi_display, vd_comp.overlay, ShapeInput, 0, 0, NULL, 0, ShapeSet, Unsorted );
+        pvd_XShapeCombineRectangles( gdi_display, r->overlay, ShapeInput, 0, 0, NULL, 0, ShapeSet, Unsorted );
 #endif
     return TRUE;
 }
 
 void vd_compositor_init( Window vd_root )
 {
-    int ev, er;
+    struct vd_root_state *r;
 
-    vd_comp.vd_root = vd_root;
-    vd_comp.active = FALSE;
-    vd_comp.dirty = FALSE;
+    if (!vd_ensure_ready()) return;
 
-    if (!is_virtual_desktop()) return;
-    if (!usexcomposite) return;
-    if (!load_functions()) return;
-    if (!pvd_XCompositeQueryExtension( gdi_display, &ev, &er )) return;
-    if (!pvd_XRenderQueryExtension( gdi_display, &ev, &er )) return;
+    /* idempotent: Wine re-initialises desktop roots across setup phases; never
+     * register the same root twice (that was the phase-1 leak: a second overlay
+     * per root, the first orphaned with an active manual redirect). */
+    if (vd_find_root( vd_root )) return;
+
+    r = vd_alloc_root();
+    if (!r) { WARN( "VD compositor: no free slot (max %d roots)\n", MAX_VD_ROOTS ); return; }
+
+    r->vd_root = vd_root;
+    r->overlay = 0;
+    r->overlay_pict = 0;
+    r->dirty = FALSE;
+    r->active = FALSE;  /* raised only after the overlay + redirect succeed */
+
+    /* create the overlay BEFORE redirecting: if overlay creation fails we
+     * leave the root's children drawn normally by the X server (visible,
+     * opaque -- the status quo), never stuck behind a manual redirect with
+     * nothing compositing them. */
+    if (!create_overlay( r ))
+    {
+        WARN( "VD compositor: overlay creation failed for root %lx\n", vd_root );
+        vd_teardown_root( r );
+        return;
+    }
 
     /* manual subwindow redirect: the X server stops drawing the VD root's
      * children itself and gives us redirected backing pixmaps. */
     pvd_XCompositeRedirectSubwindows( gdi_display, vd_root, CompositeRedirectManual );
 
-    if (!create_overlay()) { WARN( "VD compositor: overlay creation failed\n"); return; }
-
-    vd_comp.active = TRUE;
-    vd_comp.dirty = TRUE;
-    TRACE( "VD mini-compositor active, overlay %lx over VD root %lx\n", vd_comp.overlay, vd_root );
+    r->active = TRUE;
+    r->dirty = TRUE;
+    TRACE( "VD mini-compositor active, overlay %lx over VD root %lx\n", r->overlay, vd_root );
 }
 
 #else  /* !(SONAME_LIBXCOMPOSITE && SONAME_LIBXRENDER) */
