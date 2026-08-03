@@ -91,8 +91,6 @@ static BOOL X11DRV_ConfigureNotify( HWND hwnd, XEvent *event );
 static BOOL X11DRV_PropertyNotify( HWND hwnd, XEvent *event );
 static BOOL X11DRV_ClientMessage( HWND hwnd, XEvent *event );
 
-#define MAX_EVENT_HANDLERS 128
-
 static x11drv_event_handler handlers[MAX_EVENT_HANDLERS] =
 {
     NULL,                     /*  0 reserved */
@@ -525,7 +523,10 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
         }
     }
 
-    vd_compositor_paint();  /* issue 64: flush a pending per-pixel-alpha VD recomposit */
+    /* issue 64: flush a pending per-pixel-alpha VD recomposit.  Only the roots
+     * owned by this connection are painted here -- their events (and their
+     * XDamage notifications) are the ones we just drained. */
+    vd_compositor_paint( data->display );
     XFlush( gdi_display );
     if (count) TRACE( "processed %d events\n", count );
 

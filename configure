@@ -960,6 +960,7 @@ with_vulkan
 with_wayland
 with_xcomposite
 with_xcursor
+with_xdamage
 with_xfixes
 with_xinerama
 with_xinput
@@ -2589,6 +2590,7 @@ Optional Packages:
   --without-wayland       do not build the Wayland driver
   --without-xcomposite    do not use the Xcomposite extension
   --without-xcursor       do not use the Xcursor extension
+  --without-xdamage       do not use the Xdamage extension
   --without-xfixes        do not use Xfixes for clipboard change notifications
   --without-xinerama      do not use Xinerama (legacy multi-monitor support)
   --without-xinput        do not use the Xinput extension
@@ -4560,6 +4562,13 @@ fi
 if test ${with_xcursor+y}
 then :
   withval=$with_xcursor; if test "x$withval" = "xno"; then ac_cv_header_X11_Xcursor_Xcursor_h=no; fi
+fi
+
+
+# Check whether --with-xdamage was given.
+if test ${with_xdamage+y}
+then :
+  withval=$with_xdamage; if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_Xdamage_h=no; fi
 fi
 
 
@@ -15906,6 +15915,86 @@ then :
   xno) ;;
   *)   as_fn_error $? "libxcomposite ${notice_platform}development files not found, Xcomposite won't be supported.
 This is an error since --with-xcomposite was requested." "$LINENO" 5 ;;
+esac
+
+fi
+
+                ac_fn_c_check_header_compile "$LINENO" "X11/extensions/Xdamage.h" "ac_cv_header_X11_extensions_Xdamage_h" "$xlib_includes
+"
+if test "x$ac_cv_header_X11_extensions_Xdamage_h" = xyes
+then :
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for -lXdamage" >&5
+printf %s "checking for -lXdamage... " >&6; }
+if test ${ac_cv_lib_soname_Xdamage+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_soname_save_LIBS=$LIBS
+LIBS="-lXdamage $X_LIBS $LIBS"
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char XDamageCreate (void);
+int
+main (void)
+{
+return XDamageCreate ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  case "$LIBEXT" in
+    dll) ac_cv_lib_soname_Xdamage=`$ac_cv_path_LDD conftest.exe | grep "Xdamage" | sed -e "s/dll.*/dll/"';2,$d'` ;;
+    dylib) ac_cv_lib_soname_Xdamage=`$OTOOL -L conftest$ac_exeext | grep "libXdamage\\.[0-9A-Za-z.]*dylib" | sed -e "s/^.*\/\(libXdamage\.[0-9A-Za-z.]*dylib\).*$/\1/"';2,$d'` ;;
+    *) ac_cv_lib_soname_Xdamage=`$READELF -d conftest$ac_exeext | grep "NEEDED.*libXdamage\\.$LIBEXT" | sed -e "s/^.*\\[\\(libXdamage\\.$LIBEXT[^	 ]*\\)\\].*$/\1/"';2,$d'`
+       if ${ac_cv_lib_soname_Xdamage:+false} :
+then :
+  ac_cv_lib_soname_Xdamage=`$LDD conftest$ac_exeext | grep "libXdamage\\.$LIBEXT" | sed -e "s/^.*\(libXdamage\.$LIBEXT[^	 ]*\).*$/\1/"';2,$d'`
+fi ;;
+  esac
+else case e in #(
+  e) ac_cv_lib_soname_Xdamage= ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+  LIBS=$ac_check_soname_save_LIBS ;;
+esac
+fi
+if ${ac_cv_lib_soname_Xdamage:+false} :
+then :
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf "%s\n" "not found" >&6; }
+
+else case e in #(
+  e) { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_soname_Xdamage" >&5
+printf "%s\n" "$ac_cv_lib_soname_Xdamage" >&6; }
+
+printf "%s\n" "#define SONAME_LIBXDAMAGE \"$ac_cv_lib_soname_Xdamage\"" >>confdefs.h
+
+        ;;
+esac
+fi
+fi
+
+        if test "x$ac_cv_lib_soname_Xdamage" = "x"
+then :
+  case "x$with_xdamage" in
+  x)   as_fn_append wine_notices "|libxdamage ${notice_platform}development files not found, Xdamage won't be supported." ;;
+  xno) ;;
+  *)   as_fn_error $? "libxdamage ${notice_platform}development files not found, Xdamage won't be supported.
+This is an error since --with-xdamage was requested." "$LINENO" 5 ;;
 esac
 
 fi

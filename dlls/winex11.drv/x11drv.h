@@ -589,6 +589,10 @@ extern HWND systray_hwnd;
 
 typedef BOOL (*x11drv_event_handler)( HWND hwnd, XEvent *event );
 
+/* size of the event handler table: an extension event type must stay below
+ * this, the dispatcher indexes the table with it unchecked */
+#define MAX_EVENT_HANDLERS 128
+
 extern void X11DRV_register_event_handler( int type, x11drv_event_handler handler, const char *name );
 
 extern BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *event );
@@ -846,9 +850,9 @@ extern BOOL is_detached_mode(const DEVMODEW *);
 void X11DRV_Settings_Init(void);
 
 /* virtual-desktop per-pixel-alpha mini-compositor (issue 64) */
-extern void vd_compositor_init( Window vd_root );
+extern void vd_compositor_init( Display *display, Window vd_root );
 extern void vd_compositor_notify( XEvent *event );
-extern void vd_compositor_paint( void );
+extern void vd_compositor_paint( Display *display );
 
 void X11DRV_XF86VM_Init(void);
 void X11DRV_XRandR_Init(void);
