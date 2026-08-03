@@ -98,6 +98,7 @@ struct vd_root_state
     Display *display;     /* connection owning the root's events and damage objects */
     Window vd_root;       /* the RGB24 virtual-desktop root */
     Window overlay;       /* ARGB32 overlay window covering the VD root */
+    Colormap overlay_colormap; /* ARGB32 colormap the overlay was created with */
     Picture overlay_pict; /* ARGB32 picture over the overlay window */
     BOOL overlay_mapped;  /* overlay is mapped (only while the VD root is viewable) */
     BOOL dirty;           /* a recomposit of this root's child set is pending */
@@ -305,10 +306,13 @@ static void vd_teardown_root( struct vd_root_state *r )
 
     if (r->overlay_pict) pvd_XRenderFreePicture( gdi_display, r->overlay_pict );
     if (r->overlay) XDestroyWindow( gdi_display, r->overlay );
+    /* after the window is gone, so the colormap is not freed while still installed */
+    if (r->overlay_colormap) XFreeColormap( gdi_display, r->overlay_colormap );
     r->active = FALSE;
     r->display = NULL;
     r->vd_root = 0;
     r->overlay = 0;
+    r->overlay_colormap = 0;
     r->overlay_pict = 0;
     r->overlay_mapped = FALSE;
     r->dirty = FALSE;
@@ -621,6 +625,7 @@ static Bool create_overlay( struct vd_root_state *r )
     if (!XGetWindowAttributes( gdi_display, r->vd_root, &ra )) return FALSE;
 
     cmap = XCreateColormap( gdi_display, DefaultRootWindow(gdi_display), argb_visual.visual, AllocNone );
+    r->overlay_colormap = cmap;  /* owned by the slot, freed in vd_teardown_root */
     attr.override_redirect = True;
     attr.background_pixel = 0;
     attr.border_pixel = 0;
@@ -668,6 +673,7 @@ void vd_compositor_init( Display *display, Window vd_root )
     r->display = display;
     r->vd_root = vd_root;
     r->overlay = 0;
+    r->overlay_colormap = 0;
     r->overlay_pict = 0;
     r->overlay_mapped = FALSE;
     r->dirty = FALSE;
