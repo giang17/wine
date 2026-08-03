@@ -845,6 +845,11 @@ extern BOOL is_desktop_fullscreen(void);
 extern BOOL is_detached_mode(const DEVMODEW *);
 void X11DRV_Settings_Init(void);
 
+/* virtual-desktop per-pixel-alpha mini-compositor (issue 64) */
+extern void vd_compositor_init( Window vd_root );
+extern void vd_compositor_notify( XEvent *event );
+extern void vd_compositor_paint( void );
+
 void X11DRV_XF86VM_Init(void);
 void X11DRV_XRandR_Init(void);
 void init_user_driver(void);

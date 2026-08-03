@@ -502,6 +502,7 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
 
         count++;
         if (XFilterEvent( &event, None )) continue;
+        vd_compositor_notify( &event );  /* issue 64: per-pixel-alpha VD mini-compositor */
         if (host_window_filter_event( &event, &prev_event )) continue;
 
         get_event_data( &event );
@@ -524,6 +525,7 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
         }
     }
 
+    vd_compositor_paint();  /* issue 64: flush a pending per-pixel-alpha VD recomposit */
     XFlush( gdi_display );
     if (count) TRACE( "processed %d events\n", count );
 

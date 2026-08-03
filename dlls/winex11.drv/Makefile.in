@@ -18,6 +18,7 @@ SOURCES = \
 	opengl.c \
 	palette.c \
 	pen.c \
+	vd_compositor.c \
 	version.rc \
 	vulkan.c \
 	window.c \
