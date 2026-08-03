@@ -133,7 +133,8 @@ struct vd_root_state
 };
 
 static struct vd_root_state vd_roots[MAX_VD_ROOTS];
-static BOOL vd_ready;     /* one-time: extensions loaded + queried + VD mode active */
+static BOOL vd_ready;      /* one-time: extensions loaded + queried + VD mode active */
+static BOOL vd_registered; /* at least one root registered; set before vd_ready */
 static BOOL vd_use_damage;
 static int vd_damage_event_base;
 static int vd_damage_error_base;
@@ -606,13 +607,46 @@ static BOOL vd_handle_damage( XDamageNotifyEvent *event )
 }
 #endif
 
-void vd_compositor_notify( XEvent *event )
+/* Substructure events name the window that selected the mask in xany.window and
+ * the affected child in their own field; for structure events the two are the
+ * same.  The distinction matters because SubstructureNotifyMask on the VD root
+ * is ours: without it Wine would never see these events, and its dispatcher
+ * attributes them to the desktop window -- reacting to foreign children as if
+ * they were its own, which breaks the desktop handover outright. */
+static BOOL is_substructure_event( XEvent *event )
+{
+    switch (event->type)
+    {
+    case CreateNotify:    return event->xcreatewindow.window != event->xany.window;
+    case DestroyNotify:   return event->xdestroywindow.window != event->xany.window;
+    case UnmapNotify:     return event->xunmap.window != event->xany.window;
+    case MapNotify:       return event->xmap.window != event->xany.window;
+    case ReparentNotify:  return event->xreparent.window != event->xany.window;
+    case ConfigureNotify: return event->xconfigure.window != event->xany.window;
+    case GravityNotify:   return event->xgravity.window != event->xany.window;
+    case CirculateNotify: return event->xcirculate.window != event->xany.window;
+    default:              return FALSE;
+    }
+}
+
+BOOL vd_compositor_notify( XEvent *event )
 {
     struct vd_root_state *r = NULL;
     struct vd_child *c;
     int i;
+    BOOL consumed = FALSE;
 
-    if (!vd_ready) return;
+    /* not vd_ready: the extensions are loaded lazily on the first MapNotify,
+     * and dropping events until then would drop that very MapNotify. */
+    if (!vd_registered) return consumed;
+
+    /* Decided up front so that every exit path below reports it: an event that
+     * only reached this process because of the SubstructureNotifyMask this
+     * compositor puts on the VD root must not travel on to Wine's dispatcher,
+     * which would attribute a foreign child's map/configure/destroy to the
+     * desktop window itself. */
+    consumed = is_substructure_event( event ) &&
+               (vd_find_root( event->xany.window ) || vd_find_pending_root( event->xany.window ));
 
 #ifdef SONAME_LIBXDAMAGE
     /* Damage is deliberately handled here rather than through
@@ -623,7 +657,7 @@ void vd_compositor_notify( XEvent *event )
     if (vd_use_damage && event->type == vd_damage_event_base + XDamageNotify)
     {
         vd_handle_damage( (XDamageNotifyEvent *)event );
-        return;
+        return consumed;
     }
 #endif
 
@@ -649,16 +683,16 @@ void vd_compositor_notify( XEvent *event )
          * stay stuck behind its overlay, showing nothing at all.  Turning
          * towards the desktop is the moment that matters, and it is rare enough
          * to repaint on unconditionally. */
-        if (event->type == EnterNotify && event->xcrossing.detail == NotifyInferior) return;
+        if (event->type == EnterNotify && event->xcrossing.detail == NotifyInferior) return consumed;
         break;
     case GraphicsExpose:
     case NoExpose:
         /* crude stand-ins for "someone drew something"; only needed while
          * there is no damage tracking to report it precisely. */
-        if (vd_use_damage) return;
+        if (vd_use_damage) return consumed;
         break;
     default:
-        return;
+        return consumed;
     }
 
     /* A registered root takes over once its first child is mapped: by then the
@@ -692,11 +726,11 @@ void vd_compositor_notify( XEvent *event )
         /* not one of our roots: without damage tracking we cannot tell whether
          * it changed a composited child, so recomposit this connection's roots.
          * With damage this is dead weight and the events above are enough. */
-        if (vd_use_damage) return;
+        if (vd_use_damage) return consumed;
         for (i = 0; i < MAX_VD_ROOTS; i++)
             if (vd_roots[i].active && vd_roots[i].display == event->xany.display)
                 vd_roots[i].dirty = TRUE;
-        return;
+        return consumed;
     }
 
     switch (event->type)
@@ -731,6 +765,8 @@ void vd_compositor_notify( XEvent *event )
         break;
     }
     r->dirty = TRUE;
+
+    return consumed;
 }
 
 /* The overlay is a child of the VD root, not a top-level of the real root.
@@ -830,6 +866,14 @@ static Bool capture_background( struct vd_root_state *r )
 
 static void vd_activate_root( struct vd_root_state *r )
 {
+    /* the expensive setup happens here, off the desktop handover path */
+    if (!vd_ensure_ready())
+    {
+        WARN( "VD compositor: extensions unavailable, leaving root %lx alone\n", r->vd_root );
+        vd_teardown_root( r );
+        return;
+    }
+
     /* create the overlay BEFORE redirecting: if overlay creation fails we
      * leave the root's children drawn normally by the X server (visible,
      * opaque -- the status quo), never stuck behind a manual redirect with
@@ -856,11 +900,21 @@ static void vd_activate_root( struct vd_root_state *r )
            r->overlay, r->vd_root, vd_use_damage ? "on" : "off" );
 }
 
+/* Registration only -- this runs inside X11DRV_CreateDesktop, i.e. in the
+ * critical path of the desktop handover, and everything expensive here delays
+ * it: the dlopen()s, the extension queries and the server round trips they
+ * carry.  That delay is not academic.  It shifts the (upstream) race in
+ * X11DRV_SetDesktopWindow far enough that another process publishes the desktop
+ * size before the owner publishes the desktop window, and every application
+ * then stays on the real root, outside the desktop.  So do nothing here but
+ * take a slot; vd_activate_root() does the real work on the first MapNotify,
+ * which is what it was already waiting for. */
 void vd_compositor_init( Display *display, Window vd_root )
 {
     struct vd_root_state *r;
 
-    if (!vd_ensure_ready()) return;
+    if (!is_virtual_desktop()) return;
+    if (!usexcomposite) return;
 
     /* idempotent: Wine re-initialises desktop roots across setup phases; never
      * register the same root twice (that was the phase-1 leak: a second overlay
@@ -881,6 +935,7 @@ void vd_compositor_init( Display *display, Window vd_root )
     r->children_size = 0;
     r->active = FALSE;   /* raised by vd_activate_root once a child shows up */
     r->pending = TRUE;   /* registered, waiting for the desktop to settle */
+    vd_registered = TRUE;
 
     TRACE( "VD mini-compositor registered for VD root %lx, waiting for first child\n", vd_root );
 }
@@ -888,7 +943,7 @@ void vd_compositor_init( Display *display, Window vd_root )
 #else  /* !(SONAME_LIBXCOMPOSITE && SONAME_LIBXRENDER) */
 
 void vd_compositor_init( Display *display, Window vd_root ) { /* no composite/render support built in */ }
-void vd_compositor_notify( XEvent *event ) { }
+BOOL vd_compositor_notify( XEvent *event ) { return FALSE; }
 void vd_compositor_paint( Display *display ) { }
 
 #endif

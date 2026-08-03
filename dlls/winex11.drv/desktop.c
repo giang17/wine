@@ -98,14 +98,15 @@ BOOL X11DRV_CreateDesktop( const WCHAR *name, UINT width, UINT height )
     XFlush( display );
 
     X11DRV_init_desktop( win, width, height );
-    /* The VD root is created on the thread display, but the compositor renders
-     * via the global gdi_display; sync so the window is server-visible before
-     * the compositor's XGetWindowAttributes runs on the other connection.
-     * The thread display is handed over as well: it is the connection that
+    /* Registration only, and deliberately without a sync: this is the critical
+     * path of the desktop handover, and delaying it here shifts the race in
+     * X11DRV_SetDesktopWindow far enough to leave every application outside the
+     * desktop.  The compositor sets itself up on the first MapNotify, by which
+     * time the root is long since visible on the other connection.
+     * The thread display is handed over because it is the connection that
      * selected the root's SubstructureNotify and the one whose event queue
      * X11DRV_ProcessEvents drains, so the XDamage objects have to live on it
      * for their notifications to ever be read. */
-    XSync( display, False );
     vd_compositor_init( display, win );
     return TRUE;
 }
