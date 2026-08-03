@@ -14,10 +14,21 @@
  * pipeline (RenderCreatePicture BadMatch, window mapping stalls).  Instead
  * this compositor keeps the VD root RGB24, redirects its subwindows manually
  * (XCompositeRedirectSubwindows Manual) and composites them with per-pixel
- * alpha onto a SEPARATE ARGB32 overlay window that is a true top-level child
- * of the real root -- so the host compositor blends the overlay with
- * per-pixel alpha.  The overlay tracks the VD root's geometry and stacking
- * and lets input pass through (empty XInputShape) so the VD stays usable.
+ * alpha (XRenderComposite, PictOpOver) onto an overlay window that covers the
+ * VD root.  Input passes through it (empty XInputShape) so the VD stays usable.
+ *
+ * The overlay is a CHILD of the VD root, and the blending happens entirely
+ * here: the children are composited onto the root's own painted background,
+ * captured while it is still uncovered (capture_background), so the result is
+ * opaque and the host compositor has nothing left to blend.
+ *
+ * The first design made the overlay an ARGB32 top-level of the real root and
+ * left the blending to the host compositor.  That works visually but costs the
+ * stacking bond: an override-redirect top-level is not part of the window
+ * manager's stack, so it stayed on top of whatever the user switched to, and
+ * the WM reparenting the VD root in and out of its frame turned every restack
+ * attempt into a race (issue 139).  As a child, the overlay inherits the root's
+ * coordinate space and its place in the host's stack for free.
  *
  * Process boundary: the compositor only ever runs in the process that owns the
  * VD root -- normally explorer, which created it.  The applications drawing
@@ -67,6 +78,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 MAKE_FUNCPTR(XCompositeQueryExtension)
 MAKE_FUNCPTR(XCompositeRedirectSubwindows)
 MAKE_FUNCPTR(XCompositeNameWindowPixmap)
+MAKE_FUNCPTR(XCompositeUnredirectWindow)
 MAKE_FUNCPTR(XRenderQueryExtension)
 MAKE_FUNCPTR(XRenderFindVisualFormat)
 MAKE_FUNCPTR(XRenderCreatePicture)
@@ -107,10 +119,13 @@ struct vd_root_state
     BOOL pending;         /* registered, but the takeover is deferred until a child appears */
     Display *display;     /* connection owning the root's events and damage objects */
     Window vd_root;       /* the RGB24 virtual-desktop root */
-    Window overlay;       /* ARGB32 overlay window covering the VD root */
-    Colormap overlay_colormap; /* ARGB32 colormap the overlay was created with */
-    Picture overlay_pict; /* ARGB32 picture over the overlay window */
+    Window overlay;       /* opaque overlay window, a child of the VD root */
+    Picture overlay_pict; /* picture over the overlay window */
     BOOL overlay_mapped;  /* overlay is mapped (only while the VD root is viewable) */
+    Pixmap bg_pixmap;     /* the VD root's own painted background, captured while visible */
+    GC bg_gc;             /* for blitting that background, kept to avoid a GC per frame */
+    int bg_width, bg_height;
+    BOOL bg_valid;        /* the capture matches the root's current size and content */
     BOOL dirty;           /* a recomposit of this root's child set is pending */
     struct vd_child *children;
     unsigned int children_count;
@@ -133,6 +148,7 @@ static Bool load_functions(void)
     LOAD( xc, XCompositeQueryExtension );
     LOAD( xc, XCompositeRedirectSubwindows );
     LOAD( xc, XCompositeNameWindowPixmap );
+    LOAD( xc, XCompositeUnredirectWindow );
     LOAD( xr, XRenderQueryExtension );
     LOAD( xr, XRenderFindVisualFormat );
     LOAD( xr, XRenderCreatePicture );
@@ -350,23 +366,21 @@ static void vd_teardown_root( struct vd_root_state *r )
     r->children_size = 0;
 
     if (r->overlay_pict) pvd_XRenderFreePicture( gdi_display, r->overlay_pict );
+    if (r->bg_gc) XFreeGC( gdi_display, r->bg_gc );
+    if (r->bg_pixmap) XFreePixmap( gdi_display, r->bg_pixmap );
     if (r->overlay) XDestroyWindow( gdi_display, r->overlay );
-    /* after the window is gone, so the colormap is not freed while still installed */
-    if (r->overlay_colormap) XFreeColormap( gdi_display, r->overlay_colormap );
     r->active = FALSE;
     r->pending = FALSE;
     r->display = NULL;
     r->vd_root = 0;
     r->overlay = 0;
-    r->overlay_colormap = 0;
     r->overlay_pict = 0;
     r->overlay_mapped = FALSE;
+    r->bg_pixmap = 0;
+    r->bg_gc = 0;
+    r->bg_width = r->bg_height = 0;
+    r->bg_valid = FALSE;
     r->dirty = FALSE;
-}
-
-static int vd_stacking_error( Display *display, XErrorEvent *event, void *arg )
-{
-    return (event->error_code == BadMatch || event->error_code == BadWindow);
 }
 
 /* Errors a composit pass can legitimately produce: the children belong to other
@@ -384,14 +398,12 @@ static int vd_composite_error( Display *display, XErrorEvent *event, void *arg )
  * position nor its stacking is fixed.  Without this the overlay would sit at
  * the position the VD root had at creation time, before the WM ever placed it,
  * and would drop behind the VD root as soon as the desktop window is raised. */
+static Bool capture_background( struct vd_root_state *r );
+
 static void vd_overlay_follow_root( struct vd_root_state *r )
 {
-    Window real_root = DefaultRootWindow( gdi_display );
-    Window ancestor, root, parent, *children;
     XWindowAttributes attr;
     XWindowChanges changes;
-    unsigned int count;
-    int x, y;
 
     if (!XGetWindowAttributes( gdi_display, r->vd_root, &attr )) return;
     if (attr.map_state != IsViewable)
@@ -400,42 +412,33 @@ static void vd_overlay_follow_root( struct vd_root_state *r )
         r->overlay_mapped = FALSE;
         return;
     }
-    if (!XTranslateCoordinates( gdi_display, r->vd_root, real_root, 0, 0, &x, &y, &ancestor )) return;
 
-    /* a window can only be stacked relative to a sibling, so climb to the VD
-     * root's own top-level ancestor -- its WM frame, when it has one. */
-    for (ancestor = r->vd_root;;)
+    /* As a child of the VD root the overlay shares its coordinate space and its
+     * place in the host's stack: no translation, no sibling stacking, and
+     * nothing that can race the window manager reparenting the root into its
+     * frame.  Only the size has to be followed. */
+    if (attr.width != r->bg_width || attr.height != r->bg_height)
     {
-        if (!XQueryTree( gdi_display, ancestor, &root, &parent, &children, &count )) return;
-        if (children) XFree( children );
-        if (!parent || parent == real_root) break;
-        ancestor = parent;
+        changes.width = attr.width;
+        changes.height = attr.height;
+        XConfigureWindow( gdi_display, r->overlay, CWWidth | CWHeight, &changes );
+        /* the captured base no longer covers the root; it is refreshed on the
+         * next capture, which needs the root uncovered again */
+        r->bg_valid = FALSE;
+        if (r->overlay_mapped)
+        {
+            XUnmapWindow( gdi_display, r->overlay );
+            r->overlay_mapped = FALSE;
+        }
     }
 
-    changes.x = x;
-    changes.y = y;
-    changes.width = attr.width;
-    changes.height = attr.height;
-    changes.sibling = ancestor;
-    changes.stack_mode = Above;
-    /* CWSibling requires the sibling to actually be one: the window manager
-     * reparents the VD root into and out of its frame as focus moves, so the
-     * ancestor found above can stop being the overlay's sibling between the
-     * query and this request.  That is a BadMatch, which is not in the set of
-     * errors ignored on gdi_display and would take the whole process down. */
-    X11DRV_expect_error( gdi_display, vd_stacking_error, NULL );
-    XConfigureWindow( gdi_display, r->overlay,
-                      CWX | CWY | CWWidth | CWHeight | CWSibling | CWStackMode, &changes );
-    XSync( gdi_display, False );
-    if (X11DRV_check_error())
-    {
-        /* place it without the stacking request; the next repaint tries again */
-        WARN( "overlay %lx could not be stacked above %lx\n", r->overlay, ancestor );
-        XConfigureWindow( gdi_display, r->overlay, CWX | CWY | CWWidth | CWHeight, &changes );
-    }
     if (!r->overlay_mapped)
     {
+        if (!capture_background( r )) return;  /* the opaque base comes first */
         XMapWindow( gdi_display, r->overlay );
+        /* above its siblings: they are redirected and therefore not drawn, but
+         * a later-mapped child would otherwise sit above the overlay */
+        XRaiseWindow( gdi_display, r->overlay );
         r->overlay_mapped = TRUE;
     }
 }
@@ -536,10 +539,15 @@ void vd_compositor_paint( Display *display )
          * X11DRV_expect_error serialises on a plain mutex. */
         vd_sync_children( r, children, count );
 
-        /* clear the overlay to fully transparent so each frame is rendered
-         * from scratch -- no ghosting from moved or removed children. */
-        pvd_XRenderFillRectangle( gdi_display, PictOpSrc, r->overlay_pict, &clear,
-                                  0, 0, oa.width, oa.height );
+        /* Start each frame from the captured root background, so the composit is
+         * opaque -- the host does not have to blend anything -- and nothing from
+         * the previous frame ghosts through where a child moved or vanished. */
+        if (r->bg_valid)
+            XCopyArea( gdi_display, r->bg_pixmap, r->overlay, r->bg_gc, 0, 0,
+                       min( r->bg_width, oa.width ), min( r->bg_height, oa.height ), 0, 0 );
+        else
+            pvd_XRenderFillRectangle( gdi_display, PictOpSrc, r->overlay_pict, &clear,
+                                      0, 0, oa.width, oa.height );
 
         /* XQueryTree returns children in bottom-to-top stacking order;
          * compositing them in that order with PictOpOver preserves Z.
@@ -725,39 +733,47 @@ void vd_compositor_notify( XEvent *event )
     r->dirty = TRUE;
 }
 
+/* The overlay is a child of the VD root, not a top-level of the real root.
+ *
+ * A top-level would have to be blended by the host compositor to show per-pixel
+ * alpha, and buying that costs the stacking bond: an override-redirect window is
+ * not part of the window manager's stack, so it stayed on top of whatever the
+ * user switched to, and the WM reparenting the VD root in and out of its frame
+ * turned every restack attempt into a race (issue 139).
+ *
+ * Compositing already happens here -- XRenderComposite with PictOpOver -- so the
+ * host does not need to blend anything, as long as the children are blended onto
+ * an opaque base rather than onto transparency.  That base is the VD root's own
+ * background, captured in capture_background() while it is still visible.  The
+ * result is opaque, the overlay is an ordinary child, and X stacks it with its
+ * siblings for free. */
 static Bool create_overlay( struct vd_root_state *r )
 {
     XSetWindowAttributes attr;
     XWindowAttributes ra;
     XRenderPictFormat *fmt;
-    Colormap cmap;
     unsigned long mask;
 
-    if (!argb_visual.visual) return FALSE;
     if (!XGetWindowAttributes( gdi_display, r->vd_root, &ra )) return FALSE;
 
-    cmap = XCreateColormap( gdi_display, DefaultRootWindow(gdi_display), argb_visual.visual, AllocNone );
-    r->overlay_colormap = cmap;  /* owned by the slot, freed in vd_teardown_root */
-    attr.override_redirect = True;
-    attr.background_pixel = 0;
+    attr.background_pixmap = None;  /* every pixel is painted from the composit */
     attr.border_pixel = 0;
-    attr.colormap = cmap;
+    attr.colormap = default_colormap;
     attr.event_mask = ExposureMask;
-    attr.save_under = True;
-    mask = CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWColormap | CWEventMask | CWSaveUnder;
+    mask = CWBackPixmap | CWBorderPixel | CWColormap | CWEventMask;
 
-    r->overlay = XCreateWindow( gdi_display, DefaultRootWindow(gdi_display),
-                                ra.x, ra.y, ra.width, ra.height, 0, 32, InputOutput,
-                                argb_visual.visual, mask, &attr );
+    r->overlay = XCreateWindow( gdi_display, r->vd_root, 0, 0, ra.width, ra.height, 0,
+                                default_visual.depth, InputOutput, default_visual.visual,
+                                mask, &attr );
     if (!r->overlay) return FALSE;
 
-    fmt = pvd_XRenderFindVisualFormat( gdi_display, argb_visual.visual );
+    fmt = pvd_XRenderFindVisualFormat( gdi_display, default_visual.visual );
     if (!fmt) return FALSE;
     r->overlay_pict = pvd_XRenderCreatePicture( gdi_display, r->overlay, fmt, 0, NULL );
     if (!r->overlay_pict) return FALSE;
 
-    /* left unmapped: vd_overlay_follow_root maps it once the WM has placed the
-     * VD root, so it never shows up at the wrong position first. */
+    /* left unmapped: it is mapped once the background has been captured, so it
+     * never shows a frame of uninitialised content. */
 
 #ifdef SONAME_LIBXEXT
     /* empty input shape: the overlay never absorbs pointer/keyboard input,
@@ -775,6 +791,43 @@ static Bool create_overlay( struct vd_root_state *r )
  * point makes the desktop creation that follows fail with BadWindow on a root
  * that is torn down and recreated underneath us.  By the time the first child
  * appears the desktop is settled and the takeover is safe. */
+/* Capture the VD root's own painted background as the composit's opaque base.
+ *
+ * After the manual subwindow redirect the root shows nothing but its background:
+ * the server no longer draws the children, so what is on screen at that moment
+ * is exactly the base the composit needs.  It has to be taken before the overlay
+ * is mapped -- once the root is covered, the content of the covered area is
+ * undefined.  Wine's desktop root carries no background pixmap of its own
+ * (explorer paints it on Expose), so ParentRelative would yield nothing and a
+ * copy is the only reliable base. */
+static Bool capture_background( struct vd_root_state *r )
+{
+    XWindowAttributes ra;
+
+    if (r->overlay_mapped) return r->bg_valid;  /* root is covered, keep what we have */
+    if (!XGetWindowAttributes( gdi_display, r->vd_root, &ra )) return FALSE;
+    if (ra.map_state != IsViewable) return FALSE;
+
+    if (r->bg_pixmap && (r->bg_width != ra.width || r->bg_height != ra.height))
+    {
+        XFreePixmap( gdi_display, r->bg_pixmap );
+        r->bg_pixmap = 0;
+    }
+    if (!r->bg_pixmap)
+    {
+        r->bg_pixmap = XCreatePixmap( gdi_display, r->vd_root, ra.width, ra.height, default_visual.depth );
+        if (!r->bg_pixmap) return FALSE;
+        r->bg_width = ra.width;
+        r->bg_height = ra.height;
+    }
+    if (!r->bg_gc && !(r->bg_gc = XCreateGC( gdi_display, r->bg_pixmap, 0, NULL ))) return FALSE;
+
+    XCopyArea( gdi_display, r->vd_root, r->bg_pixmap, r->bg_gc,
+               0, 0, r->bg_width, r->bg_height, 0, 0 );
+    r->bg_valid = TRUE;
+    return TRUE;
+}
+
 static void vd_activate_root( struct vd_root_state *r )
 {
     /* create the overlay BEFORE redirecting: if overlay creation fails we
@@ -791,6 +844,10 @@ static void vd_activate_root( struct vd_root_state *r )
     /* manual subwindow redirect: the X server stops drawing the VD root's
      * children itself and gives us redirected backing pixmaps. */
     pvd_XCompositeRedirectSubwindows( gdi_display, r->vd_root, CompositeRedirectManual );
+    /* ...  including the overlay, which is a child as well: take it back out,
+     * or the only window that is supposed to be drawn would be the one the
+     * server stops drawing. */
+    pvd_XCompositeUnredirectWindow( gdi_display, r->overlay, CompositeRedirectManual );
     XSync( gdi_display, False );
 
     r->active = TRUE;
@@ -816,7 +873,6 @@ void vd_compositor_init( Display *display, Window vd_root )
     r->display = display;
     r->vd_root = vd_root;
     r->overlay = 0;
-    r->overlay_colormap = 0;
     r->overlay_pict = 0;
     r->overlay_mapped = FALSE;
     r->dirty = FALSE;
