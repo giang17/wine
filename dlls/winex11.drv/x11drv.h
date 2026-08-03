@@ -214,6 +214,7 @@ extern SHORT X11DRV_VkKeyScanEx( WCHAR wChar, HKL hkl );
 extern void X11DRV_NotifyIMEStatus( HWND hwnd, UINT status );
 extern BOOL X11DRV_SetIMECompositionRect( HWND hwnd, RECT rect );
 extern void X11DRV_DestroyCursorIcon( HCURSOR handle );
+extern Cursor get_default_cursor(void);
 extern void X11DRV_SetCursor( HWND hwnd, HCURSOR handle );
 extern BOOL X11DRV_SetCursorPos( INT x, INT y );
 extern BOOL X11DRV_GetCursorPos( LPPOINT pos );
@@ -551,6 +552,7 @@ enum x11drv_atoms
     XATOM__NET_WM_WINDOW_TYPE_DIALOG,
     XATOM__NET_WM_WINDOW_TYPE_NORMAL,
     XATOM__NET_WM_WINDOW_TYPE_UTILITY,
+    XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU,
     XATOM__NET_WORKAREA,
     XATOM__GTK_WORKAREAS_D0,
     XATOM__XEMBED,
@@ -600,6 +602,10 @@ extern HWND systray_hwnd;
 /* X11 event driver */
 
 typedef BOOL (*x11drv_event_handler)( HWND hwnd, XEvent *event );
+
+/* size of the event handler table: an extension event type must stay below
+ * this, the dispatcher indexes the table with it unchecked */
+#define MAX_EVENT_HANDLERS 128
 
 extern void X11DRV_register_event_handler( int type, x11drv_event_handler handler, const char *name );
 
@@ -692,6 +698,7 @@ struct x11drv_win_data
     UINT        parent_invalid : 1; /* is the parent host window possibly invalid */
     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
+    UINT        black_expose_bg : 1; /* X paints an opaque black background on expose */
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
     Pixmap         icon_mask;
@@ -739,6 +746,7 @@ extern void window_set_user_time( struct x11drv_win_data *data, Time time, BOOL 
 extern UINT get_window_net_wm_state( Display *display, Window window );
 extern void make_window_embedded( struct x11drv_win_data *data );
 extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap );
+extern void set_expose_background_suppressed( HWND hwnd, BOOL suppress );
 extern void detach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void destroy_client_window( HWND hwnd, Window client_window );
@@ -855,6 +863,11 @@ extern BOOL is_virtual_desktop(void);
 extern BOOL is_desktop_fullscreen(void);
 extern BOOL is_detached_mode(const DEVMODEW *);
 void X11DRV_Settings_Init(void);
+
+/* virtual-desktop per-pixel-alpha mini-compositor (issue 64) */
+extern void vd_compositor_init( Display *display, Window vd_root );
+extern BOOL vd_compositor_notify( XEvent *event );
+extern void vd_compositor_paint( Display *display );
 
 void X11DRV_XF86VM_Init(void);
 void X11DRV_XRandR_Init(void);

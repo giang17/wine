@@ -1348,6 +1348,63 @@ static HRESULT __stdcall grayscale_factory(IUnknown **effect)
     return d2d_effect_create_impl(effect, NULL, 0);
 }
 
+static const WCHAR color_management_description[] =
+L"<?xml version='1.0'?>                                                        \
+  <Effect>                                                                     \
+    <Property name='DisplayName' type='string' value='Color Management'/>      \
+    <Property name='Author'      type='string' value='The Wine Project'/>      \
+    <Property name='Category'    type='string' value='Stub'/>                  \
+    <Property name='Description' type='string' value='Color Management'/>      \
+    <Inputs >                                                                  \
+      <Input name='Source'/>                                                   \
+    </Inputs>                                                                  \
+    <Property name='SourceColorContext' type='iunknown' />                     \
+    <Property name='SourceRenderingIntent' type='enum' />                      \
+    <Property name='DestinationColorContext' type='iunknown' />                \
+    <Property name='DestinationRenderingIntent' type='enum' />                 \
+    <Property name='AlphaMode' type='enum' />                                  \
+    <Property name='Quality' type='enum' />                                    \
+  </Effect>";
+
+struct color_management_properties
+{
+    IUnknown *source_color_context;
+    D2D1_COLORMANAGEMENT_RENDERING_INTENT source_rendering_intent;
+    IUnknown *destination_color_context;
+    D2D1_COLORMANAGEMENT_RENDERING_INTENT destination_rendering_intent;
+    D2D1_COLORMANAGEMENT_ALPHA_MODE alpha_mode;
+    D2D1_COLORMANAGEMENT_QUALITY quality;
+};
+
+EFFECT_PROPERTY_RW(color_management, source_color_context, IUNKNOWN)
+EFFECT_PROPERTY_RW(color_management, source_rendering_intent, ENUM)
+EFFECT_PROPERTY_RW(color_management, destination_color_context, IUNKNOWN)
+EFFECT_PROPERTY_RW(color_management, destination_rendering_intent, ENUM)
+EFFECT_PROPERTY_RW(color_management, alpha_mode, ENUM)
+EFFECT_PROPERTY_RW(color_management, quality, ENUM)
+
+static const D2D1_PROPERTY_BINDING color_management_bindings[] =
+{
+    { L"SourceColorContext", BINDING_RW(color_management, source_color_context) },
+    { L"SourceRenderingIntent", BINDING_RW(color_management, source_rendering_intent) },
+    { L"DestinationColorContext", BINDING_RW(color_management, destination_color_context) },
+    { L"DestinationRenderingIntent", BINDING_RW(color_management, destination_rendering_intent) },
+    { L"AlphaMode", BINDING_RW(color_management, alpha_mode) },
+    { L"Quality", BINDING_RW(color_management, quality) },
+};
+
+static HRESULT __stdcall color_management_factory(IUnknown **effect)
+{
+    static const struct color_management_properties properties =
+    {
+        .source_rendering_intent = D2D1_COLORMANAGEMENT_RENDERING_INTENT_PERCEPTUAL,
+        .destination_rendering_intent = D2D1_COLORMANAGEMENT_RENDERING_INTENT_PERCEPTUAL,
+        .alpha_mode = D2D1_COLORMANAGEMENT_ALPHA_MODE_PREMULTIPLIED,
+        .quality = D2D1_COLORMANAGEMENT_QUALITY_NORMAL,
+    };
+    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+}
+
 static const WCHAR color_matrix_description[] =
 L"<?xml version='1.0'?>                                                   \
   <Effect>                                                                \
@@ -1420,6 +1477,124 @@ static HRESULT __stdcall flood_factory(IUnknown **effect)
     static const struct flood_properties properties =
     {
         .color = {0.0f, 0.0f, 0.0f, 1.0f},
+    };
+    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+}
+
+
+#define CONVOLVE_MATRIX_MAX_KERNEL_SIZE 1024
+
+static const WCHAR convolve_matrix_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Convolve Matrix'/>  \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Convolve Matrix'/>  \
+    <Inputs>                                                              \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='KernelUnitLength' type='vector2' />                   \
+    <Property name='ScaleMode' type='enum' />                             \
+    <Property name='KernelSizeX' type='uint32' />                         \
+    <Property name='KernelSizeY' type='uint32' />                         \
+    <Property name='KernelMatrix' type='blob' />                          \
+    <Property name='Divisor' type='float' />                              \
+    <Property name='Bias' type='float' />                                 \
+    <Property name='KernelOffset' type='vector2' />                       \
+    <Property name='PreserveAlpha' type='bool' />                         \
+    <Property name='BorderMode' type='enum' />                            \
+    <Property name='ClampOutput' type='bool' />                           \
+  </Effect>";
+
+struct convolve_matrix_properties
+{
+    D2D_VECTOR_2F kernel_unit_length;
+    D2D1_CONVOLVEMATRIX_SCALE_MODE scale_mode;
+    UINT32 kernel_size_x;
+    UINT32 kernel_size_y;
+    float kernel_matrix[CONVOLVE_MATRIX_MAX_KERNEL_SIZE];
+    UINT32 kernel_matrix_size;
+    float divisor;
+    float bias;
+    D2D_VECTOR_2F kernel_offset;
+    BOOL preserve_alpha;
+    D2D1_BORDER_MODE border_mode;
+    BOOL clamp_output;
+};
+
+EFFECT_PROPERTY_RW(convolve_matrix, kernel_unit_length, VECTOR2)
+EFFECT_PROPERTY_RW(convolve_matrix, scale_mode, ENUM)
+EFFECT_PROPERTY_RW(convolve_matrix, kernel_size_x, UINT32)
+EFFECT_PROPERTY_RW(convolve_matrix, kernel_size_y, UINT32)
+EFFECT_PROPERTY_RW(convolve_matrix, divisor, FLOAT)
+EFFECT_PROPERTY_RW(convolve_matrix, bias, FLOAT)
+EFFECT_PROPERTY_RW(convolve_matrix, kernel_offset, VECTOR2)
+EFFECT_PROPERTY_RW(convolve_matrix, preserve_alpha, BOOL)
+EFFECT_PROPERTY_RW(convolve_matrix, border_mode, ENUM)
+EFFECT_PROPERTY_RW(convolve_matrix, clamp_output, BOOL)
+
+static HRESULT __stdcall convolve_matrix_kernel_matrix_set(IUnknown *iface, const BYTE *data, UINT32 data_size)
+{
+    struct d2d_effect_impl *effect = impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)iface);
+    struct convolve_matrix_properties *props = (struct convolve_matrix_properties *)(effect + 1);
+
+    if (!data_size || data_size > sizeof(props->kernel_matrix) || data_size % sizeof(float))
+        return E_INVALIDARG;
+
+    memcpy(props->kernel_matrix, data, data_size);
+    props->kernel_matrix_size = data_size;
+
+    return S_OK;
+}
+
+static HRESULT __stdcall convolve_matrix_kernel_matrix_get(const IUnknown *iface, BYTE *data,
+        UINT32 data_size, UINT32 *actual_size)
+{
+    struct d2d_effect_impl *effect = impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)iface);
+    struct convolve_matrix_properties *props = (struct convolve_matrix_properties *)(effect + 1);
+    UINT32 size = props->kernel_matrix_size;
+
+    if (actual_size)
+        *actual_size = size;
+
+    if (data && data_size)
+    {
+        if (data_size < size)
+            return E_NOT_SUFFICIENT_BUFFER;
+        memcpy(data, props->kernel_matrix, size);
+    }
+
+    return S_OK;
+}
+
+static const D2D1_PROPERTY_BINDING convolve_matrix_bindings[] =
+{
+    { L"KernelUnitLength", BINDING_RW(convolve_matrix, kernel_unit_length) },
+    { L"ScaleMode", BINDING_RW(convolve_matrix, scale_mode) },
+    { L"KernelSizeX", BINDING_RW(convolve_matrix, kernel_size_x) },
+    { L"KernelSizeY", BINDING_RW(convolve_matrix, kernel_size_y) },
+    { L"KernelMatrix", BINDING_RW(convolve_matrix, kernel_matrix) },
+    { L"Divisor", BINDING_RW(convolve_matrix, divisor) },
+    { L"Bias", BINDING_RW(convolve_matrix, bias) },
+    { L"KernelOffset", BINDING_RW(convolve_matrix, kernel_offset) },
+    { L"PreserveAlpha", BINDING_RW(convolve_matrix, preserve_alpha) },
+    { L"BorderMode", BINDING_RW(convolve_matrix, border_mode) },
+    { L"ClampOutput", BINDING_RW(convolve_matrix, clamp_output) },
+};
+
+static HRESULT __stdcall convolve_matrix_factory(IUnknown **effect)
+{
+    static const struct convolve_matrix_properties properties =
+    {
+        .kernel_unit_length = { 1.0f, 1.0f },
+        .scale_mode = D2D1_CONVOLVEMATRIX_SCALE_MODE_LINEAR,
+        .kernel_size_x = 1,
+        .kernel_size_y = 1,
+        .kernel_matrix = { 1.0f },
+        .kernel_matrix_size = sizeof(float),
+        .divisor = 0.0f,
+        .border_mode = D2D1_BORDER_MODE_SOFT,
     };
     return d2d_effect_create_impl(effect, &properties, sizeof(properties));
 }
@@ -1718,6 +1893,40 @@ static HRESULT __stdcall hue_rotation_factory(IUnknown **effect)
     return d2d_effect_create_impl(effect, &properties, sizeof(properties));
 }
 
+static const WCHAR opacity_description[] =
+L"<?xml version='1.0'?>                                                   \
+  <Effect>                                                                \
+    <Property name='DisplayName' type='string' value='Opacity'/>          \
+    <Property name='Author'      type='string' value='The Wine Project'/> \
+    <Property name='Category'    type='string' value='Stub'/>             \
+    <Property name='Description' type='string' value='Opacity'/>          \
+    <Inputs>                                                              \
+      <Input name='Source'/>                                              \
+    </Inputs>                                                             \
+    <Property name='Opacity' type='float' />                              \
+  </Effect>";
+
+struct opacity_properties
+{
+    float opacity;
+};
+
+EFFECT_PROPERTY_RW(opacity, opacity, FLOAT)
+
+static const D2D1_PROPERTY_BINDING opacity_bindings[] =
+{
+    { L"Opacity", BINDING_RW(opacity, opacity) },
+};
+
+static HRESULT __stdcall opacity_factory(IUnknown **effect)
+{
+    static const struct opacity_properties properties =
+    {
+        .opacity = 1.0f,
+    };
+    return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+}
+
 static const WCHAR saturation_description[] =
 L"<?xml version='1.0'?>                                                   \
   <Effect>                                                                \
@@ -1824,15 +2033,18 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
         { &CLSID_D2D1Crop, X2(crop) },
         { &CLSID_D2D1Shadow, X2(shadow) },
         { &CLSID_D2D1Grayscale, X(grayscale) },
+        { &CLSID_D2D1ColorManagement, X2(color_management) },
         { &CLSID_D2D1ColorMatrix, X2(color_matrix) },
         { &CLSID_D2D1Flood, X2(flood) },
         { &CLSID_D2D1GaussianBlur, X2(gaussian_blur) },
+        { &CLSID_D2D1ConvolveMatrix, X2(convolve_matrix) },
         { &CLSID_D2D1PointSpecular, X2(point_specular) },
         { &CLSID_D2D1ArithmeticComposite, X2(arithmetic_composite) },
         { &CLSID_D2D1Blend, X2(blend) },
         { &CLSID_D2D1Brightness, X2(brightness) },
         { &CLSID_D2D1DirectionalBlur, X2(directional_blur) },
         { &CLSID_D2D1HueRotation, X2(hue_rotation) },
+        { &CLSID_D2D1Opacity, X2(opacity) },
         { &CLSID_D2D1Saturation, X2(saturation) },
         { &CLSID_D2D1Scale, X2(scale) },
 #undef X2

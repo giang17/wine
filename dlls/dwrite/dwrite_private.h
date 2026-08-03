@@ -29,6 +29,53 @@
 #include "wine/list.h"
 #include "wine/rbtree.h"
 
+#ifdef __WINE_PE_BUILD
+/* Private heap for dwrite — isolates high-frequency alloc/free churn
+ * (glyph run analysis, layout objects, font cache entries) from the
+ * process heap to reduce RSS growth from ntdll heap fragmentation. */
+extern HANDLE dwrite_heap;
+
+static inline void *dwrite_private_alloc(size_t size)
+{
+    return HeapAlloc(dwrite_heap, 0, size);
+}
+
+static inline void *dwrite_private_calloc(size_t count, size_t size)
+{
+    if (size && count > (~(size_t)0) / size)
+        return NULL;
+    return HeapAlloc(dwrite_heap, HEAP_ZERO_MEMORY, count * size);
+}
+
+static inline void *dwrite_private_realloc(void *ptr, size_t size)
+{
+    if (!ptr) return HeapAlloc(dwrite_heap, 0, size);
+    return HeapReAlloc(dwrite_heap, 0, ptr, size);
+}
+
+static inline void dwrite_private_free(void *ptr)
+{
+    if (ptr) HeapFree(dwrite_heap, 0, ptr);
+}
+
+static inline WCHAR *dwrite_private_wcsdup(const WCHAR *src)
+{
+    size_t bytes;
+    WCHAR *dst;
+    if (!src) return NULL;
+    bytes = (wcslen(src) + 1) * sizeof(WCHAR);
+    if (!(dst = HeapAlloc(dwrite_heap, 0, bytes))) return NULL;
+    memcpy(dst, src, bytes);
+    return dst;
+}
+
+#define malloc(s)       dwrite_private_alloc(s)
+#define calloc(c, s)    dwrite_private_calloc(c, s)
+#define realloc(p, s)   dwrite_private_realloc(p, s)
+#define free(p)         dwrite_private_free(p)
+#define wcsdup(s)       dwrite_private_wcsdup(s)
+#endif /* __WINE_PE_BUILD */
+
 #define MS_GSUB_TAG DWRITE_MAKE_OPENTYPE_TAG('G','S','U','B')
 #define MS_GPOS_TAG DWRITE_MAKE_OPENTYPE_TAG('G','P','O','S')
 

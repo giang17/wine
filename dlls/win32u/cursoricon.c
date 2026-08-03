@@ -77,6 +77,22 @@ static struct cursoricon_object *get_icon_ptr( HICON handle )
 BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle )
 {
     TRACE( "hwnd %p, window %p, hcursor %p\n", hwnd, window, handle );
+    if (!handle)
+    {
+        /* Native Windows shows the class cursor, then the system arrow, for a
+         * window whose cursor is not set — never the empty/transparent cursor
+         * that hides the pointer. Only ShowCursor(FALSE) (count < 0) should
+         * hide it; CURSOR_SHOWING is clear in that case. */
+        CURSORINFO info;
+        info.cbSize = sizeof(info);
+        if (NtUserGetCursorInfo( &info ) && (info.flags & CURSOR_SHOWING))
+        {
+            handle = (HCURSOR)get_class_long_ptr( window, GCLP_HCURSOR, FALSE );
+            if (!handle) handle = LoadImageW( 0, MAKEINTRESOURCEW(IDC_ARROW),
+                                              IMAGE_CURSOR, 0, 0,
+                                              LR_SHARED | LR_DEFAULTSIZE );
+        }
+    }
     user_driver->pSetCursor( window, handle );
     return TRUE;
 }
