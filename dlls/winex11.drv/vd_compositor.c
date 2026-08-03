@@ -90,11 +90,21 @@ struct vd_child
 {
     Window window;
     XID damage;  /* Damage; 0 when damage tracking is unavailable for it */
+    /* geometry cache: asking the server per child per frame is a blocking
+     * round trip each time, and the repaint runs in the desktop owner's event
+     * loop -- with a dozen children that is enough to stall it.  The values
+     * come from the ConfigureNotify/MapNotify we already receive. */
+    int x, y;
+    int width, height;
+    Visual *visual;
+    BOOL viewable;
+    BOOL geometry_valid;
 };
 
 struct vd_root_state
 {
     BOOL active;          /* this slot is compositing a live VD root */
+    BOOL pending;         /* registered, but the takeover is deferred until a child appears */
     Display *display;     /* connection owning the root's events and damage objects */
     Window vd_root;       /* the RGB24 virtual-desktop root */
     Window overlay;       /* ARGB32 overlay window covering the VD root */
@@ -215,11 +225,22 @@ static struct vd_root_state *vd_find_root( Window vd_root )
     return NULL;
 }
 
+static void vd_activate_root( struct vd_root_state *r );
+
+/* a root that is registered but whose takeover has not happened yet */
+static struct vd_root_state *vd_find_pending_root( Window vd_root )
+{
+    int i;
+    for (i = 0; i < MAX_VD_ROOTS; i++)
+        if (vd_roots[i].pending && vd_roots[i].vd_root == vd_root) return &vd_roots[i];
+    return NULL;
+}
+
 static struct vd_root_state *vd_alloc_root( void )
 {
     int i;
     for (i = 0; i < MAX_VD_ROOTS; i++)
-        if (!vd_roots[i].active) return &vd_roots[i];
+        if (!vd_roots[i].active && !vd_roots[i].pending) return &vd_roots[i];
     return NULL;
 }
 
@@ -258,11 +279,35 @@ static void vd_track_child( struct vd_root_state *r, Window child )
     c = &r->children[r->children_count++];
     c->window = child;
     c->damage = 0;
+    c->geometry_valid = FALSE;
+    c->viewable = FALSE;
+
+    /* the only geometry query per child: from here on the cache is kept up to
+     * date from ConfigureNotify/MapNotify instead of asking the server again. */
+    {
+        XWindowAttributes attr;
+
+        X11DRV_expect_error( r->display, vd_child_gone_error, NULL );
+        if (XGetWindowAttributes( gdi_display, child, &attr ) && attr.class != InputOnly)
+        {
+            c->x = attr.x;
+            c->y = attr.y;
+            c->width = attr.width;
+            c->height = attr.height;
+            c->visual = attr.visual;
+            c->viewable = (attr.map_state == IsViewable);
+            c->geometry_valid = TRUE;
+        }
+        XSync( gdi_display, False );
+        X11DRV_check_error();
+    }
 
 #ifdef SONAME_LIBXDAMAGE
     if (!vd_use_damage) return;
     X11DRV_expect_error( r->display, vd_child_gone_error, NULL );
     c->damage = pvd_XDamageCreate( r->display, child, XDamageReportNonEmpty );
+    /* NB: keep this in sync with vd_child_gone_error, which also has to cover
+     * the BadMatch that NameWindowPixmap raises for an unredirected child. */
     XSync( r->display, False );
     if (X11DRV_check_error())
     {
@@ -309,6 +354,7 @@ static void vd_teardown_root( struct vd_root_state *r )
     /* after the window is gone, so the colormap is not freed while still installed */
     if (r->overlay_colormap) XFreeColormap( gdi_display, r->overlay_colormap );
     r->active = FALSE;
+    r->pending = FALSE;
     r->display = NULL;
     r->vd_root = 0;
     r->overlay = 0;
@@ -316,6 +362,20 @@ static void vd_teardown_root( struct vd_root_state *r )
     r->overlay_pict = 0;
     r->overlay_mapped = FALSE;
     r->dirty = FALSE;
+}
+
+static int vd_stacking_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->error_code == BadMatch || event->error_code == BadWindow);
+}
+
+/* Errors a composit pass can legitimately produce: the children belong to other
+ * processes and can stop being redirected, viewable or exist at all between the
+ * tree query and the requests naming their pixmaps. */
+static int vd_composite_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->error_code == BadMatch || event->error_code == BadWindow ||
+            event->error_code == BadDrawable || event->error_code == BadPixmap);
 }
 
 /* Glue the overlay to the VD root: same screen rectangle, stacked directly on
@@ -358,8 +418,21 @@ static void vd_overlay_follow_root( struct vd_root_state *r )
     changes.height = attr.height;
     changes.sibling = ancestor;
     changes.stack_mode = Above;
+    /* CWSibling requires the sibling to actually be one: the window manager
+     * reparents the VD root into and out of its frame as focus moves, so the
+     * ancestor found above can stop being the overlay's sibling between the
+     * query and this request.  That is a BadMatch, which is not in the set of
+     * errors ignored on gdi_display and would take the whole process down. */
+    X11DRV_expect_error( gdi_display, vd_stacking_error, NULL );
     XConfigureWindow( gdi_display, r->overlay,
                       CWX | CWY | CWWidth | CWHeight | CWSibling | CWStackMode, &changes );
+    XSync( gdi_display, False );
+    if (X11DRV_check_error())
+    {
+        /* place it without the stacking request; the next repaint tries again */
+        WARN( "overlay %lx could not be stacked above %lx\n", r->overlay, ancestor );
+        XConfigureWindow( gdi_display, r->overlay, CWX | CWY | CWWidth | CWHeight, &changes );
+    }
     if (!r->overlay_mapped)
     {
         XMapWindow( gdi_display, r->overlay );
@@ -369,23 +442,20 @@ static void vd_overlay_follow_root( struct vd_root_state *r )
 
 /* Composite one child onto the overlay at its current geometry.  ARGB32
  * children blend with their alpha (PictOpOver), opaque children just paint. */
-static void composite_child( struct vd_root_state *r, Window child )
+static void composite_child( struct vd_root_state *r, struct vd_child *c )
 {
-    XWindowAttributes attr;
     XRenderPictFormat *fmt;
     Pixmap pixmap;
     Picture pict;
 
-    if (!XGetWindowAttributes( gdi_display, child, &attr )) return;
-    if (attr.class == InputOnly) return;
-    if (attr.map_state != IsViewable) return;
+    if (!c->geometry_valid || !c->viewable) return;
 
-    fmt = pvd_XRenderFindVisualFormat( gdi_display, attr.visual );
+    fmt = pvd_XRenderFindVisualFormat( gdi_display, c->visual );
     if (!fmt) return;
 
     /* the redirected backing pixmap is replaced whenever the child is resized,
      * so it has to be named again for every frame rather than cached. */
-    pixmap = pvd_XCompositeNameWindowPixmap( gdi_display, child );
+    pixmap = pvd_XCompositeNameWindowPixmap( gdi_display, c->window );
     if (!pixmap) return;
 
     pict = pvd_XRenderCreatePicture( gdi_display, pixmap, fmt, 0, NULL );
@@ -394,7 +464,7 @@ static void composite_child( struct vd_root_state *r, Window child )
         /* child geometry is relative to the VD root; the overlay shares the
          * VD root's geometry, so the same coordinates place it correctly. */
         pvd_XRenderComposite( gdi_display, PictOpOver, pict, None, r->overlay_pict,
-                              0, 0, 0, 0, attr.x, attr.y, attr.width, attr.height );
+                              0, 0, 0, 0, c->x, c->y, c->width, c->height );
         pvd_XRenderFreePicture( gdi_display, pict );
     }
     XFreePixmap( gdi_display, pixmap );
@@ -471,10 +541,22 @@ void vd_compositor_paint( Display *display )
         pvd_XRenderFillRectangle( gdi_display, PictOpSrc, r->overlay_pict, &clear,
                                   0, 0, oa.width, oa.height );
 
-        X11DRV_expect_error( gdi_display, vd_child_gone_error, NULL );
         /* XQueryTree returns children in bottom-to-top stacking order;
-         * compositing them in that order with PictOpOver preserves Z. */
-        for (j = 0; j < count; j++) composite_child( r, children[j] );
+         * compositing them in that order with PictOpOver preserves Z.
+         *
+         * The trap is not optional: NameWindowPixmap raises BadMatch for a
+         * child that stopped being redirected or viewable since the tree was
+         * read -- which happens constantly, because the children belong to
+         * other processes -- and BadMatch is not in the set ignore_error lets
+         * through on gdi_display, so it would terminate the desktop process.
+         * One sync for the whole pass, not one per child: the geometry is
+         * cached, so this is the only round trip left in a repaint. */
+        X11DRV_expect_error( gdi_display, vd_composite_error, NULL );
+        for (j = 0; j < count; j++)
+        {
+            struct vd_child *c = vd_find_child( r, children[j] );
+            if (c) composite_child( r, c );
+        }
         XSync( gdi_display, False );
         X11DRV_check_error();
 
@@ -519,6 +601,7 @@ static BOOL vd_handle_damage( XDamageNotifyEvent *event )
 void vd_compositor_notify( XEvent *event )
 {
     struct vd_root_state *r = NULL;
+    struct vd_child *c;
     int i;
 
     if (!vd_ready) return;
@@ -570,6 +653,23 @@ void vd_compositor_notify( XEvent *event )
         return;
     }
 
+    /* A registered root takes over once its first child is mapped: by then the
+     * desktop window exists and Wine is done setting it up, so redirecting no
+     * longer races the creation (see vd_activate_root). */
+    if (event->type == MapNotify)
+    {
+        for (i = 0; i < MAX_VD_ROOTS; i++)
+        {
+            if (!vd_roots[i].pending) continue;
+            if (vd_roots[i].display != event->xany.display) continue;
+            if (vd_roots[i].vd_root != event->xany.window) continue;
+            if (event->xmap.window == vd_roots[i].vd_root) break;  /* the root's own map */
+            vd_roots[i].pending = FALSE;
+            vd_activate_root( &vd_roots[i] );
+            break;
+        }
+    }
+
     /* SubstructureNotify events name the root that selected them in the same
      * field as xany.window, so a child event is attributed to its root here. */
     for (i = 0; i < MAX_VD_ROOTS; i++)
@@ -598,6 +698,18 @@ void vd_compositor_notify( XEvent *event )
         break;
     case MapNotify:
         vd_track_child( r, event->xmap.window );
+        if ((c = vd_find_child( r, event->xmap.window ))) c->viewable = TRUE;
+        break;
+    case ConfigureNotify:
+        /* keeps the geometry cache current, which is what lets the repaint run
+         * without a per-child round trip to the server. */
+        if ((c = vd_find_child( r, event->xconfigure.window )))
+        {
+            c->x = event->xconfigure.x;
+            c->y = event->xconfigure.y;
+            c->width = event->xconfigure.width;
+            c->height = event->xconfigure.height;
+        }
         break;
     case ReparentNotify:
         if (event->xreparent.parent == r->vd_root) vd_track_child( r, event->xreparent.window );
@@ -656,6 +768,37 @@ static Bool create_overlay( struct vd_root_state *r )
     return TRUE;
 }
 
+/* Second half of the setup: create the overlay and take over the drawing of
+ * the root's children.  Deliberately not done from vd_compositor_init: that
+ * runs in the middle of X11DRV_CreateDesktop, before the desktop window even
+ * exists on the Win32 side, and redirecting (plus the XSync it needs) at that
+ * point makes the desktop creation that follows fail with BadWindow on a root
+ * that is torn down and recreated underneath us.  By the time the first child
+ * appears the desktop is settled and the takeover is safe. */
+static void vd_activate_root( struct vd_root_state *r )
+{
+    /* create the overlay BEFORE redirecting: if overlay creation fails we
+     * leave the root's children drawn normally by the X server (visible,
+     * opaque -- the status quo), never stuck behind a manual redirect with
+     * nothing compositing them. */
+    if (!create_overlay( r ))
+    {
+        WARN( "VD compositor: overlay creation failed for root %lx\n", r->vd_root );
+        vd_teardown_root( r );
+        return;
+    }
+
+    /* manual subwindow redirect: the X server stops drawing the VD root's
+     * children itself and gives us redirected backing pixmaps. */
+    pvd_XCompositeRedirectSubwindows( gdi_display, r->vd_root, CompositeRedirectManual );
+    XSync( gdi_display, False );
+
+    r->active = TRUE;
+    r->dirty = TRUE;
+    TRACE( "VD mini-compositor active, overlay %lx over VD root %lx, damage %s\n",
+           r->overlay, r->vd_root, vd_use_damage ? "on" : "off" );
+}
+
 void vd_compositor_init( Display *display, Window vd_root )
 {
     struct vd_root_state *r;
@@ -665,7 +808,7 @@ void vd_compositor_init( Display *display, Window vd_root )
     /* idempotent: Wine re-initialises desktop roots across setup phases; never
      * register the same root twice (that was the phase-1 leak: a second overlay
      * per root, the first orphaned with an active manual redirect). */
-    if (vd_find_root( vd_root )) return;
+    if (vd_find_root( vd_root ) || vd_find_pending_root( vd_root )) return;
 
     r = vd_alloc_root();
     if (!r) { WARN( "VD compositor: no free slot (max %d roots)\n", MAX_VD_ROOTS ); return; }
@@ -680,28 +823,10 @@ void vd_compositor_init( Display *display, Window vd_root )
     r->children = NULL;
     r->children_count = 0;
     r->children_size = 0;
-    r->active = FALSE;  /* raised only after the overlay + redirect succeed */
+    r->active = FALSE;   /* raised by vd_activate_root once a child shows up */
+    r->pending = TRUE;   /* registered, waiting for the desktop to settle */
 
-    /* create the overlay BEFORE redirecting: if overlay creation fails we
-     * leave the root's children drawn normally by the X server (visible,
-     * opaque -- the status quo), never stuck behind a manual redirect with
-     * nothing compositing them. */
-    if (!create_overlay( r ))
-    {
-        WARN( "VD compositor: overlay creation failed for root %lx\n", vd_root );
-        vd_teardown_root( r );
-        return;
-    }
-
-    /* manual subwindow redirect: the X server stops drawing the VD root's
-     * children itself and gives us redirected backing pixmaps. */
-    pvd_XCompositeRedirectSubwindows( gdi_display, vd_root, CompositeRedirectManual );
-    XSync( gdi_display, False );
-
-    r->active = TRUE;
-    r->dirty = TRUE;
-    TRACE( "VD mini-compositor active, overlay %lx over VD root %lx, damage %s\n",
-           r->overlay, vd_root, vd_use_damage ? "on" : "off" );
+    TRACE( "VD mini-compositor registered for VD root %lx, waiting for first child\n", vd_root );
 }
 
 #else  /* !(SONAME_LIBXCOMPOSITE && SONAME_LIBXRENDER) */
