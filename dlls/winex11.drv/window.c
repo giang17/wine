@@ -3056,6 +3056,13 @@ void X11DRV_SetDesktopWindow( HWND hwnd )
     {
         RECT rect = NtUserGetVirtualScreenRect( MDT_DEFAULT );
 
+        /* Other processes use a non-empty desktop size as the signal that the
+         * desktop window is ready, and then look up the X11 window on the
+         * property. Publish the property first, or a process starting in
+         * between would see the size without the property and silently keep
+         * using the root window, ending up outside of the virtual desktop. */
+        if (is_virtual_desktop()) NtUserSetProp( hwnd, whole_window_prop, (HANDLE)root_window );
+
         SERVER_START_REQ( set_window_pos )
         {
             req->handle        = wine_server_user_handle( hwnd );
@@ -3071,6 +3078,7 @@ void X11DRV_SetDesktopWindow( HWND hwnd )
         if (!create_desktop_win_data( root_window, hwnd ))
         {
             ERR( "Failed to create virtual desktop window data\n" );
+            NtUserRemoveProp( hwnd, whole_window_prop );
             root_window = DefaultRootWindow( gdi_display );
         }
     }
