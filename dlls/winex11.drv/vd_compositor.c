@@ -135,8 +135,7 @@ struct vd_root_state
 };
 
 static struct vd_root_state vd_roots[MAX_VD_ROOTS];
-static BOOL vd_ready;      /* one-time: extensions loaded + queried + VD mode active */
-static BOOL vd_registered; /* at least one root registered; set before vd_ready */
+static BOOL vd_ready;     /* one-time: extensions loaded + queried + VD mode active */
 static BOOL vd_use_damage;
 static int vd_damage_event_base;
 static int vd_damage_error_base;
@@ -684,9 +683,7 @@ BOOL vd_compositor_notify( XEvent *event )
     int i;
     BOOL consumed = FALSE;
 
-    /* not vd_ready: the extensions are loaded lazily on the first MapNotify,
-     * and dropping events until then would drop that very MapNotify. */
-    if (!vd_registered) return consumed;
+    if (!vd_ready) return consumed;
 
     /* Decided up front so that every exit path below reports it: an event that
      * only reached this process because of the SubstructureNotifyMask this
@@ -911,14 +908,6 @@ static Bool capture_background( struct vd_root_state *r )
 
 static void vd_activate_root( struct vd_root_state *r )
 {
-    /* the expensive setup happens here, off the desktop handover path */
-    if (!vd_ensure_ready())
-    {
-        WARN( "VD compositor: extensions unavailable, leaving root %lx alone\n", r->vd_root );
-        vd_teardown_root( r );
-        return;
-    }
-
     /* create the overlay BEFORE redirecting: if overlay creation fails we
      * leave the root's children drawn normally by the X server (visible,
      * opaque -- the status quo), never stuck behind a manual redirect with
@@ -945,21 +934,11 @@ static void vd_activate_root( struct vd_root_state *r )
            r->overlay, r->vd_root, vd_use_damage ? "on" : "off" );
 }
 
-/* Registration only -- this runs inside X11DRV_CreateDesktop, i.e. in the
- * critical path of the desktop handover, and everything expensive here delays
- * it: the dlopen()s, the extension queries and the server round trips they
- * carry.  That delay is not academic.  It shifts the (upstream) race in
- * X11DRV_SetDesktopWindow far enough that another process publishes the desktop
- * size before the owner publishes the desktop window, and every application
- * then stays on the real root, outside the desktop.  So do nothing here but
- * take a slot; vd_activate_root() does the real work on the first MapNotify,
- * which is what it was already waiting for. */
 void vd_compositor_init( Display *display, Window vd_root )
 {
     struct vd_root_state *r;
 
-    if (!is_virtual_desktop()) return;
-    if (!usexcomposite) return;
+    if (!vd_ensure_ready()) return;
 
     /* idempotent: Wine re-initialises desktop roots across setup phases; never
      * register the same root twice (that was the phase-1 leak: a second overlay
@@ -981,7 +960,6 @@ void vd_compositor_init( Display *display, Window vd_root )
     r->children_size = 0;
     r->active = FALSE;   /* raised by vd_activate_root once a child shows up */
     r->pending = TRUE;   /* registered, waiting for the desktop to settle */
-    vd_registered = TRUE;
 
     TRACE( "VD mini-compositor registered for VD root %lx, waiting for first child\n", vd_root );
 }
