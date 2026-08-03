@@ -851,7 +851,7 @@ void X11DRV_Settings_Init(void);
 
 /* virtual-desktop per-pixel-alpha mini-compositor (issue 64) */
 extern void vd_compositor_init( Display *display, Window vd_root );
-extern void vd_compositor_notify( XEvent *event );
+extern BOOL vd_compositor_notify( XEvent *event );
 extern void vd_compositor_paint( Display *display );
 
 void X11DRV_XF86VM_Init(void);

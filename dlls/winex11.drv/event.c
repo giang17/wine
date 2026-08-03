@@ -500,7 +500,10 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
 
         count++;
         if (XFilterEvent( &event, None )) continue;
-        vd_compositor_notify( &event );  /* issue 64: per-pixel-alpha VD mini-compositor */
+        /* issue 64: the VD mini-compositor selects SubstructureNotify on the VD
+         * root for its own purposes; it swallows those events so they never
+         * reach the dispatcher, which would misread them as the desktop's own. */
+        if (vd_compositor_notify( &event )) continue;
         if (host_window_filter_event( &event, &prev_event )) continue;
 
         get_event_data( &event );
