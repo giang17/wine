@@ -904,6 +904,11 @@ static void focus_out( Display *display , HWND hwnd )
  *
  * Note: only top-level windows get FocusOut events.
  */
+static int clip_window_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->error_code == BadWindow);
+}
+
 static BOOL X11DRV_FocusOut( HWND hwnd, XEvent *xev )
 {
     HWND foreground = NtUserGetForegroundWindow();
@@ -915,8 +920,16 @@ static BOOL X11DRV_FocusOut( HWND hwnd, XEvent *xev )
         {
             NtUserClipCursor( NULL );
             /* NtUserClipCursor will ask the foreground window to ungrab the cursor, but
-             * it might not be responsive, so unmap the clipping window ourselves too */
+             * it might not be responsive, so unmap the clipping window ourselves too.
+             * The window id is cached per thread (init_clip_window) from a property on
+             * the desktop window, so it outlives the desktop it came from: in virtual
+             * desktop mode, switching away from a desktop that is being torn down
+             * leaves us unmapping an id the server has already destroyed, and the
+             * resulting BadWindow would be fatal. */
+            X11DRV_expect_error( event->display, clip_window_error, NULL );
             XUnmapWindow( event->display, event->window );
+            XSync( event->display, False );
+            if (X11DRV_check_error()) WARN( "clipping window %lx already destroyed\n", event->window );
         }
         return TRUE;
     }
