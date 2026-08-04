@@ -480,9 +480,48 @@ static Bool ensure_back_buffer( struct vd_root_state *r, int width, int height )
     return TRUE;
 }
 
+/* Blank the part of a child's backing pixmap that lies outside the VD root.
+ *
+ * A window's backing store only holds defined content where the window lies
+ * inside its parent.  Map one straddling the desktop edge and the part beyond it
+ * comes up as whatever was in that memory -- and comes up OPAQUE, so a window
+ * that should fade out into nothing grows a hard border instead.  On a JUCE drop
+ * shadow, whose colour is premultiplied black throughout, that reads as a black
+ * seam along the outer edge, and it survives: what repaints the window only
+ * writes where there is something to draw, and a fully transparent edge has
+ * nothing.  The garbage is baked into the backing store and travels with the
+ * window, so it stays visible long after the window is back inside the desktop.
+ *
+ * The server will not fix this either -- every drawing request aimed at a window
+ * is clipped to its parent, so even clearing the whole window leaves the part
+ * outside untouched.  A pixmap has no parent and no such clip, which is why
+ * writing to it directly is what reaches the area.
+ *
+ * Nothing can be lost by it: those pixels are not displayed while they are off
+ * the desktop, and no one paints them.  Undefined memory is all that is being
+ * replaced. */
+static void clear_offscreen_edges( struct vd_child *c, Picture pict, int root_width, int root_height )
+{
+    static const XRenderColor transparent = { 0, 0, 0, 0 };
+    int over;
+
+    if ((over = min( -c->x, c->width )) > 0)
+        pvd_XRenderFillRectangle( gdi_display, PictOpSrc, pict, &transparent,
+                                  0, 0, over, c->height );
+    if ((over = min( -c->y, c->height )) > 0)
+        pvd_XRenderFillRectangle( gdi_display, PictOpSrc, pict, &transparent,
+                                  0, 0, c->width, over );
+    if ((over = min( c->x + c->width - root_width, c->width )) > 0)
+        pvd_XRenderFillRectangle( gdi_display, PictOpSrc, pict, &transparent,
+                                  c->width - over, 0, over, c->height );
+    if ((over = min( c->y + c->height - root_height, c->height )) > 0)
+        pvd_XRenderFillRectangle( gdi_display, PictOpSrc, pict, &transparent,
+                                  0, c->height - over, c->width, over );
+}
+
 /* Composite one child onto the frame under construction at its current geometry.  ARGB32
  * children blend with their alpha (PictOpOver), opaque children just paint. */
-static void composite_child( struct vd_root_state *r, struct vd_child *c )
+static void composite_child( struct vd_root_state *r, struct vd_child *c, int root_width, int root_height )
 {
     XRenderPictFormat *fmt;
     Pixmap pixmap;
@@ -501,6 +540,10 @@ static void composite_child( struct vd_root_state *r, struct vd_child *c )
     pict = pvd_XRenderCreatePicture( gdi_display, pixmap, fmt, 0, NULL );
     if (pict)
     {
+        /* only a per-pixel-alpha child can show this: an opaque one has no
+         * transparent edge for the garbage to survive in. */
+        if (fmt->depth == 32) clear_offscreen_edges( c, pict, root_width, root_height );
+
         /* child geometry is relative to the VD root; the overlay shares the
          * VD root's geometry, so the same coordinates place it correctly. */
         pvd_XRenderComposite( gdi_display, PictOpOver, pict, None, r->back_pict,
@@ -607,7 +650,7 @@ void vd_compositor_paint( Display *display )
         for (j = 0; j < count; j++)
         {
             struct vd_child *c = vd_find_child( r, children[j] );
-            if (c) composite_child( r, c );
+            if (c) composite_child( r, c, oa.width, oa.height );
         }
         XSync( gdi_display, False );
         X11DRV_check_error();
