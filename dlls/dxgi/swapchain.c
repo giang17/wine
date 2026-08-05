@@ -276,7 +276,14 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
 
             swprintf(prop_name, ARRAY_SIZE(prop_name),
                     L"__wine_dcomp_wnd_%I64x", (UINT_PTR)iface);
-            RemovePropW(GetDesktopWindow(), prop_name);
+            /* Only drop the mapping if it still points at our own window.  The
+             * key is this object's address, and the heap hands the same address
+             * out again once we are gone: a swapchain created after ours was
+             * released can already own the key by the time this runs, and
+             * removing it then strands a live window - the lookup in dcomp
+             * finds nothing and its content never reaches the screen. */
+            if (GetPropW(GetDesktopWindow(), prop_name) == (HANDLE)swapchain->comp_wnd)
+                RemovePropW(GetDesktopWindow(), prop_name);
             RemovePropW(swapchain->comp_wnd, L"__wine_dcomp_swapchain");
             if (IsWindow(swapchain->comp_wnd)
                     && GetWindowThreadProcessId(swapchain->comp_wnd, NULL) == GetCurrentThreadId())
