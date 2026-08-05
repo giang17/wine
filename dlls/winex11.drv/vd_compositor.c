@@ -111,6 +111,15 @@ struct vd_child
     Visual *visual;
     BOOL viewable;
     BOOL geometry_valid;
+    /* Last content the client actually painted, kept to put back after a remap:
+     * the fresh backing pixmap a remap produces is pre-filled by the server from
+     * the parent, and the client only paints the part its shadow covers. */
+    Pixmap save_pixmap;
+    Picture save_pict;
+    int save_width, save_height;
+    BOOL save_valid;      /* the copy holds real content, not undefined memory */
+    BOOL save_dirty;      /* the client painted since the copy was taken */
+    BOOL needs_restore;   /* a map happened; the next composite restores */
 };
 
 struct vd_root_state
@@ -299,6 +308,12 @@ static void vd_track_child( struct vd_root_state *r, Window child )
     c->damage = 0;
     c->geometry_valid = FALSE;
     c->viewable = FALSE;
+    c->save_pixmap = 0;
+    c->save_pict = 0;
+    c->save_width = c->save_height = 0;
+    c->save_valid = FALSE;
+    c->save_dirty = TRUE;    /* nothing saved yet: the first composite takes one */
+    c->needs_restore = FALSE;
 
     /* the only geometry query per child: from here on the cache is kept up to
      * date from ConfigureNotify/MapNotify instead of asking the server again. */
@@ -353,6 +368,8 @@ static void vd_untrack_child( struct vd_root_state *r, Window child, BOOL alive 
         X11DRV_check_error();
     }
 #endif
+    if (c->save_pict) pvd_XRenderFreePicture( gdi_display, c->save_pict );
+    if (c->save_pixmap) XFreePixmap( gdi_display, c->save_pixmap );
     *c = r->children[--r->children_count];
 }
 
@@ -519,6 +536,82 @@ static void clear_offscreen_edges( struct vd_child *c, Picture pict, int root_wi
                                   0, c->height - over, c->width, over );
 }
 
+/* Keep a copy of the last content the client actually painted, and put it back
+ * after a remap.
+ *
+ * A remap hands the window a backing pixmap the server has pre-filled from the
+ * parent -- with IncludeInferiors, so including this compositor's own overlay,
+ * which carries the finished frame.  The client then paints its shadow into it,
+ * but only where that shadow has coverage: the outer edge fades to alpha 0, there
+ * is nothing to draw out there, and so the copied screen content stays -- and it
+ * arrived opaque, so it shows.  What appears is whatever happened to be underneath:
+ * desktop icons, the desktop colour, or parts of the application's own GUI.
+ *
+ * Measured on the Kurzweil KM88 editor, whose shadow windows are unmapped and
+ * remapped while the window is dragged: of the two 4-row bands sampled at the top
+ * and bottom of the 1280x12 shadow, exactly one comes back foreign and complete
+ * while the other is clean.  The client had painted -- just not out there.
+ *
+ * Blanking the fresh pixmap instead cannot work, and that was measured rather than
+ * argued: at the first composite after a remap the client has already painted (30
+ * remaps out of 30), and a blank raises no damage of its own, so anything it
+ * deleted would never be redrawn.  Restoring a copy has no such problem -- the
+ * window keeps its size across the cycle, so the copy holds exactly the content
+ * that belongs there, and writing it back cannot lose what the client put in.
+ *
+ * The copy is refreshed only when the client has painted since it was taken, so a
+ * shadow that just sits there costs one copy, not one per frame.  Nothing is lost
+ * if a copy is unavailable: without one, this does nothing and the old behaviour
+ * stands. */
+#define VD_SAVE_MAX_PIXELS (512 * 512)  /* 1 MB per child at 32bpp; a shadow is far below */
+
+static Bool ensure_save_buffer( struct vd_root_state *r, struct vd_child *c, XRenderPictFormat *fmt )
+{
+    if (c->save_pixmap && (c->save_width != c->width || c->save_height != c->height))
+    {
+        if (c->save_pict) pvd_XRenderFreePicture( gdi_display, c->save_pict );
+        XFreePixmap( gdi_display, c->save_pixmap );
+        c->save_pixmap = 0;
+        c->save_pict = 0;
+        c->save_valid = FALSE;   /* a copy of the old size restores nothing */
+    }
+    if (c->save_pixmap) return TRUE;
+    /* the artefact lives on shadow and popup borders; a full-screen ARGB32 child is
+     * not worth a megabyte of shadow copy per frame it paints. */
+    if (c->width * c->height > VD_SAVE_MAX_PIXELS) return FALSE;
+
+    if (!(c->save_pixmap = XCreatePixmap( gdi_display, r->vd_root, c->width, c->height, 32 )))
+        return FALSE;
+    if (!(c->save_pict = pvd_XRenderCreatePicture( gdi_display, c->save_pixmap, fmt, 0, NULL )))
+    {
+        XFreePixmap( gdi_display, c->save_pixmap );
+        c->save_pixmap = 0;
+        return FALSE;
+    }
+    c->save_width = c->width;
+    c->save_height = c->height;
+    return TRUE;
+}
+
+static void save_backing_store( struct vd_root_state *r, struct vd_child *c, Picture pict,
+                                XRenderPictFormat *fmt )
+{
+    if (!c->save_dirty) return;
+    if (!ensure_save_buffer( r, c, fmt )) return;
+    pvd_XRenderComposite( gdi_display, PictOpSrc, pict, None, c->save_pict,
+                          0, 0, 0, 0, 0, 0, c->width, c->height );
+    c->save_valid = TRUE;
+    c->save_dirty = FALSE;
+}
+
+static void restore_backing_store( struct vd_child *c, Picture pict )
+{
+    if (!c->save_valid) return;
+    if (c->save_width != c->width || c->save_height != c->height) return;
+    pvd_XRenderComposite( gdi_display, PictOpSrc, c->save_pict, None, pict,
+                          0, 0, 0, 0, 0, 0, c->width, c->height );
+}
+
 /* Composite one child onto the frame under construction at its current geometry.  ARGB32
  * children blend with their alpha (PictOpOver), opaque children just paint. */
 static void composite_child( struct vd_root_state *r, struct vd_child *c, int root_width, int root_height )
@@ -540,9 +633,23 @@ static void composite_child( struct vd_root_state *r, struct vd_child *c, int ro
     pict = pvd_XRenderCreatePicture( gdi_display, pixmap, fmt, 0, NULL );
     if (pict)
     {
-        /* only a per-pixel-alpha child can show this: an opaque one has no
-         * transparent edge for the garbage to survive in. */
-        if (fmt->depth == 32) clear_offscreen_edges( c, pict, root_width, root_height );
+        /* only a per-pixel-alpha child is affected by any of these: an opaque one
+         * has no transparent edge for foreign content to survive in. */
+        if (fmt->depth == 32)
+        {
+            if (c->needs_restore)
+            {
+                restore_backing_store( c, pict );
+                c->needs_restore = FALSE;
+                /* the good content is back in place; saving now would only copy
+                 * what we just wrote. */
+                c->save_dirty = FALSE;
+            }
+            clear_offscreen_edges( c, pict, root_width, root_height );
+            /* after the edge clear, so the copy carries the already corrected
+             * content and a later restore cannot reintroduce an off-desktop seam. */
+            save_backing_store( r, c, pict, fmt );
+        }
 
         /* child geometry is relative to the VD root; the overlay shares the
          * VD root's geometry, so the same coordinates place it correctly. */
@@ -688,6 +795,10 @@ static BOOL vd_handle_damage( XDamageNotifyEvent *event )
          * Without this the child reports damage exactly once and then goes
          * quiet forever. */
         pvd_XDamageSubtract( r->display, c->damage, None, None );
+        /* The client painted, so the saved copy is behind and has to be retaken --
+         * gating it on this is what keeps a static shadow at one copy instead of
+         * one per frame. */
+        c->save_dirty = TRUE;
         r->dirty = TRUE;
         return TRUE;
     }
@@ -828,7 +939,13 @@ BOOL vd_compositor_notify( XEvent *event )
         break;
     case MapNotify:
         vd_track_child( r, event->xmap.window );
-        if ((c = vd_find_child( r, event->xmap.window ))) c->viewable = TRUE;
+        if ((c = vd_find_child( r, event->xmap.window )))
+        {
+            c->viewable = TRUE;
+            /* A remap means a fresh backing pixmap, pre-filled by the server from
+             * the parent.  The next composite puts the saved content back over it. */
+            c->needs_restore = TRUE;
+        }
         break;
     case ConfigureNotify:
         /* keeps the geometry cache current, which is what lets the repaint run
@@ -846,7 +963,14 @@ BOOL vd_compositor_notify( XEvent *event )
         else vd_untrack_child( r, event->xreparent.window, TRUE );
         break;
     case UnmapNotify:
-        vd_untrack_child( r, event->xunmap.window, TRUE );
+        /* Keep the child tracked instead of dropping it.  Its saved backing-store
+         * copy has to survive the unmap/remap cycle a client puts its shadow
+         * windows through -- surviving that cycle is the entire point of the copy,
+         * and a dropped entry would come back with nothing to restore from.  The
+         * damage object stays valid across it as well: it hangs on the window, not
+         * on its map state.  Children that leave the tree for good are still
+         * dropped, by vd_sync_children and by the DestroyNotify below. */
+        if ((c = vd_find_child( r, event->xunmap.window ))) c->viewable = FALSE;
         break;
     case DestroyNotify:
         vd_untrack_child( r, event->xdestroywindow.window, FALSE );
