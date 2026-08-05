@@ -1099,7 +1099,16 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
                 swprintf(treg, ARRAY_SIZE(treg), L"__wine_dcomp_target_%u", ti);
                 t = (HWND)GetPropW(desktop_wnd, treg);
-                if (t && t != swapchain->win_handle && IsWindow(t))
+                /* Only targets that share our top level share our drawable.
+                 * The registry is desktop-wide, so it also lists targets of
+                 * other top levels - a plugin editor over Live's WebView2
+                 * panel, say.  Their rects are not "outside our window": they
+                 * map to wherever the two windows overlap on screen, and
+                 * excluding them punches that overlap out of our present.  The
+                 * hole then survives, because nothing invalidates us when the
+                 * other top level changes. */
+                if (t && t != swapchain->win_handle && IsWindow(t)
+                        && GetAncestor(t, GA_ROOT) == GetAncestor(swapchain->win_handle, GA_ROOT))
                     wined3d_exclude_dcomp_children_proc(t, (LPARAM)&ctx);
             }
             /* Always BitBlt full comp buffer to window — survives any surface reset. */
