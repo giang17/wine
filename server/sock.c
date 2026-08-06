@@ -2832,6 +2832,13 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
                 unix_len = sizeof(unix_addr.un);
                 memset( &unix_addr.un, 0, sizeof(unix_addr.un) );
                 unix_addr.un.sun_family = AF_UNIX;
+                if (strlen( base_name ) >= sizeof(unix_addr.un.sun_path))
+                {
+                    fchdir( server_dir_fd );
+                    free( unix_path );
+                    set_win32_error( WSAEINVAL );
+                    return;
+                }
                 memcpy( unix_addr.un.sun_path, base_name, strlen( base_name ) );
                 free( unix_path );
             }
@@ -2889,6 +2896,8 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         if (ret < 0 && errno != EINPROGRESS)
         {
+            if (sock->family == WS_AF_UNIX && *addr->sa_data)
+                fchdir(server_dir_fd);
             set_error( sock_get_ntstatus( errno ) );
             return;
         }
@@ -3207,6 +3216,13 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
                 }
 
                 memset( &unix_addr.un, 0, sizeof(unix_addr.un) );
+                if (strlen( base_name ) >= sizeof(unix_addr.un.sun_path))
+                {
+                    fchdir( server_dir_fd );
+                    free( unix_path );
+                    set_win32_error( WSAEINVAL );
+                    return;
+                }
                 memcpy( unix_addr.un.sun_path, base_name, strlen( base_name ) );
                 free( unix_path );
             }
