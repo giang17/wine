@@ -49,6 +49,7 @@ struct cache_key
     float size;
     unsigned short glyph;
     unsigned short mode;
+    unsigned short lcd;
 };
 
 struct cache_entry
@@ -188,28 +189,36 @@ void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, struct dwrite_glyphb
     LeaveCriticalSection(&fontface->cs);
 }
 
-static unsigned int get_glyph_bitmap_pitch(DWRITE_RENDERING_MODE1 rendering_mode, INT width)
+/* A ClearType run carries three coverage samples per pixel, so its rows are
+ * three times as wide. */
+static unsigned int get_glyph_bitmap_pitch(DWRITE_RENDERING_MODE1 rendering_mode, INT width, BOOL lcd)
 {
-    return rendering_mode == DWRITE_RENDERING_MODE1_ALIASED ? ((width + 31) >> 5) << 2 : (width + 3) / 4 * 4;
+    if (rendering_mode == DWRITE_RENDERING_MODE1_ALIASED)
+        return ((width + 31) >> 5) << 2;
+    if (lcd)
+        width *= 3;
+    return (width + 3) / 4 * 4;
 }
 
 static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface, DWRITE_RENDERING_MODE1 rendering_mode,
-        unsigned int *is_1bpp, struct dwrite_glyphbitmap *bitmap)
+        BOOL lcd, unsigned int *is_1bpp, struct dwrite_glyphbitmap *bitmap)
 {
-    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL };
+    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL,
+            .lcd = !!lcd };
     struct get_glyph_bitmap_params params;
     const RECT *bbox = &bitmap->bbox;
     unsigned int bitmap_size, _1bpp;
     struct cache_entry *entry;
     HRESULT hr = S_OK;
 
-    bitmap_size = get_glyph_bitmap_pitch(rendering_mode, bbox->right - bbox->left) *
+    bitmap_size = get_glyph_bitmap_pitch(rendering_mode, bbox->right - bbox->left, lcd) *
             (bbox->bottom - bbox->top);
 
     params.object = fontface->get_font_object(fontface);
     params.simulations = fontface->simulations;
     params.glyph = bitmap->glyph;
     params.mode = rendering_mode;
+    params.lcd = !!lcd;
     params.emsize = bitmap->emsize;
     params.bbox = bitmap->bbox;
     params.pitch = bitmap->pitch;
@@ -257,6 +266,7 @@ static int fontface_cache_compare(const void *k, const struct wine_rb_entry *e)
     if (key->size != key2->size) return key->size < key2->size ? -1 : 1;
     if (key->glyph != key2->glyph) return (int)key->glyph - (int)key2->glyph;
     if (key->mode != key2->mode) return (int)key->mode - (int)key2->mode;
+    if (key->lcd != key2->lcd) return (int)key->lcd - (int)key2->lcd;
     return 0;
 }
 
@@ -5857,8 +5867,8 @@ static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *a
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
         dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, &glyph_bitmap);
 
-        bitmap_size = get_glyph_bitmap_pitch(analysis->rendering_mode, bbox->right - bbox->left) *
-            (bbox->bottom - bbox->top);
+        bitmap_size = get_glyph_bitmap_pitch(analysis->rendering_mode, bbox->right - bbox->left,
+                analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1) * (bbox->bottom - bbox->top);
         if (bitmap_size > analysis->max_glyph_bitmap_size)
             analysis->max_glyph_bitmap_size = bitmap_size;
 
@@ -5907,6 +5917,7 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
     static const BYTE masks[8] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
     struct dwrite_fontface *fontface = unsafe_impl_from_IDWriteFontFace(analysis->run.fontFace);
     struct dwrite_glyphbitmap glyph_bitmap;
+    BOOL is_cleartype = analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1;
     D2D_POINT_2F origin;
     UINT32 i, size;
     RECT *bbox;
@@ -5948,10 +5959,11 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
         width = bbox->right - bbox->left;
         height = bbox->bottom - bbox->top;
 
-        glyph_bitmap.pitch = get_glyph_bitmap_pitch(analysis->rendering_mode, width);
+        glyph_bitmap.pitch = get_glyph_bitmap_pitch(analysis->rendering_mode, width, is_cleartype);
         memset(src, 0, height * glyph_bitmap.pitch);
 
-        if (FAILED(dwrite_fontface_get_glyph_bitmap(fontface, analysis->rendering_mode, &is_1bpp, &glyph_bitmap)))
+        if (FAILED(dwrite_fontface_get_glyph_bitmap(fontface, analysis->rendering_mode, is_cleartype,
+                &is_1bpp, &glyph_bitmap)))
         {
             WARN("Failed to render glyph[%u] = %#x.\n", i, glyph_bitmap.glyph);
             continue;
@@ -5985,9 +5997,11 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
         }
         else {
             if (analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1) {
+                /* The rasteriser produced one coverage sample per subpixel;
+                 * carry all three across rather than collapsing them. */
                 for (y = 0; y < height; y++) {
-                    for (x = 0; x < width; x++)
-                        dst[3*x] = dst[3*x+1] = dst[3*x+2] = src[x] | dst[3*x];
+                    for (x = 0; x < width * 3; x++)
+                        dst[x] |= src[x];
                     src += glyph_bitmap.pitch;
                     dst += (analysis->bounds.right - analysis->bounds.left) * 3;
                 }

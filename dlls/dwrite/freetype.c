@@ -618,6 +618,89 @@ static NTSTATUS freetype_get_aliased_glyph_bitmap(struct get_glyph_bitmap_params
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS freetype_get_aa_glyph_bitmap(struct get_glyph_bitmap_params *params, FT_Glyph glyph);
+
+/* Coverage is sampled three times per pixel horizontally, once per subpixel,
+ * then filtered along the row. Without the filter a stem lands on one colour
+ * channel and the glyph fringes; the five-tap FIR below is the same one
+ * FreeType applies for FT_RENDER_MODE_LCD, spreading each sample over its
+ * neighbours so the fringing averages back to grey at normal viewing
+ * distance. The outline is scaled rather than rendered through
+ * FT_Render_Glyph because the caller supplies the destination bitmap and its
+ * exact bounds. */
+static void lcd_filter_row(BYTE *row, int width)
+{
+    static const unsigned int coeffs[5] = { 0x08, 0x4d, 0x56, 0x4d, 0x08 };
+    BYTE tmp[3 * 256];
+    BYTE *src = tmp;
+    int i, j;
+
+    if (width > ARRAY_SIZE(tmp))
+    {
+        if (!(src = malloc(width)))
+            return;
+    }
+    memcpy(src, row, width);
+
+    for (i = 0; i < width; i++)
+    {
+        unsigned int sum = 0;
+
+        for (j = 0; j < 5; j++)
+        {
+            int k = i + j - 2;
+
+            if (k >= 0 && k < width)
+                sum += src[k] * coeffs[j];
+        }
+        row[i] = min(sum >> 8, 255);
+    }
+
+    if (src != tmp)
+        free(src);
+}
+
+static NTSTATUS freetype_get_lcd_glyph_bitmap(struct get_glyph_bitmap_params *params, FT_Glyph glyph)
+{
+    const RECT *bbox = &params->bbox;
+    int width = (bbox->right - bbox->left) * 3;
+    int height = bbox->bottom - bbox->top;
+    int y;
+
+    *params->is_1bpp = 0;
+
+    if (glyph->format != FT_GLYPH_FORMAT_OUTLINE)
+        return freetype_get_aa_glyph_bitmap(params, glyph);
+
+    {
+        FT_OutlineGlyph outline = (FT_OutlineGlyph)glyph;
+        const FT_Outline *src = &outline->outline;
+        FT_Matrix scale = { 3 << 16, 0, 0, 1 << 16 };
+        FT_Bitmap ft_bitmap;
+        FT_Outline copy;
+
+        ft_bitmap.width = width;
+        ft_bitmap.rows = height;
+        ft_bitmap.pitch = params->pitch;
+        ft_bitmap.pixel_mode = FT_PIXEL_MODE_GRAY;
+        ft_bitmap.buffer = params->bitmap;
+
+        if (pFT_Outline_New(library, src->n_points, src->n_contours, &copy) != 0)
+            return STATUS_UNSUCCESSFUL;
+
+        pFT_Outline_Copy(src, &copy);
+        pFT_Outline_Transform(&copy, &scale);
+        pFT_Outline_Translate(&copy, -(bbox->left * 3) << 6, bbox->bottom << 6);
+        pFT_Outline_Get_Bitmap(library, &copy, &ft_bitmap);
+        pFT_Outline_Done(library, &copy);
+    }
+
+    for (y = 0; y < height; y++)
+        lcd_filter_row(params->bitmap + y * params->pitch, width);
+
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS freetype_get_aa_glyph_bitmap(struct get_glyph_bitmap_params *params, FT_Glyph glyph)
 {
     const RECT *bbox = &params->bbox;
@@ -701,6 +784,8 @@ static NTSTATUS get_glyph_bitmap(void *args)
 
         if (params->mode == DWRITE_RENDERING_MODE1_ALIASED)
             ret = freetype_get_aliased_glyph_bitmap(params, glyph);
+        else if (params->lcd)
+            ret = freetype_get_lcd_glyph_bitmap(params, glyph);
         else
             ret = freetype_get_aa_glyph_bitmap(params, glyph);
 
@@ -976,6 +1061,7 @@ static NTSTATUS wow64_get_glyph_bitmap(void *args)
         ULONG simulations;
         ULONG glyph;
         ULONG mode;
+        ULONG lcd;
         float emsize;
         MATRIX_2X2 m;
         RECT bbox;
@@ -989,6 +1075,7 @@ static NTSTATUS wow64_get_glyph_bitmap(void *args)
         params32->simulations,
         params32->glyph,
         params32->mode,
+        params32->lcd,
         params32->emsize,
         params32->m,
         params32->bbox,
