@@ -1992,8 +1992,23 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
          * that error code here. */
         if (errno == EOPNOTSUPP || errno == ENXIO)
         {
-            if (!stat(name, &st) && S_ISSOCK(st.st_mode) && (options & FILE_DELETE_ON_CLOSE))
-                goto skip_open_fail;
+            if (!stat(name, &st) && S_ISSOCK(st.st_mode))
+            {
+                if (options & FILE_DELETE_ON_CLOSE) goto skip_open_fail;
+
+                /* Windows exposes a bound AF_UNIX socket as a reparse point: opening it
+                 * without FILE_OPEN_REPARSE_POINT fails with STATUS_IO_REPARSE_TAG_NOT_HANDLED,
+                 * and with the flag it yields a handle that only carries metadata. O_PATH is
+                 * exactly that on Linux; without it we fall through to the errno mapping. */
+                if (!(options & FILE_OPEN_REPARSE_POINT))
+                {
+                    set_error( STATUS_IO_REPARSE_TAG_NOT_HANDLED );
+                    goto error;
+                }
+#ifdef O_PATH
+                fd->unix_fd = open( name, O_PATH );
+#endif
+            }
         }
 
         if (fd->unix_fd == -1)
@@ -2543,6 +2558,7 @@ static void get_reparse_point( struct fd *fd, struct async *async )
     /* we can't just allocate get_reply_max_size() here;
      * Linux won't return any data if the size is too small */
     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    struct stat st;
     int ret;
 
     if (!fd->unix_name)
@@ -2554,6 +2570,26 @@ static void get_reparse_point( struct fd *fd, struct async *async )
     if (!get_reply_max_size())
     {
         set_error( STATUS_INVALID_USER_BUFFER );
+        return;
+    }
+
+    /* A bound AF_UNIX socket carries its reparse tag in the inode type, not in the
+     * name suffix and extended attribute the other reparse points use. Windows
+     * reports IO_REPARSE_TAG_AF_UNIX with no reparse data at all. */
+    if (fd->unix_fd != -1 && !fstat( fd->unix_fd, &st ) && S_ISSOCK( st.st_mode ))
+    {
+        REPARSE_DATA_BUFFER *data = (REPARSE_DATA_BUFFER *)buffer;
+        unsigned int size = sizeof(data->ReparseTag) + sizeof(data->ReparseDataLength)
+                            + sizeof(data->Reserved);
+
+        if (get_reply_max_size() < size)
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+        memset( data, 0, size );
+        data->ReparseTag = IO_REPARSE_TAG_AF_UNIX;
+        set_reply_data( data, size );
         return;
     }
 
