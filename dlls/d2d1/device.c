@@ -486,6 +486,9 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
             IDWriteRenderingParams_Release(context->text_rendering_params);
         if (context->bs)
             ID3D11BlendState_Release(context->bs);
+        for (i = 0; i < ARRAY_SIZE(context->subpixel_bs); ++i)
+            if (context->subpixel_bs[i])
+                ID3D11BlendState_Release(context->subpixel_bs[i]);
         if (context->stencil_dsv)
             ID3D11DepthStencilView_Release(context->stencil_dsv);
         if (context->stencil_texture)
@@ -2055,6 +2058,142 @@ static HRESULT d2d_device_context_get_glyph_run_analysis(struct d2d_device_conte
     return S_OK;
 }
 
+/* The standard blend, restricted to one subpixel channel. Alpha rides with
+ * green: coverage has to reach the target's alpha channel exactly once, and
+ * green is the channel closest to perceived luminance. */
+static ID3D11BlendState *d2d_device_context_get_subpixel_blend_state(struct d2d_device_context *context,
+        unsigned int channel)
+{
+    static const UINT8 write_masks[3] =
+    {
+        D3D11_COLOR_WRITE_ENABLE_RED,
+        D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_ALPHA,
+        D3D11_COLOR_WRITE_ENABLE_BLUE,
+    };
+    D3D11_BLEND_DESC blend_desc;
+    HRESULT hr;
+
+    if (context->subpixel_bs[channel])
+        return context->subpixel_bs[channel];
+
+    memset(&blend_desc, 0, sizeof(blend_desc));
+    blend_desc.IndependentBlendEnable = FALSE;
+    blend_desc.RenderTarget[0].BlendEnable = TRUE;
+    blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blend_desc.RenderTarget[0].RenderTargetWriteMask = write_masks[channel];
+
+    if (FAILED(hr = ID3D11Device1_CreateBlendState(context->d3d_device, &blend_desc,
+            &context->subpixel_bs[channel])))
+    {
+        WARN("Failed to create subpixel blend state, hr %#lx.\n", hr);
+        context->subpixel_bs[channel] = NULL;
+    }
+
+    return context->subpixel_bs[channel];
+}
+
+/* Draw the run once per subpixel channel, each pass masked by that channel's
+ * coverage and writing only that channel. */
+static void d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_context *context,
+        ID2D1Brush *brush, const BYTE *coverage, unsigned int width, unsigned int height,
+        const RECT *bounds)
+{
+    ID2D1RectangleGeometry *geometry = NULL;
+    ID3D11BlendState *prev_bs = context->bs;
+    D2D1_BITMAP_PROPERTIES bitmap_desc;
+    D2D1_BRUSH_PROPERTIES brush_desc;
+    D2D1_MATRIX_3X2_F *transform, m;
+    D2D1_SIZE_U bitmap_size;
+    float scale_x, scale_y;
+    D2D1_RECT_F run_rect;
+    unsigned int c, x, y;
+    BYTE *plane;
+    HRESULT hr;
+
+    if (!width || !height)
+        return;
+
+    if (!(plane = malloc((size_t)width * height)))
+        return;
+
+    scale_x = context->desc.dpiX / 96.0f;
+    scale_y = context->desc.dpiY / 96.0f;
+    d2d_rect_set(&run_rect, bounds->left / scale_x, bounds->top / scale_y,
+            bounds->right / scale_x, bounds->bottom / scale_y);
+    d2d_size_set(&bitmap_size, width, height);
+
+    bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
+    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bitmap_desc.dpiX = context->desc.dpiX;
+    bitmap_desc.dpiY = context->desc.dpiY;
+
+    brush_desc.opacity = 1.0f;
+    brush_desc.transform._11 = 1.0f;
+    brush_desc.transform._12 = 0.0f;
+    brush_desc.transform._21 = 0.0f;
+    brush_desc.transform._22 = 1.0f;
+    brush_desc.transform._31 = run_rect.left;
+    brush_desc.transform._32 = run_rect.top;
+
+    if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, &run_rect, &geometry)))
+    {
+        ERR("Failed to create geometry, hr %#lx.\n", hr);
+        free(plane);
+        return;
+    }
+
+    transform = &context->drawing_state.transform;
+    m = *transform;
+    *transform = identity;
+
+    for (c = 0; c < 3; ++c)
+    {
+        ID2D1BitmapBrush *opacity_brush = NULL;
+        ID2D1Bitmap *opacity_bitmap = NULL;
+        ID3D11BlendState *bs;
+
+        if (!(bs = d2d_device_context_get_subpixel_blend_state(context, c)))
+            break;
+
+        for (y = 0; y < height; ++y)
+            for (x = 0; x < width; ++x)
+                plane[y * width + x] = coverage[((size_t)y * width + x) * 3 + c];
+
+        if (FAILED(hr = d2d_device_context_CreateBitmap(&context->ID2D1DeviceContext6_iface,
+                bitmap_size, plane, width, &bitmap_desc, &opacity_bitmap)))
+        {
+            ERR("Failed to create opacity bitmap, hr %#lx.\n", hr);
+            break;
+        }
+
+        if (FAILED(hr = d2d_device_context_CreateBitmapBrush(&context->ID2D1DeviceContext6_iface,
+                opacity_bitmap, NULL, &brush_desc, &opacity_brush)))
+        {
+            ERR("Failed to create opacity bitmap brush, hr %#lx.\n", hr);
+            ID2D1Bitmap_Release(opacity_bitmap);
+            break;
+        }
+
+        context->bs = bs;
+        d2d_device_context_fill_geometry(context, unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
+                unsafe_impl_from_ID2D1Brush(brush), unsafe_impl_from_ID2D1Brush((ID2D1Brush *)opacity_brush));
+
+        ID2D1BitmapBrush_Release(opacity_brush);
+        ID2D1Bitmap_Release(opacity_bitmap);
+    }
+
+    context->bs = prev_bs;
+    *transform = m;
+
+    ID2D1RectangleGeometry_Release(geometry);
+    free(plane);
+}
+
 static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *context,
         D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run, ID2D1Brush *brush,
         DWRITE_RENDERING_MODE rendering_mode, DWRITE_MEASURING_MODE measuring_mode,
@@ -2070,6 +2209,7 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
     D2D1_MATRIX_3X2_F *transform, m;
     void *opacity_values = NULL;
     size_t opacity_values_size;
+    unsigned int run_width;
     D2D1_SIZE_U bitmap_size;
     float scale_x, scale_y;
     D2D1_RECT_F run_rect;
@@ -2105,6 +2245,7 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
         goto done;
     }
     opacity_values_size = bitmap_size.height * bitmap_size.width;
+    run_width = bounds.right - bounds.left;
 
     if (FAILED(hr = IDWriteGlyphRunAnalysis_CreateAlphaTexture(analysis,
             texture_type, &bounds, opacity_values, opacity_values_size)))
@@ -2113,11 +2254,24 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
         goto done;
     }
 
+    /* A ClearType texture carries one coverage sample per subpixel, so the
+     * three channels have to reach the target separately. Sampling them as a
+     * single alpha mask three times as wide averages them back into one
+     * value, which is the greyscale result the mask was meant to improve on.
+     * Draw the run once per channel instead, each pass writing only its own
+     * colour channel and masked by that channel's coverage. The blend is
+     * unchanged, so each channel gets the same premultiplied-over maths it
+     * would have had on its own. */
+    if (texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
+    {
+        d2d_device_context_draw_glyph_run_subpixel(context, brush, opacity_values,
+                run_width, bitmap_size.height, &bounds);
+        goto done;
+    }
+
     bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
     bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
     bitmap_desc.dpiX = context->desc.dpiX;
-    if (texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
-        bitmap_desc.dpiX *= 3.0f;
     bitmap_desc.dpiY = context->desc.dpiY;
     if (FAILED(hr = d2d_device_context_CreateBitmap(&context->ID2D1DeviceContext6_iface,
             bitmap_size, opacity_values, bitmap_size.width, &bitmap_desc, &opacity_bitmap)))

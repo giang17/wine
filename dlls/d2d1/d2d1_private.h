@@ -294,6 +294,9 @@ struct d2d_device_context
      * ColorManagement effect to encode a linear (scRGB) source for an
      * unsigned-normalised, non-sRGB target. */
     BOOL srgb_encode;
+    /* Same blend as bs, restricted to one subpixel channel, for ClearType
+     * text. Created on first use; index 0 is red, 1 green, 2 blue. */
+    ID3D11BlendState *subpixel_bs[3];
     struct d2d_scratch_buffer scratch_vb[D2D_SHAPE_TYPE_COUNT];
     struct d2d_scratch_buffer scratch_ib[D2D_SHAPE_TYPE_COUNT];
     /* Session 6 (C1): persistent scratch rectangle geometry for FillRectangle.
