@@ -80,9 +80,18 @@ static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp
 /* Periodic tree compositing for rootless trees (Chromium/WebView2, issue 88):
  * the root visual carries no content, the swapchains hang on nested leaf
  * visuals, so no root Present ever composites them. The timer drives the
- * target-side composite in dcomp_target_composite_tree(). */
+ * target-side composite in dcomp_target_composite_tree().
+ *
+ * The timer is meant as a backstop behind the hook-driven composite below, but
+ * Chromium commits the tree exactly once -- at build-up -- and never again
+ * (measured: 1 commit in 265 s against 2600 composites).  The hook therefore
+ * stops firing after the first frame and this timer alone paces the display,
+ * which makes its period the frame rate: at 100 ms every WebView2 view ran at
+ * a hard 10 Hz.  The cost of 16 ms sits in Chromium's readback, not in the
+ * composite (0.0% either way), and does not scale with the number of targets:
+ * +17 pp for one view (UVI Portal), +9.9 pp for two (Live 12). */
 #define DCOMP_TREE_TIMER     ((UINT_PTR)0xDC0FFEE2)
-#define DCOMP_TREE_TIMER_MS  100
+#define DCOMP_TREE_TIMER_MS  16
 #define DCOMP_TREE_FRAME_MS  16   /* ~60 Hz rate limit for hook-driven composites */
 /* How long the target window may show something other than what we delivered
  * before we re-deliver it.  A tab switch legitimately repaints the panel while
