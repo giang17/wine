@@ -5843,6 +5843,7 @@ static ULONG WINAPI glyphrunanalysis_Release(IDWriteGlyphRunAnalysis *iface)
 
 static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *analysis, RECT *bounds)
 {
+    struct dwrite_fontface *fontface = unsafe_impl_from_IDWriteFontFace(analysis->run.fontFace);
     struct dwrite_glyphbitmap glyph_bitmap;
     UINT32 i;
 
@@ -5866,6 +5867,23 @@ static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *a
 
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
         dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, &glyph_bitmap);
+
+        /* FreeType's five-tap LCD filter extends an outline by two subpixels
+         * on either side. DWrite exposes whole-pixel texture bounds, so retain
+         * the filter tails with one pixel of horizontal padding. Embedded
+         * bitmap glyphs have no LCD filter and keep their exact bounds. */
+        if (analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
+        {
+            BOOL has_contours;
+
+            fontface_get_glyph_advance(fontface, glyph_bitmap.emsize, glyph_bitmap.glyph,
+                    DWRITE_MEASURING_MODE_NATURAL, &has_contours);
+            if (has_contours && !IsRectEmpty(bbox))
+            {
+                --bbox->left;
+                ++bbox->right;
+            }
+        }
 
         bitmap_size = get_glyph_bitmap_pitch(analysis->rendering_mode, bbox->right - bbox->left,
                 analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1) * (bbox->bottom - bbox->top);
@@ -5952,6 +5970,19 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
 
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
         dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, &glyph_bitmap);
+
+        if (is_cleartype)
+        {
+            BOOL has_contours;
+
+            fontface_get_glyph_advance(fontface, glyph_bitmap.emsize, glyph_bitmap.glyph,
+                    DWRITE_MEASURING_MODE_NATURAL, &has_contours);
+            if (has_contours && !IsRectEmpty(bbox))
+            {
+                --bbox->left;
+                ++bbox->right;
+            }
+        }
 
         if (IsRectEmpty(bbox))
             continue;

@@ -628,7 +628,7 @@ static NTSTATUS freetype_get_aa_glyph_bitmap(struct get_glyph_bitmap_params *par
  * distance. The outline is scaled rather than rendered through
  * FT_Render_Glyph because the caller supplies the destination bitmap and its
  * exact bounds. */
-static void lcd_filter_row(BYTE *row, int width)
+static BOOL lcd_filter_row(BYTE *row, int width)
 {
     static const unsigned int coeffs[5] = { 0x08, 0x4d, 0x56, 0x4d, 0x08 };
     BYTE tmp[3 * 256];
@@ -638,7 +638,7 @@ static void lcd_filter_row(BYTE *row, int width)
     if (width > ARRAY_SIZE(tmp))
     {
         if (!(src = malloc(width)))
-            return;
+            return FALSE;
     }
     memcpy(src, row, width);
 
@@ -658,6 +658,7 @@ static void lcd_filter_row(BYTE *row, int width)
 
     if (src != tmp)
         free(src);
+    return TRUE;
 }
 
 static NTSTATUS freetype_get_lcd_glyph_bitmap(struct get_glyph_bitmap_params *params, FT_Glyph glyph)
@@ -688,15 +689,24 @@ static NTSTATUS freetype_get_lcd_glyph_bitmap(struct get_glyph_bitmap_params *pa
         if (pFT_Outline_New(library, src->n_points, src->n_contours, &copy) != 0)
             return STATUS_UNSUCCESSFUL;
 
-        pFT_Outline_Copy(src, &copy);
+        if (pFT_Outline_Copy(src, &copy))
+        {
+            pFT_Outline_Done(library, &copy);
+            return STATUS_UNSUCCESSFUL;
+        }
         pFT_Outline_Transform(&copy, &scale);
         pFT_Outline_Translate(&copy, -(bbox->left * 3) << 6, bbox->bottom << 6);
-        pFT_Outline_Get_Bitmap(library, &copy, &ft_bitmap);
+        if (pFT_Outline_Get_Bitmap(library, &copy, &ft_bitmap))
+        {
+            pFT_Outline_Done(library, &copy);
+            return STATUS_UNSUCCESSFUL;
+        }
         pFT_Outline_Done(library, &copy);
     }
 
     for (y = 0; y < height; y++)
-        lcd_filter_row(params->bitmap + y * params->pitch, width);
+        if (!lcd_filter_row(params->bitmap + y * params->pitch, width))
+            return STATUS_NO_MEMORY;
 
     return STATUS_SUCCESS;
 }
