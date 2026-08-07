@@ -1124,8 +1124,12 @@ static HRESULT WINAPI dwritefactory_CreateRenderingParams(IDWriteFactory7 *iface
 static HRESULT WINAPI dwritefactory_CreateMonitorRenderingParams(IDWriteFactory7 *iface, HMONITOR monitor,
     IDWriteRenderingParams **params)
 {
+    DWRITE_PIXEL_GEOMETRY geometry = DWRITE_PIXEL_GEOMETRY_FLAT;
+    UINT smoothing_type, orientation;
     IDWriteRenderingParams3 *params3;
+    float cleartype_level = 0.0f;
     static int fixme_once = 0;
+    BOOL smoothing;
     HRESULT hr;
 
     TRACE("%p, %p, %p.\n", iface, monitor, params);
@@ -1133,8 +1137,30 @@ static HRESULT WINAPI dwritefactory_CreateMonitorRenderingParams(IDWriteFactory7
     if (!fixme_once++)
         FIXME("(%p): monitor setting ignored\n", monitor);
 
+    /* The ClearType level and the pixel geometry decide whether a caller that
+     * asks for DWRITE_TEXT_ANTIALIAS_MODE_DEFAULT gets subpixel text: d2d1
+     * only promotes the default to ClearType when the level is above zero.
+     * Reporting zero and a flat geometry meant every application taking the
+     * default drew greyscale no matter what the user had configured, so take
+     * both from the system font-smoothing settings, the same ones GDI reads. */
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0))
+        smoothing = FALSE;
+    if (smoothing)
+    {
+        if (!SystemParametersInfoW(SPI_GETFONTSMOOTHINGTYPE, 0, &smoothing_type, 0))
+            smoothing_type = FE_FONTSMOOTHINGSTANDARD;
+        if (smoothing_type == FE_FONTSMOOTHINGCLEARTYPE)
+        {
+            if (!SystemParametersInfoW(SPI_GETFONTSMOOTHINGORIENTATION, 0, &orientation, 0))
+                orientation = FE_FONTSMOOTHINGORIENTATIONRGB;
+            geometry = orientation == FE_FONTSMOOTHINGORIENTATIONBGR
+                    ? DWRITE_PIXEL_GEOMETRY_BGR : DWRITE_PIXEL_GEOMETRY_RGB;
+            cleartype_level = 1.0f;
+        }
+    }
+
     /* FIXME: use actual per-monitor gamma factor */
-    hr = IDWriteFactory7_CreateCustomRenderingParams(iface, 2.0f, 0.0f, 1.0f, 0.0f, DWRITE_PIXEL_GEOMETRY_FLAT,
+    hr = IDWriteFactory7_CreateCustomRenderingParams(iface, 2.0f, 0.0f, 1.0f, cleartype_level, geometry,
         DWRITE_RENDERING_MODE1_DEFAULT, DWRITE_GRID_FIT_MODE_DEFAULT, &params3);
     *params = (IDWriteRenderingParams*)params3;
     return hr;
