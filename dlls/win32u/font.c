@@ -194,6 +194,10 @@ static const WCHAR font_assoc_keyW[] =
 
 static UINT font_smoothing = GGO_BITMAP;
 static UINT subpixel_orientation = GGO_GRAY4_BITMAP;
+/* Set when the prefix carries its own FontSmoothingType. A fresh prefix has
+ * none, so this distinguishes "the user configured Windows-side smoothing"
+ * from "nothing was said and the host should decide". */
+static BOOL font_smoothing_from_prefix;
 static BOOL antialias_fakes = TRUE;
 static struct font_gamma_ramp font_gamma_ramp;
 
@@ -4587,6 +4591,30 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
 
         if (font)
         {
+            /* A prefix carrying its own FontSmoothingType has had the
+             * Windows-side decision made deliberately, so it outranks the
+             * host's default. That default does not arrive here as an unset
+             * value: winex11's xrenderdrv_SelectFont has already filled
+             * aa_flags from the Xft.antialias and Xft.rgba X resources, so a
+             * desktop set to greyscale hands us GGO_GRAY4_BITMAP and nothing
+             * below could ever choose subpixel.
+             *
+             * Only an antialiased choice is upgraded. A bitmap-only flag
+             * carries a constraint rather than a preference - a colour depth
+             * of 8 or less, or a metafile - and must survive. An application
+             * naming NONANTIALIASED_QUALITY or ANTIALIASED_QUALITY has asked
+             * for a specific mode and keeps it. The prefix never downgrades a
+             * host that already chose subpixel. */
+            if (font_smoothing_from_prefix && font_smoothing
+                    && lf.lfQuality != NONANTIALIASED_QUALITY && lf.lfQuality != ANTIALIASED_QUALITY
+                    && (!*aa_flags || *aa_flags == GGO_GRAY2_BITMAP
+                        || *aa_flags == GGO_GRAY4_BITMAP || *aa_flags == GGO_GRAY8_BITMAP))
+            {
+                if (lf.lfQuality == CLEARTYPE_QUALITY || lf.lfQuality == CLEARTYPE_NATURAL_QUALITY)
+                    *aa_flags = subpixel_orientation;
+                else
+                    *aa_flags = font_smoothing;
+            }
             if (!*aa_flags) *aa_flags = font->aa_flags;
             if (!*aa_flags)
             {
@@ -4746,10 +4774,24 @@ static UINT init_font_options(void)
         }
         if (get_key_value( key, "FontSmoothing", &val ) && val /* enabled */)
         {
-            if (get_key_value( key, "FontSmoothingType", &val ) && val == 2 /* FE_FONTSMOOTHINGCLEARTYPE */)
-                font_smoothing = subpixel_orientation;
+            if (get_key_value( key, "FontSmoothingType", &val ))
+            {
+                font_smoothing = val == 2 /* FE_FONTSMOOTHINGCLEARTYPE */
+                        ? subpixel_orientation : GGO_GRAY4_BITMAP;
+                font_smoothing_from_prefix = TRUE;
+            }
             else
                 font_smoothing = GGO_GRAY4_BITMAP;
+        }
+        /* WINE_DISABLE_PREFIX_FONT_SMOOTHING=1 gives the host's fontconfig
+         * back its precedence, for a desktop whose own setting should govern
+         * Windows applications too. */
+        if (font_smoothing_from_prefix)
+        {
+            const char *disable = getenv( "WINE_DISABLE_PREFIX_FONT_SMOOTHING" );
+
+            if (disable && *disable && *disable != '0')
+                font_smoothing_from_prefix = FALSE;
         }
         if (get_key_value( key, "FontSmoothingGamma", &val ) && val)
         {
