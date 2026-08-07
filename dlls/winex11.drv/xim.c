@@ -77,7 +77,25 @@ BOOL xim_in_compose_mode(void)
 
 static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR *result_str )
 {
-    NtUserMessageCall( hwnd, WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str,
+    HWND target = get_focus();  /* route to the actual focus window (e.g. an embedded client
+                                 * in another process), not the X event recipient window */
+    if (!target) target = get_active_window();
+    if (!target) target = hwnd;
+
+    /* Embedded clients in another process (e.g. Chromium/WebView2) ignore the WM_IME
+     * composition result and only consume WM_CHAR, so characters routed solely through
+     * the IME update never appear. Post the finished result string as WM_CHAR as well
+     * so it reaches the focus window directly. Composition strings (comp_str) stay
+     * IME-only, which CJK input methods rely on.
+     * TODO: scope to cross-process windows to avoid duplicates for in-process IME. */
+    if (result_str && target != hwnd)
+    {
+        UINT i;
+        for (i = 0; result_str[i]; i++)
+            NtUserPostMessage( target, WM_CHAR, (WPARAM)result_str[i], 0 );
+    }
+
+    NtUserMessageCall( target, WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str,
                        result_str, NtUserImeDriverCall, FALSE );
 }
 
