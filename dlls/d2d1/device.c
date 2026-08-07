@@ -2163,7 +2163,7 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
             for (x = 0; x < width; ++x)
             {
                 const BYTE *pixel = &coverage[((size_t)y * width + x) * 3];
-                unsigned int gray = (pixel[0] + pixel[1] + pixel[2] + 1) / 3;
+                int gray = (pixel[0] + pixel[1] + pixel[2] + 1) / 3;
                 float value = gray + cleartype_level * (pixel[sample] - gray);
 
                 plane[y * width + x] = min(max((int)(value + 0.5f), 0), 255);
