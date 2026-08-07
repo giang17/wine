@@ -2058,16 +2058,15 @@ static HRESULT d2d_device_context_get_glyph_run_analysis(struct d2d_device_conte
     return S_OK;
 }
 
-/* The standard blend, restricted to one subpixel channel. Alpha rides with
- * green: coverage has to reach the target's alpha channel exactly once, and
- * green is the channel closest to perceived luminance. */
+/* The standard blend, restricted to one subpixel channel. ClearType is only
+ * used for opaque targets, so alpha must remain untouched. */
 static ID3D11BlendState *d2d_device_context_get_subpixel_blend_state(struct d2d_device_context *context,
         unsigned int channel)
 {
     static const UINT8 write_masks[3] =
     {
         D3D11_COLOR_WRITE_ENABLE_RED,
-        D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_ALPHA,
+        D3D11_COLOR_WRITE_ENABLE_GREEN,
         D3D11_COLOR_WRITE_ENABLE_BLUE,
     };
     D3D11_BLEND_DESC blend_desc;
@@ -2098,12 +2097,16 @@ static ID3D11BlendState *d2d_device_context_get_subpixel_blend_state(struct d2d_
 }
 
 /* Draw the run once per subpixel channel, each pass masked by that channel's
- * coverage and writing only that channel. */
-static void d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_context *context,
+ * coverage and writing only that channel. Build all resources before drawing
+ * so an allocation failure cannot leave a partially coloured run behind. */
+static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_context *context,
         ID2D1Brush *brush, const BYTE *coverage, unsigned int width, unsigned int height,
-        const RECT *bounds)
+        const RECT *bounds, DWRITE_PIXEL_GEOMETRY pixel_geometry, float cleartype_level)
 {
     ID2D1RectangleGeometry *geometry = NULL;
+    ID2D1BitmapBrush *opacity_brushes[3] = {NULL};
+    ID2D1Bitmap *opacity_bitmaps[3] = {NULL};
+    ID3D11BlendState *blend_states[3];
     ID3D11BlendState *prev_bs = context->bs;
     D2D1_BITMAP_PROPERTIES bitmap_desc;
     D2D1_BRUSH_PROPERTIES brush_desc;
@@ -2111,15 +2114,15 @@ static void d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_context
     D2D1_SIZE_U bitmap_size;
     float scale_x, scale_y;
     D2D1_RECT_F run_rect;
-    unsigned int c, x, y;
+    unsigned int c, i, x, y;
     BYTE *plane;
-    HRESULT hr;
+    HRESULT hr = S_OK;
 
     if (!width || !height)
-        return;
+        return S_OK;
 
-    if (!(plane = malloc((size_t)width * height)))
-        return;
+    if (height > ~(size_t)0 / width || !(plane = malloc((size_t)width * height)))
+        return E_OUTOFMEMORY;
 
     scale_x = context->desc.dpiX / 96.0f;
     scale_y = context->desc.dpiY / 96.0f;
@@ -2143,61 +2146,78 @@ static void d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_context
     if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, &run_rect, &geometry)))
     {
         ERR("Failed to create geometry, hr %#lx.\n", hr);
-        free(plane);
-        return;
+        goto done;
     }
-
-    transform = &context->drawing_state.transform;
-    m = *transform;
-    *transform = identity;
 
     for (c = 0; c < 3; ++c)
     {
-        ID2D1BitmapBrush *opacity_brush = NULL;
-        ID2D1Bitmap *opacity_bitmap = NULL;
-        ID3D11BlendState *bs;
+        unsigned int sample = pixel_geometry == DWRITE_PIXEL_GEOMETRY_BGR ? 2 - c : c;
 
-        if (!(bs = d2d_device_context_get_subpixel_blend_state(context, c)))
+        if (!(blend_states[c] = d2d_device_context_get_subpixel_blend_state(context, c)))
+        {
+            hr = E_OUTOFMEMORY;
             break;
+        }
 
         for (y = 0; y < height; ++y)
             for (x = 0; x < width; ++x)
-                plane[y * width + x] = coverage[((size_t)y * width + x) * 3 + c];
+            {
+                const BYTE *pixel = &coverage[((size_t)y * width + x) * 3];
+                unsigned int gray = (pixel[0] + pixel[1] + pixel[2] + 1) / 3;
+                float value = gray + cleartype_level * (pixel[sample] - gray);
+
+                plane[y * width + x] = min(max((int)(value + 0.5f), 0), 255);
+            }
 
         if (FAILED(hr = d2d_device_context_CreateBitmap(&context->ID2D1DeviceContext6_iface,
-                bitmap_size, plane, width, &bitmap_desc, &opacity_bitmap)))
+                bitmap_size, plane, width, &bitmap_desc, &opacity_bitmaps[c])))
         {
             ERR("Failed to create opacity bitmap, hr %#lx.\n", hr);
             break;
         }
 
         if (FAILED(hr = d2d_device_context_CreateBitmapBrush(&context->ID2D1DeviceContext6_iface,
-                opacity_bitmap, NULL, &brush_desc, &opacity_brush)))
+                opacity_bitmaps[c], NULL, &brush_desc, &opacity_brushes[c])))
         {
             ERR("Failed to create opacity bitmap brush, hr %#lx.\n", hr);
-            ID2D1Bitmap_Release(opacity_bitmap);
             break;
         }
-
-        context->bs = bs;
-        d2d_device_context_fill_geometry(context, unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
-                unsafe_impl_from_ID2D1Brush(brush), unsafe_impl_from_ID2D1Brush((ID2D1Brush *)opacity_brush));
-
-        ID2D1BitmapBrush_Release(opacity_brush);
-        ID2D1Bitmap_Release(opacity_bitmap);
     }
 
-    context->bs = prev_bs;
-    *transform = m;
+    if (SUCCEEDED(hr))
+    {
+        transform = &context->drawing_state.transform;
+        m = *transform;
+        *transform = identity;
 
-    ID2D1RectangleGeometry_Release(geometry);
+        for (c = 0; c < 3; ++c)
+        {
+            context->bs = blend_states[c];
+            d2d_device_context_fill_geometry(context,
+                    unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
+                    unsafe_impl_from_ID2D1Brush(brush),
+                    unsafe_impl_from_ID2D1Brush((ID2D1Brush *)opacity_brushes[c]));
+        }
+
+        context->bs = prev_bs;
+        *transform = m;
+    }
+
+done:
+    for (i = 0; i < ARRAY_SIZE(opacity_brushes); ++i)
+    {
+        if (opacity_brushes[i]) ID2D1BitmapBrush_Release(opacity_brushes[i]);
+        if (opacity_bitmaps[i]) ID2D1Bitmap_Release(opacity_bitmaps[i]);
+    }
+    if (geometry) ID2D1RectangleGeometry_Release(geometry);
     free(plane);
+    return hr;
 }
 
 static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *context,
         D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run, ID2D1Brush *brush,
         DWRITE_RENDERING_MODE rendering_mode, DWRITE_MEASURING_MODE measuring_mode,
-        DWRITE_TEXT_ANTIALIAS_MODE antialias_mode)
+        DWRITE_TEXT_ANTIALIAS_MODE antialias_mode, IDWriteRenderingParams *rendering_params)
 {
     ID2D1RectangleGeometry *geometry = NULL;
     ID2D1BitmapBrush *opacity_brush = NULL;
@@ -2264,8 +2284,24 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
      * would have had on its own. */
     if (texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
     {
-        d2d_device_context_draw_glyph_run_subpixel(context, brush, opacity_values,
-                run_width, bitmap_size.height, &bounds);
+        DWRITE_PIXEL_GEOMETRY pixel_geometry = IDWriteRenderingParams_GetPixelGeometry(rendering_params);
+        float gamma, contrast, cleartype_level;
+
+        if (FAILED(hr = IDWriteGlyphRunAnalysis_GetAlphaBlendParams(analysis, rendering_params,
+                &gamma, &contrast, &cleartype_level)))
+        {
+            WARN("Failed to get ClearType blend parameters, hr %#lx.\n", hr);
+            goto done;
+        }
+        if (!(cleartype_level >= 0.0f)) cleartype_level = 0.0f;
+        else if (cleartype_level > 1.0f) cleartype_level = 1.0f;
+
+        TRACE("ClearType blend parameters: gamma %.3f, contrast %.3f, level %.3f, geometry %u.\n",
+                gamma, contrast, cleartype_level, pixel_geometry);
+        hr = d2d_device_context_draw_glyph_run_subpixel(context, brush, opacity_values,
+                run_width, bitmap_size.height, &bounds, pixel_geometry, cleartype_level);
+        if (FAILED(hr))
+            d2d_device_context_set_error(context, hr);
         goto done;
     }
 
@@ -2323,15 +2359,26 @@ done:
     IDWriteGlyphRunAnalysis_Release(analysis);
 }
 
+static BOOL d2d_device_context_can_draw_cleartype(const struct d2d_device_context *context,
+        IDWriteRenderingParams *rendering_params)
+{
+    return context->target.type == D2D_TARGET_BITMAP
+            && context->target.bitmap->format.alphaMode == D2D1_ALPHA_MODE_IGNORE
+            && context->drawing_state.primitiveBlend == D2D1_PRIMITIVE_BLEND_SOURCE_OVER
+            && IDWriteRenderingParams_GetPixelGeometry(rendering_params) != DWRITE_PIXEL_GEOMETRY_FLAT;
+}
+
 static HRESULT d2d_device_context_get_text_rendering_mode(struct d2d_device_context *context,
         const DWRITE_GLYPH_RUN *glyph_run, DWRITE_MEASURING_MODE measuring_mode,
-        DWRITE_TEXT_ANTIALIAS_MODE *antialias_mode, DWRITE_RENDERING_MODE *rendering_mode)
+        DWRITE_TEXT_ANTIALIAS_MODE *antialias_mode, DWRITE_RENDERING_MODE *rendering_mode,
+        IDWriteRenderingParams **selected_rendering_params)
 {
     IDWriteRenderingParams *rendering_params;
     HRESULT hr = S_OK;
 
     rendering_params = context->text_rendering_params ? context->text_rendering_params
             : context->default_text_rendering_params;
+    if (selected_rendering_params) *selected_rendering_params = rendering_params;
 
     *antialias_mode = DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE;
     *rendering_mode = IDWriteRenderingParams_GetRenderingMode(rendering_params);
@@ -2369,12 +2416,14 @@ static HRESULT d2d_device_context_get_text_rendering_mode(struct d2d_device_cont
     switch (context->drawing_state.textAntialiasMode)
     {
         case D2D1_TEXT_ANTIALIAS_MODE_DEFAULT:
-            if (IDWriteRenderingParams_GetClearTypeLevel(rendering_params) > 0.0f)
+            if (IDWriteRenderingParams_GetClearTypeLevel(rendering_params) > 0.0f
+                    && d2d_device_context_can_draw_cleartype(context, rendering_params))
                 *antialias_mode = DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE;
             break;
 
         case D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE:
-            *antialias_mode = DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE;
+            if (d2d_device_context_can_draw_cleartype(context, rendering_params))
+                *antialias_mode = DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE;
             break;
 
         case D2D1_TEXT_ANTIALIAS_MODE_ALIASED:
@@ -2405,6 +2454,7 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
 {
     DWRITE_TEXT_ANTIALIAS_MODE antialias_mode;
     DWRITE_RENDERING_MODE rendering_mode;
+    IDWriteRenderingParams *rendering_params;
     HRESULT hr;
 
     if (FAILED(context->error.code))
@@ -2424,7 +2474,7 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
     }
 
     if (FAILED(hr = d2d_device_context_get_text_rendering_mode(context, glyph_run, measuring_mode,
-            &antialias_mode, &rendering_mode)))
+            &antialias_mode, &rendering_mode, &rendering_params)))
     {
         d2d_device_context_set_error(context, hr);
         return;
@@ -2442,7 +2492,7 @@ static void d2d_device_context_draw_glyph_run(struct d2d_device_context *context
     }
 
     d2d_device_context_draw_glyph_run_bitmap(context, baseline_origin, glyph_run, brush,
-            rendering_mode, measuring_mode, antialias_mode);
+            rendering_mode, measuring_mode, antialias_mode, rendering_params);
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_DrawGlyphRun(ID2D1DeviceContext6 *iface,
@@ -3733,7 +3783,7 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_GetGlyphRunWorldBounds(ID2D1
             iface, debug_d2d_point_2f(&baseline_origin), glyph_run, measuring_mode, bounds);
 
     if (FAILED(hr = d2d_device_context_get_text_rendering_mode(context, glyph_run, measuring_mode,
-            &antialias_mode, &rendering_mode)))
+            &antialias_mode, &rendering_mode, NULL)))
     {
         return hr;
     }
