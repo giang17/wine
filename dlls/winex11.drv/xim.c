@@ -87,12 +87,21 @@ static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR 
      * the IME update never appear. Post the finished result string as WM_CHAR as well
      * so it reaches the focus window directly. Composition strings (comp_str) stay
      * IME-only, which CJK input methods rely on.
-     * TODO: scope to cross-process windows to avoid duplicates for in-process IME. */
-    if (result_str && target != hwnd)
+     * Scope this to cross-process windows: a local window that consumes the IME
+     * composition result (CJK/Vietnamese input methods in process) would otherwise
+     * receive each committed character twice. A foreign top-level has no win_data
+     * in this process, which is how we tell the cases apart. */
     {
-        UINT i;
-        for (i = 0; result_str[i]; i++)
-            NtUserPostMessage( target, WM_CHAR, (WPARAM)result_str[i], 0 );
+        struct x11drv_win_data *root_data = get_win_data( NtUserGetAncestor( target, GA_ROOT ) );
+        BOOL cross_process = !root_data;
+        release_win_data( root_data );
+
+        if (result_str && cross_process)
+        {
+            UINT i;
+            for (i = 0; result_str[i]; i++)
+                NtUserPostMessage( target, WM_CHAR, (WPARAM)result_str[i], 0 );
+        }
     }
 
     NtUserMessageCall( target, WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str,
