@@ -33,6 +33,7 @@
 #include "d2d1_1.h"
 #include "dcomp.h"
 #include "wine/debug.h"
+#include "wine/winedxgi.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
@@ -112,7 +113,7 @@ static void dcomp_send_child_mode(IUnknown *content)
         return;
 
     swprintf(prop_name, ARRAY_SIZE(prop_name),
-            L"__wine_dcomp_wnd_%I64x", (UINT_PTR)content);
+            WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)content);
     comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
     if (comp_wnd)
     {
@@ -2022,13 +2023,13 @@ static void dcomp_visual_try_reparent(struct dcomp_visual *visual)
     }
 
     swprintf(prop_name, ARRAY_SIZE(prop_name),
-            L"__wine_dcomp_wnd_%I64x", (UINT_PTR)visual->content);
+            WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)visual->content);
     comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
 
     if (!comp_wnd)
     {
-        FIXME("Composition window NOT FOUND for content %p (prop: __wine_dcomp_wnd_%I64x).\n",
-                visual->content, (UINT_PTR)visual->content);
+        FIXME("Composition window NOT FOUND for content %p (prop: %s).\n",
+                visual->content, debugstr_w(prop_name));
         return;
     }
 
@@ -2472,7 +2473,7 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
         HWND child_comp_wnd;
 
         swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_wnd_%I64x", (UINT_PTR)visual->content);
+                WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)visual->content);
         child_comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
         if (child_comp_wnd)
         {
@@ -2813,7 +2814,7 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
 
         /* Same lookup the serializer uses: comp window via desktop prop. */
         swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_wnd_%I64x", (UINT_PTR)visual->content);
+                WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)visual->content);
         comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
         if (comp_wnd)
         {

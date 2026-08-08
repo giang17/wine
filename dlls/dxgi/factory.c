@@ -579,7 +579,7 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
                 swapchain->target_hwnd = NULL;
 
                 swprintf(prop_name, ARRAY_SIZE(prop_name),
-                        L"__wine_dcomp_wnd_%I64x", (UINT_PTR)sc);
+                        WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)sc);
                 comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
 
                 wined3d_swapchain_set_prefer_gl_present(swapchain->wined3d_swapchain, FALSE);
@@ -1106,7 +1106,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWin
     if (SUCCEEDED(hr))
     {
         swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_wnd_%I64x", (UINT_PTR)*swapchain);
+                WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)*swapchain);
         SetPropW(GetDesktopWindow(), prop_name, (HANDLE)window);
         /* Store back-reference for WM_WINE_DCOMP_SET_TARGET handler */
         SetPropW(window, L"__wine_dcomp_swapchain", (HANDLE)*swapchain);

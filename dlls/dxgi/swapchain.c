@@ -275,7 +275,7 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
             WCHAR prop_name[64];
 
             swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_wnd_%I64x", (UINT_PTR)iface);
+                    WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)iface);
             /* Only drop the mapping if it still points at our own window.  The
              * key is this object's address, and the heap hands the same address
              * out again once we are gone: a swapchain created after ours was
