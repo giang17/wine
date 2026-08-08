@@ -4611,13 +4611,56 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetBounds(ID2D1PathGeometry1 
     return S_OK;
 }
 
+/* Conservative approximation of the widened bounding box.
+ *
+ * The real widened bounds enclose the stroke outline, which can exceed the fill
+ * outline by up to half the stroke width — and, for miter joins at sharp
+ * corners, by up to miter_limit * half_width. Callers use widened bounds for
+ * invalidation regions and clipping, where a slightly large rectangle is
+ * correct and safe; a too-small one would drop dirty pixels. The previous stub
+ * returned no bounds at all (E_NOTIMPL), so this approximation is never a
+ * regression. */
+static void d2d_geometry_widen_bounds(const D2D1_RECT_F *fill_bounds, float stroke_width,
+        ID2D1StrokeStyle *stroke_style, D2D1_RECT_F *bounds)
+{
+    float half_width = stroke_width * 0.5f;
+    float expand = half_width;
+
+    if (stroke_style)
+    {
+        D2D1_LINE_JOIN join = ID2D1StrokeStyle_GetLineJoin(stroke_style);
+        if (join == D2D1_LINE_JOIN_MITER || join == D2D1_LINE_JOIN_MITER_OR_BEVEL)
+        {
+            float miter_limit = ID2D1StrokeStyle_GetMiterLimit(stroke_style);
+            if (miter_limit > 1.0f && half_width * miter_limit > expand)
+                expand = half_width * miter_limit;
+        }
+    }
+
+    bounds->left = fill_bounds->left - expand;
+    bounds->top = fill_bounds->top - expand;
+    bounds->right = fill_bounds->right + expand;
+    bounds->bottom = fill_bounds->bottom + expand;
+}
+
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetWidenedBounds(ID2D1PathGeometry1 *iface, float stroke_width,
         ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform, float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1PathGeometry1_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_StrokeContainsPoint(ID2D1PathGeometry1 *iface,
@@ -5398,10 +5441,21 @@ static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_GetWidenedBounds(ID2D1Elli
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1EllipseGeometry_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_StrokeContainsPoint(ID2D1EllipseGeometry *iface,
@@ -5804,10 +5858,21 @@ static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_GetWidenedBounds(ID2D1Re
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1RectangleGeometry_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_StrokeContainsPoint(ID2D1RectangleGeometry *iface,
@@ -6327,10 +6392,21 @@ static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_GetWidenedBounds
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1RoundedRectangleGeometry_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_StrokeContainsPoint(
@@ -6758,10 +6834,21 @@ static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_GetWidenedBounds(ID2D1
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1TransformedGeometry_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_StrokeContainsPoint(ID2D1TransformedGeometry *iface,
