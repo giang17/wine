@@ -29,8 +29,8 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
 - **DComp**: IDCompositionDesktopDevice implementation with D2D1 bitmap rendering path,
   dirty-rect clipping, DIB+BitBlt presentation (9 phases); IDCompositionDevice3/4/5,
   composition and dynamic textures, D3D11 BeginDraw and surface handle export;
-  rootless visual trees composited onto the target window, cross-process targets,
-  backdrop capture
+  rootless visual trees composited onto the target window at ~60 Hz, cross-process
+  targets, backdrop capture
 - **D2D1 effects and colour**: Color Management effect (registration plus the
   scRGB → sRGB transfer function applied in the shape pixel shader),
   ID2D1GradientStopCollection1, sRGB pixel formats for WIC-sourced bitmaps.
@@ -40,7 +40,11 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   font fallback mapping for Miscellaneous Symbols and Arrows (U+2B00-2BFF, fixes star
   rating display in Serum2)
 - **DXGI**: Composition swapchain, FLIP_SEQUENTIAL preservation, DComp popup handling,
-  micro-resize for stale UI, monitored fence support
+  micro-resize for stale UI, monitored fence support. The swapchain-to-window mapping is
+  published on the desktop window, whose property list is shared across the window
+  station, so it is keyed by owning process id — otherwise a host application and its
+  WebView2 child can allocate a swapchain at the same address and resolve each other's
+  window
 - **D3D11**: ID3D11Fence with CPU timeline semantics
 - **WineD3D**: Composition buffer with dirty rect accumulation, GL buffer recycling pool
   (70% RSS reduction), scratch buffer reuse (98.6% fewer allocs), constant buffer
@@ -70,7 +74,30 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   behaviour
 - **ole32**: RevokeDragDrop no longer touches drop targets owned by other processes
   (fixes a use-after-free crash when closing plugin windows)
-- **shell32**: VirtualDesktopManager COM stub
+- **Virtual-desktop compositor (winex11)**: windows inside a Wine virtual desktop get
+  real per-pixel alpha, which the plain desktop drawable cannot provide. A small
+  XDamage-driven compositor assembles frames off screen and composites them through an
+  ARGB overlay onto an opaque child window, so translucent plugin popups and drop
+  shadows blend correctly instead of showing black or leftover pixels. It is set up on
+  demand, tracks every virtual-desktop root, survives a desktop window that has been
+  replaced, and restores or blanks a child's backing store when the child is remapped
+  or leaves the desktop
+- **AF_UNIX sockets (ws2_32, wineserver, ntdll)**: Unix-domain socket support, based on
+  the long-standing wine-staging patch set plus hardening and three conformance fixes of
+  our own — a socket is given its family before bind, a bound socket is reported as a
+  reparse point by GetFileAttributes, and it can be opened and queried through CreateFile
+  with FSCTL_GET_REPARSE_POINT. With these the ws2_32 AF_UNIX conformance tests run at
+  all (upstream they skip) and pass without a failure. Needed by applications that talk
+  to a local helper over a Unix socket; FL Studio's Cloud plugins install normally
+  instead of spinning on a socket that never appears
+- **Keyboard input into out-of-process content (wineserver, winex11)**: a process that
+  translates keys for a window owned by *another* process now has the whole thread input
+  family attached, derives the AltGr modifier from the passed key state rather than from
+  a process-global cache of the last X11 event, and posts a finished IME result string as
+  WM_CHAR as well. Together these make typing work in embedded WebView2 fields, including
+  AltGr characters such as `@`, `\` and `€` on non-US layouts
+- **windows.security.authentication.web.core**: WebAuthenticationCoreManager
+  implementation, for applications that probe the WinRT web-account API on startup
 
 ### Building
 
@@ -152,7 +179,8 @@ are not specific to it.
 | Korg Trinity (VST3 in Reaper) | JUCE 8 + DComp | Fully functional, DComp rendering path |
 | Korg Prophecy (VST3 in Reaper) | JUCE 8 + DComp | Fully functional |
 | Pianoteq 9 (standalone + VST3) | JUCE 8 + DComp | Fully functional |
-| FL Studio (Wine + ntsync) | Custom | Runs without xruns at 64 samples / 48 kHz |
+| FL Studio (Wine + ntsync) | Custom | Runs without xruns at 64 samples / 48 kHz; Cloud plugins install and stream (needs the AF_UNIX patches) |
+| UVI Portal | WebView2 | Installs and signs in, including special characters typed into the login fields |
 | WineSynth (custom VSTGUI plugin) | VSTGUI + DComp | 18k+ partial redraws without crash |
 | Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing. See *Ableton Live 12 Setup* below |
 
