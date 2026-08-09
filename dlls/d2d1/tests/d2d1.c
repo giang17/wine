@@ -15592,6 +15592,145 @@ static void test_image_bounds(BOOL d3d11)
     release_test_context(&ctx);
 }
 
+static void test_color_context(BOOL d3d11)
+{
+    static const D2D1_SIMPLE_COLOR_PROFILE simple_desc =
+    {
+        {0.640f, 0.330f}, {0.300f, 0.600f}, {0.150f, 0.060f},
+        {0.9505f, 1.0891f}, D2D1_GAMMA1_G22,
+    };
+    D2D1_SIMPLE_COLOR_PROFILE simple_profile;
+    ID2D1ColorContext *color_context, *context2;
+    ID2D1DeviceContext *device_context;
+    ID2D1ColorContext1 *color_context1;
+    ID2D1DeviceContext5 *context5;
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    struct d2d1_test_context ctx;
+    DXGI_COLOR_SPACE_TYPE space;
+    BYTE *profile, *profile2;
+    ID2D1Bitmap1 *bitmap;
+    UINT32 size, size2;
+    D2D1_SIZE_U pixel_size;
+    ULONG refcount;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    device_context = ctx.context;
+
+    /* The well known colour spaces do not take a profile; it is generated from
+     * the space instead. */
+    hr = ID2D1DeviceContext_CreateColorContext(device_context, D2D1_COLOR_SPACE_SRGB, NULL, 0, &color_context);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(ID2D1ColorContext_GetColorSpace(color_context) == D2D1_COLOR_SPACE_SRGB,
+            "Got unexpected colour space %#x.\n", ID2D1ColorContext_GetColorSpace(color_context));
+
+    size = ID2D1ColorContext_GetProfileSize(color_context);
+    ok(size > 128, "Got unexpected profile size %u.\n", size);
+    profile = calloc(1, size);
+    hr = ID2D1ColorContext_GetProfile(color_context, profile, size);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    /* Every ICC profile carries the 'acsp' signature at offset 36. */
+    ok(!memcmp(profile + 36, "acsp", 4), "Got unexpected profile signature %#x.\n", *(unsigned int *)(profile + 36));
+    hr = ID2D1ColorContext_GetProfile(color_context, profile, size - 1);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    /* A colour context created from raw profile bytes hands them back. */
+    hr = ID2D1DeviceContext_CreateColorContext(device_context, D2D1_COLOR_SPACE_CUSTOM, profile, size, &context2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    size2 = ID2D1ColorContext_GetProfileSize(context2);
+    ok(size2 == size, "Got unexpected profile size %u, expected %u.\n", size2, size);
+    profile2 = calloc(1, size2);
+    hr = ID2D1ColorContext_GetProfile(context2, profile2, size2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!memcmp(profile, profile2, size), "Profile data does not round trip.\n");
+    ok(ID2D1ColorContext_GetColorSpace(context2) == D2D1_COLOR_SPACE_CUSTOM,
+            "Got unexpected colour space %#x.\n", ID2D1ColorContext_GetColorSpace(context2));
+    free(profile2);
+    ID2D1ColorContext_Release(context2);
+
+    /* A custom space without a profile has nothing to describe it. */
+    hr = ID2D1DeviceContext_CreateColorContext(device_context, D2D1_COLOR_SPACE_CUSTOM, NULL, 0, &context2);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    hr = ID2D1ColorContext_QueryInterface(color_context, &IID_ID2D1ColorContext1, (void **)&color_context1);
+    ok(hr == S_OK || broken(hr == E_NOINTERFACE) /* d2d1 < 1.3 */, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        ok(ID2D1ColorContext1_GetColorContextType(color_context1) == D2D1_COLOR_CONTEXT_TYPE_ICC,
+                "Got unexpected context type %#x.\n", ID2D1ColorContext1_GetColorContextType(color_context1));
+        ID2D1ColorContext1_Release(color_context1);
+    }
+    free(profile);
+
+    hr = ID2D1DeviceContext_CreateColorContext(device_context, D2D1_COLOR_SPACE_SCRGB, NULL, 0, &context2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(ID2D1ColorContext_GetColorSpace(context2) == D2D1_COLOR_SPACE_SCRGB,
+            "Got unexpected colour space %#x.\n", ID2D1ColorContext_GetColorSpace(context2));
+    ID2D1ColorContext_Release(context2);
+
+    /* A bitmap hands back the colour context it was created with. */
+    pixel_size.width = 4;
+    pixel_size.height = 4;
+    memset(&bitmap_desc, 0, sizeof(bitmap_desc));
+    bitmap_desc.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bitmap_desc.colorContext = color_context;
+    hr = ID2D1DeviceContext_CreateBitmap(device_context, pixel_size, NULL, 0, &bitmap_desc, &bitmap);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    context2 = (void *)0xdeadbeef;
+    ID2D1Bitmap1_GetColorContext(bitmap, &context2);
+    ok(context2 == color_context, "Got unexpected colour context %p, expected %p.\n", context2, color_context);
+    if (context2 && context2 != (void *)0xdeadbeef)
+        ID2D1ColorContext_Release(context2);
+    ID2D1Bitmap1_Release(bitmap);
+
+    /* A bitmap without one hands back NULL. */
+    bitmap_desc.colorContext = NULL;
+    hr = ID2D1DeviceContext_CreateBitmap(device_context, pixel_size, NULL, 0, &bitmap_desc, &bitmap);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    context2 = (void *)0xdeadbeef;
+    ID2D1Bitmap1_GetColorContext(bitmap, &context2);
+    ok(!context2, "Got unexpected colour context %p.\n", context2);
+    ID2D1Bitmap1_Release(bitmap);
+
+    refcount = ID2D1ColorContext_Release(color_context);
+    ok(!refcount, "Got unexpected refcount %lu.\n", refcount);
+
+    hr = ID2D1DeviceContext_QueryInterface(device_context, &IID_ID2D1DeviceContext5, (void **)&context5);
+    if (FAILED(hr))
+    {
+        win_skip("ID2D1DeviceContext5 is not supported.\n");
+        release_test_context(&ctx);
+        return;
+    }
+
+    hr = ID2D1DeviceContext5_CreateColorContextFromDxgiColorSpace(context5,
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, &color_context1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(ID2D1ColorContext1_GetColorContextType(color_context1) == D2D1_COLOR_CONTEXT_TYPE_DXGI,
+            "Got unexpected context type %#x.\n", ID2D1ColorContext1_GetColorContextType(color_context1));
+    space = ID2D1ColorContext1_GetDXGIColorSpace(color_context1);
+    ok(space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, "Got unexpected DXGI colour space %u.\n", space);
+    ok(ID2D1ColorContext1_GetColorSpace(color_context1) == D2D1_COLOR_SPACE_SRGB,
+            "Got unexpected colour space %#x.\n", ID2D1ColorContext1_GetColorSpace(color_context1));
+    ID2D1ColorContext1_Release(color_context1);
+
+    hr = ID2D1DeviceContext5_CreateColorContextFromSimpleColorProfile(context5, &simple_desc, &color_context1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(ID2D1ColorContext1_GetColorContextType(color_context1) == D2D1_COLOR_CONTEXT_TYPE_SIMPLE,
+            "Got unexpected context type %#x.\n", ID2D1ColorContext1_GetColorContextType(color_context1));
+    memset(&simple_profile, 0, sizeof(simple_profile));
+    hr = ID2D1ColorContext1_GetSimpleColorProfile(color_context1, &simple_profile);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!memcmp(&simple_profile, &simple_desc, sizeof(simple_profile)), "Simple profile does not round trip.\n");
+    ID2D1ColorContext1_Release(color_context1);
+
+    ID2D1DeviceContext5_Release(context5);
+    release_test_context(&ctx);
+}
+
 static void test_bitmap_map(BOOL d3d11)
 {
     static const struct
@@ -18193,6 +18332,7 @@ START_TEST(d2d1)
     queue_d3d10_test(test_invert_matrix);
     queue_d3d10_test(test_skew_matrix);
     queue_test(test_command_list);
+    queue_test(test_color_context);
     queue_d3d10_test(test_max_bitmap_size);
     queue_test(test_dpi);
     queue_test(test_unit_mode);

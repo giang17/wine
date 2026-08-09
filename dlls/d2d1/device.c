@@ -3238,26 +3238,47 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_CreateBit
 static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContext(ID2D1DeviceContext6 *iface,
         D2D1_COLOR_SPACE space, const BYTE *profile, UINT32 profile_size, ID2D1ColorContext **color_context)
 {
-    FIXME("iface %p, space %#x, profile %p, profile_size %u, color_context %p stub!\n",
+    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    struct d2d_color_context *object;
+    HRESULT hr;
+
+    TRACE("iface %p, space %#x, profile %p, profile_size %u, color_context %p.\n",
             iface, space, profile, profile_size, color_context);
 
-    return E_NOTIMPL;
+    if (SUCCEEDED(hr = d2d_color_context_create(context->factory, space, profile, profile_size, &object)))
+        *color_context = (ID2D1ColorContext *)&object->ID2D1ColorContext1_iface;
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromFilename(ID2D1DeviceContext6 *iface,
         const WCHAR *filename, ID2D1ColorContext **color_context)
 {
-    FIXME("iface %p, filename %s, color_context %p stub!\n", iface, debugstr_w(filename), color_context);
+    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    struct d2d_color_context *object;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, filename %s, color_context %p.\n", iface, debugstr_w(filename), color_context);
+
+    if (SUCCEEDED(hr = d2d_color_context_create_from_filename(context->factory, filename, &object)))
+        *color_context = (ID2D1ColorContext *)&object->ID2D1ColorContext1_iface;
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromWicColorContext(ID2D1DeviceContext6 *iface,
         IWICColorContext *wic_color_context, ID2D1ColorContext **color_context)
 {
-    FIXME("iface %p, wic_color_context %p, color_context %p stub!\n", iface, wic_color_context, color_context);
+    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    struct d2d_color_context *object;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, wic_color_context %p, color_context %p.\n", iface, wic_color_context, color_context);
+
+    if (SUCCEEDED(hr = d2d_color_context_create_from_wic(context->factory, wic_color_context, &object)))
+        *color_context = (ID2D1ColorContext *)&object->ID2D1ColorContext1_iface;
+
+    return hr;
 }
 
 static BOOL d2d_bitmap_check_options_with_surface(unsigned int options, unsigned int surface_options)
@@ -4139,14 +4160,22 @@ static BOOL d2d_format_is_srgb(DXGI_FORMAT format)
     }
 }
 
+/* D2D treats floating point buffers as scRGB (linear) and 8 bits per channel
+ * unsigned normalised buffers as sRGB. That is the colour space a surface lives
+ * in when nothing says otherwise. */
+static D2D1_COLOR_SPACE d2d_color_space_from_format(DXGI_FORMAT format)
+{
+    return d2d_format_is_float(format) ? D2D1_COLOR_SPACE_SCRGB : D2D1_COLOR_SPACE_SRGB;
+}
+
 /* The ColorManagement effect converts its input from the source colour space to
- * the destination colour space. CreateColorContext() is a stub here, so the
- * effect's colour context properties are always NULL and the colour spaces have
- * to be derived from the pixel formats instead. D2D treats floating point
- * buffers as scRGB (linear) and 8 bits per channel unsigned normalised buffers
- * as sRGB, so a linear source drawn to a plain UNORM target is the one case
- * that needs the sRGB transfer function applied. Everything else keeps passing
- * the source through unconverted.
+ * the destination colour space. Applications describe those spaces with colour
+ * contexts; where they leave one unset the space is derived from the pixel
+ * format instead. A linear source drawn to a plain UNORM target is the one case
+ * that needs the sRGB transfer function applied — everything else keeps passing
+ * the source through unconverted. Targets that already carry an _SRGB format
+ * are excluded because the hardware encodes those on write, and float targets
+ * because they stay linear.
  *
  * The encoding happens in the shape pixel shader; the effect is drawn hundreds
  * of times per frame, which rules out a CPU side conversion like the one
@@ -4155,6 +4184,8 @@ static void d2d_device_context_draw_color_management(struct d2d_device_context *
         const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
         D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
 {
+    D2D1_COLOR_SPACE source_space = D2D1_COLOR_SPACE_CUSTOM;
+    D2D1_COLOR_SPACE dest_space = D2D1_COLOR_SPACE_CUSTOM;
     struct d2d_bitmap *bitmap_impl;
     ID2D1Bitmap *bitmap;
     ID2D1Image *input;
@@ -4164,6 +4195,8 @@ static void d2d_device_context_draw_color_management(struct d2d_device_context *
     if (!input)
         return;
 
+    d2d_effect_get_color_management_spaces(effect, &source_space, &dest_space);
+
     if (SUCCEEDED(ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap)))
     {
         prev_encode = context->srgb_encode;
@@ -4172,7 +4205,13 @@ static void d2d_device_context_draw_color_management(struct d2d_device_context *
         {
             DXGI_FORMAT target_format = context->target.bitmap->format.format;
 
-            context->srgb_encode = d2d_format_is_float(bitmap_impl->format.format)
+            if (source_space == D2D1_COLOR_SPACE_CUSTOM)
+                source_space = d2d_color_space_from_format(bitmap_impl->format.format);
+            if (dest_space == D2D1_COLOR_SPACE_CUSTOM)
+                dest_space = d2d_color_space_from_format(target_format);
+
+            context->srgb_encode = source_space == D2D1_COLOR_SPACE_SCRGB
+                    && dest_space == D2D1_COLOR_SPACE_SRGB
                     && !d2d_format_is_float(target_format) && !d2d_format_is_srgb(target_format);
         }
 
@@ -4898,17 +4937,31 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawSvgDocument(ID2D1DeviceCont
 static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromDxgiColorSpace(
         ID2D1DeviceContext6 *iface, DXGI_COLOR_SPACE_TYPE color_space, ID2D1ColorContext1 **color_context)
 {
-    FIXME("iface %p, color_space %u, color_context %p stub!\n", iface, color_space, color_context);
+    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    struct d2d_color_context *object;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, color_space %u, color_context %p.\n", iface, color_space, color_context);
+
+    if (SUCCEEDED(hr = d2d_color_context_create_from_dxgi_space(context->factory, color_space, &object)))
+        *color_context = &object->ID2D1ColorContext1_iface;
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromSimpleColorProfile(
         ID2D1DeviceContext6 *iface, const D2D1_SIMPLE_COLOR_PROFILE *simple_profile, ID2D1ColorContext1 **color_context)
 {
-    FIXME("iface %p, simple_profile %p, color_context %p stub!\n", iface, simple_profile, color_context);
+    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+    struct d2d_color_context *object;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, simple_profile %p, color_context %p.\n", iface, simple_profile, color_context);
+
+    if (SUCCEEDED(hr = d2d_color_context_create_from_simple_profile(context->factory, simple_profile, &object)))
+        *color_context = &object->ID2D1ColorContext1_iface;
+
+    return hr;
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_BlendImage(ID2D1DeviceContext6 *iface, ID2D1Image *image,

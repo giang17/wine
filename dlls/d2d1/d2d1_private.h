@@ -520,6 +520,31 @@ HRESULT d2d_stroke_style_init(struct d2d_stroke_style *style, ID2D1Factory *fact
         const D2D1_STROKE_STYLE_PROPERTIES1 *desc, const float *dashes, UINT32 dash_count);
 struct d2d_stroke_style *unsafe_impl_from_ID2D1StrokeStyle(ID2D1StrokeStyle *iface);
 
+struct d2d_color_context
+{
+    ID2D1ColorContext1 ID2D1ColorContext1_iface;
+    LONG refcount;
+
+    ID2D1Factory *factory;
+    D2D1_COLOR_CONTEXT_TYPE type;
+    D2D1_COLOR_SPACE space;
+    DXGI_COLOR_SPACE_TYPE dxgi_space;
+    D2D1_SIMPLE_COLOR_PROFILE simple_profile;
+    BYTE *profile;
+    UINT32 profile_size;
+};
+
+HRESULT d2d_color_context_create(ID2D1Factory *factory, D2D1_COLOR_SPACE space,
+        const BYTE *profile, UINT32 profile_size, struct d2d_color_context **out);
+HRESULT d2d_color_context_create_from_filename(ID2D1Factory *factory, const WCHAR *filename,
+        struct d2d_color_context **out);
+HRESULT d2d_color_context_create_from_wic(ID2D1Factory *factory, IWICColorContext *wic_context,
+        struct d2d_color_context **out);
+HRESULT d2d_color_context_create_from_dxgi_space(ID2D1Factory *factory, DXGI_COLOR_SPACE_TYPE dxgi_space,
+        struct d2d_color_context **out);
+HRESULT d2d_color_context_create_from_simple_profile(ID2D1Factory *factory,
+        const D2D1_SIMPLE_COLOR_PROFILE *simple_profile, struct d2d_color_context **out);
+
 struct d2d_layer
 {
     ID2D1Layer ID2D1Layer_iface;
@@ -570,6 +595,7 @@ struct d2d_bitmap
     float dpi_x;
     float dpi_y;
     D2D1_BITMAP_OPTIONS options;
+    ID2D1ColorContext *color_context;
 };
 
 HRESULT d2d_bitmap_create(struct d2d_device_context *context, D2D1_SIZE_U size, const void *src_data,
@@ -980,6 +1006,8 @@ struct d2d_effect
 
 HRESULT d2d_effect_create(struct d2d_device_context *context, const CLSID *effect_id,
         ID2D1Effect **effect);
+BOOL d2d_effect_get_color_management_spaces(ID2D1Effect *iface, D2D1_COLOR_SPACE *source,
+        D2D1_COLOR_SPACE *destination);
 void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
 HRESULT d2d_effect_properties_add(struct d2d_effect_properties *props, const WCHAR *name,
         UINT32 index, D2D1_PROPERTY_TYPE type, const WCHAR *value);

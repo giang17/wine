@@ -1374,11 +1374,47 @@ struct color_management_properties
     D2D1_COLORMANAGEMENT_RENDERING_INTENT destination_rendering_intent;
     D2D1_COLORMANAGEMENT_ALPHA_MODE alpha_mode;
     D2D1_COLORMANAGEMENT_QUALITY quality;
+
+    /* The colour space of the contexts above, resolved when they are set. The
+     * property itself only stores the interface pointer without holding a
+     * reference, so the drawing code must not dereference it later; caching the
+     * colour space keeps the information without depending on the lifetime of
+     * the object. D2D1_COLOR_SPACE_CUSTOM means no usable context was set. */
+    D2D1_COLOR_SPACE source_space;
+    D2D1_COLOR_SPACE destination_space;
 };
 
-EFFECT_PROPERTY_RW(color_management, source_color_context, IUNKNOWN)
+static D2D1_COLOR_SPACE color_management_get_color_space(IUnknown *unknown)
+{
+    D2D1_COLOR_SPACE space = D2D1_COLOR_SPACE_CUSTOM;
+    ID2D1ColorContext *color_context;
+
+    if (unknown && SUCCEEDED(IUnknown_QueryInterface(unknown, &IID_ID2D1ColorContext, (void **)&color_context)))
+    {
+        space = ID2D1ColorContext_GetColorSpace(color_context);
+        ID2D1ColorContext_Release(color_context);
+    }
+
+    return space;
+}
+
+#define COLOR_MANAGEMENT_CONTEXT_PROPERTY(prop, cache) \
+    static HRESULT __stdcall color_management_##prop##_set(IUnknown *iface, const BYTE *data, UINT32 data_size) \
+    { \
+        struct d2d_effect_impl *effect = impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)iface); \
+        struct color_management_properties *props = (struct color_management_properties *)(effect + 1); \
+        HRESULT hr; \
+        if (FAILED(hr = effect_impl_prop_set_helper(&props->prop, D2D1_PROPERTY_TYPE_IUNKNOWN, data, data_size))) \
+            return hr; \
+        props->cache = color_management_get_color_space(props->prop); \
+        return S_OK; \
+    } \
+    EFFECT_PROPERTY_GET(color_management, prop, IUNKNOWN)
+
+COLOR_MANAGEMENT_CONTEXT_PROPERTY(source_color_context, source_space)
+COLOR_MANAGEMENT_CONTEXT_PROPERTY(destination_color_context, destination_space)
+
 EFFECT_PROPERTY_RW(color_management, source_rendering_intent, ENUM)
-EFFECT_PROPERTY_RW(color_management, destination_color_context, IUNKNOWN)
 EFFECT_PROPERTY_RW(color_management, destination_rendering_intent, ENUM)
 EFFECT_PROPERTY_RW(color_management, alpha_mode, ENUM)
 EFFECT_PROPERTY_RW(color_management, quality, ENUM)
@@ -2819,6 +2855,31 @@ void d2d_effect_context_init(struct d2d_effect_context *effect_context, struct d
 static inline struct d2d_effect *impl_from_ID2D1Effect(ID2D1Effect *iface)
 {
     return CONTAINING_RECORD(iface, struct d2d_effect, ID2D1Effect_iface);
+}
+
+/* Retrieve the colour spaces a ColorManagement effect was configured with. The
+ * caller has already established that this is the builtin effect by its class
+ * id; the vtable check guards against an application that registered its own
+ * implementation under the same class id, whose property block has a different
+ * layout. Returns FALSE when no colour space information is available, which
+ * leaves the caller with its pixel format based heuristic. */
+BOOL d2d_effect_get_color_management_spaces(ID2D1Effect *iface, D2D1_COLOR_SPACE *source,
+        D2D1_COLOR_SPACE *destination)
+{
+    struct d2d_effect *effect = impl_from_ID2D1Effect(iface);
+    const struct color_management_properties *props;
+    struct d2d_effect_impl *impl;
+
+    if (!effect->impl || effect->impl->lpVtbl != &d2d_effect_impl_vtbl)
+        return FALSE;
+
+    impl = impl_from_ID2D1EffectImpl(effect->impl);
+    props = (const struct color_management_properties *)(impl + 1);
+
+    *source = props->source_space;
+    *destination = props->destination_space;
+
+    return TRUE;
 }
 
 static void d2d_effect_cleanup(struct d2d_effect *effect)
