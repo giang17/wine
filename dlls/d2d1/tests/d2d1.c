@@ -15592,6 +15592,108 @@ static void test_image_bounds(BOOL d3d11)
     release_test_context(&ctx);
 }
 
+static void test_stroke_contains_point_dashed(BOOL d3d11)
+{
+    /* Stroke width 10 with a 2/2 dash pattern paints [0,20), skips [20,40),
+     * paints [40,60) and so on — dash lengths are multiples of the width. */
+    static const struct
+    {
+        float x;
+        BOOL solid;
+        BOOL dashed;
+        BOOL offset;
+        const char *where;
+    }
+    tests[] =
+    {
+        { 10.0f, TRUE,  TRUE,  FALSE, "erster Strich" },
+        { 30.0f, TRUE,  FALSE, TRUE,  "erste Luecke" },
+        { 50.0f, TRUE,  TRUE,  FALSE, "zweiter Strich" },
+        { 70.0f, TRUE,  FALSE, TRUE,  "zweite Luecke" },
+        { 90.0f, TRUE,  TRUE,  FALSE, "dritter Strich" },
+    };
+    D2D1_STROKE_STYLE_PROPERTIES stroke_desc;
+    ID2D1StrokeStyle *dashed = NULL, *shifted = NULL;
+    struct d2d1_test_context ctx;
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    unsigned int i;
+    D2D1_POINT_2F p;
+    BOOL contains;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(geometry, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* A straight horizontal line from (0,0) to (100,0). */
+    set_point(&p, 0.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, p, D2D1_FIGURE_BEGIN_HOLLOW);
+    set_point(&p, 100.0f, 0.0f);
+    ID2D1GeometrySink_AddLine(sink, p);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    stroke_desc.startCap = D2D1_CAP_STYLE_FLAT;
+    stroke_desc.endCap = D2D1_CAP_STYLE_FLAT;
+    stroke_desc.dashCap = D2D1_CAP_STYLE_FLAT;
+    stroke_desc.lineJoin = D2D1_LINE_JOIN_MITER;
+    stroke_desc.miterLimit = 10.0f;
+    stroke_desc.dashStyle = D2D1_DASH_STYLE_DASH;
+    stroke_desc.dashOffset = 0.0f;
+    hr = ID2D1Factory_CreateStrokeStyle(ctx.factory, &stroke_desc, NULL, 0, &dashed);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* Shifting by one dash length swaps dashes and gaps. */
+    stroke_desc.dashOffset = 2.0f;
+    hr = ID2D1Factory_CreateStrokeStyle(ctx.factory, &stroke_desc, NULL, 0, &shifted);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("%s (x %.0f)", tests[i].where, tests[i].x);
+
+        set_point(&p, tests[i].x, 0.0f);
+
+        /* Without a stroke style the whole line is covered — this is the
+         * control: it must keep behaving exactly as before. */
+        contains = !tests[i].solid;
+        hr = ID2D1PathGeometry_StrokeContainsPoint(geometry, p, 10.0f, NULL, NULL, 0.0f, &contains);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(contains == tests[i].solid, "Solid: got %#x, expected %#x.\n", contains, tests[i].solid);
+
+        contains = !tests[i].dashed;
+        hr = ID2D1PathGeometry_StrokeContainsPoint(geometry, p, 10.0f, dashed, NULL, 0.0f, &contains);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(contains == tests[i].dashed, "Dashed: got %#x, expected %#x.\n", contains, tests[i].dashed);
+
+        contains = !tests[i].offset;
+        hr = ID2D1PathGeometry_StrokeContainsPoint(geometry, p, 10.0f, shifted, NULL, 0.0f, &contains);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(contains == tests[i].offset, "Offset: got %#x, expected %#x.\n", contains, tests[i].offset);
+
+        winetest_pop_context();
+    }
+
+    /* Off the line entirely: never contained, dashed or not. */
+    set_point(&p, 10.0f, 50.0f);
+    contains = TRUE;
+    hr = ID2D1PathGeometry_StrokeContainsPoint(geometry, p, 10.0f, dashed, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "Got unexpected contains %#x for a point away from the line.\n", contains);
+
+    ID2D1StrokeStyle_Release(shifted);
+    ID2D1StrokeStyle_Release(dashed);
+    ID2D1PathGeometry_Release(geometry);
+    release_test_context(&ctx);
+}
+
 static void test_color_context(BOOL d3d11)
 {
     static const D2D1_SIMPLE_COLOR_PROFILE simple_desc =
@@ -18333,6 +18435,7 @@ START_TEST(d2d1)
     queue_d3d10_test(test_skew_matrix);
     queue_test(test_command_list);
     queue_test(test_color_context);
+    queue_test(test_stroke_contains_point_dashed);
     queue_d3d10_test(test_max_bitmap_size);
     queue_test(test_dpi);
     queue_test(test_unit_mode);

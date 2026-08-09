@@ -4663,12 +4663,261 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetWidenedBounds(ID2D1PathGeo
     return S_OK;
 }
 
+/* Dashed strokes only cover part of the path, so a point sitting in a gap is
+ * not on the stroke. The dash pattern is measured in multiples of the stroke
+ * width along the path, which means the work happens in geometry space, before
+ * the transformation. */
+#define D2D_MAX_DASHES 32
+
+struct d2d_dash_pattern
+{
+    float dashes[D2D_MAX_DASHES];
+    unsigned int count;
+    float period;
+    float offset;
+    float cap_extend;
+};
+
+static BOOL d2d_dash_pattern_init(struct d2d_dash_pattern *pattern, ID2D1StrokeStyle *stroke_style,
+        float stroke_width)
+{
+    D2D1_CAP_STYLE dash_cap;
+    unsigned int i, count;
+
+    if (!stroke_style || ID2D1StrokeStyle_GetDashStyle(stroke_style) == D2D1_DASH_STYLE_SOLID)
+        return FALSE;
+
+    if (!(count = ID2D1StrokeStyle_GetDashesCount(stroke_style)) || count > D2D_MAX_DASHES)
+    {
+        if (count)
+            FIXME("Ignoring dash pattern with %u entries.\n", count);
+        return FALSE;
+    }
+
+    ID2D1StrokeStyle_GetDashes(stroke_style, pattern->dashes, count);
+    pattern->count = count;
+
+    /* The pattern alternates dash, gap, dash, …; an odd entry count means the
+     * sequence repeats shifted, which is handled by doubling it. */
+    if (count & 1)
+    {
+        if (count * 2 > D2D_MAX_DASHES)
+            return FALSE;
+        memcpy(&pattern->dashes[count], pattern->dashes, count * sizeof(*pattern->dashes));
+        pattern->count = count * 2;
+    }
+
+    pattern->period = 0.0f;
+    for (i = 0; i < pattern->count; ++i)
+    {
+        /* Dash lengths are multiples of the stroke width. */
+        pattern->dashes[i] *= stroke_width;
+        pattern->period += pattern->dashes[i];
+    }
+
+    if (pattern->period <= 0.0f)
+        return FALSE;
+
+    pattern->offset = ID2D1StrokeStyle_GetDashOffset(stroke_style) * stroke_width;
+    pattern->offset = fmodf(pattern->offset, pattern->period);
+    if (pattern->offset < 0.0f)
+        pattern->offset += pattern->period;
+
+    /* A flat dash cap ends the dash exactly; square and round caps extend it by
+     * half the stroke width. Round caps are approximated by that extension,
+     * which is a superset of the half disc — the difference is confined to the
+     * corners. */
+    dash_cap = ID2D1StrokeStyle_GetDashCap(stroke_style);
+    pattern->cap_extend = dash_cap == D2D1_CAP_STYLE_FLAT ? 0.0f : stroke_width * 0.5f;
+
+    return TRUE;
+}
+
+/* Test the part of [start, end] that the dash pattern actually paints. The
+ * segment covers the path from arc length "pos" onwards. */
+static BOOL d2d_dash_pattern_test_segment(const struct d2d_dash_pattern *pattern,
+        const D2D1_POINT_2F *q, const D2D1_POINT_2F *start, const D2D1_POINT_2F *end,
+        const D2D1_MATRIX_3X2_F *transform, float stroke_width, float tolerance, float *pos)
+{
+    float length, covered, dash_start, dash_end;
+    D2D1_POINT_2F dir, p0, p1;
+    unsigned int i;
+
+    d2d_point_subtract(&dir, end, start);
+    if ((length = d2d_point_length(&dir)) == 0.0f)
+        return FALSE;
+    d2d_point_scale(&dir, 1.0f / length);
+
+    /* Walk the pattern from where this segment starts. */
+    covered = -fmodf(*pos + pattern->offset, pattern->period);
+    i = 0;
+    while (covered + pattern->dashes[i] <= 0.0f)
+    {
+        covered += pattern->dashes[i];
+        i = (i + 1) % pattern->count;
+    }
+
+    for (; covered < length; i = (i + 1) % pattern->count)
+    {
+        float next = covered + pattern->dashes[i];
+
+        /* Even entries are dashes, odd ones gaps. */
+        if (!(i & 1))
+        {
+            dash_start = covered - pattern->cap_extend;
+            dash_end = next + pattern->cap_extend;
+
+            if (dash_start < 0.0f)
+                dash_start = 0.0f;
+            if (dash_end > length)
+                dash_end = length;
+
+            if (dash_end > dash_start)
+            {
+                p0.x = start->x + dir.x * dash_start;
+                p0.y = start->y + dir.y * dash_start;
+                p1.x = start->x + dir.x * dash_end;
+                p1.y = start->y + dir.y * dash_end;
+
+                if (d2d_point_on_line_segment(q, &p0, &p1, transform, stroke_width * 0.5f, tolerance))
+                {
+                    *pos += length;
+                    return TRUE;
+                }
+            }
+        }
+
+        covered = next;
+    }
+
+    *pos += length;
+    return FALSE;
+}
+
+/* Flatten a Bézier segment into line segments and run the dash test on each of
+ * them, so that the arc length keeps accumulating across the curve. */
+static BOOL d2d_dash_pattern_test_bezier(const struct d2d_dash_pattern *pattern,
+        const D2D1_POINT_2F *q, const D2D1_POINT_2F *p0, const D2D1_BEZIER_SEGMENT *b,
+        const D2D1_MATRIX_3X2_F *transform, float stroke_width, float tolerance, float *pos,
+        unsigned int depth)
+{
+    D2D1_BEZIER_SEGMENT b0, b1;
+    D2D1_POINT_2F m;
+    float d;
+
+    /* Same deviation estimate and subdivision as d2d_geometry_flatten_cubic().
+     * The depth limit keeps pathological curves bounded. */
+    d2d_point_lerp(&m, p0, &b->point2, 0.5f);
+    d2d_point_subtract(&m, &b->point1, &m);
+    d = fabsf(m.x) + fabsf(m.y);
+    d2d_point_lerp(&m, &b->point1, &b->point3, 0.5f);
+    d2d_point_subtract(&m, &b->point2, &m);
+    d += fabsf(m.x) + fabsf(m.y);
+
+    if (depth >= 16 || d < tolerance)
+        return d2d_dash_pattern_test_segment(pattern, q, p0, &b->point3, transform,
+                stroke_width, tolerance, pos);
+
+    d2d_point_lerp(&m, &b->point1, &b->point2, 0.5f);
+
+    b1.point3 = b->point3;
+    d2d_point_lerp(&b1.point2, &b1.point3, &b->point2, 0.5f);
+    d2d_point_lerp(&b1.point1, &b1.point2, &m, 0.5f);
+
+    d2d_point_lerp(&b0.point1, p0, &b->point1, 0.5f);
+    d2d_point_lerp(&b0.point2, &b0.point1, &m, 0.5f);
+    d2d_point_lerp(&b0.point3, &b0.point2, &b1.point1, 0.5f);
+
+    if (d2d_dash_pattern_test_bezier(pattern, q, p0, &b0, transform, stroke_width,
+            tolerance, pos, depth + 1))
+        return TRUE;
+    return d2d_dash_pattern_test_bezier(pattern, q, &b0.point3, &b1, transform, stroke_width,
+            tolerance, pos, depth + 1);
+}
+
+static BOOL d2d_path_geometry_dashed_stroke_contains_point(const struct d2d_geometry *geometry,
+        const D2D1_POINT_2F *q, const struct d2d_dash_pattern *pattern, float stroke_width,
+        const D2D1_MATRIX_3X2_F *transform, float tolerance)
+{
+    enum d2d_vertex_type type;
+    unsigned int i, j, bezier_idx;
+    D2D1_BEZIER_SEGMENT b;
+    D2D1_POINT_2F p, p1;
+    float pos;
+
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        const struct d2d_figure *figure = &geometry->u.path.figures[i];
+
+        type = D2D_VERTEX_TYPE_NONE;
+        for (j = 0; j < figure->vertex_count; ++j)
+        {
+            if (figure->vertex_types[j] == D2D_VERTEX_TYPE_NONE)
+                continue;
+
+            p = figure->vertices[j];
+            type = figure->vertex_types[j];
+            break;
+        }
+
+        /* Each figure restarts the dash pattern. */
+        pos = 0.0f;
+
+        for (bezier_idx = 0, ++j; j < figure->vertex_count; ++j)
+        {
+            enum d2d_vertex_type next_type;
+
+            if ((next_type = figure->vertex_types[j]) == D2D_VERTEX_TYPE_NONE
+                    || d2d_vertex_type_is_split_bezier(next_type))
+                continue;
+
+            switch (type)
+            {
+                case D2D_VERTEX_TYPE_LINE:
+                    p1 = figure->vertices[j];
+                    if (d2d_dash_pattern_test_segment(pattern, q, &p, &p1, transform,
+                            stroke_width, tolerance, &pos))
+                        return TRUE;
+                    p = p1;
+                    break;
+
+                case D2D_VERTEX_TYPE_BEZIER:
+                    b.point1 = figure->original_bezier_controls[bezier_idx++];
+                    b.point2 = figure->original_bezier_controls[bezier_idx++];
+                    b.point3 = figure->vertices[j];
+                    if (d2d_dash_pattern_test_bezier(pattern, q, &p, &b, transform,
+                            stroke_width, tolerance, &pos, 0))
+                        return TRUE;
+                    p = b.point3;
+                    break;
+
+                default:
+                    FIXME("Unhandled vertex type %#x.\n", type);
+                    p = figure->vertices[j];
+                    break;
+            }
+            type = next_type;
+        }
+
+        if (type == D2D_VERTEX_TYPE_LINE && figure->flags & D2D_FIGURE_FLAG_CLOSED)
+        {
+            p1 = figure->vertices[0];
+            if (d2d_dash_pattern_test_segment(pattern, q, &p, &p1, transform,
+                    stroke_width, tolerance, &pos))
+                return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_StrokeContainsPoint(ID2D1PathGeometry1 *iface,
         D2D1_POINT_2F point, float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, BOOL *contains)
 {
     struct d2d_geometry *geometry = impl_from_ID2D1PathGeometry1(iface);
     enum d2d_vertex_type type = D2D_VERTEX_TYPE_NONE;
+    struct d2d_dash_pattern dash_pattern;
     unsigned int i, j, bezier_idx;
     D2D1_BEZIER_SEGMENT b;
     D2D1_POINT_2F p, p1;
@@ -4676,14 +4925,22 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_StrokeContainsPoint(ID2D1Path
     TRACE("iface %p, point %s, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, contains %p.\n",
             iface, debug_d2d_point_2f(&point), stroke_width, stroke_style, transform, tolerance, contains);
 
-    if (stroke_style)
-        FIXME("Ignoring stroke style %p.\n", stroke_style);
-
     if (!transform)
         transform = &identity;
 
     if (tolerance <= 0.0f)
         tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    /* A dashed stroke only covers part of the path. Solid strokes keep taking
+     * the plain path below, so the common case is unaffected. Line joins and
+     * the caps at the ends of a figure are still not taken into account. */
+    if (d2d_dash_pattern_init(&dash_pattern, stroke_style, stroke_width))
+    {
+        *contains = d2d_path_geometry_dashed_stroke_contains_point(geometry, &point,
+                &dash_pattern, stroke_width, transform, tolerance);
+        TRACE("-> %#x.\n", *contains);
+        return S_OK;
+    }
 
     *contains = FALSE;
     for (i = 0; i < geometry->u.path.figure_count; ++i)
