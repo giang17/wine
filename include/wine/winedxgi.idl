@@ -20,6 +20,16 @@
 
 import "dxgi1_6.idl";
 
+/* The interfaces below take wined3d objects as opaque pointers.  Forward
+ * declare them so that each parameter list refers to the same type: without
+ * this, a translation unit that does not include wined3d.h first declares a
+ * fresh struct type scoped to every prototype, and passing the real object in
+ * is then an incompatible pointer type - an error by default since GCC 14.
+ * dlls/dcomp/device.c is such a consumer. */
+cpp_quote("struct wined3d_resource;")
+cpp_quote("struct wined3d_texture;")
+cpp_quote("struct wined3d_device_parent;")
+
 /* Desktop-property name format mapping a composition swapchain to its
  * composition window.  Shared verbatim by dxgi (setter) and dcomp (getter);
  * keeping it in one place here is the only guard against the two DLLs'
