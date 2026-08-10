@@ -101,9 +101,9 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
 - **Direct2D for JUCE 8.0.13+ (ntdll)**: JUCE 8.0.13 and later pick their renderer with
   `GetProcAddress(GetModuleHandleA("ntdll"), "wine_get_version") != nullptr` and fall back
   to GDI whenever that succeeds, which bypasses this entire stack — a JUCE plugin then
-  never creates a device context and never gets a composition swapchain. This branch hides
-  that one export so those plugins take the Direct2D path again. **On by default**, see
-  the note below
+  never creates a device context and never gets a composition swapchain. This branch can
+  hide that one export so those plugins take the Direct2D path again. **Opt-in**, see the
+  note below
 
 ### Note: JUCE 8.0.13+ and the hidden `wine_get_version` export
 
@@ -113,32 +113,34 @@ because stock Wine does not implement the Direct2D 1.3 / DirectComposition surfa
 needs — but this branch does, so the fallback only costs functionality here. Measured with
 one plugin: 23 d2d1 calls with the fallback, 2.6 million without it.
 
-This branch therefore hides `wine_get_version` from `GetProcAddress`, **enabled by
-default**. It restored the complete UI of a WebView2-based JUCE plugin whose artwork,
-icons and content had been missing, and removed flicker that had been chased for weeks in
-the wrong place.
+This branch can therefore hide `wine_get_version` from `GetProcAddress`. Doing so restored
+the complete UI of a WebView2-based JUCE plugin whose artwork, icons and content had been
+missing, and removed flicker that had been chased for weeks in the wrong place.
 
-Because the switch applies to the whole process, other components that probe for Wine stop
-finding it too. Turn it off if that matters:
+It is **off by default** and meant to be enabled for the hosts that actually run JUCE
+plug-ins, not system-wide — see the caveat below.
 
 ```bash
-# for a single run
-WINE_HIDE_WINE_VERSION=0 wine your-app.exe
+# single run
+WINE_HIDE_WINE_VERSION=1 wine your-host.exe
 ```
 
 ```
-# globally
-HKCU\Software\Wine\HideWineVersion = "N"
-# or for one application only (this wins over the global value)
-HKCU\Software\Wine\AppDefaults\your-app.exe\HideWineVersion = "N"
+# per application, the usual case
+HKCU\Software\Wine\AppDefaults\your-host.exe\HideWineVersion = "Y"
+# globally, if you know what runs in this prefix
+HKCU\Software\Wine\HideWineVersion = "Y"
 ```
 
-**Known case:** PACE/iLok **standalone** applications fail to start with *"Error 2000: An
-iLok background component required to validate the license for this product is not
-running"* and need the `"N"` exception for their executable. PACE-protected **plugins
-inside a host are not affected** — they load and license normally. The failure is silent
-in the sense that it points at iLok rather than at Wine, so it is worth knowing about
-before it bites.
+The per-application value wins over the global one, so `"N"` can carve out an exception
+where the global switch is on.
+
+**Why not system-wide:** the switch applies to the whole process, so anything else probing
+for Wine stops finding it — and some software depends on the answer. Two cases seen here:
+PACE/iLok protected software fails to start with *"Error 2000: An iLok background component
+required to validate the license for this product is not running"*, and Ableton Live's
+embedded Splice view stops loading. Both fail in a way that points anywhere but at Wine,
+which is exactly why the default is off.
 
 An upstream fix is proposed as [juce-framework/JUCE#1701](https://github.com/juce-framework/JUCE/pull/1701),
 which would add the same opt-in inside JUCE and make this workaround unnecessary.

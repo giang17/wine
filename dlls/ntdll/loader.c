@@ -2071,16 +2071,18 @@ NTSTATUS WINAPI LdrUnlockLoaderLock( ULONG flags, ULONG_PTR magic )
  * stack the fallback is not wanted.  Hiding this one export makes those builds
  * take the Direct2D path again.
  *
- * On by default on this branch, because every JUCE 8.0.13+ plugin would
- * otherwise lose the Direct2D path.  Turn it off with WINE_HIDE_WINE_VERSION=0,
- * or per application with
+ * Off unless asked for, because the switch applies to the whole process: other
+ * components that probe for Wine stop finding it too, and some depend on the
+ * answer.  PACE/iLok protected software fails to start without it ("Error 2000,
+ * iLok background component not running"), and Ableton Live's embedded Splice
+ * view stops loading.  Enable it for the hosts that run JUCE plug-ins instead:
  *
- *     HKCU\Software\Wine\AppDefaults\<app.exe>\HideWineVersion = "N"
+ *     WINE_HIDE_WINE_VERSION=1                                  (single run)
+ *     HKCU\Software\Wine\AppDefaults\<app.exe>\HideWineVersion = "Y"
+ *     HKCU\Software\Wine\HideWineVersion = "Y"                  (global)
  *
- * Note this applies to the whole process: other components that probe for Wine
- * stop finding it too.  Known case: PACE/iLok standalone applications fail to
- * start ("Error 2000, iLok background component not running") and need the "N"
- * exception.  PACE-protected plugins inside a host are not affected.
+ * The per-application value wins over the global one, so "N" can carve out an
+ * exception if the global switch is enabled.
  */
 /* Reads the HideWineVersion value from an open key; -1 if absent. */
 static int query_hide_wine_version_value( HANDLE key )
@@ -2165,7 +2167,7 @@ static BOOL hide_wine_version_export(void)
         else if ((reg = query_hide_wine_version_registry()) != -1)
             cached = reg;
         else
-            cached = 1;  /* default on, see comment above */
+            cached = 0;  /* off unless asked for, see comment above */
     }
     return cached;
 }
