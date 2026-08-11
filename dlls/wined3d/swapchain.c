@@ -49,28 +49,6 @@ static BOOL wined3d_gl_present_disabled(void)
     return disabled > 0;
 }
 
-struct dcomp_child_exclude_ctx
-{
-    HDC dc;
-    HWND parent;
-    unsigned int excluded;
-};
-
-static BOOL CALLBACK wined3d_exclude_dcomp_children_proc(HWND child, LPARAM lp)
-{
-    struct dcomp_child_exclude_ctx *ctx = (struct dcomp_child_exclude_ctx *)lp;
-    RECT r;
-
-    if (IsWindowVisible(child) && GetPropW(child, L"__wine_dcomp_child_count")
-            && GetWindowRect(child, &r))
-    {
-        MapWindowPoints(NULL, ctx->parent, (POINT *)&r, 2);
-        ExcludeClipRect(ctx->dc, r.left, r.top, r.right, r.bottom);
-        ctx->excluded++;
-    }
-    return TRUE;
-}
-
 static BOOL set_window_present_rect(HWND hwnd, UINT x, UINT y, UINT width, UINT height)
 {
     RECT rect = {x, y, x + width, y + height};
@@ -1077,46 +1055,25 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         }
         else
         {
-            /* A DComp composition target (WebView2) owns its window area: on
-             * Windows it renders into its own redirection surface and the DWM
-             * composes it above everything else, so no present ever paints
-             * there. Our GDI blit shares the drawable with all windows of the
-             * top level — including sibling branches (Ableton Live hosts the
-             * WebView2 tree next to, not under, its D3D window, and WebView2
-             * reparents it at runtime). Exclude every target from the dcomp
-             * desktop-window registry, or this present overpaints its content
-             * at 60 Hz while the dcomp tree timer paints it back at 10 Hz:
-             * visible flicker (issue 121). Rects outside our window map to
-             * empty clip areas and are harmless. */
-            struct dcomp_child_exclude_ctx ctx = { swapchain->dc, swapchain->win_handle, 0 };
-            HWND desktop_wnd = GetDesktopWindow();
-            WCHAR treg[32];
-            unsigned int ti;
-
-            for (ti = 0; ti < 16; ++ti)
-            {
-                HWND t;
-
-                swprintf(treg, ARRAY_SIZE(treg), L"__wine_dcomp_target_%u", ti);
-                t = (HWND)GetPropW(desktop_wnd, treg);
-                /* Only targets that share our top level share our drawable.
-                 * The registry is desktop-wide, so it also lists targets of
-                 * other top levels - a plugin editor over Live's WebView2
-                 * panel, say.  Their rects are not "outside our window": they
-                 * map to wherever the two windows overlap on screen, and
-                 * excluding them punches that overlap out of our present.  The
-                 * hole then survives, because nothing invalidates us when the
-                 * other top level changes. */
-                if (t && t != swapchain->win_handle && IsWindow(t)
-                        && GetAncestor(t, GA_ROOT) == GetAncestor(swapchain->win_handle, GA_ROOT))
-                    wined3d_exclude_dcomp_children_proc(t, (LPARAM)&ctx);
-            }
+            /* No area is kept out of this blit on account of another DComp
+             * target sharing the top level.  That exclusion used to live here
+             * (for issue 121) and was measured to subtract nothing: it keys off
+             * the foreign target's window rect, and Chromium parks that window
+             * exactly one client width to the side, so the rect it excludes and
+             * the area we paint never meet.  Both the flicker it was written
+             * for and the black block a later refinement addressed are handled
+             * elsewhere now — top levels take the GL present path and never
+             * reach this function, and targets of other top levels were already
+             * filtered out by their differing GA_ROOT.  What remained was a
+             * walk of the 16-slot desktop registry on every present, each slot
+             * a wineserver round trip, that declined to act every time.  If a
+             * present ever does need to spare a target's area, the source for
+             * it cannot be the window rect; it has to be the geometry the
+             * target is actually composed at, which nothing publishes today. */
             /* Always BitBlt full comp buffer to window — survives any surface reset. */
             if (!BitBlt(swapchain->dc, dst_rect->left, dst_rect->top, dst_w, dst_h,
                     swapchain->comp_dc, 0, 0, SRCCOPY))
                 WARN("Failed to blit composition buffer to window.\n");
-            if (ctx.excluded)
-                SelectClipRgn(swapchain->dc, NULL);
         }
 
         /* Store comp_dc as window property so WM_PAINT can re-blit. Don't
