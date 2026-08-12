@@ -2129,6 +2129,13 @@ struct dcomp_target
     LONGLONG last_present_qpc;            /* QPC of last actual present — drives ~60 Hz coalescing (issue 56) */
     BOOL foreign;                         /* target hwnd belongs to another process — no subclass, hook-driven compositing (issue 88) */
     DWORD last_tree_composite_tick;       /* GetTickCount of last hook-driven tree composite (~60 Hz rate limit) */
+    /* Sticky: this target's tree has carried at least one content leaf at some
+     * point (issue 184).  Latched, never cleared — a rootless tree may be
+     * momentarily empty between two generations, and taking over the window
+     * only while it actually has content would hand those frames back to the
+     * application mid-flight.  Never latched at all means the tree carries
+     * nothing and this target must keep its hands off the window. */
+    BOOL tree_had_content;
     /* Unchanged-content gate (issue 99): hash over all content-leaf sources
      * of the current walk vs. the hash of the last frame that actually
      * reached the window.  The tree timer must only push NEW leaf content —
@@ -2849,6 +2856,66 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
         dcomp_target_composite_leaves(target, child, vx, vy);
 }
 
+/* Does any visual below this one carry content of its own?  Pointer walk over
+ * the same three leaf kinds dcomp_target_composite_leaves() knows, but without
+ * their cost: no property lookups, no texture readback, no pixels.  A leaf whose
+ * source is not resolvable yet still counts as content — it will be, and
+ * answering "no content" too eagerly is the expensive mistake (issue 184). */
+static BOOL dcomp_visual_subtree_has_content(struct dcomp_visual *visual)
+{
+    struct dcomp_visual *child;
+
+    if (visual->content || visual->surface_content || dcomp_visual_effective_texture(visual))
+        return TRUE;
+
+    for (child = visual->children; child; child = child->next_sibling)
+        if (dcomp_visual_subtree_has_content(child))
+            return TRUE;
+
+    return FALSE;
+}
+
+/* Is this target entitled to paint the window — that is, does our composition
+ * have anything to put there (issue 184)?
+ *
+ * A rootless target subclasses the window, swallows its WM_PAINT and blits our
+ * composed tree in its place.  That is right where our composition IS the
+ * content (WebView2, issue 88).  With a tree that never held any content there
+ * is nothing to put in the message's place: the application is never asked to
+ * redraw, stops presenting, and its last frame stands still on screen —
+ * Fender Studio Pro 8, whose target sits on the very window it presents to
+ * itself and which never calls SetContent at all (issue 183).
+ *
+ * "Empty right now" is the wrong question: a WebView2 tree drops to zero leaves
+ * between two generations (measured: commit #1 one leaf, commit #2 none), and
+ * releasing the window in those frames would let the application paint over our
+ * composition.  So the verdict latches on first content and never goes back —
+ * from then on this target behaves exactly as it did before.  Only a tree that
+ * has never carried a single leaf stays out of the way. */
+static BOOL dcomp_target_tree_carries_content(struct dcomp_target *target)
+{
+    struct dcomp_visual *child;
+
+    if (target->tree_had_content)
+        return TRUE;
+
+    /* The root's own content is presented by its swapchain/surface path and is
+     * not ours to composite — start at its children, like the walks do. */
+    if (target->root_visual)
+    {
+        for (child = target->root_visual->children; child; child = child->next_sibling)
+        {
+            if (dcomp_visual_subtree_has_content(child))
+            {
+                target->tree_had_content = TRUE;
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+}
+
 static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_timer)
 {
     struct dcomp_visual *root;
@@ -2862,6 +2929,14 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
     /* Content-bearing roots composite their children via their own Present —
      * this path is only for rootless trees (Chromium/WebView2). */
     if (!root || root->content || root->surface_content)
+        return;
+
+    /* Nothing to compose (issue 184): leave before touching a DC.  Every pass
+     * here costs a GetDC, a full-window BitBlt readback, the composite walk and
+     * a full-window BitBlt back — driven at DCOMP_TREE_TIMER_MS this repaints
+     * the window ~60 times a second with the window's own pixels, which is
+     * visible as fast flicker on a window the application is presenting to. */
+    if (!dcomp_target_tree_carries_content(target))
         return;
 
     GetClientRect(target->hwnd, &rc);
@@ -3433,9 +3508,15 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
     case WM_PAINT:
         /* Rootless tree (issue 88): repaint from the composed tree instead of
          * the original wndproc (which would show the empty/loader content).
-         * Content-bearing roots keep the VSTGUI paint path. */
+         * Content-bearing roots keep the VSTGUI paint path.
+         *
+         * Only take the message away from the application while our tree has
+         * something to deliver in its place (issue 184) — otherwise the window
+         * is validated by a composition of nothing and the application, never
+         * asked to redraw again, freezes on its last frame. */
         if (target->root_visual && !target->root_visual->content
-                && !target->root_visual->surface_content)
+                && !target->root_visual->surface_content
+                && dcomp_target_tree_carries_content(target))
         {
             PAINTSTRUCT ps;
 
