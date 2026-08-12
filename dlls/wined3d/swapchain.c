@@ -1162,6 +1162,47 @@ static void swapchain_gl_set_swap_interval(struct wined3d_swapchain *swapchain,
     }
 }
 
+/* Whether this swapchain's back buffers may be left alone on a present.
+ *
+ * A present rotates the back buffer textures, and for the flip model it copies
+ * the presented frame back into back buffer 0 so an application can keep
+ * rendering incrementally (dirty rects).  The two halves are only correct
+ * together: rotating without copying hands the application a buffer holding an
+ * older frame, copying without rotating overwrites what it just drew.
+ *
+ * Doing neither is equivalent for the application and cheaper than both -- back
+ * buffer 0 simply keeps the frame that was just presented.  That equivalence
+ * holds wherever the application cannot address the other buffers as distinct
+ * surfaces:
+ *
+ *   DISCARD                        the content of a back buffer after a present
+ *                                  is undefined by specification, so nothing may
+ *                                  rely on which buffer it is handed
+ *   FLIP_DISCARD, FLIP_SEQUENTIAL  the DXGI flip model allows only back buffer 0
+ *                                  as a render target
+ *
+ * SEQUENTIAL is deliberately not included: that is D3D9's D3DSWAPEFFECT_FLIP,
+ * where rotating through the buffer chain is the documented behaviour and an
+ * application may render into the other buffers.
+ *
+ * Fender Studio Pro 8 renders incrementally into a DISCARD swapchain with more
+ * than one back buffer.  It therefore drew onto a buffer two frames old every
+ * other frame, which showed as the window's tool and transport bars alternating
+ * between two states while the arrangement area stood still (issue 185). */
+bool wined3d_swapchain_keeps_back_buffers(const struct wined3d_swapchain *swapchain)
+{
+    switch (swapchain->state.desc.swap_effect)
+    {
+        case WINED3D_SWAP_EFFECT_DISCARD:
+        case WINED3D_SWAP_EFFECT_FLIP_DISCARD:
+        case WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
 /* Context activation is done by the caller. */
 static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, struct wined3d_context *context)
 {
@@ -1173,7 +1214,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
     unsigned int i;
     static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
 
-    if (swapchain->state.desc.backbuffer_count < 2)
+    if (swapchain->state.desc.backbuffer_count < 2
+            || wined3d_swapchain_keeps_back_buffers(swapchain))
         return;
 
     texture_prev = wined3d_texture_gl(swapchain->back_buffers[0]);
@@ -1863,7 +1905,8 @@ static void wined3d_swapchain_vk_rotate(struct wined3d_swapchain *swapchain, str
 
     static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
 
-    if (swapchain->state.desc.backbuffer_count < 2)
+    if (swapchain->state.desc.backbuffer_count < 2
+            || wined3d_swapchain_keeps_back_buffers(swapchain))
         return;
 
     texture_prev = wined3d_texture_vk(swapchain->back_buffers[0]);

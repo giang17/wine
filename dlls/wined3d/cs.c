@@ -731,14 +731,21 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
 
     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
 
-    /* FLIP_SEQUENTIAL: copy the just-presented content back into back_buffer[0]
-     * so the app can do incremental rendering (DirtyRects). After rotation,
+    /* Copy the just-presented content back into back_buffer[0] so the app can
+     * do incremental rendering (DirtyRects).  After rotation,
      * back_buffers[N-1] has the presented frame; copy it to back_buffers[0].
      * This MUST happen in the CS thread (not from DXGI) to avoid a race with
-     * the frame latency event that wakes the app. */
+     * the frame latency event that wakes the app.
+     *
+     * Only meaningful where the buffers were rotated in the first place: this
+     * copy exists to undo the rotation, and doing it without one would
+     * overwrite what the application just drew.  Both halves therefore ask
+     * wined3d_swapchain_keeps_back_buffers() instead of testing the swap effect
+     * on their own. */
     if ((desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
             || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
-            && desc->backbuffer_count >= 2)
+            && desc->backbuffer_count >= 2
+            && !wined3d_swapchain_keeps_back_buffers(swapchain))
     {
         struct wined3d_texture *copy_src = swapchain->back_buffers[desc->backbuffer_count - 1];
         struct wined3d_texture *copy_dst = swapchain->back_buffers[0];

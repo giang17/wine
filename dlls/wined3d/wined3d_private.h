@@ -4195,6 +4195,7 @@ struct wined3d_swapchain
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);
 void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain);
 struct wined3d_output * wined3d_swapchain_get_output(const struct wined3d_swapchain *swapchain);
+bool wined3d_swapchain_keeps_back_buffers(const struct wined3d_swapchain *swapchain);
 void swapchain_update_draw_bindings(struct wined3d_swapchain *swapchain);
 void swapchain_set_max_frame_latency(struct wined3d_swapchain *swapchain,
         const struct wined3d_device *device);
