@@ -1918,6 +1918,7 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawTextLayout(ID2D1DeviceConte
 {
     struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
     struct d2d_draw_text_layout_ctx ctx;
+    BOOL clipped = FALSE;
     HRESULT hr;
 
     TRACE("iface %p, origin %s, layout %p, brush %p, options %#x.\n",
@@ -1926,9 +1927,29 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawTextLayout(ID2D1DeviceConte
     ctx.brush = brush;
     ctx.options = options;
 
+    /* D2D1_DRAW_TEXT_OPTIONS_CLIP confines the run to the layout box. The box
+     * is the layout's maximum extent placed at the drawing origin, which is
+     * also what DrawText() derives its layout from, so clipping here covers
+     * both entry points. */
+    if (options & D2D1_DRAW_TEXT_OPTIONS_CLIP)
+    {
+        D2D1_RECT_F clip_rect;
+
+        clip_rect.left = origin.x;
+        clip_rect.top = origin.y;
+        clip_rect.right = origin.x + IDWriteTextLayout_GetMaxWidth(layout);
+        clip_rect.bottom = origin.y + IDWriteTextLayout_GetMaxHeight(layout);
+        ID2D1DeviceContext1_PushAxisAlignedClip((ID2D1DeviceContext1 *)iface,
+                &clip_rect, D2D1_ANTIALIAS_MODE_ALIASED);
+        clipped = TRUE;
+    }
+
     if (FAILED(hr = IDWriteTextLayout_Draw(layout,
             &ctx, &render_target->IDWriteTextRenderer_iface, origin.x, origin.y)))
         FIXME("Failed to draw text layout, hr %#lx.\n", hr);
+
+    if (clipped)
+        ID2D1DeviceContext1_PopAxisAlignedClip((ID2D1DeviceContext1 *)iface);
 }
 
 static D2D1_ANTIALIAS_MODE d2d_device_context_set_aa_mode_from_text_aa_mode(struct d2d_device_context *rt)
@@ -5189,7 +5210,9 @@ static HRESULT STDMETHODCALLTYPE d2d_text_renderer_DrawGlyphRun(IDWriteTextRende
             iface, ctx, baseline_origin_x, baseline_origin_y,
             measuring_mode, glyph_run, glyph_run_desc, effect);
 
-    if (context->options & ~(D2D1_DRAW_TEXT_OPTIONS_NO_SNAP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT))
+    /* CLIP is handled by the caller via PushAxisAlignedClip(). */
+    if (context->options & ~(D2D1_DRAW_TEXT_OPTIONS_NO_SNAP
+            | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | D2D1_DRAW_TEXT_OPTIONS_CLIP))
         FIXME("Ignoring options %#x.\n", context->options);
 
     brush = d2d_draw_get_text_brush(context, effect);
