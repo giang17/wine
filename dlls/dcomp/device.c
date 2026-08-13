@@ -3528,8 +3528,21 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
  * it had, in the thread it had it in: that path answers WM_PAINT and must stay
  * ordered against it.
  *
- * WINE_DCOMP_DELIVER_THREAD=0 delivers from the GUI thread as before, so the
- * two can be compared without a rebuild. */
+ * That is off by default, and the thread is kept only as a switch.  It was
+ * introduced against a freeze that turned out to be an instrumented win32u.so
+ * and was never reproducible afterwards, so it has no defect left to pay for --
+ * while it does cost: a thread whose lifetime has to be managed across window
+ * teardown, a region copy under the device lock, and a second thread reaching
+ * for the same composition DC as the GUI thread.
+ *
+ * Measured against it as well.  On a software-rendered display the line is
+ * missing from far more capture frames with the thread than without (median of
+ * five runs each, 77.0% against 41.7%, ranges apart).  On a GPU the difference
+ * in flicker is not apparent -- but dragging a selection in Fender Studio Pro 8
+ * faults with the thread and does not without it, repeatedly and either speed.
+ *
+ * WINE_DCOMP_DELIVER_THREAD=1 puts the delivery back on a thread of ours, so
+ * anyone who does hit a freeze here still has the switch. */
 static int dcomp_deliver_thread_enabled = -1;
 
 static BOOL dcomp_deliver_thread(void)
@@ -3537,7 +3550,7 @@ static BOOL dcomp_deliver_thread(void)
     if (dcomp_deliver_thread_enabled < 0)
     {
         const char *e = getenv("WINE_DCOMP_DELIVER_THREAD");
-        dcomp_deliver_thread_enabled = (!e || atoi(e)) ? 1 : 0;
+        dcomp_deliver_thread_enabled = (e && atoi(e)) ? 1 : 0;
     }
     return dcomp_deliver_thread_enabled > 0;
 }
