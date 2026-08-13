@@ -246,6 +246,25 @@ static ULONG STDMETHODCALLTYPE dcomp_surface_Release(IDCompositionSurface *iface
     return refcount;
 }
 
+/* An application that draws through IDXGISurface1::GetDC needs the texture
+ * behind the surface created for it, and D3D11 only accepts the flag on a
+ * B8G8R8A8 texture of default usage.  Ask for it exactly where it is allowed:
+ * requesting it elsewhere fails CreateTexture2D outright and would cost the
+ * surface altogether.  Where it is allowed it is free until someone calls
+ * GetDC -- wined3d only records the capability and builds the DIB on demand. */
+static UINT dcomp_surface_gdi_flag(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            return D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
+        default:
+            return 0;
+    }
+}
+
 /* Lazy-init the persistent D2D1 context and bitmaps for the D2D1Device path. */
 static HRESULT dcomp_surface_ensure_d2d1_resources(struct dcomp_surface *surface)
 {
@@ -417,15 +436,27 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_BeginDraw(IDCompositionSurface *i
         return S_OK;
     }
 
-    if (IsEqualGUID(iid, &IID_IDXGISurface))
+    /* IDXGISurface1 adds GetDC()/ReleaseDC() and is how an application draws
+     * into a composition surface with GDI.  Fender Studio Pro 8 asks for
+     * nothing else: its entire visual tree is the transport playhead, three
+     * one-pixel leaves, and it opens every one of them this way.  Refusing the
+     * interface left those leaves empty for good -- measured over three
+     * sessions, 16688 to 41202 calls, every one of them turned away and not a
+     * single EndDraw in return, which is why the playhead was never drawn. */
+    if (IsEqualGUID(iid, &IID_IDXGISurface)
+            || IsEqualGUID(iid, &IID_IDXGISurface1)
+            || IsEqualGUID(iid, &IID_IDXGISurface2))
     {
         if (!surface->dxgi_surface)
         {
             WARN("Surface has no DXGI surface.\n");
             return E_FAIL;
         }
-        IDXGISurface_AddRef(surface->dxgi_surface);
-        *object = surface->dxgi_surface;
+        if (FAILED(hr = IDXGISurface_QueryInterface(surface->dxgi_surface, iid, object)))
+        {
+            WARN("Surface does not support %s: %#lx.\n", debugstr_guid(iid), hr);
+            return hr;
+        }
         surface->drawing = TRUE;
         offset->x = rect ? rect->left : 0;
         offset->y = rect ? rect->top : 0;
@@ -596,6 +627,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
         tex_desc.SampleDesc.Count = 1;
         tex_desc.Usage = D3D11_USAGE_DEFAULT;
         tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        tex_desc.MiscFlags = dcomp_surface_gdi_flag(surface->format);
 
         hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &tex_desc, NULL, &new_texture);
         if (FAILED(hr))
@@ -608,6 +640,9 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
         tex_desc.Usage = D3D11_USAGE_STAGING;
         tex_desc.BindFlags = 0;
         tex_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        /* GDI compatibility is a property of the drawable copy; a staging
+         * texture carrying the flag fails validation for lack of default usage. */
+        tex_desc.MiscFlags = 0;
 
         hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &tex_desc, NULL, &new_staging);
         if (FAILED(hr))
@@ -743,6 +778,7 @@ static HRESULT dcomp_surface_create(ID3D11Device *d3d11_device, ID2D1Device *d2d
         tex_desc.SampleDesc.Count = 1;
         tex_desc.Usage = D3D11_USAGE_DEFAULT;
         tex_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        tex_desc.MiscFlags = dcomp_surface_gdi_flag(pixel_format);
 
         hr = ID3D11Device_CreateTexture2D(d3d11_device, &tex_desc, NULL, &surface->texture);
         if (FAILED(hr))
@@ -754,6 +790,9 @@ static HRESULT dcomp_surface_create(ID3D11Device *d3d11_device, ID2D1Device *d2d
         tex_desc.Usage = D3D11_USAGE_STAGING;
         tex_desc.BindFlags = 0;
         tex_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        /* GDI compatibility is a property of the drawable copy; a staging
+         * texture carrying the flag fails validation for lack of default usage. */
+        tex_desc.MiscFlags = 0;
 
         hr = ID3D11Device_CreateTexture2D(d3d11_device, &tex_desc, NULL, &surface->staging);
         if (FAILED(hr))
@@ -2532,6 +2571,8 @@ static ULONG STDMETHODCALLTYPE dcomp_device_Release(IDCompositionDevice *iface)
 }
 
 static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_timer);
+static void dcomp_surface_readback_region(struct dcomp_surface *surface,
+        LONG l, LONG t, LONG r, LONG b);
 
 /* Depth-first leaf serialization with accumulated offsets. The visual's own
  * offset positions its whole subtree (DComp semantics), so it is added on
@@ -2910,6 +2951,34 @@ static void dcomp_composite_premul_over(DWORD *dst_bits, UINT dst_w, UINT dst_h,
     }
 }
 
+/* Bring the bits the composition reads up to date with what the application
+ * drew.  EndDraw only records the dirty region and leaves the GPU→CPU readback
+ * to the present (issue 56), but that present only ever runs for a surface on
+ * the *root* visual: both call sites of dcomp_target_flush_present() skip a
+ * target whose root carries no content.  A surface hanging on a child visual
+ * was therefore composited out of a buffer nothing ever filled -- measured on
+ * Studio Pro 8, whose entire tree is three such leaves: 1590 walks of them, not
+ * one non-transparent pixel, while the application was drawing all along.
+ * This is the surface counterpart of dcomp_texture_ensure_bits() below. */
+static void dcomp_surface_ensure_bits(struct dcomp_surface *surface)
+{
+    LONG l, t, r, b;
+
+    if (!surface->has_pending || !surface->bits || !surface->width || !surface->height)
+        return;
+
+    l = surface->pending_dirty.left;   t = surface->pending_dirty.top;
+    r = surface->pending_dirty.right;  b = surface->pending_dirty.bottom;
+    if (l < 0) l = 0;
+    if (t < 0) t = 0;
+    if (r > (LONG)surface->width)  r = (LONG)surface->width;
+    if (b > (LONG)surface->height) b = (LONG)surface->height;
+
+    dcomp_surface_readback_region(surface, l, t, r, b);
+    surface->has_pending = FALSE;
+    SetRectEmpty(&surface->pending_dirty);
+}
+
 static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dcomp_visual *visual,
         int base_x, int base_y)
 {
@@ -2921,6 +2990,7 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
     {
         /* Not hashed — never skip-unchanged this tree. */
         target->walk_leaf_hash_valid = FALSE;
+        dcomp_surface_ensure_bits(visual->surface_content);
         dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
                 visual->surface_content->bits, visual->surface_content->width,
                 visual->surface_content->height, vx, vy);
@@ -3288,7 +3358,9 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
      * across the arranger that nothing ever repaired, while the same build with
      * the path skipped drew the window exactly like the unpatched one. */
     if (!target->covers_window)
+    {
         return;
+    }
 
     EnterCriticalSection(&target->device->cs);
     dcomp_target_ensure_comp_dc(target, rc.right, rc.bottom);
