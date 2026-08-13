@@ -2301,6 +2301,21 @@ struct dcomp_target
      * window shows.  Below that we keep off the window entirely: no blit, no
      * WM_PAINT, not even the 60 Hz read-back (issue 187).  Latched. */
     BOOL covers_window;
+    /* Below that threshold we still deliver what the tree covers, just without
+     * claiming the window (issue 190).  These two are that mode's whole state:
+     * the leaf region of the CURRENT frame -- covered_rgn latches and a moving
+     * leaf would grow it into a band -- and the region the last delivery
+     * actually painted, so what we stop covering can be handed back. */
+    HRGN frame_rgn;
+    HRGN delivered_rgn;
+    /* That delivery runs in a thread of ours instead of the application's GUI
+     * thread (issue 190, WINE_DCOMP_DELIVER_THREAD).  deliver_rgn is the
+     * thread's own copy of frame_rgn, taken under the device lock, so the tree
+     * walk can keep rewriting the original while a delivery is in flight. */
+    HANDLE deliver_thread;
+    HANDLE deliver_event;
+    LONG deliver_stop;
+    HRGN deliver_rgn;
     /* Unchanged-content gate (issue 99): hash over all content-leaf sources
      * of the current walk vs. the hash of the last frame that actually
      * reached the window.  The tree timer must only push NEW leaf content —
@@ -2332,6 +2347,8 @@ static inline struct dcomp_target *impl_from_IDCompositionTarget(IDCompositionTa
 {
     return CONTAINING_RECORD(iface, struct dcomp_target, IDCompositionTarget_iface);
 }
+
+static void dcomp_target_join_deliver_thread(struct dcomp_target *target);
 
 static HRESULT STDMETHODCALLTYPE dcomp_target_QueryInterface(IDCompositionTarget *iface,
         REFIID iid, void **out)
@@ -2371,6 +2388,10 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
 
     if (!refcount)
     {
+        /* Our delivery thread dereferences this target and takes the device
+         * lock, so it has to be gone before either is (issue 190). */
+        dcomp_target_join_deliver_thread(target);
+
         /* Remove from device's target list */
         if (target->device)
             dcomp_device_remove_target(target->device, target);
@@ -2406,6 +2427,10 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         /* Clean up presentation state */
         if (target->covered_rgn)
             DeleteObject(target->covered_rgn);
+        if (target->frame_rgn)
+            DeleteObject(target->frame_rgn);
+        if (target->delivered_rgn)
+            DeleteObject(target->delivered_rgn);
         if (target->comp_bitmap)
         {
             SelectObject(target->comp_dc, NULL);
@@ -3279,6 +3304,17 @@ static void dcomp_target_update_covered(struct dcomp_target *target, const RECT 
         dcomp_target_collect_covered(child, (int)target->root_visual->offset_x,
                 (int)target->root_visual->offset_y, current, &unresolved);
 
+    /* Keep this frame's own leaf region (issue 190), taken before the
+     * unresolved fallback below widens it to the whole client area: it is
+     * exactly the area we can put pixels into, and the delivery path needs it
+     * unlatched -- covered_rgn grows with every position a moving leaf has ever
+     * had, and delivering that would put us back to reading and rewriting an
+     * area we do not draw. */
+    if (!target->frame_rgn)
+        target->frame_rgn = CreateRectRgn(0, 0, 0, 0);
+    if (target->frame_rgn)
+        CombineRgn(target->frame_rgn, current, NULL, RGN_COPY);
+
     if (unresolved)
     {
         HRGN all = CreateRectRgn(0, 0, client_rc->right, client_rc->bottom);
@@ -3315,6 +3351,297 @@ static void dcomp_target_update_covered(struct dcomp_target *target, const RECT 
             FIXME("Target %p hwnd %p: tree covers %I64u of %I64u client pixels, taking the "
                     "window over.\n", target, target->hwnd, cover, client);
         }
+    }
+}
+
+/* Blit a region rectangle by rectangle.  Clipping the destination and running
+ * one full-window BitBlt paints the same pixels, but still makes the driver
+ * fetch the whole source -- for the read-back that is an X GetImage over the
+ * entire window, which is precisely the cost this path exists to avoid. */
+static BOOL dcomp_blt_region(HDC dst, HDC src, HRGN region)
+{
+    BOOL ok = FALSE;
+    RGNDATA *data;
+    DWORD size;
+    DWORD i;
+
+    if (!(size = GetRegionData(region, 0, NULL)))
+        return FALSE;
+    if (!(data = malloc(size)))
+        return FALSE;
+    if (GetRegionData(region, size, data))
+    {
+        const RECT *r = (const RECT *)data->Buffer;
+
+        ok = TRUE;
+        for (i = 0; i < data->rdh.nCount; i++)
+        {
+            if (!BitBlt(dst, r[i].left, r[i].top, r[i].right - r[i].left,
+                    r[i].bottom - r[i].top, src, r[i].left, r[i].top, SRCCOPY))
+                ok = FALSE;
+        }
+    }
+    free(data);
+    return ok;
+}
+
+/* -------------------------------------------------------------------------
+ * Delivering the covered region without claiming the window (issue 190).
+ *
+ * The threshold above answers whether our composition IS what the window
+ * shows.  For Fender Studio Pro 8 it plainly is not -- three one-pixel leaves
+ * in a 1920x1027 window -- and claiming the window on their account is what
+ * issue 187 had to undo.  But those three strips are the transport playhead,
+ * and nobody else draws them: below the threshold we delivered nothing at all,
+ * so the line was simply missing while the transport ran.
+ *
+ * Both are avoidable, because the two consequences of the takeover were never
+ * one thing.  Delivering pixels is harmless; taking WM_PAINT away is what goes
+ * stale.  So this reads back, blends and blits ONLY the rectangles the tree
+ * covers -- three one-pixel columns instead of two million pixels -- and leaves
+ * the message with the application.  Nothing is taken from it, so nothing goes
+ * unrepainted, and neither of us writes pixels the other owns.
+ *
+ * This frame's region, never covered_rgn: that one latches (issue 184), and a
+ * playhead walks across the window, so within seconds it would be a wide band
+ * -- reading and rewriting an area we do not draw, which is the takeover again
+ * under another name.
+ *
+ * What we stop covering we hand back.  A leaf that moved or vanished leaves its
+ * pixels standing otherwise, and at sixty frames a second that is the stripe
+ * pattern of issue 187 with the roles reversed.  Invalidating the difference
+ * lets the application repaint it -- which it can, because its WM_PAINT is
+ * still its own.  The playhead disappearing when the transport stops is that
+ * same mechanism and needs no case of its own.
+ *
+ * WINE_DCOMP_REGION_DELIVER=0 falls back to delivering nothing below the
+ * threshold, for counter-checks. */
+static int dcomp_region_delivery_enabled = -1;
+
+static BOOL dcomp_region_delivery(void)
+{
+    if (dcomp_region_delivery_enabled < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_REGION_DELIVER");
+        dcomp_region_delivery_enabled = (!e || atoi(e)) ? 1 : 0;
+    }
+    return dcomp_region_delivery_enabled > 0;
+}
+
+/* The region to deliver is passed in rather than read off the target: with the
+ * delivery running in a thread of its own (below) the tree walk keeps writing
+ * frame_rgn while this runs, so the caller hands over a copy it took under the
+ * device lock.  Same object, same order for the in-thread caller. */
+static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT *rc, HRGN rgn)
+{
+    struct dcomp_visual *root = target->root_visual;
+    struct dcomp_visual *child;
+    RECT box, clip_rc;
+    HRGN vacated;
+    HDC hdc;
+
+    if (!dcomp_region_delivery() || !rgn)
+        return;
+
+    /* Hand back what the last delivery painted and this one does not cover. */
+    if (target->delivered_rgn && (vacated = CreateRectRgn(0, 0, 0, 0)))
+    {
+        if (CombineRgn(vacated, target->delivered_rgn, rgn, RGN_DIFF) > NULLREGION)
+            InvalidateRgn(target->hwnd, vacated, FALSE);
+        DeleteObject(vacated);
+    }
+
+    /* Tree covers nothing this frame: the hand-back above is the whole job. */
+    if (GetRgnBox(rgn, &box) <= NULLREGION)
+    {
+        if (target->delivered_rgn)
+            SetRectRgn(target->delivered_rgn, 0, 0, 0, 0);
+        return;
+    }
+
+    if (!IsWindowVisible(target->hwnd))
+        return;
+
+    EnterCriticalSection(&target->device->cs);
+    dcomp_target_ensure_comp_dc(target, rc->right, rc->bottom);
+    if (target->comp_dc && target->comp_bits)
+    {
+        HDC hdc_win = GetDC(target->hwnd);
+
+        /* Backdrop for the blend, but only underneath the leaves: a leaf that
+         * is not fully opaque has to show what the window has there.  The
+         * read-back that issue 187 measured as damaging is this same call over
+         * the whole client area; bounded to the leaf rectangles it cannot get
+         * in the way of anything the application paints elsewhere. */
+        if (hdc_win)
+        {
+            dcomp_blt_region(target->comp_dc, hdc_win, rgn);
+            ReleaseDC(target->hwnd, hdc_win);
+        }
+
+        for (child = root->children; child; child = child->next_sibling)
+            dcomp_target_composite_leaves(target, child,
+                    (int)root->offset_x, (int)root->offset_y);
+    }
+    LeaveCriticalSection(&target->device->cs);
+
+    if (!target->comp_dc || !(hdc = GetDC(target->hwnd)))
+        return;
+
+    /* An empty clip means the blit cannot reach the window -- BitBlt returns
+     * TRUE all the same, so recording a delivery here would invent a hand-back
+     * for the next frame. */
+    if (GetClipBox(hdc, &clip_rc) > NULLREGION
+            && dcomp_blt_region(hdc, target->comp_dc, rgn))
+    {
+        if (!target->delivered_rgn)
+            target->delivered_rgn = CreateRectRgn(0, 0, 0, 0);
+        if (target->delivered_rgn)
+            CombineRgn(target->delivered_rgn, rgn, NULL, RGN_COPY);
+
+        TRACE("Delivered (%ld,%ld)-(%ld,%ld) of %ldx%ld to hwnd %p, window not claimed.\n",
+                (long)box.left, (long)box.top, (long)box.right, (long)box.bottom,
+                (long)rc->right, (long)rc->bottom, target->hwnd);
+    }
+    ReleaseDC(target->hwnd, hdc);
+}
+
+/* -------------------------------------------------------------------------
+ * Delivering from a thread of our own (issue 190).
+ *
+ * Everything above runs in the application's GUI thread: the composite is
+ * driven by DCOMP_TREE_TIMER through the subclassed wndproc, so the read-back,
+ * the blend and the blit-out happen between two of the application's own
+ * messages.  That thread is also the one that renders through D2D1 and waits on
+ * the wined3d cs thread, so our X traffic and its GL traffic take turns inside
+ * one message loop -- and whatever the delivery costs, the application's own
+ * painting waits for it.
+ *
+ * The delivery does not need that thread.  It reads a region the tree walk
+ * produced and writes it back to the window; both are legal from any thread.
+ * Moving it off means the GUI thread only sets an event, and a thread of ours
+ * may block on X as long as it likes without the application's message loop
+ * noticing.
+ *
+ * Only the below-threshold path moves.  A tree that covers its window
+ * (covers_window, WebView2 and everything like it) keeps every line of the code
+ * it had, in the thread it had it in: that path answers WM_PAINT and must stay
+ * ordered against it.
+ *
+ * WINE_DCOMP_DELIVER_THREAD=0 delivers from the GUI thread as before, so the
+ * two can be compared without a rebuild. */
+static int dcomp_deliver_thread_enabled = -1;
+
+static BOOL dcomp_deliver_thread(void)
+{
+    if (dcomp_deliver_thread_enabled < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_DELIVER_THREAD");
+        dcomp_deliver_thread_enabled = (!e || atoi(e)) ? 1 : 0;
+    }
+    return dcomp_deliver_thread_enabled > 0;
+}
+
+static DWORD CALLBACK dcomp_target_deliver_proc(void *arg)
+{
+    struct dcomp_target *target = arg;
+
+    for (;;)
+    {
+        RECT rc;
+        BOOL have, taken_over;
+
+        /* The timeout is a backstop, not the drive: a signal that arrives while
+         * a delivery runs is not lost (auto-reset event stays set), and one that
+         * arrives after the last frame still gets a pass. */
+        WaitForSingleObject(target->deliver_event, 100);
+        if (InterlockedCompareExchange(&target->deliver_stop, 0, 0))
+            break;
+
+        if (!target->device || !target->hwnd || !IsWindow(target->hwnd))
+            continue;
+        GetClientRect(target->hwnd, &rc);
+        if (rc.right <= 0 || rc.bottom <= 0)
+            continue;
+
+        /* Take a copy of this frame's region under the device lock -- the tree
+         * walk in the GUI thread keeps rewriting frame_rgn. */
+        have = taken_over = FALSE;
+        EnterCriticalSection(&target->device->cs);
+        /* The takeover latch can flip while we run (issue 187): from then on the
+         * GUI thread composites the whole window through the same comp_dc, and a
+         * delivery of ours would be a second thread writing it -- for a window
+         * that path is already painting whole.  The latch never goes back, so
+         * there is nothing left for this thread to do.  The backstop timeout
+         * above means it would keep delivering on its own otherwise, long after
+         * the composite path stopped asking. */
+        if (target->covers_window)
+            taken_over = TRUE;
+        else if (target->frame_rgn)
+        {
+            if (!target->deliver_rgn)
+                target->deliver_rgn = CreateRectRgn(0, 0, 0, 0);
+            if (target->deliver_rgn)
+                have = CombineRgn(target->deliver_rgn, target->frame_rgn, NULL, RGN_COPY) != ERROR;
+        }
+        LeaveCriticalSection(&target->device->cs);
+
+        if (taken_over)
+            break;
+        if (have)
+            dcomp_target_deliver_region(target, &rc, target->deliver_rgn);
+    }
+    return 0;
+}
+
+static BOOL dcomp_target_start_deliver_thread(struct dcomp_target *target)
+{
+    if (target->deliver_thread)
+        return TRUE;
+    if (InterlockedCompareExchange(&target->deliver_stop, 0, 0))
+        return FALSE;
+
+    if (!target->deliver_event
+            && !(target->deliver_event = CreateEventW(NULL, FALSE, FALSE, NULL)))
+        return FALSE;
+    if (!(target->deliver_thread = CreateThread(NULL, 0, dcomp_target_deliver_proc, target, 0, NULL)))
+        return FALSE;
+
+    FIXME("Delivering the covered region of target %p hwnd %p from a thread of our own.\n",
+            target, target->hwnd);
+    return TRUE;
+}
+
+/* Signal only -- never wait here.  Called from the window's own teardown, where
+ * blocking on a thread that may be inside a GDI call on that very window would
+ * be the freeze we are trying to keep out of the GUI thread. */
+static void dcomp_target_stop_deliver_thread(struct dcomp_target *target)
+{
+    InterlockedExchange(&target->deliver_stop, 1);
+    if (target->deliver_event)
+        SetEvent(target->deliver_event);
+}
+
+/* The join belongs to Release, the one place that frees the target the thread
+ * dereferences. */
+static void dcomp_target_join_deliver_thread(struct dcomp_target *target)
+{
+    dcomp_target_stop_deliver_thread(target);
+    if (target->deliver_thread)
+    {
+        WaitForSingleObject(target->deliver_thread, INFINITE);
+        CloseHandle(target->deliver_thread);
+        target->deliver_thread = NULL;
+    }
+    if (target->deliver_event)
+    {
+        CloseHandle(target->deliver_event);
+        target->deliver_event = NULL;
+    }
+    if (target->deliver_rgn)
+    {
+        DeleteObject(target->deliver_rgn);
+        target->deliver_rgn = NULL;
     }
 }
 
@@ -3359,6 +3686,19 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
      * the path skipped drew the window exactly like the unpatched one. */
     if (!target->covers_window)
     {
+        /* Deliver the covered region all the same, without claiming the window
+         * (issue 190): those leaves are content nobody else draws -- Studio
+         * Pro 8's entire tree is its transport playhead, and it was missing
+         * because below the threshold we composited nothing at all.
+         *
+         * Hand it to our own thread if we have one: the region for this frame is
+         * already in frame_rgn, so all this thread owes the delivery is a signal
+         * (see dcomp_target_deliver_proc). */
+        if (dcomp_deliver_thread() && dcomp_region_delivery()
+                && dcomp_target_start_deliver_thread(target))
+            SetEvent(target->deliver_event);
+        else
+            dcomp_target_deliver_region(target, &rc, target->frame_rgn);
         return;
     }
 
@@ -3949,9 +4289,21 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             dcomp_target_composite_tree(target, FALSE);
 
             /* A tree that covers too little of the window never took it over,
-             * so its WM_PAINT was never ours to answer (issue 187). */
+             * so its WM_PAINT was never ours to answer (issue 187).  Let the
+             * application answer it in full -- and put our leaves back on top
+             * afterwards (issue 190), because its BeginPaint clip may well have
+             * covered them.  Waiting for the next tree timer tick instead would
+             * drop the line for up to a frame every time the application
+             * repaints that area, which while scrolling is constantly. */
             if (!target->covers_window)
-                break;
+            {
+                LRESULT ret = orig_wndproc
+                        ? CallWindowProcW(orig_wndproc, hwnd, msg, wparam, lparam)
+                        : DefWindowProcW(hwnd, msg, wparam, lparam);
+
+                dcomp_target_composite_tree(target, FALSE);
+                return ret;
+            }
 
             BeginPaint(hwnd, &ps);
             EndPaint(hwnd, &ps);
@@ -3965,6 +4317,11 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
          * wndproc of its own; restoring NULL would leave the window without a
          * procedure at all. */
         KillTimer(hwnd, DCOMP_TREE_TIMER);
+        /* Tell our delivery thread to stop, but do not wait for it here: it may
+         * be inside a GDI call on the very window being torn down, and blocking
+         * the GUI thread on that is exactly what this thread exists to avoid.
+         * Release joins it (issue 190). */
+        dcomp_target_stop_deliver_thread(target);
         if (orig_wndproc)
         {
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig_wndproc);
