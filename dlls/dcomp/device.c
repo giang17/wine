@@ -3955,6 +3955,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateSurfaceFromHandle(IDComposit
         HANDLE handle, IUnknown **surface)
 {
     FIXME("iface %p, handle %p, surface %p stub!\n", iface, handle, surface);
+
+    *surface = NULL;
     return E_NOTIMPL;
 }
 
@@ -3962,6 +3964,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateSurfaceFromHwnd(IDCompositio
         HWND hwnd, IUnknown **surface)
 {
     FIXME("iface %p, hwnd %p, surface %p stub!\n", iface, hwnd, surface);
+
+    *surface = NULL;
     return E_NOTIMPL;
 }
 
@@ -3969,6 +3973,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTranslateTransform(IDComposi
         IDCompositionTranslateTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -3976,6 +3982,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateScaleTransform(IDComposition
         IDCompositionScaleTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -3983,6 +3991,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateRotateTransform(IDCompositio
         IDCompositionRotateTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -3990,6 +4000,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateSkewTransform(IDCompositionD
         IDCompositionSkewTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -3997,6 +4009,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateMatrixTransform(IDCompositio
         IDCompositionMatrixTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -4006,6 +4020,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTransformGroup(IDComposition
 {
     FIXME("iface %p, transforms %p, elements %u, group %p stub!\n",
             iface, transforms, elements, transform_group);
+
+    *transform_group = NULL;
     return E_NOTIMPL;
 }
 
@@ -4013,6 +4029,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTranslateTransform3D(IDCompo
         IDCompositionTranslateTransform3D **transform_3d)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform_3d);
+
+    *transform_3d = NULL;
     return E_NOTIMPL;
 }
 
@@ -4020,6 +4038,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateScaleTransform3D(IDCompositi
         IDCompositionScaleTransform3D **transform_3d)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform_3d);
+
+    *transform_3d = NULL;
     return E_NOTIMPL;
 }
 
@@ -4027,6 +4047,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateRotateTransform3D(IDComposit
         IDCompositionRotateTransform3D **transform_3d)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform_3d);
+
+    *transform_3d = NULL;
     return E_NOTIMPL;
 }
 
@@ -4034,6 +4056,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateMatrixTransform3D(IDComposit
         IDCompositionMatrixTransform3D **transform_3d)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform_3d);
+
+    *transform_3d = NULL;
     return E_NOTIMPL;
 }
 
@@ -4043,6 +4067,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTransform3DGroup(IDCompositi
 {
     FIXME("iface %p, transforms %p, elements %u, group %p stub!\n",
             iface, transforms_3d, elements, transform_3d_group);
+
+    *transform_3d_group = NULL;
     return E_NOTIMPL;
 }
 
@@ -4050,6 +4076,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateEffectGroup(IDCompositionDev
         IDCompositionEffectGroup **effect_group)
 {
     FIXME("iface %p, effect_group %p stub!\n", iface, effect_group);
+
+    *effect_group = NULL;
     return E_NOTIMPL;
 }
 
@@ -4057,6 +4085,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateRectangleClip(IDCompositionD
         IDCompositionRectangleClip **clip)
 {
     FIXME("iface %p, clip %p stub!\n", iface, clip);
+
+    *clip = NULL;
     return E_NOTIMPL;
 }
 
@@ -4064,6 +4094,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateAnimation(IDCompositionDevic
         IDCompositionAnimation **animation)
 {
     FIXME("iface %p, animation %p stub!\n", iface, animation);
+
+    *animation = NULL;
     return E_NOTIMPL;
 }
 
@@ -4232,6 +4264,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateTranslateTransform(
         IDCompositionDesktopDevice *iface, IDCompositionTranslateTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -4239,6 +4273,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateScaleTransform(
         IDCompositionDesktopDevice *iface, IDCompositionScaleTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -4246,6 +4282,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateRotateTransform(
         IDCompositionDesktopDevice *iface, IDCompositionRotateTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -4253,6 +4291,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateSkewTransform(
         IDCompositionDesktopDevice *iface, IDCompositionSkewTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -4260,6 +4300,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateMatrixTransform(
         IDCompositionDesktopDevice *iface, IDCompositionMatrixTransform **transform)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform);
+
+    *transform = NULL;
     return E_NOTIMPL;
 }
 
@@ -4269,6 +4311,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateTransformGroup(
 {
     FIXME("iface %p, transforms %p, elements %u, group %p stub!\n",
             iface, transforms, elements, transform_group);
+
+    *transform_group = NULL;
     return E_NOTIMPL;
 }
 
@@ -4276,6 +4320,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateTranslateTransform3D
         IDCompositionDesktopDevice *iface, IDCompositionTranslateTransform3D **transform_3d)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform_3d);
+
+    *transform_3d = NULL;
     return E_NOTIMPL;
 }
 
@@ -4283,6 +4329,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateScaleTransform3D(
         IDCompositionDesktopDevice *iface, IDCompositionScaleTransform3D **transform_3d)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform_3d);
+
+    *transform_3d = NULL;
     return E_NOTIMPL;
 }
 
@@ -4290,6 +4338,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateRotateTransform3D(
         IDCompositionDesktopDevice *iface, IDCompositionRotateTransform3D **transform_3d)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform_3d);
+
+    *transform_3d = NULL;
     return E_NOTIMPL;
 }
 
@@ -4297,6 +4347,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateMatrixTransform3D(
         IDCompositionDesktopDevice *iface, IDCompositionMatrixTransform3D **transform_3d)
 {
     FIXME("iface %p, transform %p stub!\n", iface, transform_3d);
+
+    *transform_3d = NULL;
     return E_NOTIMPL;
 }
 
@@ -4306,6 +4358,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateTransform3DGroup(
 {
     FIXME("iface %p, transforms %p, elements %u, group %p stub!\n",
             iface, transforms_3d, elements, transform_3d_group);
+
+    *transform_3d_group = NULL;
     return E_NOTIMPL;
 }
 
@@ -4313,6 +4367,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateEffectGroup(
         IDCompositionDesktopDevice *iface, IDCompositionEffectGroup **effect_group)
 {
     FIXME("iface %p, effect_group %p stub!\n", iface, effect_group);
+
+    *effect_group = NULL;
     return E_NOTIMPL;
 }
 
@@ -4320,6 +4376,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateRectangleClip(
         IDCompositionDesktopDevice *iface, IDCompositionRectangleClip **clip)
 {
     FIXME("iface %p, clip %p stub!\n", iface, clip);
+
+    *clip = NULL;
     return E_NOTIMPL;
 }
 
@@ -4327,6 +4385,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateAnimation(
         IDCompositionDesktopDevice *iface, IDCompositionAnimation **animation)
 {
     FIXME("iface %p, animation %p stub!\n", iface, animation);
+
+    *animation = NULL;
     return E_NOTIMPL;
 }
 
