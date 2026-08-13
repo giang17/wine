@@ -1480,6 +1480,116 @@ static const IDCompositionDynamicTextureVtbl dcomp_dynamic_texture_vtbl =
     dcomp_dynamic_texture_SetTextureFull,
 };
 
+/* =====================================================================
+ * IDCompositionEffectGroup
+ *
+ * The object exists so that an application which does not check the result of
+ * CreateEffectGroup has something to hold, but the effects are not applied.
+ * SetEffect refuses the group for the same reason: an application told that
+ * the effect is in place stops drawing the affected content itself.
+ * ===================================================================== */
+
+struct dcomp_effect_group
+{
+    IDCompositionEffectGroup IDCompositionEffectGroup_iface;
+    LONG refcount;
+};
+
+static inline struct dcomp_effect_group *impl_from_IDCompositionEffectGroup(
+        IDCompositionEffectGroup *iface)
+{
+    return CONTAINING_RECORD(iface, struct dcomp_effect_group, IDCompositionEffectGroup_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_effect_group_QueryInterface(
+        IDCompositionEffectGroup *iface, REFIID iid, void **out)
+{
+    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IUnknown)
+            || IsEqualGUID(iid, &IID_IDCompositionEffect)
+            || IsEqualGUID(iid, &IID_IDCompositionEffectGroup))
+    {
+        *out = iface;
+        IDCompositionEffectGroup_AddRef(iface);
+        return S_OK;
+    }
+
+    FIXME("unsupported iid %s.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_effect_group_AddRef(IDCompositionEffectGroup *iface)
+{
+    struct dcomp_effect_group *group = impl_from_IDCompositionEffectGroup(iface);
+    ULONG refcount = InterlockedIncrement(&group->refcount);
+
+    TRACE("%p, refcount %lu.\n", iface, refcount);
+    return refcount;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_effect_group_Release(IDCompositionEffectGroup *iface)
+{
+    struct dcomp_effect_group *group = impl_from_IDCompositionEffectGroup(iface);
+    ULONG refcount = InterlockedDecrement(&group->refcount);
+
+    TRACE("%p, refcount %lu.\n", iface, refcount);
+
+    if (!refcount)
+        free(group);
+    return refcount;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_effect_group_SetOpacityAnimation(
+        IDCompositionEffectGroup *iface, IDCompositionAnimation *animation)
+{
+    FIXME("iface %p, animation %p: not applied.\n", iface, animation);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_effect_group_SetOpacity(
+        IDCompositionEffectGroup *iface, float opacity)
+{
+    FIXME("iface %p, opacity %f: not applied.\n", iface, opacity);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_effect_group_SetTransform3D(
+        IDCompositionEffectGroup *iface, IDCompositionTransform3D *transform)
+{
+    FIXME("iface %p, transform %p: not applied.\n", iface, transform);
+    return S_OK;
+}
+
+static const IDCompositionEffectGroupVtbl dcomp_effect_group_vtbl =
+{
+    dcomp_effect_group_QueryInterface,
+    dcomp_effect_group_AddRef,
+    dcomp_effect_group_Release,
+    dcomp_effect_group_SetOpacityAnimation,
+    dcomp_effect_group_SetOpacity,
+    dcomp_effect_group_SetTransform3D,
+};
+
+static HRESULT dcomp_effect_group_create(IDCompositionEffectGroup **out)
+{
+    struct dcomp_effect_group *group;
+
+    if (!out)
+        return E_INVALIDARG;
+
+    *out = NULL;
+    if (!(group = calloc(1, sizeof(*group))))
+        return E_OUTOFMEMORY;
+
+    group->IDCompositionEffectGroup_iface.lpVtbl = &dcomp_effect_group_vtbl;
+    group->refcount = 1;
+
+    *out = &group->IDCompositionEffectGroup_iface;
+    return S_OK;
+}
+
 struct dcomp_visual
 {
     IDCompositionVisual IDCompositionVisual_iface;
@@ -1715,8 +1825,11 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetTransformParent(IDCompositionVi
 static HRESULT STDMETHODCALLTYPE dcomp_visual_SetEffect(IDCompositionVisual *iface,
         IDCompositionEffect *effect)
 {
-    FIXME("iface %p, effect %p stub!\n", iface, effect);
-    return S_OK;
+    FIXME("iface %p, effect %p: effects are not applied.\n", iface, effect);
+
+    /* Refusing the effect is deliberate: told that it took, the application
+     * hands the affected content to the compositor and stops drawing it. */
+    return effect ? E_NOTIMPL : S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_visual_SetBitmapInterpolationMode(IDCompositionVisual *iface,
@@ -2136,6 +2249,19 @@ struct dcomp_target
      * application mid-flight.  Never latched at all means the tree carries
      * nothing and this target must keep its hands off the window. */
     BOOL tree_had_content;
+    /* Client-space union of every leaf rectangle this target's tree has ever
+     * covered (issue 187).  The latch above says WHETHER we may paint, this
+     * says HOW FAR: outside it the window was never ours, and taking its
+     * WM_PAINT away there stops the application from repainting an area we do
+     * not deliver.  Latched like the verdict and for the same reason
+     * (issue 184) -- a tree that runs empty between two generations must not
+     * hand back the area it already owns.  NULL until the first composite. */
+    HRGN covered_rgn;
+    /* covered_rgn has reached DCOMP_MIN_COVER_PERCENT of the client area at
+     * least once, i.e. our composition can plausibly be said to BE what this
+     * window shows.  Below that we keep off the window entirely: no blit, no
+     * WM_PAINT, not even the 60 Hz read-back (issue 187).  Latched. */
+    BOOL covers_window;
     /* Unchanged-content gate (issue 99): hash over all content-leaf sources
      * of the current walk vs. the hash of the last frame that actually
      * reached the window.  The tree timer must only push NEW leaf content —
@@ -2239,6 +2365,8 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         }
 
         /* Clean up presentation state */
+        if (target->covered_rgn)
+            DeleteObject(target->covered_rgn);
         if (target->comp_bitmap)
         {
             SelectObject(target->comp_dc, NULL);
@@ -2916,6 +3044,210 @@ static BOOL dcomp_target_tree_carries_content(struct dcomp_target *target)
     return FALSE;
 }
 
+/* Pixel extent this leaf would occupy in the composition, derived the same way
+ * dcomp_target_composite_leaves() derives it — but without paying for it: no
+ * texture readback, no pixel pointer, only the dimensions.  FALSE when the
+ * visual carries no content of its own or its size is not known yet. */
+static BOOL dcomp_visual_leaf_extent(struct dcomp_visual *visual, UINT *w, UINT *h)
+{
+    struct dcomp_texture *tex;
+
+    if (visual->surface_content)
+    {
+        *w = visual->surface_content->width;
+        *h = visual->surface_content->height;
+        return *w && *h;
+    }
+    if ((tex = dcomp_visual_effective_texture(visual)))
+    {
+        UINT x, y;
+
+        *w = tex->desc.Width;
+        *h = tex->desc.Height;
+        if (tex->has_source_rect)
+        {
+            x = min(tex->source_rect.left, tex->desc.Width);
+            y = min(tex->source_rect.top, tex->desc.Height);
+            *w = min(tex->source_rect.right, tex->desc.Width) - x;
+            *h = min(tex->source_rect.bottom, tex->desc.Height) - y;
+        }
+        return (int)*w > 0 && (int)*h > 0;
+    }
+    if (visual->content)
+    {
+        WCHAR prop_name[64];
+        HWND comp_wnd;
+        ULONG_PTR dims;
+
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)visual->content);
+        if (!(comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name)))
+            return FALSE;
+        if (!(dims = (ULONG_PTR)GetPropW(comp_wnd, L"__wine_dcomp_comp_size")))
+            return FALSE;
+        *w = LOWORD(dims);
+        *h = HIWORD(dims);
+        return *w && *h;
+    }
+    return FALSE;
+}
+
+/* -------------------------------------------------------------------------
+ * How far the takeover reaches (issue 187).
+ *
+ * dcomp_target_tree_carries_content() answers WHETHER this target may paint
+ * the window.  That verdict is binary, and the consequence used to be total:
+ * the whole window blitted from our composition, its whole WM_PAINT swallowed.
+ * For a tree that IS the window (WebView2, issue 88) that is right.  Fender
+ * Studio Pro 8 shows what it costs otherwise -- three one-pixel strips in a
+ * 1920x1027 window, 0.03% coverage, and the application is never asked to
+ * repaint the remaining 99.97% again.  It scrolls its arranger, the exposed
+ * area is never redrawn, and the old pixels pile up into a stripe pattern.
+ *
+ * So the area answers HOW FAR: the union of every leaf rectangle the tree has
+ * ever covered.  Outside it the window was never ours.
+ *
+ * Latched exactly like the verdict, and for the same reason (issue 184): a
+ * rootless tree is momentarily empty between two generations, and a region
+ * that shrank in those frames would hand the window back mid-flight and let
+ * the application paint over our composition.
+ *
+ * A leaf whose extent is not resolvable yet (a swapchain leaf before wined3d
+ * published its comp size) claims the whole client area instead of nothing --
+ * being too eager to disown an area is the expensive mistake, and the fallback
+ * is exactly the behaviour this code had before.
+ */
+static UINT64 dcomp_region_area(HRGN region)
+{
+    UINT64 area = 0;
+    RGNDATA *data;
+    DWORD size;
+    DWORD i;
+
+    if (!(size = GetRegionData(region, 0, NULL)))
+        return 0;
+    if (!(data = malloc(size)))
+        return 0;
+    if (GetRegionData(region, size, data))
+    {
+        const RECT *r = (const RECT *)data->Buffer;
+
+        for (i = 0; i < data->rdh.nCount; i++)
+            area += (UINT64)(r[i].right - r[i].left) * (r[i].bottom - r[i].top);
+    }
+    free(data);
+    return area;
+}
+
+/* Share of the client area the tree has to cover before this target takes the
+ * window over at all.  The two kinds of tree are three orders of magnitude
+ * apart, so the exact number matters little: WebView2 and the trees like it
+ * put the page itself into one leaf and cover essentially the whole window,
+ * while Fender Studio Pro 8 covers 0.03%.  Anything between them separates the
+ * cases; half the window says plainly what the takeover assumes, namely that
+ * our composition IS what the window shows.  WINE_DCOMP_MIN_COVER overrides it
+ * (percent, 0 disables the check). */
+#define DCOMP_MIN_COVER_PERCENT 50
+
+static int dcomp_min_cover_percent = -1;
+
+static int dcomp_min_cover(void)
+{
+    if (dcomp_min_cover_percent < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_MIN_COVER");
+        dcomp_min_cover_percent = e ? atoi(e) : DCOMP_MIN_COVER_PERCENT;
+        if (dcomp_min_cover_percent < 0)
+            dcomp_min_cover_percent = 0;
+    }
+    return dcomp_min_cover_percent;
+}
+
+static void dcomp_target_collect_covered(struct dcomp_visual *visual, int base_x, int base_y,
+        HRGN region, BOOL *unresolved)
+{
+    struct dcomp_visual *child;
+    int vx = base_x + (int)visual->offset_x;
+    int vy = base_y + (int)visual->offset_y;
+    UINT w, h;
+
+    if (dcomp_visual_leaf_extent(visual, &w, &h))
+    {
+        HRGN leaf = CreateRectRgn(vx, vy, vx + (int)w, vy + (int)h);
+
+        if (leaf)
+        {
+            CombineRgn(region, region, leaf, RGN_OR);
+            DeleteObject(leaf);
+        }
+        else *unresolved = TRUE;
+    }
+    else if (visual->content || visual->surface_content || dcomp_visual_effective_texture(visual))
+    {
+        /* Carries content by the same test the latch uses, but will not say how
+         * large it is yet. */
+        *unresolved = TRUE;
+    }
+
+    for (child = visual->children; child; child = child->next_sibling)
+        dcomp_target_collect_covered(child, vx, vy, region, unresolved);
+}
+
+static void dcomp_target_update_covered(struct dcomp_target *target, const RECT *client_rc)
+{
+    struct dcomp_visual *child;
+    BOOL unresolved = FALSE;
+    HRGN current;
+
+    if (!target->root_visual)
+        return;
+
+    if (!(current = CreateRectRgn(0, 0, 0, 0)))
+        return;
+
+    for (child = target->root_visual->children; child; child = child->next_sibling)
+        dcomp_target_collect_covered(child, (int)target->root_visual->offset_x,
+                (int)target->root_visual->offset_y, current, &unresolved);
+
+    if (unresolved)
+    {
+        HRGN all = CreateRectRgn(0, 0, client_rc->right, client_rc->bottom);
+
+        if (all)
+        {
+            CombineRgn(current, current, all, RGN_OR);
+            DeleteObject(all);
+        }
+    }
+
+    if (!target->covered_rgn)
+        target->covered_rgn = current;
+    else
+    {
+        CombineRgn(target->covered_rgn, target->covered_rgn, current, RGN_OR);
+        DeleteObject(current);
+    }
+
+    /* Latched like everything else here: a tree that once covered the window
+     * keeps the window, so an empty generation cannot revoke the takeover
+     * mid-flight (issue 184). */
+    if (!target->covers_window)
+    {
+        UINT64 client = (UINT64)client_rc->right * client_rc->bottom;
+        UINT64 cover;
+
+        if (!dcomp_min_cover())
+            target->covers_window = TRUE;
+        else if (client && (cover = dcomp_region_area(target->covered_rgn)) * 100
+                >= client * dcomp_min_cover())
+        {
+            target->covers_window = TRUE;
+            FIXME("Target %p hwnd %p: tree covers %I64u of %I64u client pixels, taking the "
+                    "window over.\n", target, target->hwnd, cover, client);
+        }
+    }
+}
+
 static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_timer)
 {
     struct dcomp_visual *root;
@@ -2941,6 +3273,21 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
 
     GetClientRect(target->hwnd, &rc);
     if (rc.right <= 0 || rc.bottom <= 0)
+        return;
+
+    EnterCriticalSection(&target->device->cs);
+    dcomp_target_update_covered(target, &rc);
+    LeaveCriticalSection(&target->device->cs);
+
+    /* Too little of the window to call our composition its content (issue 187).
+     * Then the honest answer is to keep off it altogether: the read-back and
+     * blit below would put a foreign body into a window the application paints
+     * itself, and every pass of it fights the application's own drawing.
+     * MEASURED on Fender Studio Pro 8: three one-pixel leaves, 0.03% of the
+     * window; running this path at all left vertical strips of stale pixels
+     * across the arranger that nothing ever repaired, while the same build with
+     * the path skipped drew the window exactly like the unpatched one. */
+    if (!target->covers_window)
         return;
 
     EnterCriticalSection(&target->device->cs);
@@ -3026,6 +3373,12 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
         hdc = GetDC(target->hwnd);
         if (hdc)
         {
+            /* Paint only as far as the tree reaches (issue 187).  Everything
+             * outside comes straight out of the backdrop read back from this
+             * very window a moment ago, so writing it back is at best a no-op
+             * -- and at worst it loses whatever the application painted in
+             * between, sixty times a second.  A tree that covers the window
+             * clips to the same area as before and is unaffected. */
             clip_out = GetClipBox(hdc, &clip_out_rc);
 
             /* Parked targets must not be painted: WebView2 keeps the target
@@ -3520,7 +3873,14 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         {
             PAINTSTRUCT ps;
 
+            /* Also brings covered_rgn and covers_window up to date. */
             dcomp_target_composite_tree(target, FALSE);
+
+            /* A tree that covers too little of the window never took it over,
+             * so its WM_PAINT was never ours to answer (issue 187). */
+            if (!target->covers_window)
+                break;
+
             BeginPaint(hwnd, &ps);
             EndPaint(hwnd, &ps);
             return 0;
@@ -4075,10 +4435,9 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTransform3DGroup(IDCompositi
 static HRESULT STDMETHODCALLTYPE dcomp_device_CreateEffectGroup(IDCompositionDevice *iface,
         IDCompositionEffectGroup **effect_group)
 {
-    FIXME("iface %p, effect_group %p stub!\n", iface, effect_group);
+    TRACE("iface %p, effect_group %p.\n", iface, effect_group);
 
-    *effect_group = NULL;
-    return E_NOTIMPL;
+    return dcomp_effect_group_create(effect_group);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device_CreateRectangleClip(IDCompositionDevice *iface,
@@ -4366,10 +4725,9 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateTransform3DGroup(
 static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateEffectGroup(
         IDCompositionDesktopDevice *iface, IDCompositionEffectGroup **effect_group)
 {
-    FIXME("iface %p, effect_group %p stub!\n", iface, effect_group);
+    TRACE("iface %p, effect_group %p.\n", iface, effect_group);
 
-    *effect_group = NULL;
-    return E_NOTIMPL;
+    return dcomp_effect_group_create(effect_group);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateRectangleClip(
