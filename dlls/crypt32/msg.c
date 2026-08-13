@@ -969,6 +969,12 @@ typedef struct _CSignedMsgData
     CRYPT_SIGNED_INFO *info;
     DWORD              cSignerHandle;
     CSignerHandles    *signerHandles;
+    /* The signed attributes of each signer as they appear in a decoded
+     * message, with the implicit [0] tag replaced by the SET OF tag the
+     * signature was computed over.  Empty when encoding a message.
+     */
+    DWORD              cAuthAttrsEncoded;
+    CRYPT_DER_BLOB    *authAttrsEncoded;
 } CSignedMsgData;
 
 /* Constructs the signer handles for the signerIndex'th signer of msg_data.
@@ -1044,6 +1050,11 @@ static void CSignedMsgData_CloseHandles(CSignedMsgData *msg_data)
     CryptMemFree(msg_data->signerHandles);
     msg_data->signerHandles = NULL;
     msg_data->cSignerHandle = 0;
+    for (i = 0; i < msg_data->cAuthAttrsEncoded; i++)
+        CryptMemFree(msg_data->authAttrsEncoded[i].pbData);
+    CryptMemFree(msg_data->authAttrsEncoded);
+    msg_data->authAttrsEncoded = NULL;
+    msg_data->cAuthAttrsEncoded = 0;
 }
 
 static BOOL CSignedMsgData_UpdateHash(CSignedMsgData *msg_data,
@@ -1103,6 +1114,125 @@ typedef enum {
     Verify
 } SignOrVerify;
 
+/* Reads the header of a definite-length DER element.  Returns FALSE for the
+ * indefinite-length form and for any length that doesn't fit in the buffer.
+ */
+static BOOL CRYPT_DERPeekTLV(const BYTE *pbEncoded, DWORD cbEncoded, BYTE *tag,
+ DWORD *hdrLen, DWORD *contentLen)
+{
+    DWORD len, lenBytes, i;
+
+    if (cbEncoded < 2)
+        return FALSE;
+    *tag = pbEncoded[0];
+    if (pbEncoded[1] & 0x80)
+    {
+        lenBytes = pbEncoded[1] & 0x7f;
+        if (!lenBytes || lenBytes > sizeof(DWORD) || cbEncoded < 2 + lenBytes)
+            return FALSE;
+        for (len = 0, i = 0; i < lenBytes; i++)
+            len = (len << 8) | pbEncoded[2 + i];
+        *hdrLen = 2 + lenBytes;
+    }
+    else
+    {
+        len = pbEncoded[1];
+        *hdrLen = 2;
+    }
+    if (len > cbEncoded - *hdrLen)
+        return FALSE;
+    *contentLen = len;
+    return TRUE;
+}
+
+/* Records the signed attributes of each signer exactly as they appear in
+ * pbEncoded, with the implicit [0] tag replaced by the SET OF tag.
+ *
+ * Verification has to hash these bytes verbatim.  Re-encoding the decoded
+ * attributes is not equivalent: the encoder sorts the SET OF into DER order,
+ * but a signer is free to emit the attributes unsorted, and the signature
+ * covers the order it used.  Widely used signing tools do emit them unsorted.
+ *
+ * Failing here is not fatal; the caller falls back to re-encoding.
+ */
+static void CSignedMsgData_RecordAuthAttrsEncoding(CSignedMsgData *msg_data,
+ const BYTE *pbEncoded, DWORD cbEncoded)
+{
+    const BYTE *ptr, *end, *signers = NULL;
+    DWORD hdrLen, contentLen, signersLen = 0, i;
+    BYTE tag;
+
+    if (!msg_data->info->cSignerInfo)
+        return;
+    if (!CRYPT_DERPeekTLV(pbEncoded, cbEncoded, &tag, &hdrLen, &contentLen) ||
+     tag != ASN_SEQUENCE)
+        return;
+
+    /* signerInfos is the last field of SignedData. */
+    ptr = pbEncoded + hdrLen;
+    end = ptr + contentLen;
+    while (ptr < end && CRYPT_DERPeekTLV(ptr, end - ptr, &tag, &hdrLen,
+     &contentLen))
+    {
+        signers = ptr + hdrLen;
+        signersLen = contentLen;
+        ptr += hdrLen + contentLen;
+    }
+    if (ptr != end || !signers || tag != (ASN_CONSTRUCTOR | ASN_SETOF))
+        return;
+
+    msg_data->authAttrsEncoded = CryptMemAlloc(
+     msg_data->info->cSignerInfo * sizeof(CRYPT_DER_BLOB));
+    if (!msg_data->authAttrsEncoded)
+        return;
+    memset(msg_data->authAttrsEncoded, 0,
+     msg_data->info->cSignerInfo * sizeof(CRYPT_DER_BLOB));
+    msg_data->cAuthAttrsEncoded = msg_data->info->cSignerInfo;
+
+    ptr = signers;
+    end = signers + signersLen;
+    for (i = 0; i < msg_data->cAuthAttrsEncoded && ptr < end; i++)
+    {
+        const BYTE *field, *signerEnd;
+
+        if (!CRYPT_DERPeekTLV(ptr, end - ptr, &tag, &hdrLen, &contentLen) ||
+         tag != ASN_SEQUENCE)
+            return;
+        field = ptr + hdrLen;
+        signerEnd = field + contentLen;
+        ptr = signerEnd;
+
+        /* SignerInfo is version, sid, digestAlgorithm, then the optional
+         * signedAttrs.  sid can itself be a [0], so count fields rather than
+         * looking for the first [0].
+         */
+        if (!CRYPT_DERPeekTLV(field, signerEnd - field, &tag, &hdrLen,
+         &contentLen))
+            return;
+        field += hdrLen + contentLen;
+        if (!CRYPT_DERPeekTLV(field, signerEnd - field, &tag, &hdrLen,
+         &contentLen))
+            return;
+        field += hdrLen + contentLen;
+        if (!CRYPT_DERPeekTLV(field, signerEnd - field, &tag, &hdrLen,
+         &contentLen))
+            return;
+        field += hdrLen + contentLen;
+        if (!CRYPT_DERPeekTLV(field, signerEnd - field, &tag, &hdrLen,
+         &contentLen) || tag != (ASN_CONSTRUCTOR | ASN_CONTEXT | 0))
+            continue;
+
+        msg_data->authAttrsEncoded[i].pbData = CryptMemAlloc(
+         hdrLen + contentLen);
+        if (!msg_data->authAttrsEncoded[i].pbData)
+            return;
+        memcpy(msg_data->authAttrsEncoded[i].pbData, field,
+         hdrLen + contentLen);
+        msg_data->authAttrsEncoded[i].pbData[0] = ASN_CONSTRUCTOR | ASN_SETOF;
+        msg_data->authAttrsEncoded[i].cbData = hdrLen + contentLen;
+    }
+}
+
 static BOOL CSignedMsgData_UpdateAuthenticatedAttributes(
  CSignedMsgData *msg_data, SignOrVerify flag)
 {
@@ -1131,7 +1261,14 @@ static BOOL CSignedMsgData_UpdateAuthenticatedAttributes(
                     ret = CSignedMsgData_AppendMessageDigestAttribute(msg_data,
                      i);
             }
-            if (ret)
+            if (ret && i < msg_data->cAuthAttrsEncoded &&
+             msg_data->authAttrsEncoded[i].cbData)
+            {
+                ret = CryptHashData(msg_data->signerHandles[i].authAttrHash,
+                 msg_data->authAttrsEncoded[i].pbData,
+                 msg_data->authAttrsEncoded[i].cbData, 0);
+            }
+            else if (ret)
             {
                 LPBYTE encodedAttrs;
                 DWORD size;
@@ -1436,6 +1573,7 @@ static HCRYPTMSG CSignedEncodeMsg_Open(DWORD dwFlags,
         CryptMsgBase_Init((CryptMsgBase *)msg, dwFlags, pStreamInfo,
          CSignedEncodeMsg_Close, CSignedEncodeMsg_GetParam,
          CSignedEncodeMsg_Update, CRYPT_DefaultMsgControl);
+        memset(&msg->msg_data, 0, sizeof(msg->msg_data));
         if (pszInnerContentObjID)
         {
             msg->innerOID = CryptMemAlloc(strlen(pszInnerContentObjID) + 1);
@@ -2314,7 +2452,11 @@ static BOOL CDecodeMsg_DecodeSignedContent(CDecodeMsg *msg,
      CRYPT_DECODE_ALLOC_FLAG, NULL, (CRYPT_SIGNED_INFO *)&signedInfo,
      &size);
     if (ret)
+    {
         msg->u.signed_data.info = signedInfo;
+        CSignedMsgData_RecordAuthAttrsEncoding(&msg->u.signed_data,
+         blob->pbData, blob->cbData);
+    }
     return ret;
 }
 
