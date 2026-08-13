@@ -9872,6 +9872,69 @@ static void test_bezier_intersect(BOOL d3d11)
     release_test_context(&ctx);
 }
 
+static void test_bezier_non_finite(BOOL d3d11)
+{
+    D2D1_QUADRATIC_BEZIER_SEGMENT quadratic;
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    ID2D1Factory *factory;
+    D2D1_POINT_2F point;
+    unsigned int i;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* Closing these figures used to hang: resolving overlapping Bézier control
+     * triangles subdivides the curves involved until they no longer overlap,
+     * but the area of these control triangles is not a finite number, so the
+     * overlap test never stopped reporting an overlap. */
+    static const struct
+    {
+        const char *name;
+        float x1, y1, x2, y2;
+        float x3, y3, x4, y4;
+    }
+    tests[] =
+    {
+        {"NaN endpoint", 10.0f, 20.0f, NAN, NAN, -20.0f, 5.0f, 0.0f, 0.0f},
+        {"NaN control point", NAN, 0.0f, 100.0f, 0.0f, -200.0f, 50.0f, 0.0f, 0.0f},
+        {"infinite control point", INFINITY, 0.0f, 100.0f, 0.0f, -200.0f, 50.0f, 0.0f, 0.0f},
+        /* The area overflows to infinity even though every coordinate is finite. */
+        {"area overflow", 3.0e30f, 1.0e30f, 1.0e30f, 0.0f, -2.0e30f, 1.0e30f, 0.0f, 0.0f},
+    };
+
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("%s", tests[i].name);
+
+        hr = ID2D1Factory_CreatePathGeometry(factory, &geometry);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        hr = ID2D1PathGeometry_Open(geometry, &sink);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        set_point(&point, 0.0f, 0.0f);
+        ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+        set_quadratic(&quadratic, tests[i].x1, tests[i].y1, tests[i].x2, tests[i].y2);
+        ID2D1GeometrySink_AddQuadraticBezier(sink, &quadratic);
+        set_quadratic(&quadratic, tests[i].x3, tests[i].y3, tests[i].x4, tests[i].y4);
+        ID2D1GeometrySink_AddQuadraticBezier(sink, &quadratic);
+        ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+        hr = ID2D1GeometrySink_Close(sink);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        ID2D1GeometrySink_Release(sink);
+        ID2D1PathGeometry_Release(geometry);
+
+        winetest_pop_context();
+    }
+
+    refcount = ID2D1Factory_Release(factory);
+    ok(!refcount, "Factory has %lu references left.\n", refcount);
+}
+
 static void test_create_device(BOOL d3d11)
 {
     D2D1_CREATION_PROPERTIES properties = {0};
@@ -18427,6 +18490,7 @@ START_TEST(d2d1)
     queue_test(test_wic_gdi_interop);
     queue_test(test_layer);
     queue_test(test_bezier_intersect);
+    queue_d3d10_test(test_bezier_non_finite);
     queue_test(test_create_device);
     queue_test(test_create_device_context);
     queue_test(test_bitmap_surface);

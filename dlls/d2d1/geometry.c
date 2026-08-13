@@ -4061,6 +4061,7 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
     const struct d2d_figure *figure;
     D2D1_POINT_2F v_q[3], v_p, v_qp;
     unsigned int i, j, score;
+    float ccw_a, ccw_b;
     float det, t;
 
     figure = &geometry->u.path.figures[idx_p->figure_idx];
@@ -4073,7 +4074,14 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
     b[1] = &figure->bezier_controls[idx_q->control_idx];
     b[2] = &figure->vertices[idx_q->vertex_idx + 1];
 
-    if (d2d_point_ccw(a[0], a[1], a[2]) == 0.0f || d2d_point_ccw(b[0], b[1], b[2]) == 0.0f)
+    /* Degenerate control triangles can't overlap in a way that splitting them
+     * would resolve.  Note that a non-finite area needs to be rejected here as
+     * well: every comparison against a NaN is false, so none of the tests below
+     * would ever reject an overlap, and the caller would keep subdividing the
+     * curve indefinitely. */
+    ccw_a = d2d_point_ccw(a[0], a[1], a[2]);
+    ccw_b = d2d_point_ccw(b[0], b[1], b[2]);
+    if (!isfinite(ccw_a) || ccw_a == 0.0f || !isfinite(ccw_b) || ccw_b == 0.0f)
         return FALSE;
 
     d2d_point_subtract(&v_q[0], b[1], b[0]);
