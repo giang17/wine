@@ -80,6 +80,13 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   behaviour
 - **ole32**: RevokeDragDrop no longer touches drop targets owned by other processes
   (fixes a use-after-free crash when closing plugin windows)
+- **crypt32**: verifying a signature hashes the signed attributes as they are stored in
+  the message instead of re-encoding them. The encoder sorts a SET OF into DER order,
+  but a signer may emit the attributes unsorted and the signature covers the order it
+  used, so re-encoding produced a different hash and verification failed with
+  TRUST_E_CERT_SIGNATURE. Affects any application that checks its own Authenticode
+  signature at startup; FL Studio 2026 reports that the program could not be verified
+  and exits
 - **Virtual-desktop compositor (winex11)**: windows inside a Wine virtual desktop get
   real per-pixel alpha, which the plain desktop drawable cannot provide. A small
   XDamage-driven compositor assembles frames off screen and composites them through an
