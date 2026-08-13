@@ -2104,16 +2104,35 @@ static BOOL d2d_cdt_triangulate(struct d2d_cdt *cdt, size_t start_vertex, size_t
     return TRUE;
 }
 
+/* Order NaNs after all numbers and equal to each other, so that the result is
+ * a total order.  Comparing the difference against zero instead would return
+ * "less than" for every pair involving a NaN, including a pair of equal ones,
+ * which is not an ordering qsort() and bsearch() can work with. */
+static int d2d_compare_float(float a, float b)
+{
+    if (a < b)
+        return -1;
+    if (a > b)
+        return 1;
+    if (a == b)
+        return 0;
+    if (!isnan(a))
+        return -1;
+    if (!isnan(b))
+        return 1;
+    return 0;
+}
+
 static int __cdecl d2d_cdt_compare_vertices(const void *a, const void *b)
 {
     const D2D1_POINT_2F *p0 = a;
     const D2D1_POINT_2F *p1 = b;
-    float diff = p0->x - p1->x;
+    int ret;
 
-    if (diff == 0.0f)
-        diff = p0->y - p1->y;
+    if ((ret = d2d_compare_float(p0->x, p1->x)))
+        return ret;
 
-    return diff == 0.0f ? 0 : (diff > 0.0f ? 1 : -1);
+    return d2d_compare_float(p0->y, p1->y);
 }
 
 /* Determine whether a given point is inside the geometry, using the current
