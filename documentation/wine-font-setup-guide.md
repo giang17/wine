@@ -90,6 +90,49 @@ Signs of a font-related crash:
 - `CreateFileW(... L"C:\\windows\\Fonts\\SomeFont.ttf")` returning `ffffffffffffffff`
 - Followed immediately by `EXCEPTION_ACCESS_VIOLATION` with `info[1]` near 0x00 (NULL+offset)
 
+### Which font is the application actually using?
+
+The section above finds a *missing* font file. This one answers the other
+question: the application starts, but is it drawing with the typeface you
+expect — and does anything on screen fall back to a substitute?
+
+```bash
+WINEDEBUG=+font,+dwrite wine "/path/to/App.exe" 2>&1 | tee /tmp/font.log
+```
+
+Three greps carry the answer:
+
+```bash
+# 1. Faces the application loaded from its own resources (no file path):
+grep 'insert_face_in_family_list.*from (null)' /tmp/font.log
+
+# 2. Every family DirectWrite was asked for:
+grep FindFamilyName /tmp/font.log \
+    | sed -E 's/.*FindFamilyName [0-9A-F]+, (L"[^"]*").*/\1/' | sort | uniq -c
+
+# 3. Families actually selected through GDI:
+grep 'font_SelectFont L"' /tmp/font.log \
+    | sed -E 's/.*SelectFont (L"[^"]*").*/\1/' | sort | uniq -c
+```
+
+A lookup in (2) succeeded when — and only when — a `GetFontFamily` follows it
+immediately: `create_matching_font()` in `dlls/dwrite/analyzer.c` returns
+`E_FAIL` directly after `FindFamilyName` when the family does not exist, so a
+lookup *without* a following `GetFontFamily` is a miss. If (2) lists nothing but
+the family the application asked for, the fallback path was never entered and no
+font is missing. A second, unrelated family name appearing there is the fallback
+stepping in — that is what a font setup problem looks like from the log.
+
+Two warnings in that log read like causes and are not:
+
+- `warn:dwrite:factory_create_system_fontset Failed to add font file, hr 0x88985003`
+  — registry entries under the Fonts key that hold a bare file name instead of a
+  path. DirectWrite expands those to `C:\windows\fonts\<name>`
+  (`dlls/dwrite/main.c`), which is not where Wine keeps its own bitmap fonts.
+  They are `.fon` files DirectWrite cannot use anyway.
+- Hundreds of `warn:font:... unable to parse font, falling back to FreeType`
+  for `.fon` files — Wine parses those on every start, in every prefix.
+
 ## 1. Installing Fonts into the Test Container
 
 ### fontconfig path (for DWrite/D2D1)

@@ -31,6 +31,12 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   composition and dynamic textures, D3D11 BeginDraw and surface handle export;
   rootless visual trees composited onto the target window at ~60 Hz, cross-process
   targets, backdrop capture
+- **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
+  only the version 1 classes, so an application that creates the version 2 pair while
+  bringing up its Direct Composition engine fails there. Applications built on the CCL
+  framework — Fender Studio Pro 8, PreSonus Studio One 6.6 and newer — then abort with
+  "This application requires Windows 10 or later", which is the framework's generic
+  alert for a graphics engine that did not start, not a version check
 - **D2D1 effects and colour**: Color Management effect (registration plus the
   scRGB → sRGB transfer function applied in the shape pixel shader),
   ID2D1GradientStopCollection1, sRGB pixel formats for WIC-sourced bitmaps.
@@ -229,6 +235,7 @@ are not specific to it.
 | UVI Portal | WebView2 | Installs and signs in, including special characters typed into the login fields |
 | WineSynth (custom VSTGUI plugin) | VSTGUI + DComp | 18k+ partial redraws without crash |
 | Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing. See *Ableton Live 12 Setup* below |
+| Fender Studio Pro 8 | CCL (DXGI + DWrite + DComp) | Fully functional — the song view draws completely and stays stable, no stale tool bar or transport and no flicker. Starting at all needs the `UIAnimationManager2` and `UIAnimationTransitionLibrary2` stubs from this branch; without them the CCL framework aborts with "requires Windows 10 or newer" |
 
 ## Font Setup
 
@@ -260,6 +267,15 @@ Two of those steps matter more than they look:
 See **[documentation/wine-font-setup-guide.md](documentation/wine-font-setup-guide.md)**
 for the full guide, including the container setup and working around the missing
 `BitPDisp-10` tooltip font in Serum 2, which the script deliberately leaves out.
+
+Not every application needs any of this. Some ship their typefaces as binary
+resources and load them with `AddFontMemResourceEx` into a private DirectWrite
+collection, never touching the prefix' font directory for their own UI — Fender
+Studio Pro 8 loads 25 faces that way, from its "Nimbus Sans Novus" interface
+family to the notation fonts. Running the setup script changes nothing for those,
+and text that looks wrong in such an application is not a missing system font.
+The guide's *Which font is the application actually using?* section tells the two
+cases apart from a single `WINEDEBUG=+font,+dwrite` log.
 
 Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
