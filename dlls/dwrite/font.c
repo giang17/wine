@@ -156,9 +156,14 @@ static int fontface_get_glyph_advance(struct dwrite_fontface *fontface, float fo
     return entry->advance;
 }
 
-void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, struct dwrite_glyphbitmap *bitmap)
+/* The bounding box has to describe the same rendered form the rasteriser will
+ * produce, so a ClearType run asks for the box of the outline even where the
+ * face also has a bitmap strike. That makes the box part of the cache key as
+ * well - see get_glyph_bitmap_pitch(). */
+void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, BOOL lcd, struct dwrite_glyphbitmap *bitmap)
 {
-    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL };
+    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL,
+            .lcd = !!lcd };
     struct dwrite_fontface *fontface = unsafe_impl_from_IDWriteFontFace(iface);
     struct get_glyph_bbox_params params;
     struct cache_entry *entry;
@@ -166,6 +171,7 @@ void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, struct dwrite_glyphb
     params.object = fontface->get_font_object(fontface);
     params.simulations = bitmap->simulations;
     params.glyph = bitmap->glyph;
+    params.lcd = !!lcd;
     params.emsize = bitmap->emsize;
     matrix_2x2_from_dwrite_matrix(&params.m, bitmap->m ? bitmap->m : &identity);
 
@@ -5866,7 +5872,8 @@ static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *a
         UINT32 bitmap_size;
 
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
-        dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, &glyph_bitmap);
+        dwrite_fontface_get_glyph_bbox(analysis->run.fontFace,
+                analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1, &glyph_bitmap);
 
         /* FreeType's five-tap LCD filter extends an outline by two subpixels
          * on either side. DWrite exposes whole-pixel texture bounds, so retain
@@ -5969,7 +5976,7 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
         unsigned int is_1bpp;
 
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
-        dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, &glyph_bitmap);
+        dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, is_cleartype, &glyph_bitmap);
 
         if (is_cleartype)
         {

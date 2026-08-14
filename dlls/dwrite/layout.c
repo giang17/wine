@@ -3793,7 +3793,7 @@ static void layout_get_erun_bbox(struct dwrite_textlayout *layout, struct layout
             D2D1_RECT_F glyph_bbox;
 
             glyph_bitmap.glyph = glyph_run.glyphIndices[i];
-            dwrite_fontface_get_glyph_bbox(glyph_run.fontFace, &glyph_bitmap);
+            dwrite_fontface_get_glyph_bbox(glyph_run.fontFace, FALSE, &glyph_bitmap);
 
             glyph_bbox.left = glyph_bitmap.bbox.left;
             glyph_bbox.top = glyph_bitmap.bbox.top;

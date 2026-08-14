@@ -900,6 +900,6 @@ extern HRESULT shape_check_typographic_feature(struct scriptshaping_context *con
 struct font_data_context;
 extern HMODULE dwrite_module;
 
-extern void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *fontface, struct dwrite_glyphbitmap *bitmap);
+extern void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *fontface, BOOL lcd, struct dwrite_glyphbitmap *bitmap);
 
 #endif /* __WINE_DWRITE_PRIVATE_H */

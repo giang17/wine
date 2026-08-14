@@ -66,6 +66,7 @@ struct get_glyph_bbox_params
     UINT64 object;
     unsigned int simulations;
     unsigned int glyph;
+    unsigned int lcd;
     float emsize;
     MATRIX_2X2 m;
     RECT *bbox;

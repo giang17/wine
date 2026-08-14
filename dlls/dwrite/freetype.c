@@ -528,6 +528,30 @@ static BOOL get_glyph_transform(unsigned int simulations, const MATRIX_2X2 *m, F
     return TRUE;
 }
 
+/* A ClearType texture holds three coverage samples per pixel, and only an
+ * outline can supply three different ones: an embedded bitmap strike has a
+ * single sample per pixel, which glyphrunanalysis_render() then expands into
+ * three identical subpixels, so the texture keeps the shape of ClearType and
+ * loses its horizontal resolution. Wine's own Tahoma - the face MS Shell Dlg
+ * resolves to, and so the default user interface font - carries strikes for
+ * 8 to 16 ppem, which covers most interface text.
+ *
+ * Ask for the outline when the caller wants a ClearType texture. A face that
+ * has no outline for this glyph keeps its strike, so the worst case is the
+ * result we would have had anyway. Both the bounding box and the rasteriser
+ * go through here, so the two cannot disagree about which form was used. */
+static FT_Error freetype_load_glyph(FT_Face face, unsigned int glyph, FT_Int32 flags, BOOL lcd)
+{
+    if (!lcd || (flags & FT_LOAD_NO_BITMAP))
+        return pFT_Load_Glyph(face, glyph, flags);
+
+    if (!pFT_Load_Glyph(face, glyph, flags | FT_LOAD_NO_BITMAP)
+            && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE)
+        return 0;
+
+    return pFT_Load_Glyph(face, glyph, flags);
+}
+
 static NTSTATUS get_glyph_bbox(void *args)
 {
     struct get_glyph_bbox_params *params = args;
@@ -545,7 +569,7 @@ static NTSTATUS get_glyph_bbox(void *args)
 
     needs_transform = FT_IS_SCALABLE(face) && get_glyph_transform(params->simulations, &params->m, &m);
 
-    if (pFT_Load_Glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0))
+    if (freetype_load_glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0, params->lcd))
     {
         WARN("Failed to load glyph %u.\n", params->glyph);
         pFT_Done_Size(size);
@@ -779,7 +803,8 @@ static NTSTATUS get_glyph_bitmap(void *args)
 
     needs_transform = FT_IS_SCALABLE(face) && get_glyph_transform(params->simulations, &params->m, &m);
 
-    if (!pFT_Load_Glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0))
+    if (!freetype_load_glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0,
+            params->lcd && params->mode != DWRITE_RENDERING_MODE1_ALIASED))
     {
         pFT_Get_Glyph(face->glyph, &glyph);
 
@@ -1046,6 +1071,7 @@ static NTSTATUS wow64_get_glyph_bbox(void *args)
         UINT64 object;
         ULONG simulations;
         ULONG glyph;
+        ULONG lcd;
         float emsize;
         MATRIX_2X2 m;
         PTR32 bbox;
@@ -1055,6 +1081,7 @@ static NTSTATUS wow64_get_glyph_bbox(void *args)
         params32->object,
         params32->simulations,
         params32->glyph,
+        params32->lcd,
         params32->emsize,
         params32->m,
         ULongToPtr(params32->bbox),
