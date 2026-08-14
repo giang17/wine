@@ -45,6 +45,15 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
 - **DWrite**: Rendering mode 5 fix, IDWriteFontSet::GetMatchingFonts implementation,
   font fallback mapping for Miscellaneous Symbols and Arrows (U+2B00-2BFF, fixes star
   rating display in Serum2)
+- **ClearType-style subpixel text** (from Cade / @shibco, `shibco/ableton-linux`):
+  a glyph run asking for `DWRITE_TEXTURE_CLEARTYPE_3x1` used to be rendered once in
+  greyscale and copied into all three subpixels, so DirectWrite text resolved
+  horizontally at one sample per pixel where Windows uses three. DWrite now rasterises
+  the outline scaled three times horizontally and filters each row with the same
+  five-tap FIR FreeType uses for `FT_RENDER_MODE_LCD`; D2D1 blends such runs once per
+  colour channel; GDI takes its antialiasing from the prefix rather than the host's
+  fontconfig. Needs the registry keys under *Font Setup* below — without them nothing
+  changes. See `Related` for the origin
 - **DXGI**: Composition swapchain, FLIP_SEQUENTIAL preservation, DComp popup handling,
   micro-resize for stale UI, monitored fence support. The swapchain-to-window mapping is
   published on the desktop window, whose property list is shared across the window
@@ -284,6 +293,31 @@ and text that looks wrong in such an application is not a missing system font.
 The guide's *Which font is the application actually using?* section tells the two
 cases apart from a single `WINEDEBUG=+font,+dwrite` log.
 
+### Subpixel (ClearType-style) text
+
+The subpixel text patches are inert until the prefix says it wants them. A fresh
+prefix carries no `FontSmoothingType`, and its absence means "follow the host", so
+these three values are what turns the feature on:
+
+```bash
+wine reg add 'HKCU\Control Panel\Desktop' /v FontSmoothing            /t REG_SZ    /d 2 /f
+wine reg add 'HKCU\Control Panel\Desktop' /v FontSmoothingType        /t REG_DWORD /d 2 /f
+wine reg add 'HKCU\Control Panel\Desktop' /v FontSmoothingOrientation /t REG_DWORD /d 1 /f
+```
+
+`FontSmoothingType` is the switch: 2 is ClearType, 1 is greyscale. Orientation is
+1 for an RGB panel and 0 for BGR — a BGR panel driven as RGB fringes the wrong way.
+Match it to the host (`XftSubPixel` in `kdeglobals`, or
+`gsettings get org.gnome.desktop.interface font-rgba-order`).
+
+What to expect: DirectWrite text is rasterised and filtered differently, which is
+measurable across the board — in Fender Studio Pro's WebView content a third of all
+text pixels change. FL Studio's Sounds tab is a good place to see it. What does *not*
+happen yet is visible colour fringing: the three coverage samples still average back
+to grey before they reach the screen, so this is a finer, better-filtered greyscale
+rather than full ClearType. GDI text is unaffected on hosts whose fontconfig already
+resolves subpixel per font, which is the common case on KDE and GNOME.
+
 Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
 fallback through `GetGlyphIndices`. That one has its own project:
@@ -383,6 +417,10 @@ These patches are self-contained and applicable to vanilla Wine 11.0 with `git a
 
 - Discussion: [yabridge#413](https://github.com/robbert-vdh/yabridge/issues/413)
 - Upstream: [wine-mirror/wine](https://github.com/wine-mirror/wine)
+- Subpixel text: [shibco/ableton-linux](https://github.com/shibco/ableton-linux),
+  pull request 155 by Cade (@shibco), who wrote the nine patches and wants to take
+  them to WineHQ. Reviewed there by @ClickSentinel, whose measurements are worth
+  reading before touching this code
 
 ## License
 
