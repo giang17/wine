@@ -310,13 +310,32 @@ wine reg add 'HKCU\Control Panel\Desktop' /v FontSmoothingOrientation /t REG_DWO
 Match it to the host (`XftSubPixel` in `kdeglobals`, or
 `gsettings get org.gnome.desktop.interface font-rgba-order`).
 
-What to expect: DirectWrite text is rasterised and filtered differently, which is
-measurable across the board — in Fender Studio Pro's WebView content a third of all
-text pixels change. FL Studio's Sounds tab is a good place to see it. What does *not*
-happen yet is visible colour fringing: the three coverage samples still average back
-to grey before they reach the screen, so this is a finer, better-filtered greyscale
-rather than full ClearType. GDI text is unaffected on hosts whose fontconfig already
-resolves subpixel per font, which is the common case on KDE and GNOME.
+What to expect: DirectWrite text is rendered with three coverage samples per pixel
+and reaches the screen that way. Measured on Fender Studio Pro 8, counting pixels
+whose channels differ by more than 15 of 255 — that is, pixels carrying a visible
+colour fringe:
+
+| | body text | file list |
+|---|---|---|
+| without the patches | 0.00% | 0.00% |
+| with them | 29.05% | 8.47% |
+
+In `d2d-font-test` the CLEARTYPE and DEFAULT lines come out at 22–25%, while the
+GRAYSCALE and ALIASED lines stay at exactly 0.00% — those two are the control, and
+their staying at zero is what makes the measurement trustworthy. FL Studio's Sounds
+tab is a good place to see the difference by eye.
+
+Note that a font's embedded bitmap strikes used to defeat this: where a face carries
+one, FreeType returns the strike, which has a single coverage sample per pixel. Wine's
+bundled Tahoma carries strikes for 8 to 16 ppem and `MS Shell Dlg` resolves to Tahoma,
+so the default interface font lost its subpixel resolution across the whole size range
+interface text uses — and, the strike being 1bpp, was not even greyscale antialiased.
+DWrite now asks for the outline when the caller wants a ClearType texture; a face with
+no outline for a glyph keeps its strike, so the fallback is what the result would have
+been anyway.
+
+GDI text is unaffected on hosts whose fontconfig already resolves subpixel per font,
+which is the common case on KDE and GNOME.
 
 Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
