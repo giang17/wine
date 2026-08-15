@@ -334,6 +334,34 @@ DWrite now asks for the outline when the caller wants a ClearType texture; a fac
 no outline for a glyph keeps its strike, so the fallback is what the result would have
 been anyway.
 
+### Greyscale text and embedded strikes
+
+The above fixed the ClearType half. Greyscale text still takes the strike, and the
+result is inconsistent in a way that is easy to see once you look for it: Tahoma does
+not carry a strike for *every* size in its range, so at 96 dpi the character of the
+text flips between neighbouring sizes — 12, 15 and 16 px come out as hard 1-bpp
+bitmaps while 14 px and everything from 17 px up is antialiased.
+
+Windows draws this line differently: it selects by **rendering mode**, not by whether
+subpixel output was requested. The GDI-compatible modes take the strike, the NATURAL
+modes take the outline — and applications measured here request NATURAL exclusively
+(Fender Studio Pro 8 in 1625 of 1625 glyph-run analyses).
+
+```bash
+wine reg add 'HKCU\Software\Wine\DirectWrite' /v outline_in_natural_modes /t REG_DWORD /d 1 /f
+wineserver -k
+```
+
+With the key set, greyscale follows the same rule as Windows and the size-to-size
+inconsistency disappears. Leaving it unset keeps the current behaviour exactly —
+verified at 0 of 291580 pixels difference. It is opt-in because the strike is
+hand-tuned and crisp: switching to the outline makes small greyscale text softer,
+which is a matter of taste. If you run with `FontSmoothingType=2` it barely matters,
+since almost everything then goes through the ClearType path anyway.
+
+`projects/d2d-font-test/d2d_strike_test.cpp` renders the size ladder in both modes
+side by side if you want to judge it yourself.
+
 GDI text is unaffected on hosts whose fontconfig already resolves subpixel per font,
 which is the common case on KDE and GNOME.
 
