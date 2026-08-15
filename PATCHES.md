@@ -353,16 +353,30 @@ coverage while leaving fully covered and empty samples alone, so at 0 — the de
 — rendering is bit-identical to not having the feature at all. `AppDefaults` works
 as for the other keys, so it can be set for a single application.
 
-**Why you may want a non-zero value:** light text on a dark background looks thinner
-than it geometrically is, because stray light in the eye eats into the edges
-(irradiation). Audio software is almost entirely dark-themed, and tightly set body
-text suffers most. Raising the contrast puts that weight back. Reported result on a
-dark interface at 92 DPI with `hintslight`: at 0.70 text reads "clearer, cleaner and
-easier to read, minimally thicker", most visibly in tightly-spaced body text.
+**The default needs no defending.** At 0 the text is already clean — assessed on a
+dark audio interface by a graphics designer, who described the untouched rendering
+as reading "like print, not bold", with clean edges in both polarities under
+magnification. Nothing here is a repair; the key is a preference, not a fix.
 
-Windows runs around 0.5. On a **light** background the effect works against you —
-there the same setting makes text look heavy — which is why the default stays 0 and
-this is opt-in.
+**Why you may still want a non-zero value:** light text on a dark background looks
+thinner than it geometrically is, because stray light in the eye eats into the edges
+(irradiation). Audio software is almost entirely dark-themed, and tightly set body
+text suffers most. Raising the contrast puts that weight back.
+
+| value | when |
+|---|---|
+| `0` | default. Clean as it stands; leave it unless you have a reason |
+| `50` | what Windows runs. A safe middle if you want a little more weight |
+| `70` | dark interfaces with dense body text. Measured to give the clearest reading of the three on such a UI |
+
+Reported result on a dark interface at 92 DPI with `hintslight`: at 0.70 text reads
+"clearer, cleaner and easier to read, minimally thicker" on both an ordinary and a
+rotated monitor, most visibly in tightly-spaced body text such as a news feed.
+
+On a **light** background the effect works against you — there the same setting makes
+text look heavy. That, and the fact that 0 already looks right, is why the default
+stays 0 and this is opt-in. Watch small sizes if you go high: at 11px a strong
+setting can start closing the counters in `e`, `a` and `g`.
 
 Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
