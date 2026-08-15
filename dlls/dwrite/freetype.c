@@ -540,9 +540,9 @@ static BOOL get_glyph_transform(unsigned int simulations, const MATRIX_2X2 *m, F
  * has no outline for this glyph keeps its strike, so the worst case is the
  * result we would have had anyway. Both the bounding box and the rasteriser
  * go through here, so the two cannot disagree about which form was used. */
-static FT_Error freetype_load_glyph(FT_Face face, unsigned int glyph, FT_Int32 flags, BOOL lcd)
+static FT_Error freetype_load_glyph(FT_Face face, unsigned int glyph, FT_Int32 flags, BOOL want_outline)
 {
-    if (!lcd || (flags & FT_LOAD_NO_BITMAP))
+    if (!want_outline || (flags & FT_LOAD_NO_BITMAP))
         return pFT_Load_Glyph(face, glyph, flags);
 
     if (!pFT_Load_Glyph(face, glyph, flags | FT_LOAD_NO_BITMAP)
@@ -569,7 +569,8 @@ static NTSTATUS get_glyph_bbox(void *args)
 
     needs_transform = FT_IS_SCALABLE(face) && get_glyph_transform(params->simulations, &params->m, &m);
 
-    if (freetype_load_glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0, params->lcd))
+    if (freetype_load_glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0,
+            params->lcd || params->no_bitmap))
     {
         WARN("Failed to load glyph %u.\n", params->glyph);
         pFT_Done_Size(size);
@@ -804,7 +805,7 @@ static NTSTATUS get_glyph_bitmap(void *args)
     needs_transform = FT_IS_SCALABLE(face) && get_glyph_transform(params->simulations, &params->m, &m);
 
     if (!freetype_load_glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0,
-            params->lcd && params->mode != DWRITE_RENDERING_MODE1_ALIASED))
+            (params->lcd || params->no_bitmap) && params->mode != DWRITE_RENDERING_MODE1_ALIASED))
     {
         pFT_Get_Glyph(face->glyph, &glyph);
 
@@ -1072,6 +1073,7 @@ static NTSTATUS wow64_get_glyph_bbox(void *args)
         ULONG simulations;
         ULONG glyph;
         ULONG lcd;
+        ULONG no_bitmap;
         float emsize;
         MATRIX_2X2 m;
         PTR32 bbox;
@@ -1082,6 +1084,7 @@ static NTSTATUS wow64_get_glyph_bbox(void *args)
         params32->simulations,
         params32->glyph,
         params32->lcd,
+        params32->no_bitmap,
         params32->emsize,
         params32->m,
         ULongToPtr(params32->bbox),
@@ -1099,6 +1102,7 @@ static NTSTATUS wow64_get_glyph_bitmap(void *args)
         ULONG glyph;
         ULONG mode;
         ULONG lcd;
+        ULONG no_bitmap;
         float emsize;
         MATRIX_2X2 m;
         RECT bbox;
@@ -1113,6 +1117,7 @@ static NTSTATUS wow64_get_glyph_bitmap(void *args)
         params32->glyph,
         params32->mode,
         params32->lcd,
+        params32->no_bitmap,
         params32->emsize,
         params32->m,
         params32->bbox,

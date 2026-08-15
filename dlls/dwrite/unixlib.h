@@ -67,6 +67,10 @@ struct get_glyph_bbox_params
     unsigned int simulations;
     unsigned int glyph;
     unsigned int lcd;
+    /* Ask FreeType for the outline even where the face has an embedded strike.
+     * Must carry the same value as the matching get_glyph_bitmap_params, or the
+     * box and the rasterised form disagree about which one was used. */
+    unsigned int no_bitmap;
     float emsize;
     MATRIX_2X2 m;
     RECT *bbox;
@@ -79,6 +83,7 @@ struct get_glyph_bitmap_params
     unsigned int glyph;
     unsigned int mode;
     unsigned int lcd;
+    unsigned int no_bitmap;
     float emsize;
     MATRIX_2X2 m;
     RECT bbox;

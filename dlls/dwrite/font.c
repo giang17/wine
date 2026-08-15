@@ -50,6 +50,9 @@ struct cache_key
     unsigned short glyph;
     unsigned short mode;
     unsigned short lcd;
+    /* A strike and an outline of the same glyph at the same size differ in
+     * content, so they cannot share a cache entry. */
+    unsigned short no_bitmap;
 };
 
 struct cache_entry
@@ -160,10 +163,11 @@ static int fontface_get_glyph_advance(struct dwrite_fontface *fontface, float fo
  * produce, so a ClearType run asks for the box of the outline even where the
  * face also has a bitmap strike. That makes the box part of the cache key as
  * well - see get_glyph_bitmap_pitch(). */
-void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, BOOL lcd, struct dwrite_glyphbitmap *bitmap)
+void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, BOOL lcd, BOOL no_bitmap,
+        struct dwrite_glyphbitmap *bitmap)
 {
     struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL,
-            .lcd = !!lcd };
+            .lcd = !!lcd, .no_bitmap = !!no_bitmap };
     struct dwrite_fontface *fontface = unsafe_impl_from_IDWriteFontFace(iface);
     struct get_glyph_bbox_params params;
     struct cache_entry *entry;
@@ -172,6 +176,7 @@ void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, BOOL lcd, struct dwr
     params.simulations = bitmap->simulations;
     params.glyph = bitmap->glyph;
     params.lcd = !!lcd;
+    params.no_bitmap = !!no_bitmap;
     params.emsize = bitmap->emsize;
     matrix_2x2_from_dwrite_matrix(&params.m, bitmap->m ? bitmap->m : &identity);
 
@@ -195,6 +200,44 @@ void dwrite_fontface_get_glyph_bbox(IDWriteFontFace *iface, BOOL lcd, struct dwr
     LeaveCriticalSection(&fontface->cs);
 }
 
+/* Windows decides between an embedded strike and the outline by rendering mode,
+ * not by whether subpixel output was asked for: the GDI-compatible modes take
+ * the strike, the NATURAL modes take the outline. We currently key it on the
+ * ClearType flag instead, so the same string changes shape when font smoothing
+ * is switched between greyscale and ClearType, and neighbouring sizes disagree
+ * with each other wherever the face happens to carry a strike - Wine's Tahoma
+ * has them for 8..16 ppem but not for every size in that range.
+ *
+ * Aligning with Windows makes small greyscale text softer, which is a matter of
+ * taste rather than correctness, so it is opt-in for now:
+ *   HKCU\Software\Wine\DirectWrite "outline_in_natural_modes" (REG_DWORD, 0/1)
+ * Unset keeps today's behaviour exactly. */
+static BOOL analysis_wants_outline(DWRITE_RENDERING_MODE1 mode)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        DWORD value = 0, size = sizeof(value), type;
+        HKEY key;
+        int result = 0;
+
+        if (!RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Wine\\DirectWrite", 0, KEY_READ, &key))
+        {
+            if (!RegQueryValueExW(key, L"outline_in_natural_modes", NULL, &type, (BYTE *)&value, &size)
+                    && type == REG_DWORD)
+                result = !!value;
+            RegCloseKey(key);
+        }
+        enabled = result;
+    }
+
+    if (!enabled)
+        return FALSE;
+
+    return mode == DWRITE_RENDERING_MODE1_NATURAL || mode == DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC;
+}
+
 /* A ClearType run carries three coverage samples per pixel, so its rows are
  * three times as wide. */
 static unsigned int get_glyph_bitmap_pitch(DWRITE_RENDERING_MODE1 rendering_mode, INT width, BOOL lcd)
@@ -207,10 +250,10 @@ static unsigned int get_glyph_bitmap_pitch(DWRITE_RENDERING_MODE1 rendering_mode
 }
 
 static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface, DWRITE_RENDERING_MODE1 rendering_mode,
-        BOOL lcd, unsigned int *is_1bpp, struct dwrite_glyphbitmap *bitmap)
+        BOOL lcd, BOOL no_bitmap, unsigned int *is_1bpp, struct dwrite_glyphbitmap *bitmap)
 {
     struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL,
-            .lcd = !!lcd };
+            .lcd = !!lcd, .no_bitmap = !!no_bitmap };
     struct get_glyph_bitmap_params params;
     const RECT *bbox = &bitmap->bbox;
     unsigned int bitmap_size, _1bpp;
@@ -225,6 +268,7 @@ static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface
     params.glyph = bitmap->glyph;
     params.mode = rendering_mode;
     params.lcd = !!lcd;
+    params.no_bitmap = !!no_bitmap;
     params.emsize = bitmap->emsize;
     params.bbox = bitmap->bbox;
     params.pitch = bitmap->pitch;
@@ -273,6 +317,7 @@ static int fontface_cache_compare(const void *k, const struct wine_rb_entry *e)
     if (key->glyph != key2->glyph) return (int)key->glyph - (int)key2->glyph;
     if (key->mode != key2->mode) return (int)key->mode - (int)key2->mode;
     if (key->lcd != key2->lcd) return (int)key->lcd - (int)key2->lcd;
+    if (key->no_bitmap != key2->no_bitmap) return (int)key->no_bitmap - (int)key2->no_bitmap;
     return 0;
 }
 
@@ -5873,7 +5918,8 @@ static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *a
 
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
         dwrite_fontface_get_glyph_bbox(analysis->run.fontFace,
-                analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1, &glyph_bitmap);
+                analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1,
+                analysis_wants_outline(analysis->rendering_mode), &glyph_bitmap);
 
         /* FreeType's five-tap LCD filter extends an outline by two subpixels
          * on either side. DWrite exposes whole-pixel texture bounds, so retain
@@ -5943,6 +5989,7 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
     struct dwrite_fontface *fontface = unsafe_impl_from_IDWriteFontFace(analysis->run.fontFace);
     struct dwrite_glyphbitmap glyph_bitmap;
     BOOL is_cleartype = analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1;
+    BOOL want_outline = analysis_wants_outline(analysis->rendering_mode);
     D2D_POINT_2F origin;
     UINT32 i, size;
     RECT *bbox;
@@ -5976,7 +6023,7 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
         unsigned int is_1bpp;
 
         glyph_bitmap.glyph = analysis->run.glyphIndices[i];
-        dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, is_cleartype, &glyph_bitmap);
+        dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, is_cleartype, want_outline, &glyph_bitmap);
 
         if (is_cleartype)
         {
@@ -6001,7 +6048,7 @@ static HRESULT glyphrunanalysis_render(struct dwrite_glyphrunanalysis *analysis)
         memset(src, 0, height * glyph_bitmap.pitch);
 
         if (FAILED(dwrite_fontface_get_glyph_bitmap(fontface, analysis->rendering_mode, is_cleartype,
-                &is_1bpp, &glyph_bitmap)))
+                want_outline, &is_1bpp, &glyph_bitmap)))
         {
             WARN("Failed to render glyph[%u] = %#x.\n", i, glyph_bitmap.glyph);
             continue;
