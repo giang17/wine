@@ -105,6 +105,14 @@ enum d2d_shape_type
 struct d2d_settings
 {
     unsigned int max_version_factory;
+    /* Enhanced contrast for ClearType text, in hundredths. DirectWrite reports
+     * the value through GetAlphaBlendParams(), but Wine's dwrite hardcodes zero
+     * (dlls/dwrite/main.c, "FIXME: use actual per-monitor gamma factor"), so
+     * there is nothing to honour. This overrides it for experiments; Windows
+     * typically runs around 0.5. Absent means "use what DirectWrite said",
+     * which keeps the default behaviour bit-identical. */
+    unsigned int text_enhanced_contrast;
+    BOOL text_enhanced_contrast_set;
 };
 extern struct d2d_settings d2d_settings;
 

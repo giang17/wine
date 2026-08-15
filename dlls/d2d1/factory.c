@@ -1687,6 +1687,14 @@ static void d2d_settings_init(void)
     if (get_config_key_u32(default_key, application_key, "max_version_factory", &d2d_settings.max_version_factory))
         ERR_(winediag)("Limiting maximum Direct2D factory version to %#x.\n", d2d_settings.max_version_factory);
 
+    if (get_config_key_u32(default_key, application_key, "text_enhanced_contrast",
+            &d2d_settings.text_enhanced_contrast))
+    {
+        d2d_settings.text_enhanced_contrast_set = TRUE;
+        ERR_(winediag)("Overriding ClearType enhanced contrast with %u/100.\n",
+                d2d_settings.text_enhanced_contrast);
+    }
+
     if (application_key)
         RegCloseKey(application_key);
     if (default_key)

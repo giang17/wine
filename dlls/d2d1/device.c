@@ -2099,9 +2099,32 @@ static ID3D11BlendState *d2d_device_context_get_subpixel_blend_state(struct d2d_
 /* Draw the run once per subpixel channel, each pass masked by that channel's
  * coverage and writing only that channel. Build all resources before drawing
  * so an allocation failure cannot leave a partially coloured run behind. */
+/* Enhanced contrast, as DirectWrite reports it through GetAlphaBlendParams().
+ * Raises partial coverage while leaving both endpoints alone, so a fully covered
+ * or fully empty sample never moves and the mapping stays monotonic in coverage.
+ * At contrast 0 this is the identity, which is what Wine's dwrite reports today,
+ * so the default path is bit-identical to having no correction at all.
+ *
+ * This is an approximation: the exact curve Windows applies is not documented.
+ * It deliberately does not touch gamma — blending linearly is a separate and
+ * much larger change, see the linear-blend issue. */
+static float d2d_apply_enhanced_contrast(float coverage, float contrast)
+{
+    float a;
+
+    if (!(contrast > 0.0f))
+        return coverage;
+
+    a = coverage / 255.0f;
+    a += contrast * a * (1.0f - a);
+
+    return a * 255.0f;
+}
+
 static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_context *context,
         ID2D1Brush *brush, const BYTE *coverage, unsigned int width, unsigned int height,
-        const RECT *bounds, DWRITE_PIXEL_GEOMETRY pixel_geometry, float cleartype_level)
+        const RECT *bounds, DWRITE_PIXEL_GEOMETRY pixel_geometry, float cleartype_level,
+        float enhanced_contrast)
 {
     ID2D1RectangleGeometry *geometry = NULL;
     ID2D1BitmapBrush *opacity_brushes[3] = {NULL};
@@ -2165,6 +2188,8 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
                 const BYTE *pixel = &coverage[((size_t)y * width + x) * 3];
                 int gray = (pixel[0] + pixel[1] + pixel[2] + 1) / 3;
                 float value = gray + cleartype_level * (pixel[sample] - gray);
+
+                value = d2d_apply_enhanced_contrast(value, enhanced_contrast);
 
                 plane[y * width + x] = min(max((int)(value + 0.5f), 0), 255);
             }
@@ -2296,10 +2321,18 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
         if (!(cleartype_level >= 0.0f)) cleartype_level = 0.0f;
         else if (cleartype_level > 1.0f) cleartype_level = 1.0f;
 
+        /* Wine's dwrite hardcodes enhanced contrast to zero, so honouring the
+         * reported value changes nothing on its own. The registry key exists to
+         * try other values without rebuilding; unset keeps DirectWrite's. */
+        if (d2d_settings.text_enhanced_contrast_set)
+            contrast = d2d_settings.text_enhanced_contrast / 100.0f;
+        if (!(contrast >= 0.0f)) contrast = 0.0f;
+        else if (contrast > 1.0f) contrast = 1.0f;
+
         TRACE("ClearType blend parameters: gamma %.3f, contrast %.3f, level %.3f, geometry %u.\n",
                 gamma, contrast, cleartype_level, pixel_geometry);
         hr = d2d_device_context_draw_glyph_run_subpixel(context, brush, opacity_values,
-                run_width, bitmap_size.height, &bounds, pixel_geometry, cleartype_level);
+                run_width, bitmap_size.height, &bounds, pixel_geometry, cleartype_level, contrast);
         if (FAILED(hr))
             d2d_device_context_set_error(context, hr);
         goto done;
