@@ -337,6 +337,33 @@ been anyway.
 GDI text is unaffected on hosts whose fontconfig already resolves subpixel per font,
 which is the common case on KDE and GNOME.
 
+### Enhanced contrast — worth setting on a dark interface
+
+DirectWrite reports an *enhanced contrast* value alongside gamma and ClearType
+level; Wine hardcodes it to zero, so nothing is applied. This branch honours it and
+lets the prefix override it:
+
+```bash
+wine reg add 'HKCU\Software\Wine\Direct2D' /v text_enhanced_contrast /t REG_DWORD /d 70 /f
+wineserver -k    # the value is read when d2d1 loads, so restart the application
+```
+
+The value is in hundredths; deleting it restores the default. It raises partial
+coverage while leaving fully covered and empty samples alone, so at 0 — the default
+— rendering is bit-identical to not having the feature at all. `AppDefaults` works
+as for the other keys, so it can be set for a single application.
+
+**Why you may want a non-zero value:** light text on a dark background looks thinner
+than it geometrically is, because stray light in the eye eats into the edges
+(irradiation). Audio software is almost entirely dark-themed, and tightly set body
+text suffers most. Raising the contrast puts that weight back. Reported result on a
+dark interface at 92 DPI with `hintslight`: at 0.70 text reads "clearer, cleaner and
+easier to read, minimally thicker", most visibly in tightly-spaced body text.
+
+Windows runs around 0.5. On a **light** background the effect works against you —
+there the same setting makes text look heavy — which is why the default stays 0 and
+this is opt-in.
+
 Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
 fallback through `GetGlyphIndices`. That one has its own project:
