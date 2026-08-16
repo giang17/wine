@@ -2289,17 +2289,20 @@ struct dcomp_target
      * nothing and this target must keep its hands off the window. */
     BOOL tree_had_content;
     /* Client-space union of every leaf rectangle this target's tree has ever
-     * covered (issue 187).  The latch above says WHETHER we may paint, this
-     * says HOW FAR: outside it the window was never ours, and taking its
-     * WM_PAINT away there stops the application from repainting an area we do
-     * not deliver.  Latched like the verdict and for the same reason
-     * (issue 184) -- a tree that runs empty between two generations must not
-     * hand back the area it already owns.  NULL until the first composite. */
+     * covered (issue 187).  Kept as the WINE_DCOMP_COVER_FRAME=0 measurement
+     * for the covers_window threshold: by default that threshold asks the
+     * CURRENT frame's region instead (issue 205), because this union grows
+     * with every position a moving leaf has ever had, and a playhead 1 px
+     * wide crosses the 50% mark on accumulation alone after ~1200 columns --
+     * taking the window over from a tree that covers a sliver of every
+     * frame.  NULL until the first composite. */
     HRGN covered_rgn;
-    /* covered_rgn has reached DCOMP_MIN_COVER_PERCENT of the client area at
-     * least once, i.e. our composition can plausibly be said to BE what this
-     * window shows.  Below that we keep off the window entirely: no blit, no
-     * WM_PAINT, not even the 60 Hz read-back (issue 187).  Latched. */
+    /* The leaf region of the current frame (unresolved fallback included) has
+     * reached DCOMP_MIN_COVER_PERCENT of the client area at least once, i.e.
+     * our composition can plausibly be said to BE what this window shows.
+     * Below that we keep off the window entirely: no blit, no WM_PAINT, not
+     * even the 60 Hz read-back (issue 187).  Latched -- the verdict is, the
+     * measurement is not (issue 205). */
     BOOL covers_window;
     /* Below that threshold we still deliver what the tree covers, just without
      * claiming the window (issue 190).  These two are that mode's whole state:
@@ -3266,7 +3269,8 @@ static BOOL dcomp_visual_leaf_extent(struct dcomp_visual *visual, UINT *w, UINT 
 }
 
 /* -------------------------------------------------------------------------
- * How far the takeover reaches (issue 187).
+ * When the takeover happens, and how far anything below it reaches
+ * (issue 187, issue 205).
  *
  * dcomp_target_tree_carries_content() answers WHETHER this target may paint
  * the window.  That verdict is binary, and the consequence used to be total:
@@ -3277,18 +3281,30 @@ static BOOL dcomp_visual_leaf_extent(struct dcomp_visual *visual, UINT *w, UINT 
  * repaint the remaining 99.97% again.  It scrolls its arranger, the exposed
  * area is never redrawn, and the old pixels pile up into a stripe pattern.
  *
- * So the area answers HOW FAR: the union of every leaf rectangle the tree has
- * ever covered.  Outside it the window was never ours.
+ * DCOMP_MIN_COVER_PERCENT answers WHEN that verdict may flip: the leaf region
+ * of the CURRENT frame has to cover half the client area first (issue 205).
+ * The lifetime union covered_rgn used to be asked instead, and a moving leaf
+ * grew it across the threshold one position at a time -- the region is still
+ * maintained, but only for the WINE_DCOMP_COVER_FRAME=0 counter-check.  A
+ * tree that legitimately covers its window does so in every frame, so
+ * measuring per frame keeps the two kinds of tree three orders of magnitude
+ * apart, permanently rather than until enough positions accumulated.
  *
- * Latched exactly like the verdict, and for the same reason (issue 184): a
- * rootless tree is momentarily empty between two generations, and a region
- * that shrank in those frames would hand the window back mid-flight and let
- * the application paint over our composition.
+ * HOW FAR anything reaches is per-area only below the threshold: the delivery
+ * (issue 190) answers it with this frame's region, exactly the area we put
+ * pixels into.  The takeover itself is all or nothing.
+ *
+ * Latched is the verdict alone: once covers_window is TRUE it stays TRUE, so
+ * a rootless tree momentarily empty between two generations cannot revoke a
+ * takeover mid-flight (issue 184).  Extending that latch to the measurement
+ * was the defect issue 205 closed.
  *
  * A leaf whose extent is not resolvable yet (a swapchain leaf before wined3d
  * published its comp size) claims the whole client area instead of nothing --
  * being too eager to disown an area is the expensive mistake, and the fallback
- * is exactly the behaviour this code had before.
+ * is exactly the behaviour this code had before.  The threshold region
+ * contains that fallback; frame_rgn, which the delivery reads, deliberately
+ * does not.
  */
 static UINT64 dcomp_region_area(HRGN region)
 {
@@ -3334,6 +3350,23 @@ static int dcomp_min_cover(void)
             dcomp_min_cover_percent = 0;
     }
     return dcomp_min_cover_percent;
+}
+
+/* Which region the takeover threshold below is asked of (issue 205).  The
+ * verdict latches either way -- only the measurement differs.  Default on:
+ * this frame's leaf region, so a moving leaf cannot grow its way across the
+ * threshold one position at a time.  WINE_DCOMP_COVER_FRAME=0 restores the
+ * lifetime-union measurement of 6220c00ff4b for counter-checks. */
+static int dcomp_cover_frame_enabled = -1;
+
+static BOOL dcomp_cover_frame(void)
+{
+    if (dcomp_cover_frame_enabled < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_COVER_FRAME");
+        dcomp_cover_frame_enabled = (!e || atoi(e)) ? 1 : 0;
+    }
+    return dcomp_cover_frame_enabled > 0;
 }
 
 static void dcomp_target_collect_covered(struct dcomp_visual *visual, int base_x, int base_y,
@@ -3404,17 +3437,35 @@ static void dcomp_target_update_covered(struct dcomp_target *target, const RECT 
         }
     }
 
+    /* The lifetime union, still maintained for the WINE_DCOMP_COVER_FRAME=0
+     * measurement below (issue 205). */
     if (!target->covered_rgn)
-        target->covered_rgn = current;
-    else
-    {
+        target->covered_rgn = CreateRectRgn(0, 0, 0, 0);
+    if (target->covered_rgn)
         CombineRgn(target->covered_rgn, target->covered_rgn, current, RGN_OR);
-        DeleteObject(current);
-    }
 
-    /* Latched like everything else here: a tree that once covered the window
-     * keeps the window, so an empty generation cannot revoke the takeover
-     * mid-flight (issue 184). */
+    /* The verdict latches, the measurement does not (issue 205).  Asking the
+     * threshold of covered_rgn made the union a latch with a timer: a leaf
+     * 1 px wide and 821 px tall covers 0.03% of every frame in a 1920x1027
+     * window, but after ~1200 distinct columns -- about 25 s of transport at
+     * 100 px per bar -- the accumulated positions alone cross the 50% mark,
+     * and a tree that never covered more than a sliver of the window takes
+     * it over for good.  This frame's region cannot grow that way: a tree
+     * that legitimately covers its window does so in every frame (that is
+     * what the 100% measurements behind DCOMP_MIN_COVER_PERCENT say), so the
+     * three orders of magnitude between the two kinds of tree hold per frame
+     * instead of eroding over time.
+     *
+     * `current`, not frame_rgn: the threshold region must contain the
+     * unresolved fallback above -- a swapchain leaf before its first present
+     * has no extent, and the fallback claiming the client area for it is
+     * what lets such trees take over at all.  frame_rgn deliberately does
+     * not contain it, because the delivery path must not read and rewrite
+     * an area it does not draw.  Two questions, two regions.
+     *
+     * What stays latched is the verdict itself: covers_window never goes
+     * back, so a rootless tree running empty between two generations cannot
+     * revoke a takeover mid-flight (issue 184). */
     if (!target->covers_window)
     {
         UINT64 client = (UINT64)client_rc->right * client_rc->bottom;
@@ -3422,7 +3473,8 @@ static void dcomp_target_update_covered(struct dcomp_target *target, const RECT 
 
         if (!dcomp_min_cover())
             target->covers_window = TRUE;
-        else if (client && (cover = dcomp_region_area(target->covered_rgn)) * 100
+        else if (client && (cover = dcomp_region_area(dcomp_cover_frame()
+                ? current : target->covered_rgn)) * 100
                 >= client * dcomp_min_cover())
         {
             target->covers_window = TRUE;
@@ -3430,6 +3482,8 @@ static void dcomp_target_update_covered(struct dcomp_target *target, const RECT 
                     "window over.\n", target, target->hwnd, cover, client);
         }
     }
+
+    DeleteObject(current);
 }
 
 /* Blit a region rectangle by rectangle.  Clipping the destination and running
