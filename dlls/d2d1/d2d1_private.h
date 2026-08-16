@@ -113,6 +113,11 @@ struct d2d_settings
      * which keeps the default behaviour bit-identical. */
     unsigned int text_enhanced_contrast;
     BOOL text_enhanced_contrast_set;
+    /* Blend ClearType text in linear space instead of in the target's encoded
+     * space. Off by default: it needs a copy of the destination per glyph run,
+     * and it deliberately departs from what Direct2D does on a plain UNORM
+     * target, where the blend is linear in encoded values. */
+    BOOL text_linear_blend;
 };
 extern struct d2d_settings d2d_settings;
 
@@ -202,6 +207,18 @@ struct d2d_ps_cb
     BOOL is_arc;
     BOOL aa_mode;
     BOOL srgb_encode;
+    /* Linear text blending. When set, the shader reads the destination copy
+     * from t2 and produces the finished pixel itself, so the output merger
+     * blends nothing. The four scalars map a world position to a texel in that
+     * copy: uv = (p * scale - origin) / size, folded into scale/offset pairs.
+     * Laid out as scalars on purpose — a float4 here would have to start at a
+     * 16 byte boundary and leave a hole this struct would have to mirror. */
+    BOOL linear_text;
+    float dst_scale_x;
+    float dst_offset_x;
+    float dst_scale_y;
+    float dst_offset_y;
+    unsigned int pad[3];
     struct d2d_brush_cb colour_brush;
     struct d2d_brush_cb opacity_brush;
 };
@@ -305,6 +322,25 @@ struct d2d_device_context
     /* Same blend as bs, restricted to one subpixel channel, for ClearType
      * text. Created on first use; index 0 is red, 1 green, 2 blue. */
     ID3D11BlendState *subpixel_bs[3];
+    /* The same three channel masks with blending switched off, for the linear
+     * text path: there the shader has already combined source and destination,
+     * so anything the output merger did on top would be a second blend. */
+    ID3D11BlendState *subpixel_copy_bs[3];
+    /* Copy of the destination under the current glyph run, and the point
+     * sampler used to read it back. Grown on demand and kept for the lifetime
+     * of the context; text runs recur constantly, so reallocating per run
+     * would churn. */
+    ID3D11Texture2D *text_dst;
+    ID3D11ShaderResourceView *text_dst_srv;
+    ID3D11SamplerState *text_dst_sampler;
+    unsigned int text_dst_width;
+    unsigned int text_dst_height;
+    DXGI_FORMAT text_dst_format;
+    /* Set for the duration of the three text passes; mirrors into the pixel
+     * shader constant buffer. */
+    BOOL linear_text;
+    float text_dst_scale_x, text_dst_offset_x;
+    float text_dst_scale_y, text_dst_offset_y;
     struct d2d_scratch_buffer scratch_vb[D2D_SHAPE_TYPE_COUNT];
     struct d2d_scratch_buffer scratch_ib[D2D_SHAPE_TYPE_COUNT];
     /* Session 6 (C1): persistent scratch rectangle geometry for FillRectangle.

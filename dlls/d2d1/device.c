@@ -392,6 +392,11 @@ static void d2d_device_context_draw(struct d2d_device_context *render_target, en
     }
     if (opacity_brush)
         d2d_brush_bind_resources(opacity_brush, render_target, 1);
+    if (render_target->linear_text)
+    {
+        ID3D11DeviceContext1_PSSetShaderResources(context, 4, 1, &render_target->text_dst_srv);
+        ID3D11DeviceContext1_PSSetSamplers(context, 2, 1, &render_target->text_dst_sampler);
+    }
 
     if (ib)
         ID3D11DeviceContext1_DrawIndexed(context, index_count, 0, 0);
@@ -489,6 +494,15 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
         for (i = 0; i < ARRAY_SIZE(context->subpixel_bs); ++i)
             if (context->subpixel_bs[i])
                 ID3D11BlendState_Release(context->subpixel_bs[i]);
+        for (i = 0; i < ARRAY_SIZE(context->subpixel_copy_bs); ++i)
+            if (context->subpixel_copy_bs[i])
+                ID3D11BlendState_Release(context->subpixel_copy_bs[i]);
+        if (context->text_dst_srv)
+            ID3D11ShaderResourceView_Release(context->text_dst_srv);
+        if (context->text_dst)
+            ID3D11Texture2D_Release(context->text_dst);
+        if (context->text_dst_sampler)
+            ID3D11SamplerState_Release(context->text_dst_sampler);
         if (context->stencil_dsv)
             ID3D11DepthStencilView_Release(context->stencil_dsv);
         if (context->stencil_texture)
@@ -1058,10 +1072,18 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
     struct d2d_ps_cb new_cb;
     HRESULT hr;
 
+    /* Padding is compared along with the rest by the cache below, so it has to
+     * hold a defined value. */
+    memset(&new_cb, 0, sizeof(new_cb));
     new_cb.outline = outline;
     new_cb.is_arc = is_arc;
     new_cb.aa_mode = (context->drawing_state.antialiasMode == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     new_cb.srgb_encode = context->srgb_encode;
+    new_cb.linear_text = context->linear_text;
+    new_cb.dst_scale_x = context->text_dst_scale_x;
+    new_cb.dst_offset_x = context->text_dst_offset_x;
+    new_cb.dst_scale_y = context->text_dst_scale_y;
+    new_cb.dst_offset_y = context->text_dst_offset_y;
     if (!d2d_brush_fill_cb(brush, &new_cb.colour_brush))
         WARN("Failed to initialize colour brush buffer.\n");
     if (!d2d_brush_fill_cb(opacity_brush, &new_cb.opacity_brush))
@@ -2096,6 +2118,199 @@ static ID3D11BlendState *d2d_device_context_get_subpixel_blend_state(struct d2d_
     return context->subpixel_bs[channel];
 }
 
+/* The same three channel masks with blending switched off. The linear text
+ * path finishes the blend in the pixel shader, so the output merger must write
+ * the result through untouched. */
+static ID3D11BlendState *d2d_device_context_get_subpixel_copy_blend_state(struct d2d_device_context *context,
+        unsigned int channel)
+{
+    static const UINT8 write_masks[3] =
+    {
+        D3D11_COLOR_WRITE_ENABLE_RED,
+        D3D11_COLOR_WRITE_ENABLE_GREEN,
+        D3D11_COLOR_WRITE_ENABLE_BLUE,
+    };
+    D3D11_BLEND_DESC blend_desc;
+    HRESULT hr;
+
+    if (context->subpixel_copy_bs[channel])
+        return context->subpixel_copy_bs[channel];
+
+    memset(&blend_desc, 0, sizeof(blend_desc));
+    blend_desc.RenderTarget[0].BlendEnable = FALSE;
+    blend_desc.RenderTarget[0].RenderTargetWriteMask = write_masks[channel];
+
+    if (FAILED(hr = ID3D11Device1_CreateBlendState(context->d3d_device, &blend_desc,
+            &context->subpixel_copy_bs[channel])))
+    {
+        WARN("Failed to create subpixel copy blend state, hr %#lx.\n", hr);
+        context->subpixel_copy_bs[channel] = NULL;
+    }
+
+    return context->subpixel_copy_bs[channel];
+}
+
+/* Only plain 8 bit unsigned normalised targets are candidates for the linear
+ * text path. An _SRGB target already gets decoded and encoded by the hardware,
+ * and a float target is linear to begin with; in both cases reading the copy
+ * back through an ordinary view would apply the transfer function a second
+ * time. */
+static BOOL d2d_device_context_text_dst_format_supported(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8X8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+/* Take a copy of the destination under the glyph run and set up the mapping
+ * from a world position to a texel in it. Returns FALSE when anything is not
+ * available, which leaves the caller on the ordinary blend — this path may
+ * never be worse than the one it replaces. */
+static BOOL d2d_device_context_capture_text_dst(struct d2d_device_context *context,
+        const RECT *bounds, unsigned int width, unsigned int height)
+{
+    unsigned int src_left, src_top, src_right, src_bottom;
+    ID3D11DeviceContext *d3d_context;
+    D3D11_TEXTURE2D_DESC texture_desc;
+    ID3D11Texture2D *target_texture;
+    D3D11_BOX box;
+    float scale_x, scale_y;
+    DXGI_FORMAT format;
+    HRESULT hr;
+
+    if (context->target.type != D2D_TARGET_BITMAP || !context->target.bitmap)
+        return FALSE;
+
+    format = context->target.bitmap->format.format;
+    if (!d2d_device_context_text_dst_format_supported(format))
+        return FALSE;
+
+    if (FAILED(ID3D11Resource_QueryInterface(context->target.bitmap->resource,
+            &IID_ID3D11Texture2D, (void **)&target_texture)))
+        return FALSE;
+
+    ID3D11Texture2D_GetDesc(target_texture, &texture_desc);
+    /* A multisampled target cannot be the source of a region copy. */
+    if (texture_desc.SampleDesc.Count > 1)
+    {
+        ID3D11Texture2D_Release(target_texture);
+        return FALSE;
+    }
+
+    if (context->text_dst && (context->text_dst_width < width
+            || context->text_dst_height < height || context->text_dst_format != format))
+    {
+        ID3D11ShaderResourceView_Release(context->text_dst_srv);
+        ID3D11Texture2D_Release(context->text_dst);
+        context->text_dst_srv = NULL;
+        context->text_dst = NULL;
+    }
+
+    if (!context->text_dst)
+    {
+        D3D11_TEXTURE2D_DESC desc;
+
+        memset(&desc, 0, sizeof(desc));
+        desc.Width = max(width, context->text_dst_width);
+        desc.Height = max(height, context->text_dst_height);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = format;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        if (FAILED(hr = ID3D11Device1_CreateTexture2D(context->d3d_device, &desc, NULL,
+                &context->text_dst)))
+        {
+            WARN("Failed to create text destination copy, hr %#lx.\n", hr);
+            ID3D11Texture2D_Release(target_texture);
+            return FALSE;
+        }
+
+        if (FAILED(hr = ID3D11Device1_CreateShaderResourceView(context->d3d_device,
+                (ID3D11Resource *)context->text_dst, NULL, &context->text_dst_srv)))
+        {
+            WARN("Failed to create text destination view, hr %#lx.\n", hr);
+            ID3D11Texture2D_Release(context->text_dst);
+            context->text_dst = NULL;
+            ID3D11Texture2D_Release(target_texture);
+            return FALSE;
+        }
+
+        context->text_dst_width = desc.Width;
+        context->text_dst_height = desc.Height;
+        context->text_dst_format = format;
+    }
+
+    if (!context->text_dst_sampler)
+    {
+        D3D11_SAMPLER_DESC sampler_desc;
+
+        /* Point sampling: the copy is pixel aligned with the target, and any
+         * filtering would smear a neighbouring pixel's colour into the blend. */
+        memset(&sampler_desc, 0, sizeof(sampler_desc));
+        sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sampler_desc.MaxAnisotropy = 1;
+        sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+
+        if (FAILED(hr = ID3D11Device1_CreateSamplerState(context->d3d_device, &sampler_desc,
+                &context->text_dst_sampler)))
+        {
+            WARN("Failed to create text destination sampler, hr %#lx.\n", hr);
+            ID3D11Texture2D_Release(target_texture);
+            return FALSE;
+        }
+    }
+
+    /* Clip the copied region to the target. What falls outside is never
+     * sampled: the scissor rect is clamped to the target as well. */
+    src_left = max(bounds->left, 0);
+    src_top = max(bounds->top, 0);
+    src_right = min(bounds->right, (LONG)texture_desc.Width);
+    src_bottom = min(bounds->bottom, (LONG)texture_desc.Height);
+
+    if (src_left >= src_right || src_top >= src_bottom)
+    {
+        ID3D11Texture2D_Release(target_texture);
+        return FALSE;
+    }
+
+    box.left = src_left;
+    box.top = src_top;
+    box.front = 0;
+    box.right = src_right;
+    box.bottom = src_bottom;
+    box.back = 1;
+
+    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+    ID3D11DeviceContext_CopySubresourceRegion(d3d_context, (ID3D11Resource *)context->text_dst, 0,
+            src_left - bounds->left, src_top - bounds->top, 0,
+            (ID3D11Resource *)target_texture, 0, &box);
+    ID3D11DeviceContext_Release(d3d_context);
+    ID3D11Texture2D_Release(target_texture);
+
+    /* uv = (world position * scale - bounds origin) / copy size. */
+    scale_x = context->desc.dpiX / 96.0f;
+    scale_y = context->desc.dpiY / 96.0f;
+    context->text_dst_scale_x = scale_x / context->text_dst_width;
+    context->text_dst_offset_x = -(float)bounds->left / context->text_dst_width;
+    context->text_dst_scale_y = scale_y / context->text_dst_height;
+    context->text_dst_offset_y = -(float)bounds->top / context->text_dst_height;
+
+    return TRUE;
+}
+
 /* Draw the run once per subpixel channel, each pass masked by that channel's
  * coverage and writing only that channel. Build all resources before drawing
  * so an allocation failure cannot leave a partially coloured run behind. */
@@ -2137,8 +2352,10 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
     D2D1_SIZE_U bitmap_size;
     float scale_x, scale_y;
     D2D1_RECT_F run_rect;
+    D2D1_ANTIALIAS_MODE antialias_mode = context->drawing_state.antialiasMode;
     unsigned int c, i, x, y;
     BYTE *plane;
+    BOOL linear;
     HRESULT hr = S_OK;
 
     if (!width || !height)
@@ -2172,11 +2389,19 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
         goto done;
     }
 
+    /* Linear blending needs the destination, which the output merger cannot
+     * supply through a transfer function. Take a copy of it and let the shader
+     * finish the blend; if that is not available, stay on the ordinary path. */
+    linear = d2d_settings.text_linear_blend
+            && d2d_device_context_capture_text_dst(context, bounds, width, height);
+
     for (c = 0; c < 3; ++c)
     {
         unsigned int sample = pixel_geometry == DWRITE_PIXEL_GEOMETRY_BGR ? 2 - c : c;
 
-        if (!(blend_states[c] = d2d_device_context_get_subpixel_blend_state(context, c)))
+        blend_states[c] = linear ? d2d_device_context_get_subpixel_copy_blend_state(context, c)
+                : d2d_device_context_get_subpixel_blend_state(context, c);
+        if (!blend_states[c])
         {
             hr = E_OUTOFMEMORY;
             break;
@@ -2214,6 +2439,16 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
         transform = &context->drawing_state.transform;
         m = *transform;
         *transform = identity;
+        context->linear_text = linear;
+
+        /* The run rectangle is pixel aligned, so antialiasing its edges gains
+         * nothing — but it costs correctness here: the antialiased fill path
+         * covers the border pixels with partial coverage and scales the shader
+         * result by it. That is harmless while the output merger blends, and
+         * wrong once the shader produces the finished pixel, which is exactly
+         * what the linear path does. Draw the rectangle aliased instead. */
+        if (linear)
+            context->drawing_state.antialiasMode = D2D1_ANTIALIAS_MODE_ALIASED;
 
         for (c = 0; c < 3; ++c)
         {
@@ -2224,6 +2459,8 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
                     unsafe_impl_from_ID2D1Brush((ID2D1Brush *)opacity_brushes[c]));
         }
 
+        context->drawing_state.antialiasMode = antialias_mode;
+        context->linear_text = FALSE;
         context->bs = prev_bs;
         *transform = m;
     }
@@ -6113,6 +6350,11 @@ static const char shape_ps_code[] =
     "bool is_arc;\n"
     "bool aa_mode;\n"
     "bool srgb_encode;\n"
+    "bool linear_text;\n"
+    "float dst_scale_x;\n"
+    "float dst_offset_x;\n"
+    "float dst_scale_y;\n"
+    "float dst_offset_y;\n"
     "struct brush\n"
     "{\n"
     "    uint type;\n"
@@ -6120,9 +6362,17 @@ static const char shape_ps_code[] =
     "    float4 data[3];\n"
     "} colour_brush, opacity_brush;\n"
     "\n"
-    "SamplerState s0, s1;\n"
-    "Texture2D t0, t1;\n"
-    "Buffer<float4> b0, b1;\n"
+    /* Slots are fixed by what the brushes bind: bitmap brushes take t0/t1 and
+     * s0/s1, gradient brushes take t2/t3. The destination copy for linear text
+     * blending goes after those. */
+    "SamplerState s0 : register(s0);\n"
+    "SamplerState s1 : register(s1);\n"
+    "SamplerState s_dst : register(s2);\n"
+    "Texture2D t0 : register(t0);\n"
+    "Texture2D t1 : register(t1);\n"
+    "Buffer<float4> b0 : register(t2);\n"
+    "Buffer<float4> b1 : register(t3);\n"
+    "Texture2D t_dst : register(t4);\n"
     "\n"
     "struct input\n"
     "{\n"
@@ -6241,16 +6491,57 @@ static const char shape_ps_code[] =
     "/* scRGB (linear) -> sRGB transfer function, applied to a premultiplied\n"
     " * colour: the curve is non-linear, so the colour has to be divided by\n"
     " * alpha before encoding and multiplied by it again afterwards. */\n"
-    "float4 srgb_encode_colour(float4 colour)\n"
+    "float3 encode_srgb(float3 c)\n"
     "{\n"
-    "    float3 c, lo, hi;\n"
+    "    float3 lo, hi;\n"
     "\n"
-    "    c = saturate(colour.a > 0.0f ? colour.rgb / colour.a : colour.rgb);\n"
+    "    c = saturate(c);\n"
     "    lo = c * 12.92f;\n"
     "    hi = 1.055f * pow(max(c, 1.0e-8f), 1.0f / 2.4f) - 0.055f;\n"
-    "    c = lerp(lo, hi, step(0.0031308f, c));\n"
+    "    return lerp(lo, hi, step(0.0031308f, c));\n"
+    "}\n"
     "\n"
-    "    return float4(c * colour.a, colour.a);\n"
+    "/* sRGB -> scRGB (linear), the inverse of the above. */\n"
+    "float3 decode_srgb(float3 c)\n"
+    "{\n"
+    "    float3 lo, hi;\n"
+    "\n"
+    "    c = saturate(c);\n"
+    "    lo = c / 12.92f;\n"
+    "    hi = pow(max((c + 0.055f) / 1.055f, 1.0e-8f), 2.4f);\n"
+    "    return lerp(lo, hi, step(0.04045f, c));\n"
+    "}\n"
+    "\n"
+    "float4 srgb_encode_colour(float4 colour)\n"
+    "{\n"
+    "    float3 c;\n"
+    "\n"
+    "    c = colour.a > 0.0f ? colour.rgb / colour.a : colour.rgb;\n"
+    "\n"
+    "    return float4(encode_srgb(c) * colour.a, colour.a);\n"
+    "}\n"
+    "\n"
+    "/* Combine a glyph run with the destination in linear space.\n"
+    " *\n"
+    " * The output merger can only compute f(src) * A + g(dst) * B, so it cannot\n"
+    " * apply a transfer function to the destination; a linear blend has to be\n"
+    " * finished here, from a copy of the destination, and written straight out.\n"
+    " * Coverage stays outside the transfer function on purpose: it is a\n"
+    " * geometric area, not a colour, so it belongs in the linear domain where\n"
+    " * areas add up. */\n"
+    "float4 blend_text_linear(float4 colour, float coverage, float2 position)\n"
+    "{\n"
+    "    float3 src, dst;\n"
+    "    float2 uv;\n"
+    "\n"
+    "    src = colour.a > 0.0f ? colour.rgb / colour.a : colour.rgb;\n"
+    "    uv = float2(position.x * dst_scale_x + dst_offset_x,\n"
+    "            position.y * dst_scale_y + dst_offset_y);\n"
+    "    dst = t_dst.Sample(s_dst, uv).rgb;\n"
+    "\n"
+    "    src = lerp(decode_srgb(dst), decode_srgb(src), saturate(coverage * colour.a));\n"
+    "\n"
+    "    return float4(encode_srgb(src), 1.0f);\n"
     "}\n"
     "\n"
     "float4 sample_brush(struct brush brush, Texture2D t, SamplerState s, Buffer<float4> b, float2 position)\n"
@@ -6275,7 +6566,14 @@ static const char shape_ps_code[] =
     "    if (srgb_encode)\n"
     "        colour = srgb_encode_colour(colour);\n"
     "    if (opacity_brush.type < BRUSH_TYPE_COUNT)\n"
-    "        colour *= sample_brush(opacity_brush, t1, s1, b1, i.p).a;\n"
+    "    {\n"
+    "        float coverage = sample_brush(opacity_brush, t1, s1, b1, i.p).a;\n"
+    "\n"
+    "        if (linear_text)\n"
+    "            colour = blend_text_linear(colour, coverage, i.p);\n"
+    "        else\n"
+    "            colour *= coverage;\n"
+    "    }\n"
     "\n"
     "    if (outline)\n"
     "    {\n"
