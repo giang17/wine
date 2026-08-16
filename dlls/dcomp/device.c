@@ -2308,6 +2308,23 @@ struct dcomp_target
      * actually painted, so what we stop covering can be handed back. */
     HRGN frame_rgn;
     HRGN delivered_rgn;
+    /* Save-under for the region delivery (issue 196): a copy of the window
+     * content as it was BEFORE our blit, for exactly the area the last
+     * delivery painted (saved_rgn).  Until now vacated pixels were the
+     * application's problem -- InvalidateRgn, one attempt, no receipt -- and
+     * a compositing application paints nothing there, because the moving
+     * leaf lives in the tree precisely so it does not have to.  On Windows
+     * the DWM clears the old position while compositing; here it had already
+     * been written into the window and stood there for good.  So the cleanup
+     * is our own idempotent action now: restore the saved backdrop, and keep
+     * the invalidation next to it as a correction path for when the
+     * application did change something underneath us.  WINE_DCOMP_SAVE_UNDER=0
+     * returns to delegating the whole cleanup. */
+    HDC     save_dc;
+    HBITMAP save_bitmap;
+    DWORD  *save_bits;
+    UINT    save_width, save_height;
+    HRGN    saved_rgn;   /* region for which save_dc holds a valid backdrop */
     /* That delivery runs in a thread of ours instead of the application's GUI
      * thread (issue 190, WINE_DCOMP_DELIVER_THREAD).  deliver_rgn is the
      * thread's own copy of frame_rgn, taken under the device lock, so the tree
@@ -2431,6 +2448,15 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
             DeleteObject(target->frame_rgn);
         if (target->delivered_rgn)
             DeleteObject(target->delivered_rgn);
+        if (target->saved_rgn)
+            DeleteObject(target->saved_rgn);
+        if (target->save_bitmap)
+        {
+            SelectObject(target->save_dc, NULL);
+            DeleteObject(target->save_bitmap);
+        }
+        if (target->save_dc)
+            DeleteDC(target->save_dc);
         if (target->comp_bitmap)
         {
             SelectObject(target->comp_dc, NULL);
@@ -2822,6 +2848,58 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
 
     FIXME("Created comp DC %p with %ux%u DIB for target hwnd %p.\n",
             target->comp_dc, width, height, target->hwnd);
+}
+
+/* The save-under copy of the window content (issue 196), laid out like
+ * ensure_comp_dc above.  A size change invalidates what was saved: the
+ * backdrop belongs to another window geometry, so saved_rgn goes empty and
+ * the next delivery re-captures from the window. */
+static void dcomp_target_ensure_save_dc(struct dcomp_target *target, UINT width, UINT height)
+{
+    BITMAPINFO bmi;
+
+    if (target->save_dc && target->save_width == width && target->save_height == height)
+        return;
+
+    if (target->save_bitmap)
+    {
+        SelectObject(target->save_dc, NULL);
+        DeleteObject(target->save_bitmap);
+        target->save_bitmap = NULL;
+        target->save_bits = NULL;
+    }
+    if (target->save_dc)
+    {
+        DeleteDC(target->save_dc);
+        target->save_dc = NULL;
+    }
+    if (target->saved_rgn)
+        SetRectRgn(target->saved_rgn, 0, 0, 0, 0);
+
+    memset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -(int)height;  /* top-down DIB */
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    target->save_dc = CreateCompatibleDC(NULL);
+    if (!target->save_dc)
+        return;
+
+    target->save_bitmap = CreateDIBSection(target->save_dc, &bmi,
+            DIB_RGB_COLORS, (void **)&target->save_bits, NULL, 0);
+    if (!target->save_bitmap)
+    {
+        DeleteDC(target->save_dc);
+        target->save_dc = NULL;
+        return;
+    }
+
+    SelectObject(target->save_dc, target->save_bitmap);
+    target->save_width = width;
+    target->save_height = height;
 }
 
 /* -------------------------------------------------------------------------
@@ -3428,6 +3506,21 @@ static BOOL dcomp_region_delivery(void)
     return dcomp_region_delivery_enabled > 0;
 }
 
+/* Restoring vacated pixels ourselves instead of only invalidating them
+ * (issue 196).  Default on; WINE_DCOMP_SAVE_UNDER=0 turns the cleanup back
+ * into the delegated InvalidateRgn of 991b3cc22a6 for counter-checks. */
+static int dcomp_save_under_enabled = -1;
+
+static BOOL dcomp_save_under(void)
+{
+    if (dcomp_save_under_enabled < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_SAVE_UNDER");
+        dcomp_save_under_enabled = (!e || atoi(e)) ? 1 : 0;
+    }
+    return dcomp_save_under_enabled > 0;
+}
+
 /* The region to deliver is passed in rather than read off the target: with the
  * delivery running in a thread of its own (below) the tree walk keeps writing
  * frame_rgn while this runs, so the caller hands over a copy it took under the
@@ -3443,11 +3536,37 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
     if (!dcomp_region_delivery() || !rgn)
         return;
 
-    /* Hand back what the last delivery painted and this one does not cover. */
+    /* Hand back what the last delivery painted and this one does not cover.
+     * With save-under the hand-back is first our own action: write the
+     * backdrop saved before the last blit back to the window, so the vacated
+     * area no longer depends on the application repainting it -- it will not,
+     * for the reason it uses DirectComposition at all (issue 196).  The
+     * restore runs before the delivery because vacated is disjoint to rgn by
+     * construction; nothing later in this function writes there.  InvalidateRgn
+     * stays as the correction path for the stale case: the application may
+     * have painted underneath us, and then the saved backdrop is outdated.
+     * The restore region comes off saved_rgn -- exactly the area save_dc
+     * still holds a backdrop for -- and with an empty rgn it is all of it,
+     * so a leaf that vanishes is restored by this same line (issue 190's
+     * playhead disappearing when the transport stops). */
     if (target->delivered_rgn && (vacated = CreateRectRgn(0, 0, 0, 0)))
     {
         if (CombineRgn(vacated, target->delivered_rgn, rgn, RGN_DIFF) > NULLREGION)
+        {
+            if (dcomp_save_under() && target->saved_rgn && target->save_dc
+                    && IsWindowVisible(target->hwnd) && (hdc = GetDC(target->hwnd)))
+            {
+                HRGN restore = CreateRectRgn(0, 0, 0, 0);
+
+                if (restore
+                        && CombineRgn(restore, target->saved_rgn, rgn, RGN_DIFF) > NULLREGION)
+                    dcomp_blt_region(hdc, target->save_dc, restore);
+                if (restore)
+                    DeleteObject(restore);
+                ReleaseDC(target->hwnd, hdc);
+            }
             InvalidateRgn(target->hwnd, vacated, FALSE);
+        }
         DeleteObject(vacated);
     }
 
@@ -3456,6 +3575,8 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
     {
         if (target->delivered_rgn)
             SetRectRgn(target->delivered_rgn, 0, 0, 0, 0);
+        if (target->saved_rgn)
+            SetRectRgn(target->saved_rgn, 0, 0, 0, 0);
         return;
     }
 
@@ -3464,6 +3585,12 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
 
     EnterCriticalSection(&target->device->cs);
     dcomp_target_ensure_comp_dc(target, rc->right, rc->bottom);
+    if (dcomp_save_under())
+    {
+        dcomp_target_ensure_save_dc(target, rc->right, rc->bottom);
+        if (target->save_dc && target->save_bits && !target->saved_rgn)
+            target->saved_rgn = CreateRectRgn(0, 0, 0, 0);
+    }
     if (target->comp_dc && target->comp_bits)
     {
         HDC hdc_win = GetDC(target->hwnd);
@@ -3472,10 +3599,31 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
          * is not fully opaque has to show what the window has there.  The
          * read-back that issue 187 measured as damaging is this same call over
          * the whole client area; bounded to the leaf rectangles it cannot get
-         * in the way of anything the application paints elsewhere. */
+         * in the way of anything the application paints elsewhere.
+         *
+         * With save-under the backdrop comes out of the saved copy, not the
+         * window: where this delivery overlaps the last one the window
+         * already carries our own line, and reading it back would bake that
+         * line into the background -- a fixed trail the moment the leaf moves
+         * on.  The part this delivery newly claims (fresh) has never been
+         * painted by us, so the window is the right source for exactly that
+         * part, captured into save_dc before the blend touches comp_dc. */
         if (hdc_win)
         {
-            dcomp_blt_region(target->comp_dc, hdc_win, rgn);
+            if (target->save_dc && target->save_bits && target->saved_rgn)
+            {
+                HRGN fresh = CreateRectRgn(0, 0, 0, 0);
+
+                if (fresh)
+                {
+                    if (CombineRgn(fresh, rgn, target->saved_rgn, RGN_DIFF) > NULLREGION)
+                        dcomp_blt_region(target->save_dc, hdc_win, fresh);
+                    DeleteObject(fresh);
+                }
+                dcomp_blt_region(target->comp_dc, target->save_dc, rgn);
+            }
+            else
+                dcomp_blt_region(target->comp_dc, hdc_win, rgn);
             ReleaseDC(target->hwnd, hdc_win);
         }
 
@@ -3498,6 +3646,19 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
             target->delivered_rgn = CreateRectRgn(0, 0, 0, 0);
         if (target->delivered_rgn)
             CombineRgn(target->delivered_rgn, rgn, NULL, RGN_COPY);
+
+        /* The blit reached the window, and save_dc now holds a valid backdrop
+         * for exactly rgn: fresh was captured from the window above, the rest
+         * kept the copy from the delivery before.  Only record it when the
+         * save-under buffer actually exists -- without it there is nothing to
+         * restore from, and saved_rgn must not claim otherwise. */
+        if (target->save_dc && target->save_bits)
+        {
+            if (!target->saved_rgn)
+                target->saved_rgn = CreateRectRgn(0, 0, 0, 0);
+            if (target->saved_rgn)
+                CombineRgn(target->saved_rgn, rgn, NULL, RGN_COPY);
+        }
 
         TRACE("Delivered (%ld,%ld)-(%ld,%ld) of %ldx%ld to hwnd %p, window not claimed.\n",
                 (long)box.left, (long)box.top, (long)box.right, (long)box.bottom,
