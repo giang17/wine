@@ -94,6 +94,22 @@ static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp
 #define DCOMP_TREE_TIMER     ((UINT_PTR)0xDC0FFEE2)
 #define DCOMP_TREE_TIMER_MS  16
 #define DCOMP_TREE_FRAME_MS  16   /* ~60 Hz rate limit for hook-driven composites */
+
+/* Measurement dial (issue 206): the tree timer period, adjustable without a
+ * rebuild so the delivery rate can be varied against the application's present
+ * rate.  WINE_DCOMP_TREE_TIMER_MS=<ms>, default 16 = unchanged behaviour. */
+static UINT dcomp_tree_timer_ms(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *env = getenv("WINE_DCOMP_TREE_TIMER_MS");
+
+        cached = (env && atoi(env) > 0) ? atoi(env) : DCOMP_TREE_TIMER_MS;
+    }
+    return cached;
+}
 /* How long the target window may show something other than what we delivered
  * before we re-deliver it.  A tab switch legitimately repaints the panel while
  * Chromium's hide is still in flight (~100-500 ms), and re-blitting into that
@@ -2765,7 +2781,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
         DWORD now = GetTickCount();
 
         if (target && !target->foreign)
-            SetTimer(target_hwnd, DCOMP_TREE_TIMER, DCOMP_TREE_TIMER_MS, NULL);
+            SetTimer(target_hwnd, DCOMP_TREE_TIMER, dcomp_tree_timer_ms(), NULL);
         if (target && now - target->last_tree_composite_tick >= DCOMP_TREE_FRAME_MS)
         {
             target->last_tree_composite_tick = now;
