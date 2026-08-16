@@ -196,8 +196,8 @@ BEGIN
     LTEXT       "This is a sample text using 10 point Tahoma",IDC_RES_FONT_PREVIEW,15,124,230,49
 
     GROUPBOX    "Direct2D text",IDC_STATIC,8,181,244,35
-    LTEXT       "Enhanced &contrast:",IDC_STATIC,15,192,80,8
-    COMBOBOX    IDC_TEXT_CONTRAST,98,190,147,60,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT       "Enhanced &contrast:",IDC_STATIC,15,192,95,8
+    COMBOBOX    IDC_TEXT_CONTRAST,113,190,132,60,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     LTEXT       "Running applications are unaffected until restarted.",IDC_STATIC,15,205,230,9
 END
 
