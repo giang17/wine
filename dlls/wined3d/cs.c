@@ -30,6 +30,11 @@ static NTSTATUS (WINAPI *pNtWaitForAlertByThreadId)(void *addr, const LARGE_INTE
 
 #define WINED3D_INITIAL_CS_SIZE 4096
 
+/* Posted to a swapchain window after each executed present so the dcomp
+ * subclass puts the delivered leaves back over the presented frame
+ * (issue 206).  Kept in sync with dlls/dcomp/device.c and dlls/dxgi/factory.c. */
+#define WM_WINE_DCOMP_PRESENT_FLUSH (WM_USER + 0x102)
+
 struct wined3d_deferred_upload
 {
     struct wined3d_resource *resource;
@@ -730,6 +735,18 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
                 op->present_dirty_rect_count * sizeof(*swapchain->cs_present_dirty_rects));
 
     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
+
+    /* The present above was the last writer of the window.  A dcomp tree that
+     * delivers leaves into the same window below the coverage threshold has
+     * to put them back NOW, not at its next tree-timer tick -- the gap between
+     * the two is the playhead flicker of issue 206.  Signal only: posted to
+     * the window's owning thread, never blitted from this CS thread -- GDI on
+     * a window from a foreign thread is what broke selection drags in Studio
+     * Pro (issue 190).  Windows without the property (no in-process dcomp
+     * target, composition swapchains) pay one GetPropW per present. */
+    if (swapchain->win_handle
+            && GetPropW(swapchain->win_handle, L"__wine_dcomp_present_flush"))
+        PostMessageW(swapchain->win_handle, WM_WINE_DCOMP_PRESENT_FLUSH, 0, 0);
 
     /* Copy the just-presented content back into back_buffer[0] so the app can
      * do incremental rendering (DirtyRects).  After rotation,

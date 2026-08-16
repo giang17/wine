@@ -71,6 +71,10 @@ static inline void dcomp_private_free(void *ptr)
 #define free(p)         dcomp_private_free(p)
 
 #define WM_WINE_DCOMP_SET_CHILD_MODE (WM_USER + 0x101)
+/* dxgi posts this to a target window after each successful HWND present so
+ * the subclassed wndproc can put the delivered leaves back over the presented
+ * frame without waiting for the next tree timer tick (issue 206). */
+#define WM_WINE_DCOMP_PRESENT_FLUSH (WM_USER + 0x102)
 
 /* Forward declarations for target back-pointer and list management */
 struct dcomp_device;
@@ -107,6 +111,24 @@ static UINT dcomp_tree_timer_ms(void)
         const char *env = getenv("WINE_DCOMP_TREE_TIMER_MS");
 
         cached = (env && atoi(env) > 0) ? atoi(env) : DCOMP_TREE_TIMER_MS;
+    }
+    return cached;
+}
+
+/* Present-driven delivery (issue 206): a present to the target window
+ * overwrites whatever the GDI delivery last put there, and between that
+ * present and our next tree-timer blit the leaves are gone -- measured as a
+ * miss rate linear in the delivery interval (see issue 206).  On by default;
+ * WINE_DCOMP_PRESENT_DRIVEN=0 restores pure timer behaviour. */
+static BOOL dcomp_present_driven(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *env = getenv("WINE_DCOMP_PRESENT_DRIVEN");
+
+        cached = (env && !atoi(env)) ? 0 : 1;
     }
     return cached;
 }
@@ -2229,6 +2251,11 @@ static void dcomp_visual_try_reparent(struct dcomp_visual *visual)
 
 /* Property name for storing target pointer on HWND (Phase 5 subclass) */
 static const WCHAR dcomp_target_prop[] = L"__wine_dcomp_target";
+/* Set (in-process targets only) while a subclassed wndproc is in place that
+ * will handle WM_WINE_DCOMP_PRESENT_FLUSH.  dxgi reads it after each present
+ * to decide whether to post the flush message at all -- foreign-process
+ * targets have no subclass of ours, so they are never signalled. */
+static const WCHAR dcomp_present_flush_prop[] = L"__wine_dcomp_present_flush";
 
 /* Global composition-target registry on the desktop window, so presenters in
  * other modules/processes (wined3d) can exclude target areas from their window
@@ -2456,6 +2483,7 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
             if (ours)
             {
                 RemovePropW(target->hwnd, dcomp_target_prop);
+                RemovePropW(target->hwnd, dcomp_present_flush_prop);
                 dcomp_target_registry_set(target->hwnd, FALSE);
             }
         }
@@ -4514,6 +4542,23 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         }
         break;
 
+    case WM_WINE_DCOMP_PRESENT_FLUSH:
+        /* A present has just overwritten the window with its backbuffer
+         * (issue 206): re-deliver what our tree owes this window NOW instead
+         * of at the next tree timer tick.  dxgi only posts this message on
+         * windows carrying __wine_dcomp_present_flush, so reaching here means
+         * the flush applies.  Posted, not sent: the blit runs on the thread
+         * that owns the window (this one), never on the presenting thread --
+         * the cross-thread delivery of issue 190 dragged selections in Studio
+         * Pro down.  Disabled, the message falls through to the original
+         * wndproc, which restores pure timer behaviour. */
+        if (dcomp_present_driven())
+        {
+            dcomp_target_composite_tree(target, FALSE);
+            return 0;
+        }
+        break;
+
     case WM_PAINT:
         /* Rootless tree (issue 88): repaint from the composed tree instead of
          * the original wndproc (which would show the empty/loader content).
@@ -4572,6 +4617,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             RemovePropW(hwnd, dcomp_subclass_proc_prop);
         }
         RemovePropW(hwnd, dcomp_target_prop);
+        RemovePropW(hwnd, dcomp_present_flush_prop);
         target->orig_wndproc = NULL;
         if (!orig_wndproc)
             return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -4711,6 +4757,16 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
             return S_OK;
         }
     }
+
+    /* In-process from here: our wndproc will handle WM_WINE_DCOMP_PRESENT_FLUSH
+     * for this window.  Foreign targets never get the property, so dxgi never
+     * posts the flush message to a window whose wndproc is not ours.  The
+     * property is also what carries the env gate: with present-driven delivery
+     * disabled it is never set, so dxgi never posts and no message reaches
+     * the application's wndproc -- pure timer behaviour, one gate, one place
+     * (issue 206). */
+    if (dcomp_present_driven())
+        SetPropW(hwnd, dcomp_present_flush_prop, (HANDLE)1);
 
     /* Never chain a second subclass onto ourselves.  A window can receive another
      * composition target - the app recreates them when the plugin window is
