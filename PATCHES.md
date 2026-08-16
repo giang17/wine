@@ -412,6 +412,9 @@ DirectWrite reports an *enhanced contrast* value alongside gamma and ClearType
 level; Wine hardcodes it to zero, so nothing is applied. This branch honours it and
 lets the prefix override it:
 
+**In winecfg:** *Graphics* tab, *Direct2D text*, "Enhanced contrast" — three named
+settings plus whatever a registry edit put there. Or by hand:
+
 ```bash
 wine reg add 'HKCU\Software\Wine\Direct2D' /v text_enhanced_contrast /t REG_DWORD /d 70 /f
 wineserver -k    # the value is read when d2d1 loads, so restart the application
