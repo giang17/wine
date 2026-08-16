@@ -365,6 +365,47 @@ side by side if you want to judge it yourself.
 GDI text is unaffected on hosts whose fontconfig already resolves subpixel per font,
 which is the common case on KDE and GNOME.
 
+### Linear-space text blending
+
+Coverage is a geometric area, so a correct composite linearises source and
+destination, mixes there, and encodes the result back. Direct2D's text path mixes
+in the target's *encoded* space instead, which makes the same text carry a
+different amount of ink depending on its polarity — light text on dark comes out
+thinner than dark text on light, from the arithmetic alone.
+
+```bash
+wine reg add 'HKCU\Software\Wine\Direct2D' /v text_linear_blend /t REG_DWORD /d 1 /f
+wineserver -k
+```
+
+Measured against identical text drawn in both polarities, where a correct blend
+gives zero: the mean deviation is **-0.30 at 11px and -0.20 at 24px** without the
+key, worst case -0.5719 — exactly the value half coverage predicts. With the key
+the mean falls to **+0.0004** and the worst case to 0.0058, which is 8-bit
+quantisation. The blend is then as accurate as the target format permits.
+
+Reported effect on a dark audio interface: black on white becomes noticeably more
+restrained and cleaner in its stroke, white on black slightly heavier, which reads
+better at small sizes. Both are the expected direction — the correction removes the
+polarity bias rather than adding weight everywhere.
+
+**It costs about 500 µs per `DrawText`**, tripling the ClearType surcharge from
+roughly 215 µs to 700 µs, or +12 to +13% of the total cost of a `DrawText` call.
+That is why it is off by default. With the key unset, rendering is bit-identical
+to not having the feature: 0 of 341156 pixels differ.
+
+Two things worth knowing before enabling it:
+
+- It **deliberately departs from Direct2D** on a plain UNORM target, where Windows
+  blends linearly in encoded values. This is "more correct than the original",
+  which is not automatically what an application expects.
+- The obvious cheaper route — let an `_SRGB` render target view make the hardware
+  do the conversion — **does not work in Wine**, and fails silently. wined3d
+  honours the sRGB cast only for swapchains with a single back buffer; for flip
+  models and composition swapchains `CreateRenderTargetView` succeeds and the
+  encoding does not happen. The implementation therefore copies the destination
+  under the glyph run and finishes the blend in the shader.
+
 ### Enhanced contrast — worth setting on a dark interface
 
 DirectWrite reports an *enhanced contrast* value alongside gamma and ClearType
