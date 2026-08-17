@@ -2283,12 +2283,21 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
      * shibco patch 0055). A swapchain that dxgi later marks FORCE_GDI_PRESENT
      * still takes the GDI branch at present time — swapchain_gl_present()
      * checks that flag first. Swapchains are routinely created before the
-     * first ShowWindow(), so visibility is not part of the test. */
+     * first ShowWindow(), so visibility is not part of the test.
+     *
+     * ID2D1HwndRenderTarget top-level windows stay on the GDI path too: on
+     * the GL path their first present never becomes visible (the window
+     * stays black until an expose forces a second present — resize, minimize
+     * and restore both fix it, a plain move does not; issue 208).  d2d1 sets
+     * __wine_d3d_hwnd_target on the window before creating the swapchain,
+     * so the marker is already there when we decide.  The GDI path renders
+     * these windows correctly from the first present on. */
     if (!wined3d_gl_present_disabled() && window)
     {
         LONG style = GetWindowLongW(window, GWL_STYLE);
 
-        if (!(style & (WS_CHILD | WS_POPUP)))
+        if (!(style & (WS_CHILD | WS_POPUP))
+                && !GetPropW(window, L"__wine_d3d_hwnd_target"))
         {
             swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
             TRACE("Preferring GL present for top-level window %p (style %#lx).\n", window, style);
