@@ -3594,6 +3594,38 @@ static BOOL dcomp_blt_region(HDC dst, HDC src, HRGN region)
  * threshold, for counter-checks. */
 static int dcomp_region_delivery_enabled = -1;
 
+/* How the delivery blit is pushed out to the display server (issue 206).
+ *
+ * MEASURED on Fender Studio Pro 8, same song, transport running, share of
+ * captured frames missing the playhead column (20 s per run at 20 fps):
+ *
+ *   0  off                      79.0 %
+ *   3  GdiFlush() only          not sufficient -- drains Wine's GDI batch, after
+ *                               which the requests still sit in Xlib's buffer
+ *   1  XFlush via escape         1.5 / 2.8 %      (median 2.2)
+ *   4  XSync via escape          2.5 / 4.2 / 4.0  (median 4.0)
+ *   2  full round trip           0.5 / 0.8 / 7.2  (median 0.8)   <- default
+ *
+ * The round trip wins, which is not obvious: XSync also waits for the server but
+ * blocks on the whole queue, while reading one pixel only waits for this
+ * drawable.  The ordering between 1, 2 and 4 is within the run-to-run spread and
+ * has not been settled; 2 is chosen because it is the one where the flicker is
+ * visually all but gone.  Its cost -- one pixel read back per delivery, ~220/s --
+ * has not been measured against the others yet. */
+static int dcomp_deliver_flush_mode = -1;
+
+static int dcomp_deliver_flush(void)
+{
+    if (dcomp_deliver_flush_mode < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_DELIVER_FLUSH");
+        dcomp_deliver_flush_mode = e ? atoi(e) : 2;
+        if (dcomp_deliver_flush_mode < 0)
+            dcomp_deliver_flush_mode = 0;
+    }
+    return dcomp_deliver_flush_mode;
+}
+
 static BOOL dcomp_region_delivery(void)
 {
     if (dcomp_region_delivery_enabled < 0)
@@ -3740,6 +3772,57 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
     if (GetClipBox(hdc, &clip_rc) > NULLREGION
             && dcomp_blt_region(hdc, target->comp_dc, rgn))
     {
+        /* Push the blit out to the display server now, do not leave it queued
+         * (issue 206).
+         *
+         * The application presents through GL, which writes the window
+         * immediately.  Our delivery is a batch of GDI operations that turn into
+         * XRender composites -- they arrive at the server, but on the server's
+         * schedule.  Whenever a swap lands between our composite being queued and
+         * being executed, the frame shows the window without our leaves: exactly
+         * the playhead flicker.
+         *
+         * It surfaced by accident: a diagnostic probe reading one pixel back
+         * after each delivery -- a synchronous XGetImage, i.e. a round trip that
+         * drains the queue as a side effect -- visibly removed almost all of the
+         * flicker.  That side effect is the fix.
+         *
+         * WINE_DCOMP_DELIVER_FLUSH picks how (see dcomp_deliver_flush above for
+         * the measurements); 0 turns it off. */
+        switch (dcomp_deliver_flush())
+        {
+        case 1:
+            /* Cheapest that works: ask winex11 to push its Xlib queue out.  No
+             * image is read and nothing is waited for -- the requests just stop
+             * sitting in the client-side buffer. */
+            {
+                /* Kept in sync with dlls/winex11.drv/x11drv.h. */
+                enum { X11DRV_ESCAPE = 6789, X11DRV_FLUSH_DISPLAY = 4 };
+                DWORD code = X11DRV_FLUSH_DISPLAY;
+
+                ExtEscape(hdc, X11DRV_ESCAPE, sizeof(code), (const char *)&code, 0, NULL);
+            }
+            break;
+        case 2:
+            /* Full round trip -- drains the queue AND waits for the server.
+             * Measurably effective, but reads back a pixel we do not need. */
+            GetPixel(hdc, clip_rc.left, clip_rc.top);
+            break;
+        case 3:
+            GdiFlush();   /* GDI batch only -- measured as NOT sufficient */
+            break;
+        case 4:
+            /* XSync: drains the queue AND waits for the server, like the round
+             * trip above, but transfers no image. */
+            {
+                enum { X11DRV_ESCAPE = 6789, X11DRV_SYNC_DISPLAY = 5 };
+                DWORD code = X11DRV_SYNC_DISPLAY;
+
+                ExtEscape(hdc, X11DRV_ESCAPE, sizeof(code), (const char *)&code, 0, NULL);
+            }
+            break;
+        }
+
         if (!target->delivered_rgn)
             target->delivered_rgn = CreateRectRgn(0, 0, 0, 0);
         if (target->delivered_rgn)

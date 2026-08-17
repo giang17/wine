@@ -620,6 +620,25 @@ static INT X11DRV_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID in_d
                     return TRUE;
                 }
                 break;
+            case X11DRV_FLUSH_DISPLAY:
+                /* Push everything queued for this DC out to the server now
+                 * (issue 206).  GdiFlush() only drains Wine's own GDI batch;
+                 * the resulting X requests then still sit in Xlib's client-side
+                 * buffer until something forces them out.  A compositor that
+                 * paints into a window another process presents to has to be
+                 * sure its drawing has left the client, or a swap lands in
+                 * between and the frame shows the window without it. */
+                XFlush( gdi_display );
+                return TRUE;
+            case X11DRV_SYNC_DISPLAY:
+                /* Like the above, but also waits until the server has processed
+                 * the requests.  That closes the window between "sent" and
+                 * "executed" in which a swap can still land ahead of us -- the
+                 * measured difference between the two is ~1.5 pp of frames
+                 * (issue 206).  Costs a round trip, but transfers no image, so
+                 * it should be cheaper than reading a pixel back. */
+                XSync( gdi_display, False );
+                return TRUE;
             case X11DRV_GET_DRAWABLE:
                 if (out_count >= sizeof(struct x11drv_escape_get_drawable))
                 {

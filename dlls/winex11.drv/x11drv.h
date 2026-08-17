@@ -347,6 +347,8 @@ enum x11drv_escape_codes
     X11DRV_GET_DRAWABLE,     /* get current drawable for a DC */
     X11DRV_START_EXPOSURES,  /* start graphics exposures */
     X11DRV_END_EXPOSURES,    /* end graphics exposures */
+    X11DRV_FLUSH_DISPLAY,    /* push queued requests out to the server (issue 206) */
+    X11DRV_SYNC_DISPLAY,     /* push out AND wait until the server processed them */
 };
 
 struct x11drv_escape_set_drawable
