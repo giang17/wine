@@ -1456,6 +1456,135 @@ static void d2d_device_context_fill_triangles(struct d2d_device_context *render_
             sizeof(*geometry->fill.vertices), brush, opacity_brush);
 }
 
+/* Hash a vertex position by its bit pattern. The fill vertices and the corners
+ * of the curve triangles are copies of the same figure points, so equal points
+ * are bit-identical and an exact match is the right test here. */
+static UINT32 d2d_fill_aa_position_hash(const D2D1_POINT_2F *p)
+{
+    UINT32 hx, hy;
+
+    memcpy(&hx, &p->x, sizeof(hx));
+    memcpy(&hy, &p->y, sizeof(hy));
+    return hx * 2654435761u + hy * 2246822519u;
+}
+
+/* Index of a fill vertex at the given position, or ~0 if the point is not one
+ * of them — which is the normal case for a bezier control point outside the
+ * filled area, since only control points inside it become figure vertices. */
+static size_t d2d_fill_aa_find_vertex(const struct d2d_geometry *geometry,
+        const UINT32 *vertex_map, size_t map_size, const D2D1_POINT_2F *p)
+{
+    UINT32 slot = d2d_fill_aa_position_hash(p) % map_size;
+    size_t probe = 0;
+
+    while (probe < map_size && vertex_map[slot])
+    {
+        if (!memcmp(&geometry->fill.vertices[vertex_map[slot] - 1], p, sizeof(*p)))
+            return vertex_map[slot] - 1;
+        slot = (slot + 1) % map_size;
+        ++probe;
+    }
+    return ~(size_t)0;
+}
+
+/* Mark the mesh edges that run along a curve segment.
+ *
+ * The tessellation puts the corners of every curve triangle on figure vertices,
+ * so a mesh edge belongs to a curve exactly when both its endpoints are corners
+ * of the same curve triangle: the chord for a control point outside the filled
+ * area, and the two control edges for one inside it. Such an edge is the seam
+ * between the flat mesh and the curve triangle that is drawn on top of it right
+ * afterwards, and that triangle antialiases itself — widening the seam with a
+ * skirt would cover the same pixels a second time.
+ *
+ * Only edges that are actually in the mesh are marked; a chord that ended up as
+ * an interior diagonal is simply not found.
+ *
+ * Returns FALSE if the marking could not be completed. Half-marked data is
+ * worse than none — an unmarked seam would get a skirt and be drawn twice — so
+ * the caller falls back to the plain fill in that case. */
+static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_geometry *geometry,
+        const UINT32 *edge_keys, BYTE *edge_curve, size_t map_size)
+{
+    const struct d2d_curve_vertex *curves[2];
+    size_t counts[2], vertex_map_size, i, c;
+    UINT32 *vertex_map;
+
+    curves[0] = geometry->fill.bezier_vertices;
+    counts[0] = geometry->fill.bezier_vertex_count;
+    curves[1] = geometry->fill.arc_vertices;
+    counts[1] = geometry->fill.arc_vertex_count;
+
+    vertex_map_size = geometry->fill.vertex_count * 2 + 16;
+    if (!(vertex_map = calloc(vertex_map_size, sizeof(*vertex_map))))
+        return FALSE;
+
+    for (i = 0; i < geometry->fill.vertex_count; ++i)
+    {
+        const D2D1_POINT_2F *p = &geometry->fill.vertices[i];
+        UINT32 slot = d2d_fill_aa_position_hash(p) % vertex_map_size;
+        size_t probe = 0;
+
+        while (probe < vertex_map_size && vertex_map[slot]
+                && memcmp(&geometry->fill.vertices[vertex_map[slot] - 1], p, sizeof(*p)))
+        {
+            slot = (slot + 1) % vertex_map_size;
+            ++probe;
+        }
+        if (probe == vertex_map_size)
+        {
+            free(vertex_map);
+            return FALSE;
+        }
+        if (!vertex_map[slot])
+            vertex_map[slot] = i + 1;
+    }
+
+    for (c = 0; c < 2; ++c)
+    {
+        for (i = 0; i + 2 < counts[c]; i += 3)
+        {
+            size_t idx[3];
+            int a, b;
+
+            for (a = 0; a < 3; ++a)
+                idx[a] = d2d_fill_aa_find_vertex(geometry, vertex_map, vertex_map_size,
+                        &curves[c][i + a].position);
+
+            for (a = 0; a < 3; ++a)
+            {
+                for (b = a + 1; b < 3; ++b)
+                {
+                    UINT32 lo, hi, key, slot;
+                    size_t probe = 0;
+
+                    if (idx[a] > 0xffff || idx[b] > 0xffff || idx[a] == idx[b])
+                        continue;
+                    lo = idx[a] < idx[b] ? idx[a] : idx[b];
+                    hi = idx[a] < idx[b] ? idx[b] : idx[a];
+                    key = lo * 65536u + hi + 1u;
+                    slot = key % map_size;
+                    while (probe < map_size && edge_keys[slot] && edge_keys[slot] != key)
+                    {
+                        slot = (slot + 1) % map_size;
+                        ++probe;
+                    }
+                    if (probe == map_size)
+                    {
+                        free(vertex_map);
+                        return FALSE;
+                    }
+                    if (edge_keys[slot] == key)
+                        edge_curve[slot] = 1;
+                }
+            }
+        }
+    }
+
+    free(vertex_map);
+    return TRUE;
+}
+
 /* Build and draw fill-AA geometry. Returns TRUE on success, FALSE if caller should fall back. */
 static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
@@ -1469,7 +1598,7 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
     size_t boundary_count = 0;
     size_t expanded_count, map_size, i, vi;
     UINT32 *edge_keys;
-    BYTE *edge_cnt, *edge_processed;
+    BYTE *edge_cnt, *edge_processed, *edge_curve;
     ID3D11Buffer *vb;
     HRESULT hr;
 
@@ -1479,9 +1608,10 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
     edge_keys      = calloc(map_size, sizeof(*edge_keys));
     edge_cnt       = calloc(map_size, sizeof(*edge_cnt));
     edge_processed = calloc(map_size, sizeof(*edge_processed));
-    if (!edge_keys || !edge_cnt || !edge_processed)
+    edge_curve     = calloc(map_size, sizeof(*edge_curve));
+    if (!edge_keys || !edge_cnt || !edge_processed || !edge_curve)
     {
-        free(edge_keys); free(edge_cnt); free(edge_processed);
+        free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve);
         return FALSE;
     }
 
@@ -1504,7 +1634,7 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
             }
             if (probe == map_size)
             {
-                free(edge_keys); free(edge_cnt); free(edge_processed);
+                free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve);
                 return FALSE;
             }
             edge_keys[slot] = key;
@@ -1512,16 +1642,34 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
         }
     }
 
-    /* Count boundary edges for skirt allocation. */
+    /* A geometry that mixes straight edges with curve segments keeps the
+     * antialiasing on its straight edges; the seams towards the curves are left
+     * to the curve triangles, which antialias themselves. */
+    if ((geometry->fill.bezier_vertex_count || geometry->fill.arc_vertex_count)
+            && !d2d_fill_aa_mark_curve_edges(geometry, edge_keys, edge_curve, map_size))
+    {
+        free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve);
+        return FALSE;
+    }
+
+    /* Count the boundary edges that get a skirt, i.e. everything but the seams. */
     for (i = 0; i < map_size; i++)
-        if (edge_keys[i] && edge_cnt[i] == 1) boundary_count++;
+        if (edge_keys[i] && edge_cnt[i] == 1 && !edge_curve[i]) boundary_count++;
+
+    /* Nothing left to antialias — a shape bounded by curves only, such as an
+     * ellipse. The plain path draws exactly the same pixels more cheaply. */
+    if (!boundary_count)
+    {
+        free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve);
+        return FALSE;
+    }
 
     /* Allocate: inner triangles (3 per face) + skirt quads (6 per boundary edge). */
     expanded_count = fc * 3 + boundary_count * 6;
     expanded = malloc(expanded_count * sizeof(*expanded));
     if (!expanded)
     {
-        free(edge_keys); free(edge_cnt); free(edge_processed);
+        free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve);
         return FALSE;
     }
 
@@ -1547,8 +1695,11 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
                 while (edge_keys[slot] != key)
                     slot = (slot + 1) % map_size;
                 /* Interior edge weight: large value (>> 1.0) ensures it never limits
-                 * min_edge_px, so only true boundary edges drive the AA fade. */
-                w = (edge_cnt[slot] == 1) ? (j == e ? 1.0f : 0.0f) : 10.0f;
+                 * min_edge_px, so only true boundary edges drive the AA fade.
+                 * A seam towards a curve segment counts as interior here: fading
+                 * the fill out along it would draw a line into the shape where
+                 * the curve triangle continues it. */
+                w = (edge_cnt[slot] == 1 && !edge_curve[slot]) ? (j == e ? 1.0f : 0.0f) : 10.0f;
                 if (e == 0) expanded[vi].u = w;
                 else if (e == 1) expanded[vi].v = w;
                 else expanded[vi].s = w;
@@ -1573,8 +1724,8 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
 
             while (edge_keys[slot] != key)
                 slot = (slot + 1) % map_size;
-            /* Skip interior edges and already-processed boundary edges. */
-            if (edge_cnt[slot] != 1 || edge_processed[slot]) continue;
+            /* Skip interior edges, curve seams and already-processed boundary edges. */
+            if (edge_cnt[slot] != 1 || edge_curve[slot] || edge_processed[slot]) continue;
 
             /* Compute outward normal (away from opposite vertex). */
             pa = geometry->fill.vertices[ai];
@@ -1637,6 +1788,7 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
     free(edge_keys);
     free(edge_cnt);
     free(edge_processed);
+    free(edge_curve);
 
     if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
             D3D11_BIND_VERTEX_BUFFER,
@@ -1672,10 +1824,14 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
         return;
     }
 
+    /* A curve segment anywhere in the figure used to send the whole area fill
+     * down the aliased path, straight edges included — a rounded rectangle or a
+     * play triangle with rounded corners lost the antialiasing on every one of
+     * its flat sides. The mixed case is handled inside fill_triangles_aa now: it
+     * antialiases the straight boundary edges and leaves the seams towards the
+     * curve segments alone, and it declines a shape bounded by curves only. */
     if (geometry->fill.face_count
-            && render_target->drawing_state.antialiasMode == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
-            && !geometry->fill.bezier_vertex_count
-            && !geometry->fill.arc_vertex_count)
+            && render_target->drawing_state.antialiasMode == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
     {
         if (!d2d_device_context_fill_triangles_aa(render_target, geometry, brush, opacity_brush))
             d2d_device_context_fill_triangles(render_target, geometry, brush, opacity_brush);
