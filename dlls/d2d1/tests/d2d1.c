@@ -17420,6 +17420,283 @@ static void test_compute_geometry_area(BOOL d3d11)
 
     release_test_context(&ctx);
 }
+/* Combine two geometries and return the result as a path geometry. The caller
+ * owns the returned geometry, which is valid even when the combination itself
+ * failed - it is then simply empty. */
+#define combine_geometry(a, b, c, d, e, f) combine_geometry_(__LINE__, a, b, c, d, e, f)
+static HRESULT combine_geometry_(unsigned int line, ID2D1Factory *factory, ID2D1Geometry *geometry1,
+        ID2D1Geometry *geometry2, D2D1_COMBINE_MODE mode, const D2D1_MATRIX_3X2_F *transform,
+        ID2D1PathGeometry **result)
+{
+    ID2D1GeometrySink *sink;
+    HRESULT hr, hr2;
+
+    hr = ID2D1Factory_CreatePathGeometry(factory, result);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(*result, &sink);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = ID2D1Geometry_CombineWithGeometry(geometry1, geometry2, mode, transform,
+            D2D1_DEFAULT_FLATTENING_TOLERANCE, (ID2D1SimplifiedGeometrySink *)sink);
+
+    hr2 = ID2D1GeometrySink_Close(sink);
+    ok_(__FILE__, line)(hr2 == S_OK, "Got unexpected hr %#lx.\n", hr2);
+    ID2D1GeometrySink_Release(sink);
+
+    return hr;
+}
+
+/* The exact set of figures a combination decomposes into is not specified, so
+ * check the filled area and the bounds instead. Both are well defined. */
+#define check_combined_geometry(a, b, c, d, e, f) check_combined_geometry_(__LINE__, a, b, c, d, e, f)
+static void check_combined_geometry_(unsigned int line, ID2D1PathGeometry *geometry, float area,
+        float left, float top, float right, float bottom)
+{
+    D2D1_RECT_F rect;
+    float value;
+    HRESULT hr;
+
+    hr = ID2D1PathGeometry_ComputeArea(geometry, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, &value);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok_(__FILE__, line)(compare_float(value, area, 64), "Got unexpected area %.8e, expected %.8e.\n", value, area);
+
+    hr = ID2D1PathGeometry_GetBounds(geometry, NULL, &rect);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok_(__FILE__, line)(compare_rect(&rect, left, top, right, bottom, 64),
+            "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n", rect.left, rect.top, rect.right, rect.bottom);
+}
+
+static void test_combine_geometry(BOOL d3d11)
+{
+    ID2D1TransformedGeometry *transformed_geometry;
+    ID2D1RectangleGeometry *rect1, *rect2;
+    ID2D1EllipseGeometry *ellipse_geometry;
+    ID2D1PathGeometry *path, *result;
+    struct d2d1_test_context ctx;
+    D2D1_MATRIX_3X2_F matrix;
+    ID2D1GeometrySink *sink;
+    D2D1_ELLIPSE ellipse;
+    D2D1_POINT_2F point;
+    D2D1_RECT_F rect;
+    BOOL contains;
+    HRESULT hr;
+    float area;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    /* Two overlapping axis-aligned rectangles: 400 + 400, overlapping in 100. */
+    set_rect(&rect, 0.0f, 0.0f, 20.0f, 20.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_rect(&rect, 10.0f, 10.0f, 30.0f, 30.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 100.0f, 10.0f, 10.0f, 20.0f, 20.0f);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_UNION, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 700.0f, 0.0f, 0.0f, 30.0f, 30.0f);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_XOR, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 600.0f, 0.0f, 0.0f, 30.0f, 30.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* Exclude removes the input geometry from the calling one, so the operands
+     * are not interchangeable here. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 300.0f, 0.0f, 0.0f, 20.0f, 20.0f);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect2, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 300.0f, 10.0f, 10.0f, 30.0f, 30.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* The transform applies to the input geometry only. */
+    set_matrix_identity(&matrix);
+    translate_matrix(&matrix, 10.0f, 10.0f);
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_INTERSECT, &matrix, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 100.0f, 10.0f, 10.0f, 20.0f, 20.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* A NULL transform is the identity. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 400.0f, 0.0f, 0.0f, 20.0f, 20.0f);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1RectangleGeometry_Release(rect2);
+
+    /* Disjoint geometries intersect to nothing. That is not an error, and the
+     * resulting geometry is empty. */
+    set_rect(&rect, 100.0f, 100.0f, 120.0f, 120.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 0.0f, INFINITY, INFINITY, FLT_MAX, FLT_MAX);
+    point.x = 110.0f;
+    point.y = 110.0f;
+    hr = ID2D1PathGeometry_FillContainsPoint(result, point, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "Point is inside the empty geometry.\n");
+    ID2D1PathGeometry_Release(result);
+    ID2D1RectangleGeometry_Release(rect2);
+
+    /* A rectangle intersected with a path holding several disjoint rectangles.
+     * This is the shape JUCE builds for a partial repaint clip. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 2.0f, 2.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 8.0f, 2.0f);
+    line_to(sink, 8.0f, 8.0f);
+    line_to(sink, 2.0f, 8.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    set_point(&point, 12.0f, 2.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 18.0f, 2.0f);
+    line_to(sink, 18.0f, 8.0f);
+    line_to(sink, 12.0f, 8.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    /* Reaches past the clipping rectangle. */
+    set_point(&point, 12.0f, 12.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 40.0f, 12.0f);
+    line_to(sink, 40.0f, 18.0f);
+    line_to(sink, 12.0f, 18.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    /* 36 + 36 + 8 * 6. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 120.0f, 2.0f, 2.0f, 20.0f, 18.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* The same combination the other way round - intersection is commutative. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 120.0f, 2.0f, 2.0f, 20.0f, 18.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* A transformed rectangle is a parallelogram, and stays convex under any
+     * affine transform. Rotating by 45 degrees keeps the area at 400, and the
+     * bounds grow to the diagonal. */
+    set_rect(&rect, -10.0f, -10.0f, 10.0f, 10.0f);
+    ID2D1RectangleGeometry_Release(rect2);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_matrix_identity(&matrix);
+    rotate_matrix(&matrix, M_PI / 4.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)rect2,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    set_rect(&rect, -100.0f, -100.0f, 100.0f, 100.0f);
+    ID2D1RectangleGeometry_Release(rect1);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 400.0f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1RectangleGeometry_Release(rect1);
+    ID2D1RectangleGeometry_Release(rect2);
+
+    /* An ellipse clipped to half of its bounding box. The result is half a
+     * circle of radius 10, so 157.08 - but the exact figure depends on whether
+     * the curve survives into the output or is flattened at the requested
+     * tolerance, so allow for both. */
+    set_ellipse(&ellipse, 0.0f, 0.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateEllipseGeometry(ctx.factory, &ellipse, &ellipse_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_rect(&rect, 0.0f, -10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)ellipse_geometry,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_ComputeArea(result, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, &area);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(area > 150.0f && area < 158.0f, "Got unexpected area %.8e.\n", area);
+    hr = ID2D1PathGeometry_GetBounds(result, NULL, &rect);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(compare_rect(&rect, 0.0f, -10.0f, 10.0f, 10.0f, 64),
+            "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n", rect.left, rect.top, rect.right, rect.bottom);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1EllipseGeometry_Release(ellipse_geometry);
+    ID2D1RectangleGeometry_Release(rect1);
+    ID2D1PathGeometry_Release(path);
+
+    /* Two non-convex polygons. Neither side is convex, so the general boolean
+     * case applies, which is not implemented yet. Two L shapes overlapping in
+     * their long arms: 300 each, overlapping in 100. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 0.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 10.0f, 0.0f);
+    line_to(sink, 10.0f, 40.0f);
+    line_to(sink, 30.0f, 40.0f);
+    line_to(sink, 30.0f, 50.0f);
+    line_to(sink, 0.0f, 50.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    set_matrix_identity(&matrix);
+    rotate_matrix(&matrix, M_PI);
+    translate_matrix(&matrix, -30.0f, -50.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)path,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1PathGeometry_Release(path);
+
+    release_test_context(&ctx);
+}
 
 static D2D1_PIXEL_FORMAT get_wic_target_format(const D2D1_PIXEL_FORMAT *target_format,
         const GUID *bitmap_format)
@@ -18544,6 +18821,7 @@ START_TEST(d2d1)
     queue_d3d10_test(test_get_effect_properties);
     queue_test(test_effect_vertex_buffer);
     queue_d3d10_test(test_compute_geometry_area);
+    queue_d3d10_test(test_combine_geometry);
     queue_test(test_wic_target_format);
     queue_d3d10_test(test_effect_blob_property);
     queue_test(test_get_dxgi_device);
