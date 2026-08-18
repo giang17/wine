@@ -5022,18 +5022,6 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
 
     TRACE("iface %p, layer_parameters %p, layer %p.\n", iface, layer_parameters, layer);
 
-    {
-        static unsigned int push_count;
-        if (++push_count <= 20 || !(push_count % 1000))
-            FIXME("PushLayer1 #%u: opacity=%.4f, bounds=(%.0f,%.0f)-(%.0f,%.0f), "
-                    "mask=%p, maskAA=%u, maskTrans=%.1f, options=%#x.\n",
-                    push_count, layer_parameters->opacity,
-                    layer_parameters->contentBounds.left, layer_parameters->contentBounds.top,
-                    layer_parameters->contentBounds.right, layer_parameters->contentBounds.bottom,
-                    layer_parameters->geometricMask, layer_parameters->maskAntialiasMode,
-                    layer_parameters->maskTransform._11, layer_parameters->layerOptions);
-    }
-
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
         d2d_command_list_push_layer(context->target.command_list, context, layer_parameters);
 
@@ -5069,21 +5057,6 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
             if (!d2d_layer_stack_push(&context->layer_stack, &info))
                 WARN("Failed to push layer.\n");
             return;
-        }
-
-        if (layer_parameters->geometricMask)
-        {
-            D2D1_RECT_F mask_bounds;
-
-            ID2D1Geometry_GetBounds(layer_parameters->geometricMask, NULL, &mask_bounds);
-            {
-                static unsigned int mask_count;
-                if (++mask_count <= 5 || !(mask_count % 1000))
-                    FIXME("Geometric mask #%u: bounds=(%.0f,%.0f)-(%.0f,%.0f) mask=%p.\n",
-                            mask_count, mask_bounds.left, mask_bounds.top,
-                            mask_bounds.right, mask_bounds.bottom,
-                            layer_parameters->geometricMask);
-            }
         }
 
         /* Transform contentBounds to device coordinates for scissor clip. */
