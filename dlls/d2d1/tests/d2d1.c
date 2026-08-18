@@ -17466,6 +17466,19 @@ static void check_combined_geometry_(unsigned int line, ID2D1PathGeometry *geome
             "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n", rect.left, rect.top, rect.right, rect.bottom);
 }
 
+/* Add an axis-aligned rectangle as one closed figure. */
+static void append_rect_figure(ID2D1GeometrySink *sink, float left, float top, float right, float bottom)
+{
+    D2D1_POINT_2F point;
+
+    set_point(&point, left, top);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, right, top);
+    line_to(sink, right, bottom);
+    line_to(sink, left, bottom);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+}
+
 static void test_combine_geometry(BOOL d3d11)
 {
     ID2D1TransformedGeometry *transformed_geometry;
@@ -17478,6 +17491,7 @@ static void test_combine_geometry(BOOL d3d11)
     D2D1_ELLIPSE ellipse;
     D2D1_POINT_2F point;
     D2D1_RECT_F rect;
+    UINT32 count;
     BOOL contains;
     HRESULT hr;
     float area;
@@ -17694,6 +17708,105 @@ static void test_combine_geometry(BOOL d3d11)
 
     ID2D1TransformedGeometry_Release(transformed_geometry);
     ID2D1PathGeometry_Release(path);
+
+    /* The result of a combination is the outline of the union, not the pieces
+     * an implementation happened to compute it from. A region that a scanline
+     * algorithm decomposes into several bands is still a single connected
+     * shape, and has to come back as a single figure - interior edges between
+     * the bands are an implementation artefact. */
+    set_rect(&rect, 0.0f, 0.0f, 60.0f, 40.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* Three rectangles of differing heights, meeting along shared vertical
+     * edges: one cross-shaped figure, 400 + 800 + 400. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    append_rect_figure(sink, 0.0f, 10.0f, 20.0f, 30.0f);
+    append_rect_figure(sink, 20.0f, 0.0f, 40.0f, 40.0f);
+    append_rect_figure(sink, 40.0f, 10.0f, 60.0f, 30.0f);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 1600.0f, 0.0f, 0.0f, 60.0f, 40.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path);
+
+    /* Three rectangles of equal height in a row: also a single figure. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    append_rect_figure(sink, 0.0f, 0.0f, 20.0f, 20.0f);
+    append_rect_figure(sink, 20.0f, 0.0f, 40.0f, 20.0f);
+    append_rect_figure(sink, 40.0f, 0.0f, 60.0f, 20.0f);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 1200.0f, 0.0f, 0.0f, 60.0f, 20.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path);
+
+    /* Disconnected components stay separate figures. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    append_rect_figure(sink, 0.0f, 0.0f, 10.0f, 10.0f);
+    append_rect_figure(sink, 20.0f, 0.0f, 30.0f, 10.0f);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 200.0f, 0.0f, 0.0f, 30.0f, 10.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path);
+    ID2D1RectangleGeometry_Release(rect1);
+
+    /* A rectangle with a rectangular bite taken out of its middle: an outer
+     * contour plus the hole, so two figures. */
+    set_rect(&rect, 0.0f, 0.0f, 40.0f, 40.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_rect(&rect, 10.0f, 10.0f, 30.0f, 30.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 1200.0f, 0.0f, 0.0f, 40.0f, 40.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1RectangleGeometry_Release(rect2);
+    ID2D1RectangleGeometry_Release(rect1);
 
     release_test_context(&ctx);
 }

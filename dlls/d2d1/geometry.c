@@ -5873,6 +5873,299 @@ done:
     return hr;
 }
 
+/* Outline tracing over a set of disjoint axis-aligned rectangles.
+ *
+ * Writing one closed figure per rectangle leaves interior edges in the result:
+ * where two rectangles meet, the shared edge is present twice, and both the
+ * outline and any consumer that walks the figures see a boundary that is not
+ * one. Cancelling those edges out turns the rectangle set back into the outline
+ * of its union, which is what a boolean operation is supposed to produce.
+ *
+ * Every rectangle contributes four directed edges, wound clockwise in a
+ * y-down coordinate system. A shared edge is contributed once in each
+ * direction, so summing the directions over each elementary interval and
+ * keeping only the intervals with a non-zero sum leaves exactly the boundary.
+ * The surviving edges are then chained into closed contours. */
+struct d2d_combine_span
+{
+    float pos;
+    float a, b;
+    int dir;
+};
+
+struct d2d_combine_outline_edge
+{
+    D2D1_POINT_2F p0, p1;
+    BOOL used;
+};
+
+/* The traced edges are axis-aligned, so a direction is one of four unit
+ * vectors. Comparing directions rather than the edge vectors themselves is what
+ * lets elementary intervals of differing lengths collapse into one edge. */
+static void d2d_combine_direction(D2D1_POINT_2F *dir, const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1)
+{
+    dir->x = p1->x > p0->x ? 1.0f : (p1->x < p0->x ? -1.0f : 0.0f);
+    dir->y = p1->y > p0->y ? 1.0f : (p1->y < p0->y ? -1.0f : 0.0f);
+}
+
+static int __cdecl d2d_combine_span_compare(const void *a, const void *b)
+{
+    const struct d2d_combine_span *p = a, *q = b;
+
+    if (p->pos != q->pos)
+        return p->pos < q->pos ? -1 : 1;
+    if (p->a != q->a)
+        return p->a < q->a ? -1 : 1;
+    return 0;
+}
+
+static BOOL d2d_combine_outline_add_edge(struct d2d_combine_outline_edge **edges, size_t *count,
+        size_t *size, const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1)
+{
+    if (!d2d_array_reserve((void **)edges, size, *count + 1, sizeof(**edges)))
+        return FALSE;
+
+    (*edges)[*count].p0 = *p0;
+    (*edges)[*count].p1 = *p1;
+    (*edges)[(*count)++].used = FALSE;
+    return TRUE;
+}
+
+/* Reduce one group of collinear spans to the intervals that are on the
+ * boundary, and emit those as directed edges. */
+static BOOL d2d_combine_outline_trace_spans(struct d2d_combine_span *spans, size_t count,
+        BOOL horizontal, struct d2d_combine_outline_edge **edges, size_t *edge_count, size_t *edge_size)
+{
+    float *coords = NULL;
+    size_t coords_size = 0;
+    BOOL ret = FALSE;
+
+    qsort(spans, count, sizeof(*spans), d2d_combine_span_compare);
+
+    for (size_t i = 0; i < count; )
+    {
+        size_t group_end = i, coord_count = 0;
+        float pos = spans[i].pos;
+
+        while (group_end < count && spans[group_end].pos == pos)
+            ++group_end;
+
+        if (!d2d_array_reserve((void **)&coords, &coords_size, 2 * (group_end - i), sizeof(*coords)))
+            goto done;
+        for (size_t j = i; j < group_end; ++j)
+        {
+            coords[coord_count++] = spans[j].a;
+            coords[coord_count++] = spans[j].b;
+        }
+        qsort(coords, coord_count, sizeof(*coords), d2d_combine_float_compare);
+
+        for (size_t k = 0; k + 1 < coord_count; ++k)
+        {
+            float lo = coords[k], hi = coords[k + 1], mid;
+            D2D1_POINT_2F p0, p1;
+            int winding = 0;
+
+            if (!(hi > lo))
+                continue;
+            mid = lo + (hi - lo) * 0.5f;
+
+            for (size_t j = i; j < group_end; ++j)
+            {
+                if (spans[j].a <= mid && mid <= spans[j].b)
+                    winding += spans[j].dir;
+            }
+            if (!winding)
+                continue;
+
+            /* A positive winding is a top edge (running right) or a right edge
+             * (running down); a negative one is the opposite. */
+            if (horizontal)
+            {
+                d2d_point_set(&p0, winding > 0 ? lo : hi, pos);
+                d2d_point_set(&p1, winding > 0 ? hi : lo, pos);
+            }
+            else
+            {
+                d2d_point_set(&p0, pos, winding > 0 ? lo : hi);
+                d2d_point_set(&p1, pos, winding > 0 ? hi : lo);
+            }
+
+            if (!d2d_combine_outline_add_edge(edges, edge_count, edge_size, &p0, &p1))
+                goto done;
+        }
+
+        i = group_end;
+    }
+
+    ret = TRUE;
+
+done:
+    free(coords);
+    return ret;
+}
+
+/* Pick the continuation that turns as far clockwise as possible. At a point
+ * where two parts of the boundary touch diagonally this keeps the outer
+ * contour connected instead of cutting across the touch. */
+static size_t d2d_combine_outline_next(const struct d2d_combine_outline_edge *edges, size_t count,
+        const D2D1_POINT_2F *point, const D2D1_POINT_2F *incoming)
+{
+    float dx = incoming->x, dy = incoming->y;
+    D2D1_POINT_2F edge_dir;
+    size_t best = count;
+    int best_rank = -1;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        float ex, ey;
+        int rank;
+
+        if (edges[i].used || edges[i].p0.x != point->x || edges[i].p0.y != point->y)
+            continue;
+
+        d2d_combine_direction(&edge_dir, &edges[i].p0, &edges[i].p1);
+        ex = edge_dir.x;
+        ey = edge_dir.y;
+
+        /* Clockwise in a y-down system rotates (dx, dy) to (-dy, dx). */
+        if (ex == -dy && ey == dx)
+            rank = 3;                           /* turn clockwise */
+        else if (ex == dx && ey == dy)
+            rank = 2;                           /* straight on */
+        else if (ex == dy && ey == -dx)
+            rank = 1;                           /* turn counter-clockwise */
+        else
+            rank = 0;                           /* turn back */
+
+        if (rank > best_rank)
+        {
+            best_rank = rank;
+            best = i;
+        }
+    }
+
+    return best;
+}
+
+/* Build the boundary of a set of disjoint axis-aligned rectangles as closed
+ * contours. Returns FALSE if the boundary could not be traced, in which case
+ * the caller falls back to writing the rectangles individually. Nothing is
+ * written to the sink here, so that fallback stays safe. */
+static BOOL d2d_combine_rects_to_outline(const D2D1_RECT_F *rects, size_t count,
+        struct d2d_combine_shape *out)
+{
+    struct d2d_combine_outline_edge *edges = NULL;
+    size_t edge_count = 0, edge_size = 0;
+    struct d2d_combine_span *spans = NULL;
+    size_t spans_size = 0;
+    BOOL ret = FALSE;
+
+    memset(out, 0, sizeof(*out));
+    out->fill_mode = D2D1_FILL_MODE_WINDING;
+
+    if (!count)
+        return FALSE;
+
+    if (!d2d_array_reserve((void **)&spans, &spans_size, 2 * count, sizeof(*spans)))
+        goto done;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        spans[2 * i].pos = rects[i].top;
+        spans[2 * i].a = rects[i].left;
+        spans[2 * i].b = rects[i].right;
+        spans[2 * i].dir = 1;
+        spans[2 * i + 1].pos = rects[i].bottom;
+        spans[2 * i + 1].a = rects[i].left;
+        spans[2 * i + 1].b = rects[i].right;
+        spans[2 * i + 1].dir = -1;
+    }
+    if (!d2d_combine_outline_trace_spans(spans, 2 * count, TRUE, &edges, &edge_count, &edge_size))
+        goto done;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        spans[2 * i].pos = rects[i].right;
+        spans[2 * i].a = rects[i].top;
+        spans[2 * i].b = rects[i].bottom;
+        spans[2 * i].dir = 1;
+        spans[2 * i + 1].pos = rects[i].left;
+        spans[2 * i + 1].a = rects[i].top;
+        spans[2 * i + 1].b = rects[i].bottom;
+        spans[2 * i + 1].dir = -1;
+    }
+    if (!d2d_combine_outline_trace_spans(spans, 2 * count, FALSE, &edges, &edge_count, &edge_size))
+        goto done;
+
+    if (!edge_count)
+        goto done;
+
+    for (size_t i = 0; i < edge_count; ++i)
+    {
+        D2D1_POINT_2F start, incoming = {0.0f, 0.0f};
+        struct d2d_combine_contour *contour;
+        size_t next;
+
+        if (edges[i].used)
+            continue;
+
+        if (!(contour = d2d_combine_shape_add_contour(out)))
+            goto done;
+
+        start = edges[i].p0;
+        next = i;
+        do
+        {
+            const struct d2d_combine_outline_edge *e = &edges[next];
+
+            D2D1_POINT_2F dir;
+
+            /* Skip the vertex when the direction does not change, so that the
+             * elementary intervals collapse back into full edges. */
+            d2d_combine_direction(&dir, &e->p0, &e->p1);
+            if ((!contour->count || dir.x != incoming.x || dir.y != incoming.y)
+                    && !d2d_combine_contour_add_point(contour, &e->p0))
+                goto done;
+
+            incoming = dir;
+            edges[next].used = TRUE;
+
+            if (e->p1.x == start.x && e->p1.y == start.y)
+                break;
+
+            next = d2d_combine_outline_next(edges, edge_count, &e->p1, &incoming);
+        } while (next < edge_count);
+
+        /* An unclosed contour means the edges did not cancel out as expected;
+         * do not use a partial result. */
+        if (next >= edge_count || contour->count < 3)
+            goto done;
+
+        /* If the traversal started in the middle of a straight edge, the first
+         * vertex continues the closing edge and is redundant. */
+        if (contour->count > 3)
+        {
+            D2D1_POINT_2F *p = contour->points, dir;
+
+            d2d_combine_direction(&dir, &p[0], &p[1]);
+            if (dir.x == incoming.x && dir.y == incoming.y)
+            {
+                memmove(p, p + 1, (contour->count - 1) * sizeof(*p));
+                --contour->count;
+            }
+        }
+    }
+
+    ret = TRUE;
+
+done:
+    free(edges);
+    free(spans);
+    if (!ret)
+        d2d_combine_shape_cleanup(out);
+    return ret;
+}
+
 static void d2d_combine_write_rects(ID2D1SimplifiedGeometrySink *sink, const D2D1_RECT_F *rects, size_t count)
 {
     ID2D1SimplifiedGeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
@@ -5942,7 +6235,21 @@ static HRESULT d2d_geometry_combine(ID2D1Geometry *geometry, ID2D1Geometry *geom
     {
         if (SUCCEEDED(hr = d2d_combine_rects_op(&rects1, &rects2, combine_mode, &result, &result_count)))
         {
-            d2d_combine_write_rects(sink, result, result_count);
+            struct d2d_combine_shape outline;
+
+            /* Prefer the outline of the union over the individual rectangles:
+             * the band decomposition is an artefact of the algorithm, not a
+             * property of the result, and interior edges have no business
+             * showing up in a boolean operation's output. */
+            if (d2d_combine_rects_to_outline(result, result_count, &outline))
+            {
+                d2d_combine_write_shape(sink, &outline);
+                d2d_combine_shape_cleanup(&outline);
+            }
+            else
+            {
+                d2d_combine_write_rects(sink, result, result_count);
+            }
             free(result);
         }
         goto done;
@@ -5968,6 +6275,30 @@ static HRESULT d2d_geometry_combine(ID2D1Geometry *geometry, ID2D1Geometry *geom
         {
             if (SUCCEEDED(hr = d2d_combine_clip_convex(subject, &clip->contours[0], &clipped)))
             {
+                struct d2d_combine_rects clipped_rects;
+                struct d2d_combine_shape outline;
+
+                /* The clip often leaves the rectangles of a clip list intact,
+                 * and those meet along shared edges just like in the rectangle
+                 * path, so trace their outline here as well. */
+                if (d2d_combine_shape_as_rects(&clipped, &clipped_rects))
+                {
+                    D2D1_RECT_F *plain;
+
+                    if ((plain = calloc(clipped_rects.count, sizeof(*plain))))
+                    {
+                        for (size_t i = 0; i < clipped_rects.count; ++i)
+                            plain[i] = clipped_rects.rects[i].rect;
+                        if (d2d_combine_rects_to_outline(plain, clipped_rects.count, &outline))
+                        {
+                            d2d_combine_shape_cleanup(&clipped);
+                            clipped = outline;
+                        }
+                        free(plain);
+                    }
+                }
+                free(clipped_rects.rects);
+
                 d2d_combine_write_shape(sink, &clipped);
                 d2d_combine_shape_cleanup(&clipped);
             }
