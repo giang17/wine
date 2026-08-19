@@ -310,10 +310,12 @@ if [ "$DO_RENDERING" -eq 1 ]; then
         [ -n "$(reg_value "$USERREG" 'Software\\Wine\\DirectWrite' outline_in_natural_modes)" ] && break
         sleep 1
     done
-    for kv in "Software\\Wine\\Direct2D:text_enhanced_contrast" \
-              "Software\\Wine\\Direct2D:text_linear_blend" \
-              "Software\\Wine\\DirectWrite:outline_in_natural_modes" \
-              "Control Panel\\Desktop:FontSmoothingType"; do
+    # Single quotes: in double quotes the shell would collapse the doubled
+    # backslashes of a registry path into single ones and nothing would match.
+    for kv in 'Software\\Wine\\Direct2D:text_enhanced_contrast' \
+              'Software\\Wine\\Direct2D:text_linear_blend' \
+              'Software\\Wine\\DirectWrite:outline_in_natural_modes' \
+              'Control Panel\\Desktop:FontSmoothingType'; do
         [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {
             echo "ERROR: ${kv##*:} did not appear in $USERREG." >&2; ok=0; }
     done
