@@ -275,11 +275,12 @@ documentation/wine-font-setup.sh --prefix ~/.wine --check   # report only
 ```
 
 It locates the fonts through fontconfig (so distribution paths do not matter),
-copies them into the prefix, registers the MS Core Fonts for GDI and writes the
-`FontLink` fallback chain. Re-run it after `wineboot -u`, which resets those
-entries to Wine's defaults — the script is idempotent.
+copies them into the prefix, registers the MS Core Fonts for GDI, writes the
+`FontLink` fallback chain and switches on this branch's text rendering. Re-run it
+after `wineboot -u`, which resets the FontLink entries to Wine's defaults — the
+script is idempotent.
 
-Two of those steps matter more than they look:
+Three of those steps matter more than they look:
 
 - **MS Core Fonts** are not cosmetic. Some plugins open font *files* directly
   during DLL initialisation — FL Studio's "Fruity Delay 3" opens
@@ -287,6 +288,24 @@ Two of those steps matter more than they look:
   usable error message when they are missing.
 - **FontLink** is what makes symbol glyphs resolve; without it Serum 2's star
   ratings render as tofu boxes.
+- **The text rendering switches live in the prefix, not in the build.** Enhanced
+  contrast, linear blending and outline rasterisation are all read from the
+  registry once at startup, and each falls back to stock behaviour when its value
+  is absent. A prefix that never saw this script therefore renders text the way
+  stock Wine does, however carefully the branch was built — and nothing in the
+  log says so. If text looks unchanged after installing this branch, check here
+  before suspecting the build:
+
+  ```bash
+  documentation/wine-font-setup.sh --prefix ~/.wine --check
+  ```
+
+  The values themselves are `text_enhanced_contrast` and `text_linear_blend`
+  under `HKCU\Software\Wine\Direct2D`, and `outline_in_natural_modes` under
+  `HKCU\Software\Wine\DirectWrite`. Enhanced contrast is also in winecfg's
+  graphics tab (*Off* / *Medium (50)* / *Strong (70)*); the script leaves an
+  existing value alone unless `--contrast N` is given, so a choice made there
+  survives a re-run.
 
 See **[documentation/wine-font-setup-guide.md](documentation/wine-font-setup-guide.md)**
 for the full guide, including the container setup and working around the missing

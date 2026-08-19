@@ -13,6 +13,10 @@
 #   2. DejaVu Sans and Noto Sans Symbols2, plus the GDI FontLink entries that
 #      make them the first fallback for symbol glyphs (star ratings, arrows in
 #      Serum 2 show up as tofu boxes otherwise).
+#   3. The text rendering switches this branch reads at startup.  They are
+#      registry values and therefore live in the PREFIX, not in the build: a
+#      fresh prefix does not have them, and the text then renders the way stock
+#      Wine renders it, with no hint that anything is switched off.
 #
 # Fonts are located through fontconfig, so distribution paths do not matter.
 #
@@ -21,11 +25,15 @@
 #
 # Usage:
 #   wine-font-setup.sh [--prefix DIR] [--wine BINARY] [--check] [--no-mscore]
+#                      [--no-rendering] [--contrast N]
 #
 #   --prefix DIR    Wine prefix to operate on.  Default: $WINEPREFIX, else ~/.wine
 #   --wine BINARY   wine binary to use.  Default: wine
 #   --check         report only, change nothing
 #   --no-mscore     skip the MS Core Fonts part (step 1)
+#   --no-rendering  skip the text rendering switches (step 3)
+#   --contrast N    enhanced contrast, 0-100.  Default: 50, what Windows uses.
+#                   70 suits dark interfaces; 0 turns the correction off.
 #
 # Exit codes: 0 done / 1 usage or prefix error / 2 required fonts not installed
 #             3 setup incomplete (only with --check)
@@ -36,6 +44,9 @@ PREFIX="${WINEPREFIX:-$HOME/.wine}"
 WINE="wine"
 CHECK_ONLY=0
 DO_MSCORE=1
+DO_RENDERING=1
+CONTRAST=50
+CONTRAST_EXPLICIT=0
 
 # Files the FontLink entries reference. Without these two the symbol fallback
 # cannot work, so they are hard requirements.
@@ -53,6 +64,8 @@ while [ $# -gt 0 ]; do
         --wine)      shift; WINE="${1:?--wine needs a binary}" ;;
         --check)     CHECK_ONLY=1 ;;
         --no-mscore) DO_MSCORE=0 ;;
+        --no-rendering) DO_RENDERING=0 ;;
+        --contrast)  shift; CONTRAST="${1:?--contrast needs a number 0-100}"; CONTRAST_EXPLICIT=1 ;;
         -h|--help)   sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1  (try --help)" >&2; exit 1 ;;
     esac
@@ -61,6 +74,7 @@ done
 
 FONTDIR="$PREFIX/drive_c/windows/Fonts"
 SYSREG="$PREFIX/system.reg"
+USERREG="$PREFIX/user.reg"
 
 [ -d "$PREFIX" ]  || { echo "ERROR: prefix not found: $PREFIX" >&2; exit 1; }
 [ -d "$FONTDIR" ] || { echo "ERROR: no Fonts directory in $PREFIX" >&2; exit 1; }
@@ -119,15 +133,38 @@ have_link=0
     have_link=1
 } 2>/dev/null || true
 
+# The rendering switches sit in HKCU, so they are in user.reg.  All three are
+# read once when d2d1/dwrite load, so a running application does not pick up a
+# change — it has to be restarted.
+reg_value() {  # <file> <section> <value>
+    # Passed through the environment, not with -v: awk expands escape sequences
+    # in -v assignments, which would turn the doubled backslashes of a registry
+    # path into single ones and never match.
+    RV_SEC="$2" RV_VAL="$3" awk '
+        index($0, "[" ENVIRON["RV_SEC"] "]") == 1 {f=1; next}   # Wine appends a timestamp
+        f && /^\[/ {exit}
+        f && index($0, "\"" ENVIRON["RV_VAL"] "\"=") == 1 {print; exit}' "$1" 2>/dev/null
+}
+have_rendering=0
+{
+    [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_enhanced_contrast)" ] &&
+    [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_linear_blend)" ] &&
+    [ -n "$(reg_value "$USERREG" 'Software\\Wine\\DirectWrite' outline_in_natural_modes)" ] &&
+    have_rendering=1
+} 2>/dev/null || true
+[ "$DO_RENDERING" -eq 1 ] || have_rendering=1   # not asked for, do not report it missing
+
 echo "Current state of the prefix:"
 printf '  %-34s %s\n' "fonts in windows/Fonts" \
     "$( [ "$have_fonts" -eq 1 ] && echo present || echo missing )"
 printf '  %-34s %s\n' "FontLink symbol fallback" \
     "$( [ "$have_link" -eq 1 ] && echo present || echo missing )"
+printf '  %-34s %s\n' "text rendering switches" \
+    "$( [ "$have_rendering" -eq 1 ] && echo present || echo missing )"
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     echo
-    if [ "$have_fonts" -eq 1 ] && [ "$have_link" -eq 1 ]; then
+    if [ "$have_fonts" -eq 1 ] && [ "$have_link" -eq 1 ] && [ "$have_rendering" -eq 1 ]; then
         echo "Font setup is complete."
         exit 0
     fi
@@ -212,6 +249,34 @@ WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add \
     /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f \
     </dev/null >/dev/null 2>&1
 
+# --- 4b. text rendering switches ---------------------------------------------
+# This branch renders ClearType text closer to what Windows does, but every part
+# of it is opt-in: the code reads these values once at startup and falls back to
+# stock behaviour when they are absent.  Without them a plug-in GUI looks like
+# the fix was never built, which is indistinguishable from a broken build.
+#   text_enhanced_contrast    stem darkening, in hundredths.  Windows uses 50.
+#   text_linear_blend         blend subpixel coverage in linear space
+#   outline_in_natural_modes  rasterise from the outline instead of an embedded
+#                             bitmap strike, so hinted fonts keep their shape
+if [ "$DO_RENDERING" -eq 1 ]; then
+    echo "  setting the text rendering switches..."
+    # Contrast is a matter of taste — winecfg offers 0/50/70 in the graphics tab.
+    # Never silently overwrite a value somebody chose there; only write it when
+    # nothing is set yet, or when --contrast says so explicitly.
+    cur_contrast=$(reg_value "$USERREG" 'Software\\Wine\\Direct2D' text_enhanced_contrast)
+    if [ -z "$cur_contrast" ] || [ "$CONTRAST_EXPLICIT" -eq 1 ]; then
+        echo "    enhanced contrast: $CONTRAST"
+        WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
+            /v text_enhanced_contrast /t REG_DWORD /d "$CONTRAST" /f </dev/null >/dev/null 2>&1
+    else
+        echo "    enhanced contrast: keeping $(printf '%d' "0x${cur_contrast##*:}" 2>/dev/null || echo '?') (already set; --contrast N overrides)"
+    fi
+    WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
+        /v text_linear_blend /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
+    WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\DirectWrite' \
+        /v outline_in_natural_modes /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
+fi
+
 # --- 5. verify ---------------------------------------------------------------
 # Wine keeps the registry in the wineserver and flushes system.reg to disk with
 # a delay — checking immediately reports a false failure. Poll with a cap.
@@ -228,6 +293,18 @@ printf '%s\n' "$(fontlink_block)" | grep -q '^"DejaVu Sans"=.*NotoSansSymbols2' 
     echo "ERROR: the FontLink entry did not appear in $SYSREG." >&2
     echo "       Is '$WINE' the right binary for this prefix?" >&2
     ok=0; }
+if [ "$DO_RENDERING" -eq 1 ]; then
+    for _ in $(seq 1 15); do
+        [ -n "$(reg_value "$USERREG" 'Software\\Wine\\DirectWrite' outline_in_natural_modes)" ] && break
+        sleep 1
+    done
+    for kv in "Software\\Wine\\Direct2D:text_enhanced_contrast" \
+              "Software\\Wine\\Direct2D:text_linear_blend" \
+              "Software\\Wine\\DirectWrite:outline_in_natural_modes"; do
+        [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {
+            echo "ERROR: ${kv##*:} did not appear in $USERREG." >&2; ok=0; }
+    done
+fi
 
 echo
 if [ "$ok" -eq 1 ]; then
