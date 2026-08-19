@@ -1544,12 +1544,31 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_geometry *geometry,
     {
         for (i = 0; i + 2 < counts[c]; i += 3)
         {
-            size_t idx[3];
+            size_t idx[3], missing = 0;
             int a, b;
 
             for (a = 0; a < 3; ++a)
+            {
                 idx[a] = d2d_fill_aa_find_vertex(geometry, vertex_map, vertex_map_size,
                         &curves[c][i + a].position);
+                if (idx[a] == ~(size_t)0)
+                    ++missing;
+            }
+
+            /* Only the control point may be missing, and only when it lies
+             * outside the filled area: the two curve end points are figure
+             * points by construction, hence fill vertices. Two missing points
+             * mean the positions are no longer bit-identical copies of each
+             * other, so the seams cannot be identified at all. Fall back rather
+             * than mark half of them -- an unmarked seam gets a skirt and is
+             * drawn twice, which is the artefact this whole path avoids. */
+            if (missing > 1)
+            {
+                ERR("%Iu of 3 curve triangle corners are not fill vertices, "
+                        "the curve seams cannot be identified.\n", missing);
+                free(vertex_map);
+                return FALSE;
+            }
 
             for (a = 0; a < 3; ++a)
             {
