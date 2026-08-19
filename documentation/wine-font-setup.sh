@@ -13,10 +13,11 @@
 #   2. DejaVu Sans and Noto Sans Symbols2, plus the GDI FontLink entries that
 #      make them the first fallback for symbol glyphs (star ratings, arrows in
 #      Serum 2 show up as tofu boxes otherwise).
-#   3. The text rendering switches this branch reads at startup.  They are
-#      registry values and therefore live in the PREFIX, not in the build: a
-#      fresh prefix does not have them, and the text then renders the way stock
-#      Wine renders it, with no hint that anything is switched off.
+#   3. The text rendering switches this branch reads at startup, and the system
+#      font smoothing type they build on.  All of them are registry values and
+#      therefore live in the PREFIX, not in the build: a fresh prefix does not
+#      have them, and the text then renders the way stock Wine renders it, with
+#      no hint that anything is switched off.
 #
 # Fonts are located through fontconfig, so distribution paths do not matter.
 #
@@ -150,6 +151,8 @@ have_rendering=0
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_enhanced_contrast)" ] &&
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_linear_blend)" ] &&
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\DirectWrite' outline_in_natural_modes)" ] &&
+    [ "$(reg_value "$USERREG" 'Control Panel\\Desktop' FontSmoothingType)" \
+        = '"FontSmoothingType"=dword:00000002' ] &&
     have_rendering=1
 } 2>/dev/null || true
 [ "$DO_RENDERING" -eq 1 ] || have_rendering=1   # not asked for, do not report it missing
@@ -275,6 +278,15 @@ if [ "$DO_RENDERING" -eq 1 ]; then
         /v text_linear_blend /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
     WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\DirectWrite' \
         /v outline_in_natural_modes /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
+    # Everything above builds on the system font smoothing type.  Wine defaults
+    # it to FE_FONTSMOOTHINGSTANDARD, i.e. greyscale, and dwrite then reports a
+    # ClearType level of zero — d2d1 does not promote DWRITE_TEXT_ANTIALIAS_MODE_
+    # DEFAULT to subpixel, and every switch above has no visible effect.  The
+    # d2d1 switches still announce themselves in the log while the text stays
+    # greyscale, which is a confusing place to end up.
+    echo "    font smoothing: ClearType"
+    WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Control Panel\Desktop' \
+        /v FontSmoothingType /t REG_DWORD /d 2 /f </dev/null >/dev/null 2>&1
 fi
 
 # --- 5. verify ---------------------------------------------------------------
@@ -300,7 +312,8 @@ if [ "$DO_RENDERING" -eq 1 ]; then
     done
     for kv in "Software\\Wine\\Direct2D:text_enhanced_contrast" \
               "Software\\Wine\\Direct2D:text_linear_blend" \
-              "Software\\Wine\\DirectWrite:outline_in_natural_modes"; do
+              "Software\\Wine\\DirectWrite:outline_in_natural_modes" \
+              "Control Panel\\Desktop:FontSmoothingType"; do
         [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {
             echo "ERROR: ${kv##*:} did not appear in $USERREG." >&2; ok=0; }
     done
