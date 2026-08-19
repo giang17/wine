@@ -157,6 +157,14 @@ HKCU\Software\Wine\HideWineVersion = "Y"
 The per-application value wins over the global one, so `"N"` can carve out an exception
 where the global switch is on.
 
+**The switch lives in the prefix, not in the build.** It is a registry value, so a fresh
+prefix does not have it: installing or rebuilding this branch does not carry it over, and
+neither does creating a second prefix for testing. When a JUCE plug-in that used to work
+renders nothing in a new prefix, check this first — the symptom looks like a broken build
+or a regression in the stack, but the renderer has simply fallen back to GDI again. Seen
+here on a freshly set up test prefix, where a WebView2-based plug-in stayed blank until
+the value was added for the host.
+
 **Why not system-wide:** the switch applies to the whole process, so anything else probing
 for Wine stops finding it — and some software depends on the answer. Two cases seen here:
 PACE/iLok protected software fails to start with *"Error 2000: An iLok background component
