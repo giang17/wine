@@ -3602,16 +3602,31 @@ static int dcomp_region_delivery_enabled = -1;
  *   0  off                      79.0 %
  *   3  GdiFlush() only          not sufficient -- drains Wine's GDI batch, after
  *                               which the requests still sit in Xlib's buffer
- *   1  XFlush via escape         1.5 / 2.8 %      (median 2.2)
+ *   1  XFlush via escape         1.5 / 2.8 %      (median 2.2)   <- default
  *   4  XSync via escape          2.5 / 4.2 / 4.0  (median 4.0)
- *   2  full round trip           0.5 / 0.8 / 7.2  (median 0.8)   <- default
+ *   2  full round trip           0.5 / 0.8 / 7.2  (median 0.8)
  *
  * The round trip wins, which is not obvious: XSync also waits for the server but
  * blocks on the whole queue, while reading one pixel only waits for this
  * drawable.  The ordering between 1, 2 and 4 is within the run-to-run spread and
- * has not been settled; 2 is chosen because it is the one where the flicker is
- * visually all but gone.  Its cost -- one pixel read back per delivery, ~220/s --
- * has not been measured against the others yet. */
+ * has not been settled; 2 was chosen because it is the one where the flicker was
+ * visually all but gone.
+ *
+ * A second machine reversed that (issue 206, laptop: i7-5600U, Intel HD 5500 /
+ * Mesa, X11).  Timing the deliveries there showed a FLOOR that has nothing to do
+ * with how much is delivered: 442 px already cost 4.7-6 ms in mode 2 against
+ * 0.6 ms in mode 1, and area explains little on top of that -- a factor of 754
+ * in area buys a factor of 2.3 in duration.  That floor is the round trip
+ * itself, and its size is a property of the machine, not of this code.  Where it
+ * is expensive, waiting for it costs more than it saves: with the transport
+ * stopped mode 1 is visibly calmer there, while during a drag the two are
+ * indistinguishable.
+ *
+ * Hence 1 is the default now.  The desktop numbers above were never reproduced
+ * with the floor known, and they rest on a difference inside their own spread --
+ * issue 216 measures the floor there, and if it turns out small, mode 2 is the
+ * better default on that hardware and this needs to become adaptive rather than
+ * a single constant. */
 static int dcomp_deliver_flush_mode = -1;
 
 static int dcomp_deliver_flush(void)
@@ -3619,7 +3634,7 @@ static int dcomp_deliver_flush(void)
     if (dcomp_deliver_flush_mode < 0)
     {
         const char *e = getenv("WINE_DCOMP_DELIVER_FLUSH");
-        dcomp_deliver_flush_mode = e ? atoi(e) : 2;
+        dcomp_deliver_flush_mode = e ? atoi(e) : 1;
         if (dcomp_deliver_flush_mode < 0)
             dcomp_deliver_flush_mode = 0;
     }
