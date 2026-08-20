@@ -9739,6 +9739,197 @@ static void test_layer(BOOL d3d11)
     release_test_context(&ctx);
 }
 
+/* PushLayer()/PopLayer() through every composite path PopLayer() can take.
+ * A layer is a transparent surface, so an area the layer never painted has to
+ * leave the target untouched.  On a target with D2D1_ALPHA_MODE_IGNORE the
+ * layer bitmap inherits that alpha mode, and compositing it back has to
+ * account for the layer's own alpha all the same. */
+static void test_layer_composite(BOOL d3d11)
+{
+    D2D1_RENDER_TARGET_PROPERTIES rt_desc;
+    ID2D1SolidColorBrush *brush, *opacity;
+    D2D1_LAYER_PARAMETERS1 layer_desc1;
+    D2D1_LAYER_PARAMETERS layer_desc;
+    ID2D1RectangleGeometry *mask;
+    struct d2d1_test_context ctx;
+    ID2D1DeviceContext *context;
+    struct resource_readback rb;
+    unsigned int i, j, k;
+    ID2D1RenderTarget *rt;
+    ID2D1Factory *factory;
+    D2D1_COLOR_F colour;
+    D2D1_RECT_F rect;
+    DWORD value;
+    HRESULT hr;
+
+    static const struct
+    {
+        const char *name;
+        D2D1_ALPHA_MODE alpha_mode;
+    }
+    targets[] =
+    {
+        {"opaque target", D2D1_ALPHA_MODE_IGNORE},
+        {"alpha target",  D2D1_ALPHA_MODE_PREMULTIPLIED},
+    };
+    static const struct
+    {
+        const char *name;
+        BOOL mask;
+        D2D1_ANTIALIAS_MODE mask_aa;
+        BOOL opacity_brush;
+    }
+    paths[] =
+    {
+        {"antialiased mask", TRUE,  D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, FALSE},
+        {"aliased mask",     TRUE,  D2D1_ANTIALIAS_MODE_ALIASED,       FALSE},
+        {"opacity brush",    FALSE, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, TRUE},
+        {"plain layer",     FALSE,  D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, FALSE},
+    };
+    /* The layer paints 60,60 - 100,100; the geometric mask covers 40,40 - 120,120. */
+    static const struct
+    {
+        unsigned int x, y;
+        DWORD colour;
+        const char *desc;
+    }
+    checks[] =
+    {
+        { 80,  80, 0xffff0000, "painted by the layer"},
+        { 45,  45, 0xff0000ff, "inside the mask, not painted"},
+        { 20,  20, 0xff0000ff, "outside the mask, not painted"},
+        {130, 130, 0xff0000ff, "outside the mask"},
+    };
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(targets); ++i)
+    {
+        winetest_push_context("%s", targets[i].name);
+
+        rt_desc.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+        rt_desc.pixelFormat.format = DXGI_FORMAT_UNKNOWN;
+        rt_desc.pixelFormat.alphaMode = targets[i].alpha_mode;
+        rt_desc.dpiX = 0.0f;
+        rt_desc.dpiY = 0.0f;
+        rt_desc.usage = D2D1_RENDER_TARGET_USAGE_NONE;
+        rt_desc.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
+        rt = create_render_target_desc(ctx.surface, &rt_desc, d3d11, D2D1_FACTORY_TYPE_SINGLE_THREADED);
+        ok(!!rt, "Failed to create render target.\n");
+        ID2D1RenderTarget_SetAntialiasMode(rt, D2D1_ANTIALIAS_MODE_ALIASED);
+        ID2D1RenderTarget_GetFactory(rt, &factory);
+        hr = ID2D1RenderTarget_QueryInterface(rt, &IID_ID2D1DeviceContext, (void **)&context);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        set_rect(&rect, 40.0f, 40.0f, 120.0f, 120.0f);
+        hr = ID2D1Factory_CreateRectangleGeometry(factory, &rect, &mask);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        set_color(&colour, 1.0f, 0.0f, 0.0f, 1.0f);
+        hr = ID2D1RenderTarget_CreateSolidColorBrush(rt, &colour, NULL, &brush);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        set_color(&colour, 0.0f, 0.0f, 0.0f, 1.0f);
+        hr = ID2D1RenderTarget_CreateSolidColorBrush(rt, &colour, NULL, &opacity);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        /* k == 0 paints into the layer, k == 1 leaves it empty. */
+        for (k = 0; k < 2; ++k)
+        {
+            for (j = 0; j < ARRAY_SIZE(paths); ++j)
+            {
+                winetest_push_context("%s%s", k ? "empty " : "", paths[j].name);
+
+                ID2D1RenderTarget_BeginDraw(rt);
+                set_color(&colour, 0.0f, 0.0f, 1.0f, 1.0f);
+                ID2D1RenderTarget_Clear(rt, &colour);
+
+                set_rect(&layer_desc.contentBounds, 0.0f, 0.0f, 640.0f, 480.0f);
+                layer_desc.geometricMask = paths[j].mask ? (ID2D1Geometry *)mask : NULL;
+                layer_desc.maskAntialiasMode = paths[j].mask_aa;
+                set_matrix_identity(&layer_desc.maskTransform);
+                layer_desc.opacity = 1.0f;
+                layer_desc.opacityBrush = paths[j].opacity_brush ? (ID2D1Brush *)opacity : NULL;
+                layer_desc.layerOptions = D2D1_LAYER_OPTIONS_NONE;
+                ID2D1RenderTarget_PushLayer(rt, &layer_desc, NULL);
+
+                if (!k)
+                {
+                    set_rect(&rect, 60.0f, 60.0f, 100.0f, 100.0f);
+                    ID2D1RenderTarget_FillRectangle(rt, &rect, (ID2D1Brush *)brush);
+                }
+
+                ID2D1RenderTarget_PopLayer(rt);
+                hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
+                ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+                get_surface_readback(&ctx, &rb);
+                for (value = 0; value < ARRAY_SIZE(checks); ++value)
+                {
+                    DWORD expected = k ? 0xff0000ff : checks[value].colour;
+                    DWORD got = get_readback_colour(&rb, checks[value].x, checks[value].y);
+                    ok(compare_colour(got, expected, 1),
+                            "Got colour 0x%08lx at (%u, %u) (%s), expected 0x%08lx.\n",
+                            got, checks[value].x, checks[value].y, checks[value].desc, expected);
+                }
+                release_resource_readback(&rb);
+
+                winetest_pop_context();
+            }
+        }
+
+        /* D2D1_LAYER_OPTIONS1_INITIALIZE_FROM_BACKGROUND seeds the layer with a
+         * copy of the target instead of clearing it to transparent.  On an
+         * opaque target that copy has to composite back unchanged, which only
+         * works if the target keeps an opaque alpha channel — the check on the
+         * unpainted pixels below is what makes that visible. */
+        winetest_push_context("background layer");
+
+        ID2D1RenderTarget_BeginDraw(rt);
+        set_color(&colour, 0.0f, 0.0f, 1.0f, 1.0f);
+        ID2D1RenderTarget_Clear(rt, &colour);
+
+        set_rect(&layer_desc1.contentBounds, 0.0f, 0.0f, 640.0f, 480.0f);
+        layer_desc1.geometricMask = (ID2D1Geometry *)mask;
+        layer_desc1.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+        set_matrix_identity(&layer_desc1.maskTransform);
+        layer_desc1.opacity = 1.0f;
+        layer_desc1.opacityBrush = NULL;
+        layer_desc1.layerOptions = D2D1_LAYER_OPTIONS1_INITIALIZE_FROM_BACKGROUND;
+        ID2D1DeviceContext_PushLayer(context, &layer_desc1, NULL);
+
+        set_rect(&rect, 60.0f, 60.0f, 100.0f, 100.0f);
+        ID2D1RenderTarget_FillRectangle(rt, &rect, (ID2D1Brush *)brush);
+
+        ID2D1DeviceContext_PopLayer(context);
+        hr = ID2D1RenderTarget_EndDraw(rt, NULL, NULL);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        get_surface_readback(&ctx, &rb);
+        for (value = 0; value < ARRAY_SIZE(checks); ++value)
+        {
+            DWORD got = get_readback_colour(&rb, checks[value].x, checks[value].y);
+            ok(compare_colour(got, checks[value].colour, 1),
+                    "Got colour 0x%08lx at (%u, %u) (%s), expected 0x%08lx.\n",
+                    got, checks[value].x, checks[value].y, checks[value].desc, checks[value].colour);
+        }
+        release_resource_readback(&rb);
+
+        winetest_pop_context();
+
+        ID2D1SolidColorBrush_Release(opacity);
+        ID2D1SolidColorBrush_Release(brush);
+        ID2D1RectangleGeometry_Release(mask);
+        ID2D1DeviceContext_Release(context);
+        ID2D1Factory_Release(factory);
+        ID2D1RenderTarget_Release(rt);
+
+        winetest_pop_context();
+    }
+
+    release_test_context(&ctx);
+}
+
 static void test_bezier_intersect(BOOL d3d11)
 {
     D2D1_POINT_2F point = {0.0f, 0.0f};
@@ -19022,6 +19213,7 @@ START_TEST(d2d1)
     queue_test(test_fill_geometry);
     queue_test(test_wic_gdi_interop);
     queue_test(test_layer);
+    queue_test(test_layer_composite);
     queue_test(test_bezier_intersect);
     queue_d3d10_test(test_bezier_non_finite);
     queue_test(test_create_device);
