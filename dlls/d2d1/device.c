@@ -3368,8 +3368,16 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                 if (SUCCEEDED(hr))
                 {
                     D2D1_ALPHA_MODE saved_alpha = info.layer_bitmap->format.alphaMode;
-                    if (info.ignore_alpha)
-                        info.layer_bitmap->format.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+
+                    /* The layer bitmap is an intermediate that PushLayer cleared to
+                     * transparent, but it inherits its pixel format from the target.
+                     * On an opaque target that format carries D2D1_ALPHA_MODE_IGNORE,
+                     * which makes the composite force alpha to 1.0, so the untouched
+                     * parts of the layer land as opaque black over the whole mask
+                     * shape. Composite the layer as premultiplied unless the caller
+                     * explicitly asked for its alpha to be ignored. */
+                    info.layer_bitmap->format.alphaMode = info.ignore_alpha
+                            ? D2D1_ALPHA_MODE_IGNORE : D2D1_ALPHA_MODE_PREMULTIPLIED;
 
                     /* Apply maskTransform to world transform so the mask
                      * geometry is positioned correctly in device space. */
