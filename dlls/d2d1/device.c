@@ -3249,6 +3249,23 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
     }
 }
 
+/* Pick the alpha mode the layer bitmap is composited back with.  The bitmap
+ * inherits its pixel format from the target, so on an opaque target it carries
+ * D2D1_ALPHA_MODE_IGNORE and the bitmap brush forces alpha to 1.0.  Since
+ * PushLayer() cleared the bitmap to transparent, everything the layer did not
+ * paint would then land as opaque black over the composited area.  Composite
+ * with the alpha the layer actually holds, unless the caller asked through
+ * D2D1_LAYER_OPTIONS1_IGNORE_ALPHA for it to be ignored.  Returns the previous
+ * alpha mode, which the caller restores once the composite is done. */
+static D2D1_ALPHA_MODE d2d_layer_composite_alpha_mode(struct d2d_layer_info *info)
+{
+    D2D1_ALPHA_MODE saved = info->layer_bitmap->format.alphaMode;
+
+    info->layer_bitmap->format.alphaMode = info->ignore_alpha
+            ? D2D1_ALPHA_MODE_IGNORE : D2D1_ALPHA_MODE_PREMULTIPLIED;
+    return saved;
+}
+
 static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *iface)
 {
     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
@@ -3367,17 +3384,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                         &bitmap_brush_desc, &brush_desc, &mask_brush);
                 if (SUCCEEDED(hr))
                 {
-                    D2D1_ALPHA_MODE saved_alpha = info.layer_bitmap->format.alphaMode;
-
-                    /* The layer bitmap is an intermediate that PushLayer cleared to
-                     * transparent, but it inherits its pixel format from the target.
-                     * On an opaque target that format carries D2D1_ALPHA_MODE_IGNORE,
-                     * which makes the composite force alpha to 1.0, so the untouched
-                     * parts of the layer land as opaque black over the whole mask
-                     * shape. Composite the layer as premultiplied unless the caller
-                     * explicitly asked for its alpha to be ignored. */
-                    info.layer_bitmap->format.alphaMode = info.ignore_alpha
-                            ? D2D1_ALPHA_MODE_IGNORE : D2D1_ALPHA_MODE_PREMULTIPLIED;
+                    D2D1_ALPHA_MODE saved_alpha = d2d_layer_composite_alpha_mode(&info);
 
                     /* Apply maskTransform to world transform so the mask
                      * geometry is positioned correctly in device space. */
@@ -3400,8 +3407,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                     }
 
                     context->drawing_state.transform = saved_transform;
-                    if (info.ignore_alpha)
-                        info.layer_bitmap->format.alphaMode = saved_alpha;
+                    info.layer_bitmap->format.alphaMode = saved_alpha;
                     ID2D1Brush_Release(&mask_brush->ID2D1Brush_iface);
                 }
                 else
@@ -3449,9 +3455,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                         &bitmap_brush_desc, &brush_desc, &layer_brush);
                 if (SUCCEEDED(hr))
                 {
-                    D2D1_ALPHA_MODE saved_alpha = info.layer_bitmap->format.alphaMode;
-                    if (info.ignore_alpha)
-                        info.layer_bitmap->format.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+                    D2D1_ALPHA_MODE saved_alpha = d2d_layer_composite_alpha_mode(&info);
 
                     size = ID2D1Bitmap1_GetSize(&info.layer_bitmap->ID2D1Bitmap1_iface);
                     d2d_rect_set(&dst_rect, 0.0f, 0.0f, size.width, size.height);
@@ -3475,8 +3479,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                         context->drawing_state.transform = saved_transform;
                         ID2D1RectangleGeometry_Release(rect_geo);
                     }
-                    if (info.ignore_alpha)
-                        info.layer_bitmap->format.alphaMode = saved_alpha;
+                    info.layer_bitmap->format.alphaMode = saved_alpha;
                     ID2D1Brush_Release(&layer_brush->ID2D1Brush_iface);
                 }
                 else
@@ -3494,9 +3497,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
             else
             {
                 /* No geometric mask, no opacity brush — composite full layer bitmap. */
-                D2D1_ALPHA_MODE saved_alpha = info.layer_bitmap->format.alphaMode;
-                if (info.ignore_alpha)
-                    info.layer_bitmap->format.alphaMode = D2D1_ALPHA_MODE_IGNORE;
+                D2D1_ALPHA_MODE saved_alpha = d2d_layer_composite_alpha_mode(&info);
 
                 size = ID2D1Bitmap1_GetSize(&info.layer_bitmap->ID2D1Bitmap1_iface);
                 d2d_rect_set(&dst_rect, 0.0f, 0.0f, size.width, size.height);
@@ -3506,8 +3507,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PopLayer(ID2D1DeviceContext6 *i
                         D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
                         NULL, NULL, NULL);
 
-                if (info.ignore_alpha)
-                    info.layer_bitmap->format.alphaMode = saved_alpha;
+                info.layer_bitmap->format.alphaMode = saved_alpha;
             }
 
             /* Release the layer bitmap (prev_target ref released below). */
