@@ -1684,6 +1684,12 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
     if (ret == -1) return ret;
     *attr |= get_file_attributes( st );
     if (reparse_tag) *reparse_tag = 0;
+    /* a bound AF_UNIX socket is a reparse point on Windows */
+    if (S_ISSOCK( st->st_mode ))
+    {
+        *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+        if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
+    }
     /* consider mount points to be reparse points (IO_REPARSE_TAG_MOUNT_POINT) */
     if (options & FILE_OPEN_REPARSE_POINT)
     {
