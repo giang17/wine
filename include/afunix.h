@@ -33,4 +33,6 @@ typedef struct WS(sockaddr_un)
     char sun_path[UNIX_PATH_MAX];
 } SOCKADDR_UN, *PSOCKADDR_UN;
 
+#define SIO_AF_UNIX_GETPEERPID _WSAIOR(WS(IOC_VENDOR), 256)
+
 #endif /* _WS2AFUNIX_ */
