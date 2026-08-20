@@ -17622,7 +17622,6 @@ static void test_combine_geometry(BOOL d3d11)
      * affine transform. Rotating by 45 degrees keeps the area at 400, and the
      * bounds grow to the diagonal. */
     set_rect(&rect, -10.0f, -10.0f, 10.0f, 10.0f);
-    ID2D1RectangleGeometry_Release(rect2);
     hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
     set_matrix_identity(&matrix);
