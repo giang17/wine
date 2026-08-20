@@ -111,6 +111,7 @@ struct thread_input
     int                    caret_hide;    /* caret hide count */
     int                    caret_state;   /* caret on/off state */
     struct list            msg_list;      /* list of hardware messages */
+    struct list            queues;        /* list of message queues sharing this input */
     timeout_t              user_time;     /* time of last user input */
     unsigned char          desktop_keystate[256]; /* desktop keystate when keystate was synced */
     input_shm_t           *shared;        /* thread input in session shared memory */
@@ -135,6 +136,7 @@ struct msg_queue
     lparam_t               next_timer_id;   /* id for the next timer with a 0 window */
     struct timeout_user   *timeout;         /* timeout for next timer to expire */
     struct thread_input   *input;           /* thread input descriptor */
+    struct list            input_entry;     /* entry in input->queues */
     struct hook_table     *hooks;           /* hook table */
     int                    keystate_lock;   /* owns an input keystate lock */
     queue_shm_t           *shared;          /* queue in session shared memory */
@@ -213,6 +215,7 @@ static struct thread_input *create_thread_input( struct thread *thread )
     if ((input = alloc_object( &thread_input_ops )))
     {
         list_init( &input->msg_list );
+        list_init( &input->queues );
         input->user_time = 0;
         input->shared = NULL;
 
@@ -276,6 +279,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         queue->next_timer_id   = 0x7fff;
         queue->timeout         = NULL;
         queue->input           = (struct thread_input *)grab_object( input );
+        list_add_tail( &input->queues, &queue->input_entry );
         queue->hooks           = NULL;
         queue->keystate_lock   = 0;
         list_init( &queue->send_result );
@@ -376,17 +380,11 @@ static void unlock_input_keystate( struct thread_input *input )
     if (!input_shm->keystate_lock) sync_input_keystate( input );
 }
 
-/* change the thread input data of a given thread */
-static int assign_thread_input( struct thread *thread, struct thread_input *new_input )
+/* change the thread input data of a given message queue */
+static void assign_queue_input( struct msg_queue *queue, struct thread_input *new_input )
 {
-    struct msg_queue *queue = thread->queue;
     input_shm_t *input_shm;
 
-    if (!queue)
-    {
-        thread->queue = create_msg_queue( thread, new_input );
-        return thread->queue != NULL;
-    }
     if (queue->input)
     {
         input_shm = queue->input->shared;
@@ -401,9 +399,11 @@ static int assign_thread_input( struct thread *thread, struct thread_input *new_
 
         /* invalidate the old object to force clients to refresh their cached thread input */
         invalidate_shared_object( queue->input->shared );
+        list_remove( &queue->input_entry );
         release_object( queue->input );
     }
     queue->input = (struct thread_input *)grab_object( new_input );
+    list_add_tail( &new_input->queues, &queue->input_entry );
     if (queue->keystate_lock) lock_input_keystate( queue->input );
 
     input_shm = new_input->shared;
@@ -412,7 +412,19 @@ static int assign_thread_input( struct thread *thread, struct thread_input *new_
         shared->cursor_count += queue->cursor_count;
     }
     SHARED_WRITE_END;
+}
 
+/* change the thread input data of a given thread */
+static int assign_thread_input( struct thread *thread, struct thread_input *new_input )
+{
+    struct msg_queue *queue = thread->queue;
+
+    if (!queue)
+    {
+        thread->queue = create_msg_queue( thread, new_input );
+        return thread->queue != NULL;
+    }
+    assign_queue_input( queue, new_input );
     return 1;
 }
 
@@ -1301,6 +1313,7 @@ static void msg_queue_destroy( struct object *obj )
     }
     SHARED_WRITE_END;
     if (queue->keystate_lock) unlock_input_keystate( queue->input );
+    list_remove( &queue->input_entry );
     release_object( queue->input );
     if (queue->hooks) release_object( queue->hooks );
     if (queue->fd) release_object( queue->fd );
@@ -1421,6 +1434,22 @@ int attach_thread_input( struct thread *thread_from, struct thread *thread_to )
             if (!shared->focus) shared->focus = old_input_shm->focus;
         }
         SHARED_WRITE_END;
+
+        /* move the whole input family along, not just thread_from: threads that were
+         * already sharing its input would otherwise be left behind and could no longer
+         * set focus or activate windows within the family */
+        if (old_input != input)
+        {
+            struct msg_queue *queue, *next;
+
+            old_input = (struct thread_input *)grab_object( old_input );
+            LIST_FOR_EACH_ENTRY_SAFE( queue, next, &old_input->queues, struct msg_queue, input_entry )
+            {
+                if (queue == thread_from->queue) continue;
+                assign_queue_input( queue, input );
+            }
+            release_object( old_input );
+        }
     }
 
     ret = assign_thread_input( thread_from, input );
@@ -4053,7 +4082,17 @@ DECL_HANDLER(set_cursor)
     if (req->flags & SET_CURSOR_NOCLIP) set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 0 );
 
     new_cursor = input_shm->cursor_count < 0 ? 0 : input_shm->cursor;
-    if (prev_cursor != new_cursor) update_desktop_cursor_handle( desktop, input, new_cursor );
+    /* A hide/show transition must reach the driver even when the effective
+     * cursor stays zero.  An application that hides the pointer with
+     * ShowCursor(FALSE) and also sets a null cursor while it is hidden leaves
+     * both prev_cursor and new_cursor at zero on ShowCursor(TRUE), so the
+     * handle comparison alone sends nothing and the pointer stays invisible
+     * until an unrelated event sets a cursor again.  WebView2 content does
+     * exactly this while dragging a slider.  A null handle resolves to the
+     * window class cursor, then IDC_ARROW, on the client side. */
+    if (prev_cursor != new_cursor
+            || (reply->prev_count < 0) != (input_shm->cursor_count < 0))
+        update_desktop_cursor_handle( desktop, input, new_cursor );
 
     reply->new_x       = desktop_shm->cursor.x;
     reply->new_y       = desktop_shm->cursor.y;

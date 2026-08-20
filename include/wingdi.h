@@ -1347,6 +1347,9 @@ typedef struct
 #define WINE_GGO_HBGR_BITMAP   0x12
 #define WINE_GGO_VRGB_BITMAP   0x13
 #define WINE_GGO_VBGR_BITMAP   0x14
+/* Internal provenance tag used while selecting a font. It never reaches
+ * GetGlyphOutline; the font driver strips it after resolving policy. */
+#define WINE_GGO_AA_FROM_HOST   0x80000000u
 #endif
 
 typedef struct

@@ -91,8 +91,6 @@ static BOOL X11DRV_ConfigureNotify( HWND hwnd, XEvent *event );
 static BOOL X11DRV_PropertyNotify( HWND hwnd, XEvent *event );
 static BOOL X11DRV_ClientMessage( HWND hwnd, XEvent *event );
 
-#define MAX_EVENT_HANDLERS 128
-
 static x11drv_event_handler handlers[MAX_EVENT_HANDLERS] =
 {
     NULL,                     /*  0 reserved */
@@ -376,12 +374,21 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
 
     for (count = 0; XCheckIfEvent( data->display, &event, filter_event, (XPointer)(UINT_PTR)mask ); count++)
     {
-        if (XFilterEvent( &event, None ) || host_window_filter_event( &event )) continue;
+        if (XFilterEvent( &event, None )) continue;
+        /* issue 64: the VD mini-compositor selects SubstructureNotify on the VD
+         * root for its own purposes; it swallows those events so they never
+         * reach the dispatcher, which would misread them as the desktop's own. */
+        if (vd_compositor_notify( &event )) continue;
+        if (host_window_filter_event( &event )) continue;
         get_event_data( &event );
         call_event_handler( data->display, &event );
         free_event_data( &event );
     }
 
+    /* issue 64: flush a pending per-pixel-alpha VD recomposit.  Only the roots
+     * owned by this connection are painted here -- their events (and their
+     * XDamage notifications) are the ones we just drained. */
+    vd_compositor_paint( data->display );
     XFlush( gdi_display );
     if (count) TRACE( "processed %d events\n", count );
     NtUserSendHardwareInput( NULL, SEND_HWMSG_RAWINPUT, &input, 0 ); /* flush win32u accumulated motion */
@@ -771,6 +778,11 @@ static void focus_out( Display *display , HWND hwnd )
  *
  * Note: only top-level windows get FocusOut events.
  */
+static int clip_window_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->error_code == BadWindow);
+}
+
 static BOOL X11DRV_FocusOut( HWND hwnd, XEvent *xev )
 {
     HWND foreground = NtUserGetForegroundWindow();
@@ -782,8 +794,16 @@ static BOOL X11DRV_FocusOut( HWND hwnd, XEvent *xev )
         {
             NtUserClipCursor( NULL );
             /* NtUserClipCursor will ask the foreground window to ungrab the cursor, but
-             * it might not be responsive, so unmap the clipping window ourselves too */
+             * it might not be responsive, so unmap the clipping window ourselves too.
+             * The window id is cached per thread (init_clip_window) from a property on
+             * the desktop window, so it outlives the desktop it came from: in virtual
+             * desktop mode, switching away from a desktop that is being torn down
+             * leaves us unmapping an id the server has already destroyed, and the
+             * resulting BadWindow would be fatal. */
+            X11DRV_expect_error( event->display, clip_window_error, NULL );
             XUnmapWindow( event->display, event->window );
+            XSync( event->display, False );
+            if (X11DRV_check_error()) WARN( "clipping window %lx already destroyed\n", event->window );
         }
         return TRUE;
     }

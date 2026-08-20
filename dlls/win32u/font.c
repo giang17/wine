@@ -192,7 +192,12 @@ static const WCHAR font_assoc_keyW[] =
 };
 
 static UINT font_smoothing = GGO_BITMAP;
-static UINT subpixel_orientation = GGO_GRAY4_BITMAP;
+static UINT subpixel_orientation = WINE_GGO_HRGB_BITMAP;
+/* Set when the prefix carries its own FontSmoothing value, including an
+ * explicit zero. A fresh prefix has none, so this distinguishes "the user
+ * configured Windows-side smoothing" from "nothing was said and the host
+ * should decide". */
+static BOOL font_smoothing_from_prefix;
 static BOOL antialias_fakes = TRUE;
 static struct font_gamma_ramp font_gamma_ramp;
 
@@ -4533,16 +4538,6 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
         BOOL can_use_bitmap = !!(NtGdiGetDeviceCaps( dc->hSelf, TEXTCAPS ) & TC_RA_ABLE);
 
         NtGdiExtGetObjectW( hfont, sizeof(lf), &lf );
-        switch (lf.lfQuality)
-        {
-        case NONANTIALIASED_QUALITY:
-            if (!*aa_flags) *aa_flags = GGO_BITMAP;
-            break;
-        case ANTIALIASED_QUALITY:
-            if (!*aa_flags) *aa_flags = GGO_GRAY4_BITMAP;
-            break;
-        }
-
         if (lf.lfOutPrecision == OUT_TT_ONLY_PRECIS)
             can_use_bitmap = FALSE;
 
@@ -4586,13 +4581,51 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
 
         if (font)
         {
-            if (!*aa_flags) *aa_flags = font->aa_flags;
+            UINT incoming = *aa_flags;
+            BOOL host_default = !!(incoming & WINE_GGO_AA_FROM_HOST);
+
+            incoming &= ~WINE_GGO_AA_FROM_HOST;
+
+            /* Preserve real device constraints first. XRender also passes a
+             * nonzero choice, but tags it as a host default so application
+             * quality and an explicit prefix policy can legitimately
+             * override it. */
+            if (incoming && !host_default)
+                *aa_flags = incoming;
+            else switch (lf.lfQuality)
+            {
+            case NONANTIALIASED_QUALITY:
+                *aa_flags = GGO_BITMAP;
+                break;
+            case ANTIALIASED_QUALITY:
+                *aa_flags = GGO_GRAY4_BITMAP;
+                break;
+            case CLEARTYPE_QUALITY:
+            case CLEARTYPE_NATURAL_QUALITY:
+                if (font_smoothing_from_prefix)
+                    *aa_flags = subpixel_orientation;
+                else if (incoming == WINE_GGO_HRGB_BITMAP || incoming == WINE_GGO_HBGR_BITMAP
+                        || incoming == WINE_GGO_VRGB_BITMAP || incoming == WINE_GGO_VBGR_BITMAP)
+                    *aa_flags = incoming;
+                else
+                    *aa_flags = subpixel_orientation;
+                break;
+            default:
+                if (font_smoothing_from_prefix)
+                    *aa_flags = font_smoothing;
+                else if (host_default)
+                    *aa_flags = incoming;
+                else
+                    *aa_flags = font->aa_flags;
+                break;
+            }
+
             if (!*aa_flags)
             {
                 if (lf.lfQuality == CLEARTYPE_QUALITY || lf.lfQuality == CLEARTYPE_NATURAL_QUALITY)
                     *aa_flags = subpixel_orientation;
                 else
-                    *aa_flags = font_smoothing;
+                    *aa_flags = font_smoothing_from_prefix ? font_smoothing : GGO_GRAY4_BITMAP;
             }
             *aa_flags = font_funcs->get_aa_flags( font, *aa_flags, antialias_fakes );
         }
@@ -4743,12 +4776,37 @@ static UINT init_font_options(void)
                 break;
             }
         }
-        if (get_key_value( key, "FontSmoothing", &val ) && val /* enabled */)
+        if (get_key_value( key, "FontSmoothing", &val ))
         {
-            if (get_key_value( key, "FontSmoothingType", &val ) && val == 2 /* FE_FONTSMOOTHINGCLEARTYPE */)
-                font_smoothing = subpixel_orientation;
+            font_smoothing_from_prefix = val != 2;
+            if (!val)
+            {
+                font_smoothing = GGO_BITMAP;
+                font_smoothing_from_prefix = TRUE;
+            }
+            else if (get_key_value( key, "FontSmoothingType", &val ))
+            {
+                font_smoothing = val == 2 /* FE_FONTSMOOTHINGCLEARTYPE */
+                        ? subpixel_orientation : GGO_GRAY4_BITMAP;
+                /* sysparams_init seeds FontSmoothing="2" with
+                 * FE_FONTSMOOTHINGSTANDARD into every new prefix, so only
+                 * that pair records nothing the user chose. The launcher
+                 * uses FontSmoothing="1" with STANDARD as its deliberate
+                 * greyscale marker; ClearType is also explicit. */
+                if (val == 2) font_smoothing_from_prefix = TRUE;
+            }
             else
                 font_smoothing = GGO_GRAY4_BITMAP;
+        }
+        /* WINE_DISABLE_PREFIX_FONT_SMOOTHING=1 gives the host's fontconfig
+         * back its precedence, for a desktop whose own setting should govern
+         * Windows applications too. */
+        if (font_smoothing_from_prefix)
+        {
+            const char *disable = getenv( "WINE_DISABLE_PREFIX_FONT_SMOOTHING" );
+
+            if (disable && *disable && *disable != '0')
+                font_smoothing_from_prefix = FALSE;
         }
         if (get_key_value( key, "FontSmoothingGamma", &val ) && val)
         {

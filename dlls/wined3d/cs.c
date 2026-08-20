@@ -30,6 +30,11 @@ static NTSTATUS (WINAPI *pNtWaitForAlertByThreadId)(void *addr, const LARGE_INTE
 
 #define WINED3D_INITIAL_CS_SIZE 4096
 
+/* Posted to a swapchain window after each executed present so the dcomp
+ * subclass puts the delivered leaves back over the presented frame
+ * (issue 206).  Kept in sync with dlls/dcomp/device.c and dlls/dxgi/factory.c. */
+#define WM_WINE_DCOMP_PRESENT_FLUSH (WM_USER + 0x102)
+
 struct wined3d_deferred_upload
 {
     struct wined3d_resource *resource;
@@ -165,6 +170,11 @@ struct wined3d_cs_present
     RECT dst_rect;
     unsigned int swap_interval;
     uint32_t flags;
+    /* Snapshot of the composition dirty rects at emit time, handed off to the
+     * CS thread so the present path does not read the live client-side buffer
+     * (which the app may concurrently overwrite for the next frame). */
+    RECT present_dirty_rects[16];
+    unsigned int present_dirty_rect_count;
 };
 
 struct wined3d_cs_clear
@@ -715,7 +725,53 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
                     &src_rect, WINED3D_BLT_ALPHA_TEST, NULL, WINED3D_TEXF_POINT);
     }
 
+    /* Publish this frame's dirty rects into the CS-thread-only active buffer
+     * that swapchain_blit_gdi reads.  Only the CS thread touches
+     * cs_present_dirty_rects[], so the present path is free of the client/CS
+     * data race on the live present_dirty_rects[] buffer. */
+    swapchain->cs_present_dirty_rect_count = op->present_dirty_rect_count;
+    if (op->present_dirty_rect_count)
+        memcpy(swapchain->cs_present_dirty_rects, op->present_dirty_rects,
+                op->present_dirty_rect_count * sizeof(*swapchain->cs_present_dirty_rects));
+
     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
+
+    /* The present above was the last writer of the window.  A dcomp tree that
+     * delivers leaves into the same window below the coverage threshold has
+     * to put them back NOW, not at its next tree-timer tick -- the gap between
+     * the two is the playhead flicker of issue 206.  Signal only: posted to
+     * the window's owning thread, never blitted from this CS thread -- GDI on
+     * a window from a foreign thread is what broke selection drags in Studio
+     * Pro (issue 190).  Windows without the property (no in-process dcomp
+     * target, composition swapchains) pay one GetPropW per present. */
+    if (swapchain->win_handle
+            && GetPropW(swapchain->win_handle, L"__wine_dcomp_present_flush"))
+        PostMessageW(swapchain->win_handle, WM_WINE_DCOMP_PRESENT_FLUSH, 0, 0);
+
+    /* Copy the just-presented content back into back_buffer[0] so the app can
+     * do incremental rendering (DirtyRects).  After rotation,
+     * back_buffers[N-1] has the presented frame; copy it to back_buffers[0].
+     * This MUST happen in the CS thread (not from DXGI) to avoid a race with
+     * the frame latency event that wakes the app.
+     *
+     * Only meaningful where the buffers were rotated in the first place: this
+     * copy exists to undo the rotation, and doing it without one would
+     * overwrite what the application just drew.  Both halves therefore ask
+     * wined3d_swapchain_keeps_back_buffers() instead of testing the swap effect
+     * on their own. */
+    if ((desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
+            || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
+            && desc->backbuffer_count >= 2
+            && !wined3d_swapchain_keeps_back_buffers(swapchain))
+    {
+        struct wined3d_texture *copy_src = swapchain->back_buffers[desc->backbuffer_count - 1];
+        struct wined3d_texture *copy_dst = swapchain->back_buffers[0];
+        RECT copy_rect;
+
+        SetRect(&copy_rect, 0, 0, copy_dst->resource.width, copy_dst->resource.height);
+        wined3d_device_context_blt(&cs->c, copy_dst, 0, &copy_rect,
+                copy_src, 0, &copy_rect, 0, NULL, WINED3D_TEXF_POINT);
+    }
 
     /* Discard buffers if the swap effect allows it. */
     back_buffer = swapchain->back_buffers[desc->backbuffer_count - 1];
@@ -775,6 +831,23 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
     op->dst_rect = *dst_rect;
     op->swap_interval = swap_interval;
     op->flags = flags;
+
+    /* Snapshot the client-side dirty rects into the op.  This runs on the app
+     * thread under wined3d_mutex (held by wined3d_swapchain_present), in program
+     * order after wined3d_swapchain_set_dirty_rects, so it captures this frame's
+     * rects; the CS thread later reads them from the op, never from the live
+     * swapchain buffer. */
+    op->present_dirty_rect_count = swapchain->present_dirty_rect_count;
+    if (swapchain->present_dirty_rect_count)
+        memcpy(op->present_dirty_rects, swapchain->present_dirty_rects,
+                swapchain->present_dirty_rect_count * sizeof(*op->present_dirty_rects));
+    /* Consume the pending rects: they apply to exactly this present.  A
+     * subsequent plain Present() that does not call set_dirty_rects() (only
+     * Present1 does) must then present a full frame, not re-use stale rects.
+     * Reset here on the app thread rather than on the CS thread after the blit,
+     * so the client buffer is never written from two threads. */
+    swapchain->present_dirty_rect_count = 0;
+
 
     wined3d_resource_reference(&swapchain->front_buffer->resource);
     for (i = 0; i < swapchain->state.desc.backbuffer_count; ++i)
@@ -2769,7 +2842,8 @@ void wined3d_device_context_emit_update_sub_resource(struct wined3d_device_conte
     if (resource->type == WINED3D_RTYPE_BUFFER && box->right - box->left == resource->size)
         invalidate_client_address(resource);
 
-    if (context->ops->map_upload_bo(context, resource, sub_resource_idx, &map_desc, box, WINED3D_MAP_WRITE))
+    if (context->ops->map_upload_bo(context, resource, sub_resource_idx, &map_desc, box,
+            WINED3D_MAP_WRITE | ((resource->type == WINED3D_RTYPE_BUFFER) ? WINED3D_MAP_DISCARD : 0)))
     {
         const struct wined3d_format *format = resource->format;
 
@@ -4662,8 +4736,24 @@ static void wined3d_command_list_destroy_object(void *object)
         {
             if (!--bo->refcount)
             {
+                struct wined3d_device *device = list->device;
+
                 wined3d_context_destroy_bo(context, bo);
-                free(bo);
+
+                /* Recycle the bo struct instead of freeing it. */
+                wined3d_device_bo_map_lock(device);
+                if (device->bo_gl_free_pool_count < WINED3D_BO_GL_FREE_POOL_MAX)
+                {
+                    bo->map_ptr = device->bo_gl_free_pool;
+                    device->bo_gl_free_pool = bo;
+                    ++device->bo_gl_free_pool_count;
+                    wined3d_device_bo_map_unlock(device);
+                }
+                else
+                {
+                    wined3d_device_bo_map_unlock(device);
+                    free(bo);
+                }
             }
         }
         else

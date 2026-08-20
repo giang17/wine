@@ -4388,8 +4388,22 @@ static bool adapter_gl_alloc_bo(struct wined3d_device *device, struct wined3d_re
         flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_CLIENT_STORAGE_BIT;
     }
 
-    if (!(bo_gl = malloc(sizeof(*bo_gl))))
-        return false;
+    /* Try to recycle a bo_gl struct from the free pool. */
+    wined3d_device_bo_map_lock(device);
+    if (device->bo_gl_free_pool)
+    {
+        bo_gl = CONTAINING_RECORD(device->bo_gl_free_pool, struct wined3d_bo_gl, b);
+        device->bo_gl_free_pool = (struct wined3d_bo *)bo_gl->b.map_ptr;
+        --device->bo_gl_free_pool_count;
+        wined3d_device_bo_map_unlock(device);
+        memset(bo_gl, 0, sizeof(*bo_gl));
+    }
+    else
+    {
+        wined3d_device_bo_map_unlock(device);
+        if (!(bo_gl = malloc(sizeof(*bo_gl))))
+            return false;
+    }
 
     if (!(wined3d_device_gl_create_bo(device_gl, NULL, size, binding, usage, coherent, flags, bo_gl)))
     {

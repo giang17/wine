@@ -2385,7 +2385,13 @@ got_bitmap:
     rop= ((item->fState & MF_HILITE) && !IS_MAGIC_BITMAP(bmp_to_draw)) ? NOTSRCCOPY : SRCCOPY;
     if ((item->fState & MF_HILITE) && item->hbmpItem)
         NtGdiGetAndSetDCDword( hdc, NtGdiSetBkColor, get_sys_color( COLOR_HIGHLIGHT ), NULL );
-    NtGdiBitBlt( hdc, left, top, w, h, mem_hdc, bmp_xoffset, 0, rop, 0, 0 );
+    if (bm.bmBitsPixel == 32)  /* 32-bpp ARGB bitmap: blend via alpha channel (BitBlt/SRCCOPY renders transparent pixels as black) */
+    {
+        int bw = bm.bmWidth - bmp_xoffset, bh = bm.bmHeight;
+        NtGdiAlphaBlend( hdc, left, top, bw, bh, mem_hdc, bmp_xoffset, 0, bw, bh,
+                         MAKEFOURCC( AC_SRC_OVER, 0, 255, AC_SRC_ALPHA ), 0 );
+    }
+    else NtGdiBitBlt( hdc, left, top, w, h, mem_hdc, bmp_xoffset, 0, rop, 0, 0 );
     NtGdiDeleteObjectApp( mem_hdc );
 }
 
