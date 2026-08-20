@@ -1398,6 +1398,8 @@ static BOOL WINAPI WS2_ConnectEx( SOCKET s, const struct sockaddr *name, int nam
 {
     struct afd_connect_params *params;
     void *cvalue = NULL;
+    char *unix_path = NULL;
+    int unix_varargs_size = 0;
     NTSTATUS status;
 
     TRACE( "socket %#Ix, ptr %p %s, length %d, send_buffer %p, send_len %lu, overlapped %p\n",
@@ -1409,24 +1411,50 @@ static BOOL WINAPI WS2_ConnectEx( SOCKET s, const struct sockaddr *name, int nam
         return FALSE;
     }
 
+    if (name->sa_family == AF_UNIX && *name->sa_data)
+    {
+        WCHAR *sun_pathW;
+
+        /* The server expects the translated Unix path appended to the address,
+         * which leaves no room for connect data on AF_UNIX sockets. */
+        if (send_len)
+        {
+            SetLastError( WSAEOPNOTSUPP );
+            return FALSE;
+        }
+
+        sun_pathW = strdupAtoW( name->sa_data );
+        unix_path = wine_get_unix_file_name( sun_pathW );
+        free( sun_pathW );
+        if (!unix_path)
+            return FALSE;
+        unix_varargs_size = strlen( unix_path );
+    }
+
     if (!((ULONG_PTR)overlapped->hEvent & 1)) cvalue = overlapped;
     overlapped->Internal = STATUS_PENDING;
     overlapped->InternalHigh = 0;
 
-    if (!(params = malloc( sizeof(*params) + namelen + send_len )))
+    if (!(params = malloc( sizeof(*params) + namelen + send_len + unix_varargs_size )))
     {
+        free( unix_path );
         SetLastError( ERROR_NOT_ENOUGH_MEMORY );
         return SOCKET_ERROR;
     }
     params->addr_len = namelen;
     params->synchronous = FALSE;
     memcpy( params + 1, name, namelen );
-    memcpy( (char *)(params + 1) + namelen, send_buffer, send_len );
+    if (unix_path)
+        memcpy( (char *)(params + 1) + namelen, unix_path, unix_varargs_size );
+    else
+        memcpy( (char *)(params + 1) + namelen, send_buffer, send_len );
 
     status = NtDeviceIoControlFile( SOCKET2HANDLE(s), overlapped->hEvent, NULL, cvalue,
                                     (IO_STATUS_BLOCK *)overlapped, IOCTL_AFD_WINE_CONNECT,
-                                    params, sizeof(*params) + namelen + send_len, NULL, 0 );
+                                    params, sizeof(*params) + namelen + send_len + unix_varargs_size,
+                                    NULL, 0 );
     free( params );
+    free( unix_path );
     if (ret_len) *ret_len = overlapped->InternalHigh;
     SetLastError( NtStatusToWSAError( status ) );
     TRACE( "status %#lx.\n", status );
