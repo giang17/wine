@@ -5885,7 +5885,11 @@ done:
  * y-down coordinate system. A shared edge is contributed once in each
  * direction, so summing the directions over each elementary interval and
  * keeping only the intervals with a non-zero sum leaves exactly the boundary.
- * The surviving edges are then chained into closed contours. */
+ * The surviving edges are then chained into closed contours.
+ *
+ * The result is the union of the rectangles, so the caller has to make sure
+ * that the union is what the rectangles describe in the first place - see
+ * d2d_combine_rects_are_traceable(). */
 struct d2d_combine_span
 {
     float pos;
@@ -6166,6 +6170,31 @@ done:
     return ret;
 }
 
+/* Tracing a rectangle set yields the outline of its union, which reproduces
+ * the original shape only when none of the rectangles is a hole in another.
+ * Two conditions rule that out for either fill rule: under
+ * D2D1_FILL_MODE_WINDING a hole is a rectangle wound against the rest, and
+ * under D2D1_FILL_MODE_ALTERNATE it is one overlapping another. Rectangles
+ * that merely share an edge are fine, which is the case a clip list hits. */
+static BOOL d2d_combine_rects_are_traceable(const struct d2d_combine_rects *rects)
+{
+    for (size_t i = 0; i < rects->count; ++i)
+    {
+        if (rects->rects[i].winding != rects->rects[0].winding)
+            return FALSE;
+
+        for (size_t j = i + 1; j < rects->count; ++j)
+        {
+            const D2D1_RECT_F *a = &rects->rects[i].rect, *b = &rects->rects[j].rect;
+
+            if (a->left < b->right && b->left < a->right && a->top < b->bottom && b->top < a->bottom)
+                return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
 static void d2d_combine_write_rects(ID2D1SimplifiedGeometrySink *sink, const D2D1_RECT_F *rects, size_t count)
 {
     ID2D1SimplifiedGeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
@@ -6280,8 +6309,12 @@ static HRESULT d2d_geometry_combine(ID2D1Geometry *geometry, ID2D1Geometry *geom
 
                 /* The clip often leaves the rectangles of a clip list intact,
                  * and those meet along shared edges just like in the rectangle
-                 * path, so trace their outline here as well. */
-                if (d2d_combine_shape_as_rects(&clipped, &clipped_rects))
+                 * path, so trace their outline here as well. Unlike there, the
+                 * rectangles are the contours of the shape rather than a
+                 * decomposition of the filled area, so a hole is among them
+                 * whenever the shape has one, and tracing has to be declined. */
+                if (d2d_combine_shape_as_rects(&clipped, &clipped_rects)
+                        && d2d_combine_rects_are_traceable(&clipped_rects))
                 {
                     D2D1_RECT_F *plain;
 

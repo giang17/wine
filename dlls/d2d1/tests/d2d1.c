@@ -17673,6 +17673,67 @@ static void test_combine_geometry(BOOL d3d11)
     ID2D1RectangleGeometry_Release(rect1);
     ID2D1PathGeometry_Release(path);
 
+    /* A shape with a hole, intersected with an operand that contains it. The
+     * result is the shape itself, hole included, whichever way the combination
+     * arrives at it. A 100x100 square with a 50x50 hole, so 7500. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 0.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 100.0f, 0.0f);
+    line_to(sink, 100.0f, 100.0f);
+    line_to(sink, 0.0f, 100.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    /* Wound the other way, so it is a hole under the winding fill rule. */
+    set_point(&point, 25.0f, 25.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 25.0f, 75.0f);
+    line_to(sink, 75.0f, 75.0f);
+    line_to(sink, 75.0f, 25.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    /* Both operands are rectangular here, so this goes through the scanline
+     * pass over the rectangles. */
+    set_rect(&rect, -50.0f, -50.0f, 150.0f, 150.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 7500.0f, 0.0f, 0.0f, 100.0f, 100.0f);
+    point.x = 50.0f;
+    point.y = 50.0f;
+    hr = ID2D1PathGeometry_FillContainsPoint(result, point, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "The hole is filled.\n");
+    ID2D1PathGeometry_Release(result);
+
+    /* The ellipse is not rectangular, so this goes through the convex clip
+     * instead, and has to arrive at the same shape. */
+    set_ellipse(&ellipse, 50.0f, 50.0f, 200.0f, 200.0f);
+    hr = ID2D1Factory_CreateEllipseGeometry(ctx.factory, &ellipse, &ellipse_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)ellipse_geometry,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 7500.0f, 0.0f, 0.0f, 100.0f, 100.0f);
+    point.x = 50.0f;
+    point.y = 50.0f;
+    hr = ID2D1PathGeometry_FillContainsPoint(result, point, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "The hole is filled.\n");
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1EllipseGeometry_Release(ellipse_geometry);
+    ID2D1RectangleGeometry_Release(rect1);
+    ID2D1PathGeometry_Release(path);
+
     /* Two non-convex polygons. Neither side is convex, so the general boolean
      * case applies, which is not implemented yet. Two L shapes overlapping in
      * their long arms: 300 each, overlapping in 100. */
