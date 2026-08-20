@@ -17734,6 +17734,89 @@ static void test_combine_geometry(BOOL d3d11)
     ID2D1RectangleGeometry_Release(rect1);
     ID2D1PathGeometry_Release(path);
 
+    /* Every mode other than INTERSECT is implemented for axis-aligned
+     * rectangles only, so a single convex operand that is not one already
+     * leaves the implemented set - being convex is not enough outside
+     * INTERSECT. The cases below pin that boundary, and their values are the
+     * target once the general case lands.
+     *
+     * A square and the same square rotated by 45 degrees meet in a regular
+     * octagon of 2 * a^2 * (sqrt(2) - 1), which is 331.370850 for a side of
+     * 20 and is what INTERSECT returns above. The union is therefore
+     * 800 - 331.370850, the exclusive or 800 - 2 * 331.370850, and the
+     * difference 400 - 331.370850. */
+    set_rect(&rect, -10.0f, -10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_matrix_identity(&matrix);
+    rotate_matrix(&matrix, M_PI / 4.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)rect1,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_UNION, NULL, &result);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        check_combined_geometry(result, 468.629150f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_XOR, NULL, &result);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        check_combined_geometry(result, 137.258300f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
+    ID2D1PathGeometry_Release(result);
+
+    /* The difference stays inside the calling geometry, so the bounds do not
+     * grow to the diagonal here. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+        check_combined_geometry(result, 68.629150f, -10.0f, -10.0f, 10.0f, 10.0f);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1RectangleGeometry_Release(rect1);
+
+    /* The same boundary with two curved operands. Two circles of radius 10
+     * whose centres are 10 * sqrt(2) apart overlap in 57.08, so the union is
+     * 2 * 314.16 - 57.08 = 571.24 when the curves survive into the output, and
+     * a few units less when they are flattened at the requested tolerance -
+     * allow for both. */
+    set_ellipse(&ellipse, 10.0f, 10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateEllipseGeometry(ctx.factory, &ellipse, &ellipse_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_matrix_identity(&matrix);
+    translate_matrix(&matrix, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)ellipse_geometry,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)ellipse_geometry,
+            (ID2D1Geometry *)transformed_geometry, D2D1_COMBINE_MODE_UNION, NULL, &result);
+    todo_wine
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        hr = ID2D1PathGeometry_ComputeArea(result, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, &area);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(area > 565.0f && area < 575.0f, "Got unexpected area %.8e.\n", area);
+        hr = ID2D1PathGeometry_GetBounds(result, NULL, &rect);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(compare_rect(&rect, 0.0f, 0.0f, 30.0f, 30.0f, 64),
+                "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n",
+                rect.left, rect.top, rect.right, rect.bottom);
+    }
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1EllipseGeometry_Release(ellipse_geometry);
+
     /* Two non-convex polygons. Neither side is convex, so the general boolean
      * case applies, which is not implemented yet. Two L shapes overlapping in
      * their long arms: 300 each, overlapping in 100. */
