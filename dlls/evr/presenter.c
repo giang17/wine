@@ -475,6 +475,24 @@ static BOOL video_presenter_sample_queue_pop(struct video_presenter *presenter, 
 }
 
 
+static void video_presenter_flush_samples(struct video_presenter *presenter)
+{
+    IMFSample *sample;
+
+    /* The queue is only allocated once streaming has begun; a flush before that
+     * has nothing to do. */
+    if (!presenter->thread.queue.size)
+        return;
+
+    while (video_presenter_sample_queue_pop(presenter, &sample))
+        IMFSample_Release(sample);
+
+    /* The samples that were dropped here never made it to the screen, so the
+     * pacing interval must not hold back the first one that arrives after the
+     * flush. */
+    presenter->last_present_time = 0;
+}
+
 static void video_presenter_sample_queue_free(struct video_presenter *presenter)
 {
     struct sample_queue *queue = &presenter->thread.queue;
@@ -1025,6 +1043,14 @@ static HRESULT WINAPI video_presenter_ProcessMessage(IMFVideoPresenter *iface, M
 
     switch (message)
     {
+        case MFVP_MESSAGE_FLUSH:
+            /* Samples that are still queued belong to the position the pipeline
+             * has just left.  Presenting them after a seek shows frames from the
+             * old position, and because the queue is only as deep as the sample
+             * allocator, holding on to them keeps every newer sample out. */
+            video_presenter_flush_samples(presenter);
+            hr = S_OK;
+            break;
         case MFVP_MESSAGE_INVALIDATEMEDIATYPE:
             if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
                 hr = MF_E_SHUTDOWN;
