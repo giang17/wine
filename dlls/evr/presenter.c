@@ -107,6 +107,7 @@ struct video_presenter
     unsigned int allocator_capacity;
     IMFMediaType *media_type;
     LONGLONG frame_time_threshold;
+    ULONGLONG last_present_time;
     UINT reset_token;
     HWND video_window;
     MFVideoNormalizedRect src_rect;
@@ -573,6 +574,32 @@ static void video_presenter_check_queue(struct video_presenter *presenter,
                 /* Convert 100ns -> msec */
                 wait = (delta - 3 * presenter->frame_time_threshold) / 10000;
                 present = FALSE;
+            }
+        }
+
+        if (present)
+        {
+            /* Pace presentation to the frame interval.  Nothing above limits
+             * the rate: the clock check only defers samples that are ahead of
+             * the presentation time, and while scrubbing the clock does not
+             * advance at all.  The media session meanwhile notifies the
+             * presenter as fast as the mixer can produce output, which for a
+             * 30 fps video amounts to roughly two thousand presents per
+             * second.  Swapping a window that often leaves it showing nothing
+             * -- the frames are correct all the way into the swapchain's back
+             * buffer, they just never become visible. */
+            ULONGLONG interval = 4 * presenter->frame_time_threshold / 10000;
+            ULONGLONG now = GetTickCount64();
+
+            if (interval && presenter->last_present_time
+                    && now - presenter->last_present_time < interval)
+            {
+                wait = interval - (now - presenter->last_present_time);
+                present = FALSE;
+            }
+            else
+            {
+                presenter->last_present_time = now;
             }
         }
 
