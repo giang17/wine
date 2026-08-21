@@ -885,6 +885,14 @@ static void session_clear_command_list(struct media_session *session)
 
 static void session_release_media_source(struct media_source *source);
 
+static void session_stop_sources(struct media_session *session)
+{
+    struct media_source *source;
+
+    LIST_FOR_EACH_ENTRY(source, &session->presentation.sources, struct media_source, entry)
+        IMFMediaSource_Stop(source->source);
+}
+
 static void session_clear_presentation(struct media_session *session)
 {
     struct media_source *source, *source2;
@@ -2472,6 +2480,8 @@ static HRESULT WINAPI mfsession_Shutdown(IMFMediaSession *iface)
     EnterCriticalSection(&session->cs);
     if (SUCCEEDED(hr = session_is_shut_down(session)))
     {
+        BOOL was_running = session->state == SESSION_STATE_STARTED || session->state == SESSION_STATE_PAUSED;
+
         session->state = SESSION_STATE_SHUT_DOWN;
         IMFMediaEventQueue_Shutdown(session->event_queue);
         if (session->quality_manager)
@@ -2479,6 +2489,12 @@ static HRESULT WINAPI mfsession_Shutdown(IMFMediaSession *iface)
         MFShutdownObject((IUnknown *)session->clock);
         IMFPresentationClock_Release(session->clock);
         session->clock = NULL;
+        /* Stop the sources that are still running before dropping them. Stopping
+         * completes our pending event subscription, so that an application that
+         * keeps a source alive and reuses it in another session is able to
+         * subscribe to it again. */
+        if (was_running)
+            session_stop_sources(session);
         session_clear_presentation(session);
         session_clear_queued_topologies(session);
         session_submit_simple_command(session, SESSION_CMD_SHUTDOWN);
@@ -4261,6 +4277,7 @@ static HRESULT WINAPI session_events_callback_Invoke(IMFAsyncCallback *iface, IM
     IMFMediaSource *source;
     IMFMediaStream *stream;
     PROPVARIANT value;
+    BOOL shut_down;
     HRESULT hr;
 
     if (FAILED(hr = IMFAsyncResult_GetState(result, (IUnknown **)&event_source)))
@@ -4482,7 +4499,13 @@ static HRESULT WINAPI session_events_callback_Invoke(IMFAsyncCallback *iface, IM
 
 failed:
 
-    if (FAILED(hr = IMFMediaEventGenerator_BeginGetEvent(event_source, iface, (IUnknown *)event_source)))
+    EnterCriticalSection(&session->cs);
+    shut_down = session->state == SESSION_STATE_SHUT_DOWN;
+    LeaveCriticalSection(&session->cs);
+
+    /* Do not renew the subscription for a session that is shut down: the event
+     * source may outlive it, and it would stay registered as its subscriber. */
+    if (!shut_down && FAILED(hr = IMFMediaEventGenerator_BeginGetEvent(event_source, iface, (IUnknown *)event_source)))
     {
         if (hr == MF_E_SHUTDOWN && session_get_media_source(session, (IMFMediaSource *)event_source))
         {
