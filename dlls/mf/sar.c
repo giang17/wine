@@ -105,6 +105,7 @@ struct audio_renderer
     unsigned int max_frames;
     struct list queue;
     enum stream_state state;
+    float rate;
     unsigned int flags;
     CRITICAL_SECTION cs;
 };
@@ -746,9 +747,29 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockRestart(IMFClockStateSink
 
 static HRESULT WINAPI audio_renderer_clock_sink_OnClockSetRate(IMFClockStateSink *iface, MFTIME systime, float rate)
 {
-    FIXME("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
+    struct audio_renderer *renderer = impl_from_IMFClockStateSink(iface);
+    BOOL resumed;
 
-    return E_NOTIMPL;
+    TRACE("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
+
+    EnterCriticalSection(&renderer->cs);
+
+    resumed = renderer->rate == 0.0f && rate != 0.0f;
+    renderer->rate = rate;
+
+    /* Nothing was requested while the rate was zero, so the render loop has no
+     * outstanding request to piggyback on.  Ask for one sample here. */
+    if (resumed && renderer->state == STREAM_STATE_RUNNING && !(renderer->flags & SAR_SAMPLE_REQUESTED)
+            && renderer->queued_frames < renderer->max_frames)
+    {
+        IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkRequestSample,
+                &GUID_NULL, S_OK, NULL);
+        renderer->flags |= SAR_SAMPLE_REQUESTED;
+    }
+
+    LeaveCriticalSection(&renderer->cs);
+
+    return S_OK;
 }
 
 static const IMFClockStateSinkVtbl audio_renderer_clock_sink_vtbl =
@@ -1379,7 +1400,8 @@ static HRESULT WINAPI audio_renderer_stream_ProcessSample(IMFStreamSink *iface, 
             hr = stream_queue_sample(renderer, sample);
         renderer->flags &= ~SAR_SAMPLE_REQUESTED;
 
-        if (renderer->queued_frames < renderer->max_frames && renderer->state == STREAM_STATE_RUNNING)
+        if (renderer->queued_frames < renderer->max_frames && renderer->state == STREAM_STATE_RUNNING
+                && renderer->rate != 0.0f)
         {
             IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkRequestSample,
                     &GUID_NULL, S_OK, NULL);
@@ -1880,7 +1902,17 @@ static void audio_renderer_render(struct audio_renderer *renderer, IMFAsyncResul
         release_pending_object(obj);
     }
 
-    if (list_empty(&renderer->queue) && !(renderer->flags & SAR_SAMPLE_REQUESTED))
+    /* While the clock rate is zero the presentation is scrubbing and no audio is
+     * rendered.  A renderer that keeps pulling regardless drains the read-ahead
+     * of the demultiplexer until the video stream, which stops being consumed
+     * for the still frame, starves it.  The source request handler then blocks
+     * in wait_on_sample() and, because it shares one serial work queue with the
+     * source's control commands, the Pause and Stop that follow are never run:
+     * the session stays in the pause transition and no further session events
+     * are delivered.  The preroll path is left alone so that a Start at rate
+     * zero still delivers the frame for the new position. */
+    if (list_empty(&renderer->queue) && !(renderer->flags & SAR_SAMPLE_REQUESTED)
+            && renderer->rate != 0.0f)
     {
         IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkRequestSample, &GUID_NULL, S_OK, NULL);
         renderer->flags |= SAR_SAMPLE_REQUESTED;
@@ -1933,6 +1965,7 @@ static HRESULT sar_create_object(IMFAttributes *attributes, void *user_context, 
     renderer->IMFAudioPolicy_iface.lpVtbl = &audio_renderer_policy_vtbl;
     renderer->render_callback.lpVtbl = &audio_renderer_render_callback_vtbl;
     renderer->refcount = 1;
+    renderer->rate = 1.0f;
     InitializeCriticalSection(&renderer->cs);
     renderer->buffer_ready_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     list_init(&renderer->queue);
