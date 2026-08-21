@@ -119,6 +119,7 @@ struct video_presenter
     unsigned int state;
     unsigned int flags;
     float rate;
+    BOOL scrub_pending;
 
     struct
     {
@@ -491,6 +492,7 @@ static void video_presenter_flush_samples(struct video_presenter *presenter)
      * pacing interval must not hold back the first one that arrives after the
      * flush. */
     presenter->last_present_time = 0;
+    presenter->scrub_pending = TRUE;
 }
 
 static void video_presenter_sample_queue_free(struct video_presenter *presenter)
@@ -576,9 +578,23 @@ static void video_presenter_check_queue(struct video_presenter *presenter,
         present = TRUE;
         wait = 0;
 
-        /* At rate 0 the presentation is scrubbing, and the clock does not advance.
-         * Samples are presented as they arrive instead of being scheduled against it. */
-        if (presenter->clock && presenter->rate != 0.0f)
+        /* At rate 0 the presentation is scrubbing: the clock does not advance, so
+         * samples cannot be scheduled against it.  Exactly one frame is shown for
+         * the position the clock was started at, and the ones that follow are held
+         * back.  Presenting all of them instead makes the video run on its own
+         * while the transport stands still, and it keeps the sample allocator
+         * drained, which lets the source read ahead without limit. */
+        if (presenter->rate == 0.0f)
+        {
+            if (!presenter->scrub_pending)
+            {
+                present = FALSE;
+                /* Never zero: a zero wait would spin on the sample that was just
+                 * pushed back to the front of the queue. */
+                wait = max(4 * presenter->frame_time_threshold / 10000, 10);
+            }
+        }
+        else if (presenter->clock)
         {
             pts = clocktime = 0;
 
@@ -622,7 +638,10 @@ static void video_presenter_check_queue(struct video_presenter *presenter,
         }
 
         if (present)
+        {
+            presenter->scrub_pending = FALSE;
             video_presenter_sample_present(presenter, sample);
+        }
         else
             video_presenter_sample_queue_push(presenter, sample, TRUE);
 
@@ -974,6 +993,7 @@ static HRESULT WINAPI video_presenter_OnClockStart(IMFVideoPresenter *iface, MFT
 
     EnterCriticalSection(&presenter->cs);
     presenter->state = PRESENTER_STATE_STARTED;
+    presenter->scrub_pending = TRUE;
     LeaveCriticalSection(&presenter->cs);
 
     return S_OK;
@@ -1026,6 +1046,8 @@ static HRESULT WINAPI video_presenter_OnClockSetRate(IMFVideoPresenter *iface, M
     TRACE("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
 
     EnterCriticalSection(&presenter->cs);
+    if (rate == 0.0f && presenter->rate != 0.0f)
+        presenter->scrub_pending = TRUE;
     presenter->rate = rate;
     LeaveCriticalSection(&presenter->cs);
 
@@ -2250,6 +2272,7 @@ HRESULT evr_presenter_create(IUnknown *outer, void **out)
     object->ar_mode = MFVideoARMode_PreservePicture | MFVideoARMode_PreservePixel;
     object->allocator_capacity = 3;
     object->rate = 1.0f;
+    object->scrub_pending = TRUE;
     InitializeCriticalSection(&object->cs);
 
     if (FAILED(hr = DXVA2CreateDirect3DDeviceManager9(&object->reset_token, &object->device_manager)))
