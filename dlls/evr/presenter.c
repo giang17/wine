@@ -526,17 +526,18 @@ static HRESULT video_presenter_get_sample_surface(IMFSample *sample, IDirect3DSu
     return hr;
 }
 
-static void video_presenter_sample_present(struct video_presenter *presenter, IMFSample *sample)
+/* Draws a sample to the video window. Fails only if the sample itself could not be
+ * used; a missing swapchain or backbuffer is not treated as an error here. */
+static HRESULT video_presenter_present_sample(struct video_presenter *presenter, IMFSample *sample)
 {
     IDirect3DSurface9 *surface, *backbuffer;
     IDirect3DDevice9 *device;
-    struct sample_queue *queue = &presenter->thread.queue;
     HRESULT hr;
 
     if (FAILED(hr = video_presenter_get_sample_surface(sample, &surface)))
     {
         WARN("Failed to get sample surface, hr %#lx.\n", hr);
-        return;
+        return hr;
     }
 
     if (presenter->swapchain)
@@ -556,11 +557,21 @@ static void video_presenter_sample_present(struct video_presenter *presenter, IM
             WARN("Failed to get a backbuffer, hr %#lx.\n", hr);
     }
 
+    IDirect3DSurface9_Release(surface);
+
+    return S_OK;
+}
+
+static void video_presenter_sample_present(struct video_presenter *presenter, IMFSample *sample)
+{
+    struct sample_queue *queue = &presenter->thread.queue;
+
+    if (FAILED(video_presenter_present_sample(presenter, sample)))
+        return;
+
     IMFSample_AddRef(sample);
     if ((sample = InterlockedExchangePointer((void **)&queue->last_presented, sample)))
         IMFSample_Release(sample);
-
-    IDirect3DSurface9_Release(surface);
 }
 
 static void video_presenter_check_queue(struct video_presenter *presenter,
@@ -1557,16 +1568,30 @@ static HRESULT WINAPI video_presenter_control_GetVideoWindow(IMFVideoDisplayCont
 static HRESULT WINAPI video_presenter_control_RepaintVideo(IMFVideoDisplayControl *iface)
 {
     struct video_presenter *presenter = impl_from_IMFVideoDisplayControl(iface);
+    struct sample_queue *queue = &presenter->thread.queue;
+    IMFSample *sample;
     HRESULT hr;
 
-    FIXME("%p.\n", iface);
+    TRACE("%p.\n", iface);
 
     EnterCriticalSection(&presenter->cs);
 
     if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
         hr = MF_E_SHUTDOWN;
+    else if (!(sample = InterlockedExchangePointer((void **)&queue->last_presented, NULL)))
+    {
+        WARN("No frame has been presented yet.\n");
+        hr = MF_E_INVALIDREQUEST;
+    }
     else
-        hr = E_NOTIMPL;
+    {
+        hr = video_presenter_present_sample(presenter, sample);
+
+        /* Keep the frame for further repaints, unless a newer one was presented
+         * by the streaming thread in the meantime. */
+        if (InterlockedCompareExchangePointer((void **)&queue->last_presented, sample, NULL))
+            IMFSample_Release(sample);
+    }
 
     LeaveCriticalSection(&presenter->cs);
 
