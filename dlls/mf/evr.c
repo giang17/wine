@@ -1928,22 +1928,30 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockStart(IMFClockStateSink *
     {
         IMFTransform_ProcessMessage(renderer->mixer, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         IMFVideoPresenter_ProcessMessage(renderer->presenter, MFVP_MESSAGE_BEGINSTREAMING, 0);
+    }
 
-        for (i = 0; i < renderer->stream_count; ++i)
+    for (i = 0; i < renderer->stream_count; ++i)
+    {
+        struct video_stream *stream = renderer->streams[i];
+
+        request_sample = FALSE;
+        if (state == EVR_STATE_STOPPED)
         {
-            struct video_stream *stream = renderer->streams[i];
-
             EnterCriticalSection(&stream->cs);
             request_sample = !(stream->flags & EVR_STREAM_PREROLLED) || (stream->flags & EVR_STREAM_SAMPLE_NEEDED);
             stream->flags |= EVR_STREAM_PREROLLED;
             stream->flags &= ~EVR_STREAM_SAMPLE_NEEDED;
             LeaveCriticalSection(&stream->cs);
-
-            IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkStarted, &GUID_NULL, S_OK, NULL);
-            if (request_sample)
-                IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkRequestSample,
-                        &GUID_NULL, S_OK, NULL);
         }
+
+        /* The session waits for MEStreamSinkStarted from every output node before it
+         * completes a start command.  Seeking from the paused state starts the clock
+         * without going through OnClockRestart(), so the event is sent for every
+         * previous state here, not just when starting from stopped. */
+        IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkStarted, &GUID_NULL, S_OK, NULL);
+        if (request_sample)
+            IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkRequestSample,
+                    &GUID_NULL, S_OK, NULL);
     }
 
     IMFVideoPresenter_OnClockStart(renderer->presenter, systime, offset);
