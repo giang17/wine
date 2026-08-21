@@ -117,6 +117,7 @@ struct video_presenter
     unsigned int ar_mode;
     unsigned int state;
     unsigned int flags;
+    float rate;
 
     struct
     {
@@ -556,7 +557,9 @@ static void video_presenter_check_queue(struct video_presenter *presenter,
         present = TRUE;
         wait = 0;
 
-        if (presenter->clock)
+        /* At rate 0 the presentation is scrubbing, and the clock does not advance.
+         * Samples are presented as they arrive instead of being scheduled against it. */
+        if (presenter->clock && presenter->rate != 0.0f)
         {
             pts = clocktime = 0;
 
@@ -973,9 +976,15 @@ static HRESULT WINAPI video_presenter_OnClockRestart(IMFVideoPresenter *iface, M
 
 static HRESULT WINAPI video_presenter_OnClockSetRate(IMFVideoPresenter *iface, MFTIME systime, float rate)
 {
-    FIXME("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
+    struct video_presenter *presenter = impl_from_IMFVideoPresenter(iface);
 
-    return E_NOTIMPL;
+    TRACE("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
+
+    EnterCriticalSection(&presenter->cs);
+    presenter->rate = rate;
+    LeaveCriticalSection(&presenter->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI video_presenter_ProcessMessage(IMFVideoPresenter *iface, MFVP_MESSAGE_TYPE message, ULONG_PTR param)
@@ -2187,6 +2196,7 @@ HRESULT evr_presenter_create(IUnknown *outer, void **out)
     object->src_rect.right = object->src_rect.bottom = 1.0f;
     object->ar_mode = MFVideoARMode_PreservePicture | MFVideoARMode_PreservePixel;
     object->allocator_capacity = 3;
+    object->rate = 1.0f;
     InitializeCriticalSection(&object->cs);
 
     if (FAILED(hr = DXVA2CreateDirect3DDeviceManager9(&object->reset_token, &object->device_manager)))
