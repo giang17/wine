@@ -1934,15 +1934,20 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockStart(IMFClockStateSink *
     {
         struct video_stream *stream = renderer->streams[i];
 
-        request_sample = FALSE;
+        EnterCriticalSection(&stream->cs);
         if (state == EVR_STATE_STOPPED)
         {
-            EnterCriticalSection(&stream->cs);
             request_sample = !(stream->flags & EVR_STREAM_PREROLLED) || (stream->flags & EVR_STREAM_SAMPLE_NEEDED);
             stream->flags |= EVR_STREAM_PREROLLED;
-            stream->flags &= ~EVR_STREAM_SAMPLE_NEEDED;
-            LeaveCriticalSection(&stream->cs);
         }
+        else
+        {
+            /* A request the mixer made while the renderer was not running yet -
+             * after a flush, for instance - was only recorded, not sent. */
+            request_sample = !!(stream->flags & EVR_STREAM_SAMPLE_NEEDED);
+        }
+        stream->flags &= ~EVR_STREAM_SAMPLE_NEEDED;
+        LeaveCriticalSection(&stream->cs);
 
         /* The session waits for MEStreamSinkStarted from every output node before it
          * completes a start command.  Seeking from the paused state starts the clock
