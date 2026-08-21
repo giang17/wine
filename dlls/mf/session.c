@@ -779,6 +779,39 @@ static void transform_stream_drop_events(struct transform_stream *stream)
         IMFMediaEvent_Release(event);
 }
 
+/* Drop the samples the session has queued around a transform. The transform
+ * itself is flushed with MFT_MESSAGE_COMMAND_FLUSH, but samples buffered on
+ * either side of it survive that, and would then be delivered after a seek,
+ * presenting content from the old position. Events other than samples, such as
+ * format changes, still have to be handled and are kept. */
+static void transform_node_drop_samples(struct topo_node *node)
+{
+    struct transform_stream *streams[2];
+    struct event_entry *entry, *entry2;
+    MediaEventType type;
+    UINT i, j, counts[2];
+
+    streams[0] = node->u.transform.inputs;
+    counts[0] = node->u.transform.input_count;
+    streams[1] = node->u.transform.outputs;
+    counts[1] = node->u.transform.output_count;
+
+    for (i = 0; i < ARRAY_SIZE(streams); i++)
+    {
+        for (j = 0; j < counts[i]; j++)
+        {
+            LIST_FOR_EACH_ENTRY_SAFE(entry, entry2, &streams[i][j].samples, struct event_entry, entry)
+            {
+                if (FAILED(IMFMediaEvent_GetType(entry->event, &type)) || type != MEMediaSample)
+                    continue;
+                list_remove(&entry->entry);
+                IMFMediaEvent_Release(entry->event);
+                free(entry);
+            }
+        }
+    }
+}
+
 static void release_topo_node(struct topo_node *node)
 {
     unsigned int i;
@@ -1034,6 +1067,7 @@ static void session_flush_transforms(struct media_session *session)
         if (node->type == MF_TOPOLOGY_TRANSFORM_NODE)
         {
             IMFTransform_ProcessMessage(node->object.transform, MFT_MESSAGE_COMMAND_FLUSH, 0);
+            transform_node_drop_samples(node);
             for (i = 0; i < node->u.transform.output_count; i++)
                 node->u.transform.outputs[i].requests = 0; /* these requests might have been flushed */
         }
@@ -1075,6 +1109,7 @@ static void session_flush_nodes(struct media_session *session)
                 node->u.transform.outputs[i].requests = 0;
 
             IMFTransform_ProcessMessage(node->object.transform, MFT_MESSAGE_COMMAND_FLUSH, 0);
+            transform_node_drop_samples(node);
         }
     }
 }
