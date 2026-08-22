@@ -2054,7 +2054,23 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockRestart(IMFClockStateSink
     for (i = 0; i < renderer->stream_count; ++i)
     {
         struct video_stream *stream = renderer->streams[i];
+        unsigned int request_sample;
+
+        EnterCriticalSection(&stream->cs);
+        /* A request the mixer made while the renderer was paused was only
+         * recorded, not sent.  OnClockStart() hands those out again, and a
+         * restart has to do the same: the mixer keeps at most one request
+         * outstanding, so a dropped one is never repeated and the video branch
+         * stops asking for samples altogether - the picture stands still while
+         * the transport carries on. */
+        request_sample = !!(stream->flags & EVR_STREAM_SAMPLE_NEEDED);
+        stream->flags &= ~EVR_STREAM_SAMPLE_NEEDED;
+        LeaveCriticalSection(&stream->cs);
+
         IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkStarted, &GUID_NULL, S_OK, NULL);
+        if (request_sample)
+            IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkRequestSample,
+                    &GUID_NULL, S_OK, NULL);
     }
     renderer->state = EVR_STATE_RUNNING;
 
