@@ -307,6 +307,20 @@ static HRESULT video_presenter_set_media_type(struct video_presenter *presenter,
         MFRatio ratio;
         UINT64 rate, frametime;
 
+        /* video_presenter_reset_media_type() above dropped the allocator
+         * notification together with the old sample pool, and only
+         * video_presenter_start_streaming() ever installs it.  The output type is
+         * negotiated from the first sample of a topology, so a topology that is
+         * built while the renderer is already streaming - after a loop wrap, for
+         * instance - leaves the presenter without that callback.  It is the only
+         * thing that drives ProcessOutput() again once the three-sample pool has
+         * run dry, and the pool runs dry routinely: process_input() gives up at
+         * AllocateSample() roughly as often as it succeeds.  Without the callback
+         * the video branch therefore stops for good the first time a sample cannot
+         * be allocated, while the audio branch carries on. */
+        if (presenter->thread.hthread)
+            video_presenter_set_allocator_callback(presenter, &presenter->allocator_cb);
+
         presenter->media_type = media_type;
         IMFMediaType_AddRef(presenter->media_type);
 
