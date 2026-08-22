@@ -1461,7 +1461,20 @@ static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, D
                 mixer->output_rendered = 1;
             }
 
-            if (SUCCEEDED(hr) && !repaint)
+            /* Ask for input whenever the mixer needs some, not only after it
+             * has rendered something.  ProcessOutput() is the only place that
+             * requests input while streaming, so every call that ends in
+             * MF_E_TRANSFORM_NEED_MORE_INPUT used to leave the mixer waiting
+             * for a sample nobody was going to send: the presenter drives
+             * ProcessOutput() and gives up whenever its three-sample allocator
+             * is exhausted, which happens routinely, and the retry it makes
+             * once a sample is free then finds the pending input already
+             * consumed.  With no request outstanding the video branch of the
+             * pipeline goes quiet for good while the audio branch keeps
+             * running.  The request is idempotent - video_mixer_request_sample()
+             * keeps at most one outstanding per input - so asking here cannot
+             * flood the session. */
+            if (!repaint && (SUCCEEDED(hr) || hr == MF_E_TRANSFORM_NEED_MORE_INPUT))
             {
                 for (i = 0; i < mixer->input_count; ++i)
                     video_mixer_request_sample(mixer, i);
