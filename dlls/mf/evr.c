@@ -96,6 +96,7 @@ struct video_renderer
     IUnknown *device_manager;
     unsigned int flags;
     unsigned int state;
+    float rate;
 
     struct video_stream **streams;
     size_t stream_size;
@@ -1958,6 +1959,15 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockStart(IMFClockStateSink *
         stream->flags &= ~EVR_STREAM_SAMPLE_NEEDED;
         LeaveCriticalSection(&stream->cs);
 
+        /* Starting the clock while it is not advancing is a scrub: the renderer is
+         * asked to show the frame at the new position and to stay there.  Applications
+         * that position a video this way wait for the completion event before they
+         * issue their next transport command, so it has to be sent here - the sample
+         * grabber sink does the same. */
+        if (renderer->rate == 0.0f)
+            IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkScrubSampleComplete,
+                    &GUID_NULL, S_OK, NULL);
+
         /* The session waits for MEStreamSinkStarted from every output node before it
          * completes a start command.  Seeking from the paused state starts the clock
          * without going through OnClockRestart(), so the event is sent for every
@@ -2087,6 +2097,7 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockSetRate(IMFClockStateSink
 
     EnterCriticalSection(&renderer->cs);
 
+    renderer->rate = rate;
     IMFVideoPresenter_OnClockSetRate(renderer->presenter, systime, rate);
     if (SUCCEEDED(IMFTransform_QueryInterface(renderer->mixer, &IID_IMFClockStateSink, (void **)&sink)))
     {
@@ -2903,6 +2914,7 @@ static HRESULT evr_create_object(IMFAttributes *attributes, void *user_context, 
     object->IMFQualityAdvise_iface.lpVtbl = &video_renderer_quality_advise_vtbl;
     object->IMFRateSupport_iface.lpVtbl = &video_renderer_rate_support_vtbl;
     object->refcount = 1;
+    object->rate = 1.0f;
     InitializeCriticalSection(&object->cs);
 
     if (FAILED(hr = MFCreateEventQueue(&object->event_queue)))
