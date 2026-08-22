@@ -408,7 +408,16 @@ static HRESULT WINAPI video_stream_sink_ProcessSample(IMFStreamSink *iface, IMFS
     {
         WARN("No sample timestamp, hr %#lx.\n", hr);
     }
-    else if (stream->parent->state == EVR_STATE_RUNNING || stream->flags & EVR_STREAM_PREROLLING)
+    /* A sample that arrives while the renderer is paused still has to be taken.
+     * Seeking the timeline is a scrub: the session starts the clock at the new
+     * position, the sink asks the source for one sample, and the session pauses
+     * again a few dozen milliseconds later.  Whenever the source needs longer
+     * than that to deliver -- which it regularly does, having to seek the file --
+     * the sample lands here in the paused state.  Dropping it silently left the
+     * picture on the frame it had shown before, so the jump was invisible even
+     * though the position had moved.  Only a stopped renderer has nothing to show
+     * a sample on. */
+    else if (stream->parent->state != EVR_STATE_STOPPED || stream->flags & EVR_STREAM_PREROLLING)
     {
         if (!(stream->flags & EVR_STREAM_STARTED))
         {
