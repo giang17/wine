@@ -779,6 +779,85 @@ static void transform_stream_drop_events(struct transform_stream *stream)
         IMFMediaEvent_Release(event);
 }
 
+static BOOL transform_stream_sample_time(struct event_entry *entry, MFTIME *time)
+{
+    MediaEventType type;
+    PROPVARIANT value;
+    BOOL ret = FALSE;
+
+    if (FAILED(IMFMediaEvent_GetType(entry->event, &type)) || type != MEMediaSample)
+        return FALSE;
+
+    PropVariantInit(&value);
+    if (SUCCEEDED(IMFMediaEvent_GetValue(entry->event, &value)))
+        ret = SUCCEEDED(IMFSample_GetSampleTime((IMFSample *)value.punkVal, time));
+    PropVariantClear(&value);
+
+    return ret;
+}
+
+/* A restart carries the position the sources are about to be started at. The samples
+ * the session has queued around a transform are stale exactly when they do not continue
+ * at that position - the transform itself is flushed with MFT_MESSAGE_COMMAND_FLUSH, but
+ * samples buffered on either side of it survive that and would then be presented,
+ * showing content from the old position.
+ *
+ * Applications routinely restart playback at the position they are already sitting on
+ * (a stop is often a start at the current position, and a play a start at the play
+ * head). There the queue is the read-ahead that is about to be presented, and dropping
+ * it costs the pipeline its entire buffer. Look at the queue itself to tell the two
+ * apart: if it already continues at the new position it is kept, and only the samples
+ * that now lie behind the position are dropped. Events other than samples, such as
+ * format changes, still have to be handled and are kept either way. */
+#define SESSION_SEEK_THRESHOLD 5000000 /* 0.5s */
+
+static void transform_stream_drop_samples(struct transform_stream *stream, const MFTIME *position)
+{
+    struct event_entry *entry, *entry2;
+    MFTIME time, head = 0, tail = 0;
+    BOOL drop_all = TRUE, seen = FALSE;
+    MediaEventType type;
+
+    if (position)
+    {
+        LIST_FOR_EACH_ENTRY(entry, &stream->samples, struct event_entry, entry)
+        {
+            if (!transform_stream_sample_time(entry, &time))
+                continue;
+            if (!seen)
+                head = time;
+            seen = TRUE;
+            tail = time;
+        }
+
+        /* The queued samples span the new position, so they are the read-ahead that
+         * continues there rather than leftovers from somewhere else. */
+        if (seen && *position >= head - SESSION_SEEK_THRESHOLD && *position <= tail + SESSION_SEEK_THRESHOLD)
+            drop_all = FALSE;
+    }
+
+    LIST_FOR_EACH_ENTRY_SAFE(entry, entry2, &stream->samples, struct event_entry, entry)
+    {
+        if (FAILED(IMFMediaEvent_GetType(entry->event, &type)) || type != MEMediaSample)
+            continue;
+        if (!drop_all && transform_stream_sample_time(entry, &time) && time >= *position)
+            continue;
+        list_remove(&entry->entry);
+        IMFMediaEvent_Release(entry->event);
+        free(entry);
+    }
+}
+
+static void transform_node_drop_samples(struct topo_node *node, const MFTIME *position)
+{
+    UINT i;
+
+    for (i = 0; i < node->u.transform.input_count; i++)
+        transform_stream_drop_samples(&node->u.transform.inputs[i], position);
+    for (i = 0; i < node->u.transform.output_count; i++)
+        transform_stream_drop_samples(&node->u.transform.outputs[i], position);
+}
+
 static void release_topo_node(struct topo_node *node)
 {
     unsigned int i;
@@ -1026,14 +1105,24 @@ static HRESULT session_subscribe_sources(struct media_session *session)
 
 static void session_flush_transforms(struct media_session *session)
 {
+    const MFTIME *position = NULL;
     struct topo_node *node;
+    MFTIME start;
     UINT i;
+
+    if (IsEqualGUID(&session->presentation.time_format, &GUID_NULL)
+            && session->presentation.start_position.vt == VT_I8)
+    {
+        start = session->presentation.start_position.hVal.QuadPart;
+        position = &start;
+    }
 
     LIST_FOR_EACH_ENTRY(node, &session->presentation.nodes, struct topo_node, entry)
     {
         if (node->type == MF_TOPOLOGY_TRANSFORM_NODE)
         {
             IMFTransform_ProcessMessage(node->object.transform, MFT_MESSAGE_COMMAND_FLUSH, 0);
+            transform_node_drop_samples(node, position);
             for (i = 0; i < node->u.transform.output_count; i++)
                 node->u.transform.outputs[i].requests = 0; /* these requests might have been flushed */
         }
@@ -1075,6 +1164,7 @@ static void session_flush_nodes(struct media_session *session)
                 node->u.transform.outputs[i].requests = 0;
 
             IMFTransform_ProcessMessage(node->object.transform, MFT_MESSAGE_COMMAND_FLUSH, 0);
+            transform_node_drop_samples(node, NULL);
         }
     }
 }
