@@ -647,13 +647,6 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockStart(IMFClockStateSink *
     else
         hr = MF_E_NOT_INITIALIZED;
 
-    /* Starting the clock while it is not advancing is a scrub. The session forwards
-     * MESessionScrubSampleComplete only once every output node has reported, so the
-     * audio renderer has to report as well even though it has nothing to present. */
-    if (renderer->rate == 0.0f)
-        IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkScrubSampleComplete,
-                &GUID_NULL, S_OK, NULL);
-
     IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkStarted, &GUID_NULL, hr, NULL);
     if (SUCCEEDED(hr))
         audio_renderer_preroll(renderer);
