@@ -711,6 +711,19 @@ static HRESULT video_presenter_process_input(struct video_presenter *presenter)
     if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
         return MF_E_SHUTDOWN;
 
+    /* The mixer pointer is cleared on every topology change, and
+     * video_presenter_attach_mixer() clears it on its own failure path as well,
+     * without putting the presenter into a state that would stop the notifications.
+     * What is left over still has a media type and still receives
+     * PROCESSINPUTNOTIFY, but has nothing to pull output from. Report that the way
+     * MFVP_MESSAGE_INVALIDATEMEDIATYPE already does, instead of calling through a
+     * NULL interface pointer. */
+    if (!presenter->mixer)
+    {
+        WARN("Mixer is not attached.\n");
+        return MF_E_INVALIDREQUEST;
+    }
+
     if (!presenter->media_type)
         return S_OK;
 
