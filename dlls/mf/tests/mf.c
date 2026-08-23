@@ -1578,6 +1578,7 @@ struct test_media_stream
     BOOL test_expect;
     BOOL delay_sample;
     IMFSample *delayed_sample;
+    UINT request_sample_count;
     LONG refcount;
 };
 
@@ -1679,6 +1680,8 @@ static HRESULT WINAPI test_media_stream_RequestSample(IMFMediaStream *iface, IUn
     IMFMediaBuffer *buffer;
     IMFSample *sample;
     HRESULT hr;
+
+    stream->request_sample_count++;
 
     if (stream->test_expect)
     {
@@ -7805,6 +7808,13 @@ struct test_transform
     IMFMediaType *output_type;
 
     IMFSample *output;
+
+    /* Tests using more than one transform cannot share the global expect
+     * bookkeeping, which only tracks a single call each. They set no_expect
+     * and look at the counters below instead. */
+    BOOL no_expect;
+    UINT process_input_count;
+    UINT process_output_count;
 };
 
 static struct test_transform *test_transform_from_IMFTransform(IMFTransform *iface)
@@ -8026,19 +8036,27 @@ DEFINE_EXPECT(test_transform_ProcessMessage_FLUSH);
 
 static HRESULT WINAPI test_transform_ProcessMessage(IMFTransform *iface, MFT_MESSAGE_TYPE message, ULONG_PTR param)
 {
+    struct test_transform *transform = test_transform_from_IMFTransform(iface);
+
     switch (message)
     {
     case MFT_MESSAGE_NOTIFY_BEGIN_STREAMING:
+        if (transform->no_expect)
+            return S_OK;
         CHECK_EXPECT(test_transform_ProcessMessage_BEGIN_STREAMING);
         add_object_state(&actual_object_state_record, MFT_BEGIN);
         return S_OK;
 
     case MFT_MESSAGE_NOTIFY_START_OF_STREAM:
+        if (transform->no_expect)
+            return S_OK;
         CHECK_EXPECT(test_transform_ProcessMessage_START_OF_STREAM);
         add_object_state(&actual_object_state_record, MFT_START);
         return S_OK;
 
     case MFT_MESSAGE_COMMAND_FLUSH:
+        if (transform->no_expect)
+            return S_OK;
         CHECK_EXPECT(test_transform_ProcessMessage_FLUSH);
         add_object_state(&actual_object_state_record, MFT_FLUSH);
         return S_OK;
@@ -8057,7 +8075,7 @@ static HRESULT WINAPI test_transform_ProcessInput(IMFTransform *iface, DWORD id,
     struct test_transform *transform = test_transform_from_IMFTransform(iface);
     HRESULT hr;
 
-    if (expect_test_transform_ProcessInput)
+    if (transform->no_expect || expect_test_transform_ProcessInput)
     {
         if (transform->output)
         {
@@ -8074,6 +8092,10 @@ static HRESULT WINAPI test_transform_ProcessInput(IMFTransform *iface, DWORD id,
         hr = E_NOTIMPL;
     }
 
+    transform->process_input_count++;
+    if (transform->no_expect)
+        return hr;
+
     CHECK_EXPECT(test_transform_ProcessInput);
     add_object_state(&actual_object_state_record, MFT_PROCESS_INPUT);
 
@@ -8086,7 +8108,7 @@ static HRESULT WINAPI test_transform_ProcessOutput(IMFTransform *iface, DWORD fl
     struct test_transform *transform = test_transform_from_IMFTransform(iface);
     HRESULT hr;
 
-    if (expect_test_transform_ProcessOutput)
+    if (transform->no_expect || expect_test_transform_ProcessOutput)
     {
         if (transform->output)
         {
@@ -8104,6 +8126,10 @@ static HRESULT WINAPI test_transform_ProcessOutput(IMFTransform *iface, DWORD fl
     {
         hr = E_NOTIMPL;
     }
+
+    transform->process_output_count++;
+    if (transform->no_expect)
+        return hr;
 
     CHECK_EXPECT2(test_transform_ProcessOutput);
     add_object_state(&actual_object_state_record, MFT_PROCESS_OUTPUT);
@@ -8436,6 +8462,249 @@ static void test_media_session_seek(void)
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
 }
 
+static IMFTopology *create_test_topology_transform_chain(IMFMediaSource *source, IUnknown *sink,
+        IUnknown *first_mft, IUnknown *second_mft)
+{
+    IMFTopologyNode *src_node, *first_node, *second_node, *sink_node;
+    IMFPresentationDescriptor *pd;
+    IMFTopology *topology = NULL;
+    IMFStreamDescriptor *sd;
+    BOOL selected;
+    HRESULT hr;
+
+    hr = MFCreateTopology(&topology);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = MFCreateTopologyNode(MF_TOPOLOGY_SOURCESTREAM_NODE, &src_node);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = MFCreateTopologyNode(MF_TOPOLOGY_TRANSFORM_NODE, &first_node);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = MFCreateTopologyNode(MF_TOPOLOGY_TRANSFORM_NODE, &second_node);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = MFCreateTopologyNode(MF_TOPOLOGY_OUTPUT_NODE, &sink_node);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IMFTopology_AddNode(topology, src_node);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFTopology_AddNode(topology, first_node);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFTopology_AddNode(topology, second_node);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFTopology_AddNode(topology, sink_node);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IMFTopologyNode_ConnectOutput(src_node, 0, first_node, 0);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFTopologyNode_ConnectOutput(first_node, 0, second_node, 0);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFTopologyNode_ConnectOutput(second_node, 0, sink_node, 0);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = IMFTopologyNode_SetObject(first_node, first_mft);
+    ok(hr == S_OK, "Failed to set object, hr %#lx.\n", hr);
+    hr = IMFTopologyNode_SetObject(second_node, second_mft);
+    ok(hr == S_OK, "Failed to set object, hr %#lx.\n", hr);
+
+    hr = IMFMediaSource_CreatePresentationDescriptor(source, &pd);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFPresentationDescriptor_GetStreamDescriptorByIndex(pd, 0, &selected, &sd);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(selected, "got selected %u.\n", !!selected);
+    init_source_node(source, -1, src_node, pd, sd);
+
+    hr = IMFTopologyNode_SetObject(sink_node, sink);
+    ok(hr == S_OK, "Failed to set object, hr %#lx.\n", hr);
+    hr = IMFTopologyNode_SetUINT32(sink_node, &MF_TOPONODE_CONNECT_METHOD, MF_CONNECT_ALLOW_DECODER);
+    ok(hr == S_OK, "Failed to set connect method, hr %#lx.\n", hr);
+    hr = IMFTopology_SetUINT32(topology, &MF_TOPOLOGY_ENUMERATE_SOURCE_TYPES, TRUE);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    IMFStreamDescriptor_Release(sd);
+    IMFPresentationDescriptor_Release(pd);
+    IMFTopologyNode_Release(src_node);
+    IMFTopologyNode_Release(first_node);
+    IMFTopologyNode_Release(second_node);
+    IMFTopologyNode_Release(sink_node);
+    return topology;
+}
+
+/* A transform that is fed by another transform can have its input request answered
+ * synchronously, from within the very call that issues it. The session must not mark
+ * such an input as "waiting for a sample" afterwards: nothing is on its way anymore,
+ * and the flag is only ever cleared on delivery or on a flush, so the input would
+ * never be asked for anything again and the stream would stall for good. */
+static void test_media_session_transform_chain(void)
+{
+    MFT_OUTPUT_STREAM_INFO output_stream_info = {0};
+    struct test_transform *first_impl, *second_impl;
+    struct test_media_stream *source_stream;
+    struct test_media_sink *media_sink;
+    struct test_source *media_source;
+    IMFTransform *first, *second;
+    struct test_handler *handler;
+    IMFAsyncCallback *callback;
+    IMFMediaSession *session;
+    IMFMediaSource *source;
+    IMFMediaBuffer *buffer;
+    IMFTopology *topology;
+    PROPVARIANT propvar;
+    IMFMediaType *type;
+    IMFSample *sample;
+    UINT requests;
+    UINT32 status;
+    HRESULT hr;
+    int i;
+
+    handler = create_test_handler();
+    media_sink = create_test_media_sink(&handler->IMFMediaTypeHandler_iface);
+    IMFMediaTypeHandler_Release(&handler->IMFMediaTypeHandler_iface);
+
+    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    ok(hr == S_OK, "Failed to start up, hr %#lx.\n", hr);
+
+    hr = MFCreateMediaSession(NULL, &session);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    source = create_test_source(FALSE);
+    media_source = impl_test_source_from_IMFMediaSource(source);
+    source_stream = media_source->streams[0];
+
+    hr = MFCreateMediaType(&type);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFMediaType_SetGUID(type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFMediaType_SetGUID(type, &MF_MT_SUBTYPE, &MFVideoFormat_RGB32);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFMediaType_SetUINT64(type, &MF_MT_FRAME_SIZE, (UINT64)640 << 32 | 480);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = test_transform_create(1, &type, 1, &type, FALSE, &first);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = test_transform_create(1, &type, 1, &type, FALSE, &second);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    IMFMediaType_Release(type);
+
+    test_transform_set_output_stream_info(first, &output_stream_info);
+    test_transform_set_output_stream_info(second, &output_stream_info);
+    first_impl = test_transform_from_IMFTransform(first);
+    second_impl = test_transform_from_IMFTransform(second);
+    first_impl->no_expect = TRUE;
+    second_impl->no_expect = TRUE;
+
+    topology = create_test_topology_transform_chain(source, (IUnknown *)media_sink->stream,
+            (IUnknown *)first, (IUnknown *)second);
+    hr = IMFMediaSession_SetTopology(session, 0, topology);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    IMFTopology_Release(topology);
+
+    callback = create_test_callback(TRUE);
+    PropVariantInit(&propvar);
+    hr = wait_media_event(session, callback, MESessionTopologyStatus, 1000, &propvar);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFMediaEvent_GetUINT32(impl_from_IMFAsyncCallback(callback)->media_event,
+            &MF_EVENT_TOPOLOGY_STATUS, &status);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(status == MF_TOPOSTATUS_READY, "Unexpected status %d.\n", status);
+    PropVariantClear(&propvar);
+
+    SET_EXPECT(test_media_sink_GetPresentationClock);
+    SET_EXPECT(test_media_sink_SetPresentationClock);
+    SET_EXPECT(test_media_sink_GetStreamSinkCount);
+    hr = IMFMediaSession_Start(session, NULL, &propvar);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = wait_media_event(session, callback, MESessionTopologyStatus, 1000, &propvar);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    PropVariantClear(&propvar);
+
+    hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkStarted, &GUID_NULL, S_OK, &propvar);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = wait_media_event(session, callback, MESessionStarted, 1000, &propvar);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    PropVariantClear(&propvar);
+
+    /* These are only queried on Windows, and the test does not depend on either. */
+    CLEAR_CALLED(test_media_sink_GetPresentationClock);
+    CLEAR_CALLED(test_media_sink_SetPresentationClock);
+    CLEAR_CALLED(test_media_sink_GetStreamSinkCount);
+
+    /* Hand the first transform a sample nobody has asked for, the way a source with a
+     * read ahead does. The session pushes it through ProcessInput / ProcessOutput right
+     * away, but with no request pending downstream the result stays queued on the
+     * transform output, ready to be handed out without going back to the source. */
+    hr = MFCreateSample(&sample);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFSample_SetSampleTime(sample, 0);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFSample_SetSampleDuration(sample, 333667);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = MFCreateMemoryBuffer(8, &buffer);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFSample_AddBuffer(sample, buffer);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    IMFMediaBuffer_Release(buffer);
+
+    propvar.vt = VT_UNKNOWN;
+    propvar.punkVal = (IUnknown *)sample;
+    hr = IMFMediaStream_QueueEvent(&source_stream->IMFMediaStream_iface, MEMediaSample,
+            &GUID_NULL, S_OK, &propvar);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    PropVariantInit(&propvar);
+    IMFSample_Release(sample);
+
+    for (i = 0; i < 100 && !first_impl->process_output_count; ++i)
+        Sleep(10);
+    ok(first_impl->process_input_count == 1, "Got %u ProcessInput calls on the first transform.\n",
+            first_impl->process_input_count);
+    ok(first_impl->process_output_count == 1, "Got %u ProcessOutput calls on the first transform.\n",
+            first_impl->process_output_count);
+    ok(!second_impl->process_input_count, "Got %u ProcessInput calls on the second transform.\n",
+            second_impl->process_input_count);
+
+    /* First sink request: the second transform asks the first one, which answers from
+     * its queue before the call returns, so the sample reaches the sink right away. */
+    SET_EXPECT(test_stream_sink_ProcessSample);
+    hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkRequestSample, &GUID_NULL, S_OK, &propvar);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    for (i = 0; i < 100 && !called_test_stream_sink_ProcessSample; ++i)
+        Sleep(10);
+    CHECK_CALLED(test_stream_sink_ProcessSample);
+    ok(second_impl->process_input_count == 1, "Got %u ProcessInput calls on the second transform.\n",
+            second_impl->process_input_count);
+
+    /* Second sink request: nothing is queued anywhere now, so the second transform has
+     * to ask the first one again, which in turn has to ask the source. If its input was
+     * left marked as requested by the synchronous delivery above, it asks nobody and the
+     * sample never arrives. */
+    requests = source_stream->request_sample_count;
+    SET_EXPECT(test_stream_sink_ProcessSample);
+    hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkRequestSample, &GUID_NULL, S_OK, &propvar);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    for (i = 0; i < 200 && !called_test_stream_sink_ProcessSample; ++i)
+        Sleep(10);
+    ok(source_stream->request_sample_count > requests,
+            "The source was not asked for a sample, transform input stalled.\n");
+    ok(called_test_stream_sink_ProcessSample, "The second sample never reached the sink.\n");
+    CLEAR_CALLED(test_stream_sink_ProcessSample);
+
+    IMFAsyncCallback_Release(callback);
+    IMFTransform_Release(first);
+    IMFTransform_Release(second);
+
+    hr = IMFMediaSession_Shutdown(session);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(media_sink->shutdown, "Media sink didn't shutdown.\n");
+
+    hr = IMFMediaSource_Shutdown(source);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    IMFMediaSession_Release(session);
+    IMFMediaSource_Release(source);
+    IMFMediaSink_Release(&media_sink->IMFMediaSink_iface);
+
+    hr = MFShutdown();
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+}
+
 START_TEST(mf)
 {
     init_functions();
@@ -8475,4 +8744,5 @@ START_TEST(mf)
     test_media_session_source_shutdown();
     test_media_session_thinning();
     test_media_session_seek();
+    test_media_session_transform_chain();
 }
