@@ -34,6 +34,7 @@
 #include "dcomp.h"
 #include "wine/debug.h"
 #include "wine/winedxgi.h"
+#include "wine/dcomp_layer.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
@@ -2379,6 +2380,33 @@ struct dcomp_target
     HANDLE deliver_event;
     LONG deliver_stop;
     HRGN deliver_rgn;
+    /* The leaves as a layer with alpha, so the present path can draw them into
+     * the frame instead of blitting them onto the window afterwards (issue
+     * 206).  The contract, the locking and the lifetime rules are in
+     * include/wine/dcomp_layer.h.
+     *
+     * `layer` is what wined3d reads and outlives this target; the two pixel
+     * buffers and their dirty boxes are ours alone.  We composite into
+     * layer_buf[layer_back] and publish that, so a reader is never handed a
+     * half-written frame. */
+    struct wine_dcomp_layer *layer;
+    DWORD *layer_buf[2];
+    RECT layer_dirty[2][WINE_DCOMP_LAYER_MAX_RECTS];
+    unsigned int layer_dirty_n[2];
+    unsigned int layer_back;
+    unsigned int layer_width, layer_height;
+    BOOL layer_live;                      /* a non-empty box is published right now */
+    /* Is the sink actually drawing?  layer_drawn_seen is the compositor's draw
+     * count at the last delivery, layer_unseen counts deliveries since it last
+     * moved, layer_route_off means we gave up and went back to blitting, and
+     * layer_sink_seen is the sink count we gave up against -- a change to it
+     * means the set of swapchains on this window changed and it is worth
+     * another try. */
+    LONG layer_drawn_seen;
+    unsigned int layer_unseen;
+    unsigned int layer_retry;
+    ULONG_PTR layer_sink_seen;
+    BOOL layer_route_off;
     /* Unchanged-content gate (issue 99): hash over all content-leaf sources
      * of the current walk vs. the hash of the last frame that actually
      * reached the window.  The tree timer must only push NEW leaf content —
@@ -2511,6 +2539,19 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         }
         if (target->comp_dc)
             DeleteDC(target->comp_dc);
+        /* The layer structure outlives us on purpose (dcomp_layer.h); only its
+         * pixels go.  Under the exclusive lock, so a present reading it right
+         * now finishes first and the next one finds bits NULL. */
+        if (target->layer)
+        {
+            AcquireSRWLockExclusive(&target->layer->lock);
+            target->layer->bits = NULL;
+            SetRectEmpty(&target->layer->box);
+            target->layer->rect_count = 0;
+            ReleaseSRWLockExclusive(&target->layer->lock);
+        }
+        free(target->layer_buf[0]);
+        free(target->layer_buf[1]);
 
         free(target);
     }
@@ -3666,6 +3707,301 @@ static BOOL dcomp_save_under(void)
     return dcomp_save_under_enabled > 0;
 }
 
+/* --- The leaves in the frame instead of on the window (issue 206) ----------
+ *
+ * There are two delivery routes for DirectComposition content, and only one of
+ * them is a race.  Above DCOMP_MIN_COVER_PERCENT the tree is composited into
+ * the present buffer and is part of the frame; below it, it used to go to the
+ * window as a blit of its own, after the present.  A transport playhead is 442
+ * of some two million pixels, so it always took the second route -- and there
+ * every swap landing between two deliveries wrote it away again.  Measured on
+ * Fender Studio Pro 8: the line was missing from 48.2% of the captured frames.
+ *
+ * Now the leaves are published as a layer with alpha and wined3d draws them
+ * into the frame it is about to present, which is the route DirectComposition
+ * content above the threshold takes anyway and the one the DWM takes for all
+ * of it.  Same measurement, same binary, same session: 0.2%.
+ *
+ * The layer is published only while a swapchain says it is going to draw it
+ * (the sink property, maintained by wined3d).  Without one -- no wined3d
+ * swapchain on this window at all, or one presenting through Vulkan, which has
+ * no composite step -- the layer would be published and never drawn, and the
+ * leaves would be missing not from half the frames but from all of them.  The
+ * blit route stays for exactly that case.
+ *
+ * WINE_DCOMP_FRAME_COMPOSITE=0 forces the blit route back on.
+ */
+static int dcomp_frame_composite_mode = -1;
+
+static BOOL dcomp_frame_composite(void)
+{
+    if (dcomp_frame_composite_mode < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_FRAME_COMPOSITE");
+        dcomp_frame_composite_mode = (!e || atoi(e)) ? 1 : 0;
+    }
+    return dcomp_frame_composite_mode > 0;
+}
+
+static void dcomp_target_retract_layer(struct dcomp_target *target);
+
+/* How many deliveries a published layer may go undrawn before we stop trusting
+ * the sink, and how many deliveries later we try it again.  The first has to
+ * survive a stall -- a song load or a garbage collection can hold up presents
+ * for a good second, and a transient must not switch the fix off for good.  The
+ * second is what keeps such a fallback from being permanent; it costs one
+ * delivery in six hundred, and only in a configuration that is already broken. */
+#define DCOMP_LAYER_STALL 200
+#define DCOMP_LAYER_RETRY 600
+
+/* Is anybody going to draw a layer we publish -- and are they doing it?
+ *
+ * The sink property says a swapchain on this window can composite, which is not
+ * the same as it presenting.  Three of Studio Pro 8's seven swapchains never
+ * present a single frame, and a target on such a window would publish into the
+ * void: not a flicker but a leaf gone entirely.  So the sink only arms the
+ * route, and what keeps it is the compositor's draw count moving. */
+static BOOL dcomp_target_use_layer_route(struct dcomp_target *target)
+{
+    ULONG_PTR sink;
+    LONG drawn;
+
+    if (!dcomp_frame_composite() || !target->hwnd)
+        return FALSE;
+
+    if (!(sink = (ULONG_PTR)GetPropW(target->hwnd, WINE_DCOMP_LAYER_SINK_PROP)))
+    {
+        /* No compositor on this window at all -- a Vulkan swapchain, or none. */
+        dcomp_target_retract_layer(target);
+        target->layer_route_off = FALSE;
+        target->layer_unseen = target->layer_retry = 0;
+        return FALSE;
+    }
+
+    if (target->layer_route_off)
+    {
+        if (sink != target->layer_sink_seen || ++target->layer_retry >= DCOMP_LAYER_RETRY)
+        {
+            TRACE("hwnd %p: trying the layer route again.\n", target->hwnd);
+            target->layer_route_off = FALSE;
+            target->layer_unseen = target->layer_retry = 0;
+            if (target->layer)
+                target->layer_drawn_seen = InterlockedCompareExchange(&target->layer->drawn, 0, 0);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    /* Only judge once something is actually published -- before that there is
+     * nothing for anyone to draw. */
+    if (target->layer && target->layer_live)
+    {
+        drawn = InterlockedCompareExchange(&target->layer->drawn, 0, 0);
+        if (drawn != target->layer_drawn_seen)
+        {
+            target->layer_drawn_seen = drawn;
+            target->layer_unseen = 0;
+        }
+        else if (++target->layer_unseen >= DCOMP_LAYER_STALL)
+        {
+            WARN("hwnd %p: the layer went undrawn through %u deliveries, blitting again.\n",
+                    target->hwnd, target->layer_unseen);
+            dcomp_target_retract_layer(target);
+            target->layer_route_off = TRUE;
+            target->layer_sink_seen = sink;
+            target->layer_unseen = target->layer_retry = 0;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* The region as up to WINE_DCOMP_LAYER_MAX_RECTS rectangles, or its bounding
+ * box if it has more.  Returns the number written, 0 for an empty region. */
+static unsigned int dcomp_layer_region_rects(HRGN rgn, RECT *out, const RECT *clip)
+{
+    unsigned int n = 0, i;
+    RGNDATA *data;
+    DWORD size;
+    RECT box;
+
+    if (GetRgnBox(rgn, &box) <= NULLREGION)
+        return 0;
+
+    if ((size = GetRegionData(rgn, 0, NULL)) && (data = malloc(size)))
+    {
+        if (GetRegionData(rgn, size, data) && data->rdh.nCount <= WINE_DCOMP_LAYER_MAX_RECTS)
+        {
+            const RECT *r = (const RECT *)data->Buffer;
+
+            for (i = 0; i < data->rdh.nCount; ++i)
+            {
+                RECT c;
+
+                if (IntersectRect(&c, &r[i], clip))
+                    out[n++] = c;
+            }
+            free(data);
+            return n;
+        }
+        free(data);
+    }
+
+    /* Too many rectangles, or the region data could not be had: one box. */
+    if (!IntersectRect(&out[0], &box, clip))
+        return 0;
+    return 1;
+}
+
+static void dcomp_layer_clear_box(DWORD *bits, unsigned int w, unsigned int h, const RECT *b)
+{
+    int y, l = b->left, t = b->top, r = b->right, bo = b->bottom;
+
+    if (l < 0) l = 0;
+    if (t < 0) t = 0;
+    if (r > (int)w) r = w;
+    if (bo > (int)h) bo = h;
+    for (y = t; y < bo; ++y)
+        memset(bits + (SIZE_T)y * w + l, 0, (SIZE_T)(r - l) * sizeof(DWORD));
+}
+
+/* Stop the present path from drawing what we no longer maintain: the tree took
+ * the window over, or it covers nothing this frame.  The buffers stay, only the
+ * published box goes empty. */
+static void dcomp_target_retract_layer(struct dcomp_target *target)
+{
+    struct wine_dcomp_layer *layer = target->layer;
+
+    if (!layer || !target->layer_live)
+        return;
+    AcquireSRWLockExclusive(&layer->lock);
+    SetRectEmpty(&layer->box);
+    layer->rect_count = 0;
+    ReleaseSRWLockExclusive(&layer->lock);
+    target->layer_live = FALSE;
+    TRACE("Retracted the layer on hwnd %p.\n", target->hwnd);
+}
+
+/* Caller holds device->cs. */
+static void dcomp_target_publish_layer(struct dcomp_target *target, const RECT *rc, HRGN rgn)
+{
+    struct dcomp_visual *root = target->root_visual;
+    unsigned int w = rc->right, h = rc->bottom, back, n, i;
+    RECT rects[WINE_DCOMP_LAYER_MAX_RECTS];
+    struct wine_dcomp_layer *layer;
+    struct dcomp_visual *child;
+    UINT saved_w, saved_h;
+    DWORD *saved_bits;
+    RECT clip, box;
+
+    if (!root || !w || !h)
+        return;
+
+    if (!(layer = target->layer))
+    {
+        /* Pick up the one an earlier target on this window left behind: it is
+         * deliberately never freed, see dcomp_layer.h. */
+        if (!(layer = (struct wine_dcomp_layer *)GetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP)))
+        {
+            if (!(layer = calloc(1, sizeof(*layer))))
+                return;
+            if (!SetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP, (HANDLE)layer))
+            {
+                WARN("Failed to publish the layer property on hwnd %p.\n", target->hwnd);
+                free(layer);
+                return;
+            }
+        }
+        target->layer = layer;
+    }
+
+    if (!target->layer_buf[0] || target->layer_width != w || target->layer_height != h)
+    {
+        DWORD *b0 = calloc((SIZE_T)w * h, sizeof(DWORD));
+        DWORD *b1 = calloc((SIZE_T)w * h, sizeof(DWORD));
+
+        if (!b0 || !b1)
+        {
+            free(b0);
+            free(b1);
+            return;
+        }
+        /* A reader may still be on the buffers we are about to free. */
+        AcquireSRWLockExclusive(&layer->lock);
+        layer->bits = NULL;
+        SetRectEmpty(&layer->box);
+        layer->rect_count = 0;
+        ReleaseSRWLockExclusive(&layer->lock);
+
+        free(target->layer_buf[0]);
+        free(target->layer_buf[1]);
+        target->layer_buf[0] = b0;
+        target->layer_buf[1] = b1;
+        target->layer_dirty_n[0] = target->layer_dirty_n[1] = 0;
+        target->layer_back = 0;
+        target->layer_width = w;
+        target->layer_height = h;
+    }
+
+    SetRect(&clip, 0, 0, w, h);
+    if (!(n = dcomp_layer_region_rects(rgn, rects, &clip)))
+    {
+        dcomp_target_retract_layer(target);
+        return;
+    }
+    box = rects[0];
+    for (i = 1; i < n; ++i)
+        UnionRect(&box, &box, &rects[i]);
+
+    back = target->layer_back;
+
+    /* Clear what THIS buffer last carried -- two publications back, not one.
+     * Anything left standing there would keep the leaf at a position it has
+     * long since left. */
+    for (i = 0; i < target->layer_dirty_n[back]; ++i)
+        dcomp_layer_clear_box(target->layer_buf[back], w, h, &target->layer_dirty[back][i]);
+    for (i = 0; i < n; ++i)
+        dcomp_layer_clear_box(target->layer_buf[back], w, h, &rects[i]);
+
+    /* dcomp_target_composite_leaves() writes to target->comp_bits.  Point the
+     * field at the back buffer for the walk rather than duplicating the
+     * recursion -- under the same lock the ordinary composite path holds. */
+    saved_bits = target->comp_bits;
+    saved_w = target->comp_width;
+    saved_h = target->comp_height;
+    target->comp_bits = target->layer_buf[back];
+    target->comp_width = w;
+    target->comp_height = h;
+    for (child = root->children; child; child = child->next_sibling)
+        dcomp_target_composite_leaves(target, child, (int)root->offset_x, (int)root->offset_y);
+    target->comp_bits = saved_bits;
+    target->comp_width = saved_w;
+    target->comp_height = saved_h;
+
+    memcpy(target->layer_dirty[back], rects, n * sizeof(*rects));
+    target->layer_dirty_n[back] = n;
+
+    /* Publish.  The exclusive acquire is a handful of assignments long, and it
+     * doubles as the barrier that lets the buffer we are handing over now be
+     * written again two publications from here: any reader still holding it has
+     * to be out before this returns. */
+    AcquireSRWLockExclusive(&layer->lock);
+    layer->bits = target->layer_buf[back];
+    layer->width = w;
+    layer->height = h;
+    layer->box = box;
+    layer->rect_count = n;
+    memcpy(layer->rects, rects, n * sizeof(*rects));
+    ReleaseSRWLockExclusive(&layer->lock);
+
+    TRACE("Published %u rect(s) in (%ld,%ld)-(%ld,%ld) of a %ux%u layer on hwnd %p.\n",
+            n, (long)box.left, (long)box.top, (long)box.right, (long)box.bottom,
+            w, h, target->hwnd);
+
+    target->layer_live = TRUE;
+    target->layer_back = back ^ 1;
+}
+
 /* The region to deliver is passed in rather than read off the target: with the
  * delivery running in a thread of its own (below) the tree walk keeps writing
  * frame_rgn while this runs, so the caller hands over a copy it took under the
@@ -3713,6 +4049,28 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
             InvalidateRgn(target->hwnd, vacated, FALSE);
         }
         DeleteObject(vacated);
+    }
+
+    /* The frame route replaces the window blit (issue 206).  It runs after the
+     * hand-back above and not before it: a swapchain appearing or going away
+     * switches routes mid-flight, and our last blit must not be left standing
+     * on a window we have stopped painting.  What the hand-back does not cover
+     * -- the part both routes draw -- needs none, the frame route puts the same
+     * pixels in the same place.
+     *
+     * With this route there is nothing to hand back afterwards, so the
+     * bookkeeping goes empty: we do not paint the window at all. */
+    if (dcomp_target_use_layer_route(target))
+    {
+        if (target->delivered_rgn)
+            SetRectRgn(target->delivered_rgn, 0, 0, 0, 0);
+        if (target->saved_rgn)
+            SetRectRgn(target->saved_rgn, 0, 0, 0, 0);
+
+        EnterCriticalSection(&target->device->cs);
+        dcomp_target_publish_layer(target, rc, rgn);
+        LeaveCriticalSection(&target->device->cs);
+        return;
     }
 
     /* Tree covers nothing this frame: the hand-back above is the whole job. */
@@ -3957,7 +4315,13 @@ static DWORD CALLBACK dcomp_target_deliver_proc(void *arg)
         LeaveCriticalSection(&target->device->cs);
 
         if (taken_over)
+        {
+            /* From here the composite path paints the whole window itself.  A
+             * layer left published would be drawn on top of it every present,
+             * one frame of a tree that has moved on since. */
+            dcomp_target_retract_layer(target);
             break;
+        }
         if (have)
             dcomp_target_deliver_region(target, &rc, target->deliver_rgn);
     }
@@ -4071,6 +4435,11 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
             dcomp_target_deliver_region(target, &rc, target->frame_rgn);
         return;
     }
+
+    /* Taken over: from here we composite the whole window ourselves.  A layer
+     * left published from the route below the threshold would be drawn on top
+     * of every present after this one, one frame of a tree that has moved on. */
+    dcomp_target_retract_layer(target);
 
     EnterCriticalSection(&target->device->cs);
     dcomp_target_ensure_comp_dc(target, rc.right, rc.bottom);

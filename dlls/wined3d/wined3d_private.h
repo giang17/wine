@@ -4190,6 +4190,24 @@ struct wined3d_swapchain
     unsigned int surface_width;
     unsigned int surface_height;
     BOOL surface_valid;
+
+    /* The leaf layer dcomp publishes for this window, so it can be drawn into
+     * the frame between swapchain_blit() and wglSwapBuffers() (issue 206).  The
+     * texture is persistent because only the published box is uploaded per
+     * present, not the whole layer.
+     *
+     * layer_sink records that we counted ourselves into the sink property and
+     * have to count out again, and doubles as the gate that keeps a swapchain
+     * which never composites out of the lookup altogether.  layer is a cache of
+     * the property; dcomp never frees the structure and never removes the
+     * property, so one successful lookup holds for the swapchain's life, and
+     * layer_lookup backs the unsuccessful ones off. */
+    struct wine_dcomp_layer *layer;
+    unsigned int layer_lookup;
+    struct wined3d_texture *layer_texture;
+    unsigned int layer_tex_width;
+    unsigned int layer_tex_height;
+    BOOL layer_sink;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);
