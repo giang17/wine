@@ -4019,10 +4019,23 @@ static void transform_node_deliver_samples(struct media_session *session, struct
         }
         else if (!(up_node = session_get_topo_node_input(session, topo_node, input, &output)))
             WARN("Failed to node %p/%lu input\n", topo_node, input);
-        else if (FAILED(hr = session_request_sample_from_node(session, up_node, output)))
-            WARN("Failed to request sample from upstream node %p/%lu, hr %#lx\n", up_node, output, hr);
         else
+        {
+            /* Set before the request, not after it: if the upstream node is a
+             * transform, session_request_sample_from_node() can deliver a sample
+             * from inside the call, and that delivery is what clears the flag
+             * again.  Setting it afterwards would leave it TRUE with no request on
+             * its way, and none of the three places that reset it would ever be
+             * reached - no sample arrives, because none was asked for.  The input
+             * then starves until the next flush. */
             stream->requested = TRUE;
+
+            if (FAILED(hr = session_request_sample_from_node(session, up_node, output)))
+            {
+                WARN("Failed to request sample from upstream node %p/%lu, hr %#lx\n", up_node, output, hr);
+                stream->requested = FALSE;
+            }
+        }
     }
 }
 
