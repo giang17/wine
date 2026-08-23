@@ -26,11 +26,33 @@ and run stable in production use.
 
 This is the recommended branch. It includes all 15 D2D1 patches plus:
 
+- **D2D1 layers on an opaque target**: a layer bitmap inherits the target's alpha mode, so
+  on a render target created as `ALPHA_MODE_IGNORE` it was composited straight — the
+  layer's own coverage was thrown away and everything drawn inside it turned the
+  background colour, usually black. All three `PopLayer()` paths now composite the layer
+  as premultiplied regardless of the target's alpha mode. Visible as rectangular black
+  areas swallowing clip contents and volume curves in Fender Studio Pro 8
 - **DComp**: IDCompositionDesktopDevice implementation with D2D1 bitmap rendering path,
   dirty-rect clipping, DIB+BitBlt presentation (9 phases); IDCompositionDevice3/4/5,
   composition and dynamic textures, D3D11 BeginDraw and surface handle export;
   rootless visual trees composited onto the target window at ~60 Hz, cross-process
   targets, backdrop capture
+- **DComp leaf compositing into the presented frame**: a visual tree that covers only a
+  sliver of its window — a transport playhead, a selection rectangle — is not allowed to
+  take the window over, so its leaves used to be delivered *after* the application's
+  present, by reading back the window, blending, and blitting the covered rectangles.
+  That is a race no CPU-side blit can win: between a swap landing and the next delivery
+  arriving the leaves are gone, and an application presenting at 40 Hz shows them in a
+  minority of frames. Such leaves are now composited into the buffer that is about to
+  become the frame — the same route content above the coverage threshold already took —
+  in the GL present path as a texture drawn between the backbuffer blit and
+  `wglSwapBuffers`. Measured on Fender Studio Pro 8: the playhead is missing in **14.9 %**
+  of captured frames before and **0.0 %** after, and the selection rectangle stopped
+  flickering with it, having travelled the same path. Safety net: three of seven
+  swapchains in that application never present at all, and a published layer that nobody
+  draws would hide the leaves in *every* frame instead of half of them, so wined3d counts
+  each layer it draws and dcomp returns to the blit path on its own after ~3 s of silence.
+  The Vulkan present path is untouched and keeps the previous behaviour
 - **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
   only the version 1 classes, so an application that creates the version 2 pair while
   bringing up its Direct Composition engine fails there. Applications built on the CCL
@@ -118,6 +140,23 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   a process-global cache of the last X11 event, and posts a finished IME result string as
   WM_CHAR as well. Together these make typing work in embedded WebView2 fields, including
   AltGr characters such as `@`, `\` and `€` on non-US layouts
+- **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
+  video on a DAW timeline exercises paths that a straight play-to-the-end never reaches,
+  and several of them were broken. The session asked upstream for a new sample on *every*
+  call of its delivery routine instead of one at a time, so a topology rebuild — closing
+  and reopening a video window, wrapping a loop — produced **5155 requests in one second**
+  against 23-26 in steady playback; a source with a filled read-ahead answers all of them,
+  and the samples pile up on a transform input that is not consuming yet, gigabytes of
+  them, after which the picture stops. Sample requests now also run on a work queue of
+  their own per stream instead of sharing the source's command queue, where a request that
+  blocks waiting for the next buffer used to hold up transport commands and the other
+  streams. Alongside: the renderer accepts samples that arrive while it is paused, so a
+  jump in a stopped transport updates the picture; the presenter reinstalls its allocator
+  notification after an output type renegotiation; the session is told when a scrub has
+  been carried out; and the presenter no longer pulls mixer output through a NULL mixer
+  pointer while the sink is being torn down. Together these fix seeking, looping, timeline
+  jumps, playback stalling after 20-35 seconds, stuttering after a large seek, and a black
+  picture after a window toggle in Fender Studio Pro 8
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
 - **Direct2D for JUCE 8.0.13+ (ntdll)**: JUCE 8.0.13 and later pick their renderer with
@@ -259,7 +298,7 @@ are not specific to it.
 | UVI Portal | WebView2 | Installs and signs in, including special characters typed into the login fields |
 | WineSynth (custom VSTGUI plugin) | VSTGUI + DComp | 18k+ partial redraws without crash |
 | Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing. See *Ableton Live 12 Setup* below |
-| Fender Studio Pro 8 | CCL (DXGI + DWrite + DComp) | Fully functional — the song view draws completely and stays stable, no stale tool bar or transport and no flicker. Starting at all needs the `UIAnimationManager2` and `UIAnimationTransitionLibrary2` stubs from this branch; without them the CCL framework aborts with "requires Windows 10 or newer" |
+| Fender Studio Pro 8 | CCL (DXGI + DWrite + DComp) | Fully functional — the song view draws completely and stays stable, no stale tool bar or transport and no flicker; the transport playhead and the selection rectangle no longer flicker while the transport runs, and video on the timeline plays, seeks, loops and jumps without stalling or going black. Starting at all needs the `UIAnimationManager2` and `UIAnimationTransitionLibrary2` stubs from this branch; without them the CCL framework aborts with "requires Windows 10 or newer" |
 
 ## Font Setup
 
