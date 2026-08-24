@@ -2926,6 +2926,37 @@ void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BO
 }
 
 
+/**********************************************************************
+ *              update_window_argb_visual
+ *
+ * Alpha capability is a property of the WINDOW, not a side effect of the last
+ * API call that touched it.  DwmExtendFrameIntoClientArea( margins = -1 ) asks
+ * for full glass, which on Windows makes the client area per-pixel alpha
+ * capable and combines with an LWA_ALPHA constant opacity.  dwmapi records the
+ * request as a window property; pick it up here and remember it in the window
+ * data, so a later SetLayeredWindowAttributes cannot drop it again.
+ *
+ * The transition is one-way on purpose: set_window_visual() destroys and
+ * re-creates the X window, which must not happen repeatedly while the window
+ * is being dragged.  The bit is cleared in SetWindowStyle when WS_EX_LAYERED
+ * changes, which is where layered attributes are reset anyway.
+ */
+void update_window_argb_visual( struct x11drv_win_data *data )
+{
+    static const WCHAR dwm_glass_prop[] = {'_','_','w','i','n','e','_','d','w','m','_','g','l','a','s','s',0};
+
+
+    if (!data->wants_argb)
+    {
+        if (!NtUserGetProp( data->hwnd, dwm_glass_prop )) return;
+        TRACE( "window %p requested DWM glass, using an ARGB visual\n", data->hwnd );
+        data->wants_argb = 1;
+    }
+
+    if (!data->embedded && argb_visual.visualid) set_window_visual( data, &argb_visual, TRUE );
+}
+
+
 /*****************************************************************
  *		SetWindowText   (X11DRV.@)
  */
@@ -2968,6 +2999,7 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
         if (changed & WS_EX_LAYERED) /* changing WS_EX_LAYERED resets attributes */
         {
             data->layered = FALSE;
+            data->wants_argb = 0;
             set_window_visual( data, &default_visual, FALSE );
             sync_window_opacity( data->display, data->whole_window, 0, 0 );
         }
@@ -3847,7 +3879,11 @@ void X11DRV_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWO
 
     if (data)
     {
-        set_window_visual( data, &default_visual, FALSE );
+        /* LWA_ALPHA is a constant opacity and says nothing about per-pixel
+         * alpha; it must not undo the alpha capability the window already has.
+         * sync_window_opacity() below is this call's actual job. */
+        update_window_argb_visual( data );
+        if (!data->wants_argb) set_window_visual( data, &default_visual, FALSE );
 
         if (data->whole_window)
         {

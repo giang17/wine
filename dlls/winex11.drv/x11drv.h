@@ -686,6 +686,7 @@ struct x11drv_win_data
     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
     UINT        black_expose_bg : 1; /* X paints an opaque black background on expose */
+    UINT        wants_argb : 1; /* window needs a per-pixel alpha capable visual (ULW / DWM glass) */
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
     Pixmap         icon_mask;
@@ -738,6 +739,7 @@ extern void detach_client_window( struct x11drv_win_data *data, Window client_wi
 extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void destroy_client_window( HWND hwnd, Window client_window );
 extern void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );
+extern void update_window_argb_visual( struct x11drv_win_data *data );
 extern void change_systray_owner( Display *display, Window systray_window );
 extern BOOL update_clipboard( HWND hwnd );
 extern void init_win_context(void);
