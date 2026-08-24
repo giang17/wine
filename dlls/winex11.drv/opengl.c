@@ -531,12 +531,18 @@ static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_forma
         /* Forbid drawing to windows with formats whose depth does not match the screen depth
          * so that we can copy child windows on-screen using XCopyArea().
          * See x11drv_init_pixel_formats() for the same logic with GLX. */
-        if (argb_pixfmt_enabled() && argb_visual.visualid && visual.visualid == argb_visual.visualid)
+        if (argb_pixfmt_enabled() && argb_visual.visualid && pf->pfd.cAlphaBits
+            && visual.depth == argb_visual.depth && visual.class == TrueColor)
         {
-            /* The ARGB visual is the one exception: a glass window's GL child has to
-             * carry an alpha channel, and it is composited by the X server rather than
-             * copied with XCopyArea().  Flag it via WGL_TRANSPARENT_ARB so that wined3d
-             * can prefer it for such windows - see wined3d_context_gl_set_pixel_format(). */
+            /* Visuals that can carry an alpha channel are the one exception: a glass
+             * window's GL child needs one, and such a window is composited by the X
+             * server rather than copied with XCopyArea().  Match on the properties
+             * rather than on argb_visual's id - drivers differ in whether they hand
+             * out that very visual.  Mesa reports it for its ARGB configs, while the
+             * NVIDIA driver gives every config a visual of its own and reports
+             * argb_visual only for a config that has no alpha bits at all.  Flag it
+             * via WGL_TRANSPARENT_ARB so that wined3d can prefer it for such windows,
+             * see wined3d_context_gl_set_pixel_format(). */
             pf->transparent = 1;
             TRACE( "format %d keeps PFD_DRAW_TO_WINDOW, visual 0x%lx depth %d.\n",
                    format, visual.visualid, visual.depth );
