@@ -2577,7 +2577,7 @@ static HRESULT WINAPI mfsession_Shutdown(IMFMediaSession *iface)
     EnterCriticalSection(&session->cs);
     if (SUCCEEDED(hr = session_is_shut_down(session)))
     {
-        BOOL was_running = session->state == SESSION_STATE_STARTED || session->state == SESSION_STATE_PAUSED;
+        BOOL subscribed = !!(session->presentation.flags & SESSION_FLAG_SOURCES_SUBSCRIBED);
 
         session->state = SESSION_STATE_SHUT_DOWN;
         IMFMediaEventQueue_Shutdown(session->event_queue);
@@ -2586,11 +2586,17 @@ static HRESULT WINAPI mfsession_Shutdown(IMFMediaSession *iface)
         MFShutdownObject((IUnknown *)session->clock);
         IMFPresentationClock_Release(session->clock);
         session->clock = NULL;
-        /* Stop the sources that are still running before dropping them. Stopping
+        /* Stop the sources we are subscribed to before dropping them. Stopping
          * completes our pending event subscription, so that an application that
          * keeps a source alive and reuses it in another session is able to
-         * subscribe to it again. */
-        if (was_running)
+         * subscribe to it again.
+         *
+         * The session state does not answer whether there is a subscription to
+         * complete.  A session whose start is still in flight has its sources
+         * started and subscribed, but is still in SESSION_STATE_STOPPED because
+         * MESessionStarted has not been sent yet - and its subscription is just
+         * as pending as a running session's.  Go by the subscription itself. */
+        if (subscribed)
             session_stop_sources(session);
         session_clear_presentation(session);
         session_clear_queued_topologies(session);
