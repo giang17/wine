@@ -2114,6 +2114,7 @@ struct wined3d_pixel_format
     int auxBuffers;
     int numSamples;
     int swap_method;
+    int transparent; /* TEMPORARY issue-250: WGL_TRANSPARENT_ARB, flags an ARGB-visual format */
 };
 
 enum wined3d_pci_vendor

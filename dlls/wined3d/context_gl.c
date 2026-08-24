@@ -1162,19 +1162,94 @@ void wined3d_context_gl_texture_update(struct wined3d_context_gl *context_gl,
     }
 }
 
+/* TEMPORARY issue-250 experiment (WINE_ARGB_PIXFMT=1): a window that asked for DWM
+ * glass needs its GL child window on the ARGB visual, or the per-pixel alpha is lost
+ * and the client area shows up as opaque black.  winex11 flags the ARGB-visual formats
+ * as transparent (see x11drv_egl_describe_pixel_format).  The choice cannot be made in
+ * context_choose_pixel_format(): that runs once per wined3d context, long before - and
+ * independently of - the glass window that later renders through it.  It has to happen
+ * where the format meets a concrete window, which is here.  Without the variable
+ * nothing changes. */
+static bool context_wants_argb_format(HDC hdc)
+{
+    static int enabled = -1;
+    HWND hwnd, root;
+    bool glass;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv("WINE_ARGB_PIXFMT");
+        enabled = (e && atoi(e)) ? 1 : 0;
+    }
+    if (!enabled)
+        return false;
+    if (!(hwnd = WindowFromDC(hdc)))
+        return false;
+    /* the glass property lives on the top-level window */
+    if (!(root = GetAncestor(hwnd, GA_ROOT)))
+        return false;
+    glass = !!GetPropW(root, L"__wine_dwm_glass");
+    if (glass)
+        TRACE("hdc %p hwnd %p root %p is a glass window.\n", hdc, hwnd, root);
+    return glass;
+}
+
+/* Find the ARGB-visual twin of a pixel format - same capabilities, but on the visual
+ * that can carry an alpha channel. */
+static int context_find_argb_twin(const struct wined3d_adapter *adapter, int format)
+{
+    const struct wined3d_adapter_gl *adapter_gl = wined3d_adapter_gl_const(adapter);
+    const struct wined3d_pixel_format *want;
+    unsigned int i;
+
+    if (format < 1 || (unsigned int)format > adapter_gl->pixel_format_count)
+        return 0;
+    want = &adapter_gl->pixel_formats[format - 1];
+    if (want->transparent)
+        return format;
+
+    for (i = 0; i < adapter_gl->pixel_format_count; ++i)
+    {
+        const struct wined3d_pixel_format *cfg = &adapter_gl->pixel_formats[i];
+
+        if (!cfg->transparent || cfg->numSamples)
+            continue;
+        if (!cfg->windowDrawable || cfg->doubleBuffer != want->doubleBuffer)
+            continue;
+        if (cfg->iPixelType != want->iPixelType)
+            continue;
+        if (cfg->redSize != want->redSize || cfg->greenSize != want->greenSize
+                || cfg->blueSize != want->blueSize || cfg->alphaSize != want->alphaSize)
+            continue;
+        if (cfg->depthSize != want->depthSize || cfg->stencilSize != want->stencilSize)
+            continue;
+        return i + 1;
+    }
+    return 0;
+}
+
 static BOOL wined3d_context_gl_set_pixel_format(struct wined3d_context_gl *context_gl)
 {
     const struct wined3d_gl_info *gl_info = context_gl->gl_info;
     BOOL private = context_gl->dc_is_private;
     int format = context_gl->pixel_format;
     HDC dc = context_gl->dc;
-    int current;
+    int current, twin;
 
     if (private && context_gl->dc_has_format)
         return TRUE;
 
     if (!private && WindowFromDC(dc) != context_gl->window)
         return FALSE;
+
+    /* TEMPORARY issue-250: a glass window needs the ARGB-visual twin of the format. */
+    if (!private && context_wants_argb_format(dc)
+            && (twin = context_find_argb_twin(context_gl->c.device->adapter, format))
+            && twin != format)
+    {
+        TRACE("dc %p: glass window, using ARGB format %d instead of %d.\n", dc, twin, format);
+        format = twin;
+    }
 
     current = gl_info->gl_ops.wgl.p_wglGetPixelFormat(dc);
     if ((current == format) || (!current && context_gl->internal_format_set))
@@ -1642,6 +1717,7 @@ static int context_choose_pixel_format(const struct wined3d_device *device, HDC 
         bool aux_buffers, bool swap_effect_copy)
 {
     unsigned int cfg_count = wined3d_adapter_gl(device->adapter)->pixel_format_count;
+    bool wants_argb = context_wants_argb_format(hdc);
     unsigned int current_value;
     PIXELFORMATDESCRIPTOR pfd;
     int iPixelFormat = 0;
@@ -1698,6 +1774,10 @@ static int context_choose_pixel_format(const struct wined3d_device *device, HDC 
                 && cfg->greenSize == color_format->green_size
                 && cfg->blueSize == color_format->blue_size)
             value += 32;
+        /* TEMPORARY issue-250: outweigh every other criterion, so that a glass window
+         * gets the ARGB-visual format even though it ties on all of them. */
+        if (wants_argb && cfg->transparent)
+            value += 64;
 
         if (value > current_value)
         {

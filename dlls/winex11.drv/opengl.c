@@ -505,17 +505,43 @@ BOOL visual_from_pixel_format( int format, XVisualInfo *visual )
     }
 }
 
+/* TEMPORARY issue-250 experiment (WINE_ARGB_PIXFMT=1): let the ARGB visual's
+ * configs be used for window drawing.  Without the variable nothing changes. */
+static BOOL argb_pixfmt_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "WINE_ARGB_PIXFMT" );
+        enabled = (e && atoi( e )) ? 1 : 0;
+    }
+    return enabled;
+}
+
 static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_format *pf )
 {
     XVisualInfo visual;
 
     if (!p_egl_describe_pixel_format( format, pf )) return FALSE;
-    if (!visual_from_pixel_format( format, &visual ) || visual.depth != default_visual.depth)
+    if (!visual_from_pixel_format( format, &visual ))
+        pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
+    else if (visual.depth != default_visual.depth)
     {
         /* Forbid drawing to windows with formats whose depth does not match the screen depth
          * so that we can copy child windows on-screen using XCopyArea().
          * See x11drv_init_pixel_formats() for the same logic with GLX. */
-        pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
+        if (argb_pixfmt_enabled() && argb_visual.visualid && visual.visualid == argb_visual.visualid)
+        {
+            /* The ARGB visual is the one exception: a glass window's GL child has to
+             * carry an alpha channel, and it is composited by the X server rather than
+             * copied with XCopyArea().  Flag it via WGL_TRANSPARENT_ARB so that wined3d
+             * can prefer it for such windows - see wined3d_context_gl_set_pixel_format(). */
+            pf->transparent = 1;
+            TRACE( "format %d keeps PFD_DRAW_TO_WINDOW, visual 0x%lx depth %d.\n",
+                   format, visual.visualid, visual.depth );
+        }
+        else pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
     }
 
     return TRUE;
