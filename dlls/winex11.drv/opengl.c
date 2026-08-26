@@ -611,23 +611,29 @@ static BOOL x11drv_egl_surface_create( HWND hwnd, int format, struct opengl_draw
     struct opengl_drawable *previous;
     struct client_surface *client;
     struct gl_drawable *gl;
+    int visual_format = format;
     Window window;
     int twin;
 
     /* TEMPORARY issue-250: a per-pixel alpha window needs its GL child on an
-     * alpha capable visual.  The substitution belongs here and not in wined3d's
-     * per-present path: this runs once per drawable, and because the format is
-     * replaced before the comparison below, a repeated call finds the drawable
-     * unchanged instead of tearing it down and building a new client window. */
+     * alpha capable visual.  Only the X window and the EGL config move to the
+     * ARGB twin - the drawable keeps the format that was ASKED for.
+     *
+     * That distinction is the whole point.  get_window_unused_drawable() caches
+     * one drawable per window and reuses it only while drawable->format equals
+     * the requested format.  Registering the substituted format there makes that
+     * comparison fail on every single call, so the cached drawable is dropped and
+     * a new client window is built each time: measured 53 requests and 53 new
+     * windows during a 20 s drag, which is what the flicker was. */
     if (window_wants_argb( hwnd ) && (twin = argb_twin_format( format )) && twin != format)
     {
-        TRACE( "hwnd %p: per-pixel alpha window, using ARGB format %d instead of %d.\n",
+        TRACE( "hwnd %p: per-pixel alpha window, using ARGB visual of format %d for %d.\n",
                hwnd, twin, format );
-        format = twin;
+        visual_format = twin;
     }
 
     if ((previous = *drawable) && previous->format == format) return TRUE;
-    if (!(window = x11drv_client_surface_create( hwnd, format, &client ))) return FALSE;
+    if (!(window = x11drv_client_surface_create( hwnd, visual_format, &client ))) return FALSE;
     gl = opengl_drawable_create( sizeof(*gl), &x11drv_egl_surface_funcs, format, client );
     client_surface_release( client );
     if (!gl) return FALSE;
@@ -636,7 +642,7 @@ static BOOL x11drv_egl_surface_create( HWND hwnd, int format, struct opengl_draw
     gl->base.buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
     gl->base.buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
 
-    if (!(gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, egl_config_for_format( format ),
+    if (!(gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, egl_config_for_format( visual_format ),
                                                               (void *)window, NULL )))
     {
         opengl_drawable_release( &gl->base );
