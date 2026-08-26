@@ -3937,8 +3937,25 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
      * old position. During batch processing (EndDeferWindowPos), sibling expose_window
      * calls can set update regions that cause DCX_EXCLUDERGN to skip parts of the
      * BitBlt, leaving stale content. Force a full invalidation so WM_PAINT repaints
-     * everything correctly on top of the BitBlt'd content. */
+     * everything correctly on top of the BitBlt'd content.
+     *
+     * Nothing was BitBlt'd when nothing moved, though, and SWP_AGG_NOGEOMETRYCHANGE
+     * does not cover the move bits: masking with SWP_AGG_STATUSFLAGS keeps
+     * SWP_NOMOVE|SWP_NOCLIENTMOVE in the result, so a SetWindowPos that changes
+     * nothing at all (flags 0x5917 -> masked 0x1807) never compares equal to
+     * SWP_AGG_NOGEOMETRYCHANGE (0x805) and invalidates the whole window with
+     * RDW_ERASE.  Applications that re-assert their layout on every mouse move get
+     * a full erase per motion event, and the erase reaches the screen on its own
+     * because window surfaces are flushed when the message loop goes idle - one
+     * flush shows the erased window, the next one the repainted one (issue 253:
+     * SynthEdit's canvas frames flickering while the mouse is over the menu bar).
+     *
+     * Skip that case, but compare against the *full* status mask rather than just
+     * the position bits: SWP_FRAMECHANGED asks for a non-client repaint and is a
+     * reason to invalidate even when nothing moved.  Dropping it as well leaves
+     * SynthEdit's canvas background unpainted at startup (blackcheck 18.6 %). */
     if (!(winpos->flags & (SWP_NOREDRAW | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) &&
+        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE &&
         (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOGEOMETRYCHANGE)
     {
         TRACE( "hwnd %p: post-move invalidation (flags %08x)\n", winpos->hwnd, (int)winpos->flags );
