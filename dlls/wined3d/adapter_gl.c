@@ -3970,7 +3970,7 @@ static void wined3d_adapter_init_fb_cfgs(struct wined3d_adapter_gl *adapter_gl, 
         attribs[attrib_count++] = WGL_DOUBLE_BUFFER_ARB;
         attribs[attrib_count++] = WGL_AUX_BUFFERS_ARB;
         attribs[attrib_count++] = WGL_SWAP_METHOD_ARB;
-        /* TEMPORARY issue-250: winex11 sets this on ARGB-visual formats (WINE_ARGB_PIXFMT=1). */
+        /* issue-250: winex11 sets this on ARGB-visual formats (WINE_ARGB_PIXFMT=1). */
         attribs[attrib_count++] = WGL_TRANSPARENT_ARB;
 
         for (i = 0, adapter_gl->pixel_format_count = 0; i < cfg_count; ++i)

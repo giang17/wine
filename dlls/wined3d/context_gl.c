@@ -1731,7 +1731,7 @@ static int context_choose_pixel_format(const struct wined3d_device *device, HDC 
                 && cfg->greenSize == color_format->green_size
                 && cfg->blueSize == color_format->blue_size)
             value += 32;
-        /* TEMPORARY issue-250: outweigh every other criterion, so that a glass window
+        /* issue-250: outweigh every other criterion, so that a glass window
          * gets the ARGB-visual format even though it ties on all of them. */
         if (wants_argb && cfg->transparent)
             value += 64;

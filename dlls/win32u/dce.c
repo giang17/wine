@@ -1247,7 +1247,7 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
     }
     user_unlock();
 
-    /* TEMPORARY issue-250: a cache DC drops its drawable on every ReleaseDC, and
+    /* issue-250: a cache DC drops its drawable on every ReleaseDC, and
      * the next GetDC then has to build a whole new X client window.  An
      * application that redraws per frame while dragging does that once a frame --
      * measured 54 new client windows during a 20 s drag, and the child being

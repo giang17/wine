@@ -588,7 +588,7 @@ static int argb_twin_format( int format )
     return 0;
 }
 
-/* TEMPORARY issue-250: does this window's top level carry per-pixel alpha?  The
+/* issue-250: does this window's top level carry per-pixel alpha?  The
  * bit is maintained in the window data (update_window_argb_visual), so the GL
  * child ends up on an alpha capable visual exactly when its parent is on one. */
 static BOOL window_wants_argb( HWND hwnd )
@@ -616,7 +616,7 @@ static BOOL x11drv_egl_surface_create( HWND hwnd, int format, struct opengl_draw
     Window window;
     int twin;
 
-    /* TEMPORARY issue-250: a per-pixel alpha window needs its GL child on an
+    /* issue-250: a per-pixel alpha window needs its GL child on an
      * alpha capable visual.  Only the X window and the EGL config move to the
      * ARGB twin - the drawable keeps the format that was ASKED for.
      *
