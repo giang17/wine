@@ -488,6 +488,29 @@ static void x11drv_client_surface_update( struct client_surface *client )
     client_surface_update_offscreen( hwnd, surface );
 }
 
+/* Track which client window a top-level was last presented through, so a switch
+ * to a different (and therefore still empty) one can be noticed.  See the comment
+ * in X11DRV_client_surface_present(). */
+static BOOL last_presented_changed( HWND hwnd, Window client_window )
+{
+    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    static struct { HWND hwnd; Window window; } last[32];
+    BOOL changed = FALSE;
+    unsigned int i;
+
+    pthread_mutex_lock( &mutex );
+    for (i = 0; i < ARRAY_SIZE(last); i++) if (!last[i].hwnd || last[i].hwnd == hwnd) break;
+    if (i < ARRAY_SIZE(last))
+    {
+        changed = last[i].hwnd == hwnd && last[i].window != client_window;
+        last[i].hwnd = hwnd;
+        last[i].window = client_window;
+    }
+    pthread_mutex_unlock( &mutex );
+
+    return changed;
+}
+
 static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
@@ -529,6 +552,20 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+
+    /* A client surface that has just replaced the one this window was presenting
+     * through has never been drawn into: it is a fresh X window, so its content is
+     * the black window background.  The blit below puts that black over the whole
+     * top-level, and only the parts a later window-surface flush happens to cover
+     * come back - anything outside the flush's dirty rectangle stays black until
+     * something forces a repaint (issue 175: SynthEdit's toolbar row and parameter
+     * panel after opening and closing a menu, because the SetWindowPos that closes
+     * it carries SWP_NOREDRAW and no repaint is ever asked for).
+     *
+     * Ask the application to repaint when the presented client window changes, which
+     * is what resizing the window by hand does to heal it. */
+    if (last_presented_changed( hwnd, surface->window ))
+        NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
 
     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                      surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
