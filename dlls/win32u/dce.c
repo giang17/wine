@@ -1247,7 +1247,22 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
     }
     user_unlock();
 
-    release_opengl_drawables( &drawables );
+    /* TEMPORARY issue-250: a cache DC drops its drawable on every ReleaseDC, and
+     * the next GetDC then has to build a whole new X client window.  An
+     * application that redraws per frame while dragging does that once a frame --
+     * measured 54 new client windows during a 20 s drag, and the child being
+     * swapped underneath is what makes the dragged bitmap drop out.  Park the
+     * drawable on its window instead so the next DC can pick it up; without
+     * WINE_ARGB_PIXFMT this is exactly release_opengl_drawables(). */
+    {
+        struct opengl_drawable *drawable, *next;
+
+        LIST_FOR_EACH_ENTRY_SAFE( drawable, next, &drawables, struct opengl_drawable, entry )
+        {
+            list_remove( &drawable->entry );
+            release_dc_opengl_drawable( drawable );
+        }
+    }
     return ret;
 }
 
