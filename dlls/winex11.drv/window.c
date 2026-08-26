@@ -2759,6 +2759,10 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
 }
 
 
+/* dwmapi records DwmExtendFrameIntoClientArea( margins = -1 ) as this property,
+ * see update_window_argb_visual(). */
+static const WCHAR dwm_glass_prop[] = {'_','_','w','i','n','e','_','d','w','m','_','g','l','a','s','s',0};
+
 /**********************************************************************
  *		create_whole_window
  *
@@ -2782,6 +2786,23 @@ static void create_whole_window( struct x11drv_win_data *data )
         win_rgn = 0;
     }
     data->shaped = (win_rgn != 0);
+
+    /* Pick the alpha capable visual up front when the window has already asked for
+     * glass.  update_window_argb_visual() would otherwise do it later, and
+     * set_window_visual() implements that by destroying and re-creating the X
+     * window.  Landing in the middle of a drag, that leaves the window gone for
+     * over a second - measured 27 of 80 samples without a drag window at all,
+     * which is what the remaining flicker of issue 250 turned out to be.  The end
+     * state is the same visual either way; deciding here only skips the
+     * transition. */
+    if (!data->embedded && !data->wants_argb && argb_visual.visualid
+            && NtUserGetProp( data->hwnd, dwm_glass_prop ))
+    {
+        TRACE( "window %p asked for DWM glass before creation, using an ARGB visual\n", data->hwnd );
+        data->wants_argb = 1;
+        data->vis = argb_visual;
+        data->use_alpha = TRUE;
+    }
 
     if (data->vis.visualid != default_visual.visualid)
         data->whole_colormap = XCreateColormap( data->display, root_window, data->vis.visual, AllocNone );
@@ -2943,9 +2964,6 @@ void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BO
  */
 void update_window_argb_visual( struct x11drv_win_data *data )
 {
-    static const WCHAR dwm_glass_prop[] = {'_','_','w','i','n','e','_','d','w','m','_','g','l','a','s','s',0};
-
-
     if (!data->wants_argb)
     {
         if (!NtUserGetProp( data->hwnd, dwm_glass_prop )) return;
