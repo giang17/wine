@@ -505,8 +505,8 @@ BOOL visual_from_pixel_format( int format, XVisualInfo *visual )
     }
 }
 
-/* TEMPORARY issue-250 experiment (WINE_ARGB_PIXFMT=1): let the ARGB visual's
- * configs be used for window drawing.  Without the variable nothing changes. */
+/* issue-250: let the ARGB visual's configs be used for window drawing.
+ * On by default since 26.08.2026; WINE_ARGB_PIXFMT=0 restores the old behaviour. */
 static BOOL argb_pixfmt_enabled(void)
 {
     static int enabled = -1;
@@ -514,7 +514,8 @@ static BOOL argb_pixfmt_enabled(void)
     if (enabled < 0)
     {
         const char *e = getenv( "WINE_ARGB_PIXFMT" );
-        enabled = (e && atoi( e )) ? 1 : 0;
+        /* on by default; WINE_ARGB_PIXFMT=0 turns it off without a rebuild */
+        enabled = (e && !atoi( e )) ? 0 : 1;
     }
     return enabled;
 }
@@ -553,7 +554,7 @@ static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_forma
     return TRUE;
 }
 
-/* TEMPORARY issue-250 experiment (WINE_ARGB_PIXFMT=1): find the ARGB-visual twin
+/* issue-250: find the ARGB-visual twin
  * of a pixel format.  The EGL formats are laid out as
  * (flags variant) * config_count + (config index) - see egldrv_describe_pixel_format()
  * in win32u - so the twin keeps the flags variant and only moves to a config whose

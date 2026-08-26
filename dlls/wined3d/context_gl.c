@@ -1162,13 +1162,13 @@ void wined3d_context_gl_texture_update(struct wined3d_context_gl *context_gl,
     }
 }
 
-/* TEMPORARY issue-250 experiment (WINE_ARGB_PIXFMT=1): a window that asked for DWM
+/* issue-250: a window that asked for DWM
  * glass needs its GL child window on the ARGB visual, or the per-pixel alpha is lost
  * and the client area shows up as opaque black.  winex11 flags the ARGB-visual formats
  * as transparent (see x11drv_egl_describe_pixel_format).  Preferring such a format
  * here only helps when the window is already known to be glass at context creation
  * time; the binding decision is made later and per drawable, in winex11's
- * x11drv_egl_surface_create().  Without the variable nothing changes. */
+ * x11drv_egl_surface_create().  WINE_ARGB_PIXFMT=0 restores the old behaviour. */
 static bool context_wants_argb_format(HDC hdc)
 {
     static int enabled = -1;
@@ -1178,7 +1178,8 @@ static bool context_wants_argb_format(HDC hdc)
     if (enabled < 0)
     {
         const char *e = getenv("WINE_ARGB_PIXFMT");
-        enabled = (e && atoi(e)) ? 1 : 0;
+        /* on by default; WINE_ARGB_PIXFMT=0 turns it off without a rebuild */
+        enabled = (e && !atoi(e)) ? 0 : 1;
     }
     if (!enabled)
         return false;

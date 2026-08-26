@@ -1252,8 +1252,8 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
      * application that redraws per frame while dragging does that once a frame --
      * measured 54 new client windows during a 20 s drag, and the child being
      * swapped underneath is what makes the dragged bitmap drop out.  Park the
-     * drawable on its window instead so the next DC can pick it up; without
-     * WINE_ARGB_PIXFMT this is exactly release_opengl_drawables(). */
+     * drawable on its window instead so the next DC can pick it up.  With
+     * WINE_ARGB_PIXFMT=0 this is exactly release_opengl_drawables(). */
     {
         struct opengl_drawable *drawable, *next;
 

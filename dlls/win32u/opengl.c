@@ -1368,7 +1368,7 @@ static struct opengl_drawable *get_window_current_drawable( HWND hwnd )
     return drawable;
 }
 
-/* TEMPORARY issue-250 experiment (WINE_ARGB_PIXFMT=1): park a drawable the DC is
+/* issue-250: park a drawable the DC is
  * letting go of, so the next DC for the same window can reuse it.
  *
  * An application that drags redraws through a fresh DC per frame.  A fresh DC has
@@ -1388,7 +1388,8 @@ static BOOL argb_drawable_cache_enabled(void)
     if (enabled < 0)
     {
         const char *e = getenv( "WINE_ARGB_PIXFMT" );
-        enabled = (e && atoi( e )) ? 1 : 0;
+        /* on by default; WINE_ARGB_PIXFMT=0 turns it off without a rebuild */
+        enabled = (e && !atoi( e )) ? 0 : 1;
     }
     return enabled;
 }
