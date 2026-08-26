@@ -88,6 +88,45 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   dirty-check (23% fewer DISCARDs), private heap to isolate alloc churn
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behavior)
 - **D2D1 private heap**: Isolates high-frequency geometry alloc/free from process heap
+- **Per-pixel alpha for GPU-painted layered windows**: `DwmExtendFrameIntoClientArea`
+  with `margins = -1` asks for full glass, which on Windows makes the client area
+  per-pixel alpha capable. Wine stubbed it, so a plugin dragging a bitmap around — Serum
+  2's envelope, LFO and macro handles — showed an opaque **black box** instead of the
+  bitmap. Alpha capability is now a property of the *window* rather than a side effect of
+  the last call that touched it: dwmapi records the request, winex11 keeps it in the
+  window data so a later `SetLayeredWindowAttributes` cannot drop it again, and both the
+  window and its GL child end up on an ARGB visual.
+
+  Removing the black box uncovered a second fault, and that one needed three more fixes
+  before the bitmap was actually stable while being dragged:
+
+  - The **format substitution ran per present** instead of per window. It is now decided
+    once per drawable in `x11drv_egl_surface_create()`, and the drawable keeps the format
+    that was *asked for* — only the X window and the EGL config move to the ARGB twin.
+    Registering the substituted format instead makes the cache comparison in
+    `get_window_unused_drawable()` fail on every call, which quietly rebuilds the client
+    window each time.
+  - The **ARGB visual switch destroyed the top level mid-drag**. `set_window_visual()`
+    implements the switch by tearing the X window down and building it again; for a
+    window that is created and dragged in one go, that landed inside the drag. Measured:
+    27 of 80 samples with no window at all, about 1.3 s of not existing. The visual is now
+    chosen when the window is created, so the transition never happens.
+  - A **cache DC dropped its drawable on every `ReleaseDC`**, and anything drawing per
+    frame through `GetDC`/`ReleaseDC` therefore lost its GL client window once a frame —
+    54 new X client windows during a 20 s drag. A fresh one is empty, and at depth 32
+    empty means fully transparent. The drawable is now parked on the window for the next
+    DC to pick up, only while the cache slot is free, and it is taken back out when handed
+    over so it can never belong to two consumers at once.
+
+  Measured over a 200 px drag, 20 s, mouse moving: **one** GL client window instead of 8,
+  one top level instead of 2, no sample without a window, and the brightness range of the
+  dragged bitmap down from 6.62 to 0.90 with no jump above 1 where there had been 142.
+
+  On by default. `WINE_ARGB_PIXFMT=0` turns the whole path off without a rebuild and is
+  byte-identical to the previous behaviour — worth knowing because the drawable caching
+  touches `dce.c`, which every application with a GL window goes through. Smoke tested
+  across Korg Trinity, EPROM Memory Rites, FL Studio, Fender Studio Pro 8 and Ableton
+  Live 12.
 - **winex11**: DComp window support, backing store, micro-resize suppression;
   ownerless TOOLWINDOW popups are no longer folded into the active window's group,
   given a transient_for owner, or mapped as UTILITY — this fixes sticky, wrongly
@@ -289,7 +328,7 @@ are not specific to it.
 
 | Application | Framework | Status |
 |-------------|-----------|--------|
-| Serum2 (VST3 in Reaper) | VSTGUI + DComp | Fully functional, all waveform views + envelopes + presets |
+| Serum2 (VST3 in Reaper) | VSTGUI + DComp | Fully functional, all waveform views + envelopes + presets; dragging the envelope, LFO and macro handles shows the drag bitmap with per-pixel alpha and no flicker |
 | VProm3 (VST3 in Reaper) | SynthEdit/GMPI + D2D1 | Fully functional, correct colours (needs the Color Management effect patches) |
 | Korg Trinity (VST3 in Reaper) | JUCE 8 + DComp | Fully functional, DComp rendering path |
 | Korg Prophecy (VST3 in Reaper) | JUCE 8 + DComp | Fully functional |
