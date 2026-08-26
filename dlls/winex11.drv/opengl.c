@@ -541,8 +541,8 @@ static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_forma
              * out that very visual.  Mesa reports it for its ARGB configs, while the
              * NVIDIA driver gives every config a visual of its own and reports
              * argb_visual only for a config that has no alpha bits at all.  Flag it
-             * via WGL_TRANSPARENT_ARB so that wined3d can prefer it for such windows,
-             * see wined3d_context_gl_set_pixel_format(). */
+             * via WGL_TRANSPARENT_ARB, which is what argb_twin_format() matches on when a
+             * per-pixel alpha window's GL child is created. */
             pf->transparent = 1;
             TRACE( "format %d keeps PFD_DRAW_TO_WINDOW, visual 0x%lx depth %d.\n",
                    format, visual.visualid, visual.depth );
@@ -553,12 +553,78 @@ static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_forma
     return TRUE;
 }
 
+/* TEMPORARY issue-250 experiment (WINE_ARGB_PIXFMT=1): find the ARGB-visual twin
+ * of a pixel format.  The EGL formats are laid out as
+ * (flags variant) * config_count + (config index) - see egldrv_describe_pixel_format()
+ * in win32u - so the twin keeps the flags variant and only moves to a config whose
+ * visual can carry an alpha channel.  Returns 0 when there is none. */
+static int argb_twin_format( int format )
+{
+    struct wgl_pixel_format want, cfg;
+    unsigned int variant, base, i;
+
+    if (!egl || !egl->config_count || format < 1) return 0;
+    if (!x11drv_egl_describe_pixel_format( format, &want )) return 0;
+    if (want.transparent) return format;
+
+    variant = (format - 1) / egl->config_count;
+    base = variant * egl->config_count;
+
+    for (i = 0; i < egl->config_count; ++i)
+    {
+        int candidate = base + i + 1;
+
+        if (candidate == format) continue;
+        if (!x11drv_egl_describe_pixel_format( candidate, &cfg )) continue;
+        if (!cfg.transparent) continue;
+        if (!(cfg.pfd.dwFlags & PFD_DRAW_TO_WINDOW)) continue;
+        if ((cfg.pfd.dwFlags & PFD_DOUBLEBUFFER) != (want.pfd.dwFlags & PFD_DOUBLEBUFFER)) continue;
+        if (cfg.pfd.cColorBits != want.pfd.cColorBits) continue;
+        if (cfg.pfd.cDepthBits != want.pfd.cDepthBits) continue;
+        if (cfg.pfd.cStencilBits != want.pfd.cStencilBits) continue;
+        return candidate;
+    }
+    return 0;
+}
+
+/* TEMPORARY issue-250: does this window's top level carry per-pixel alpha?  The
+ * bit is maintained in the window data (update_window_argb_visual), so the GL
+ * child ends up on an alpha capable visual exactly when its parent is on one. */
+static BOOL window_wants_argb( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+    BOOL ret = FALSE;
+    HWND root;
+
+    if (!argb_pixfmt_enabled()) return FALSE;
+    if (!(root = NtUserGetAncestor( hwnd, GA_ROOT ))) return FALSE;
+    if ((data = get_win_data( root )))
+    {
+        ret = data->wants_argb && !data->embedded;
+        release_win_data( data );
+    }
+    return ret;
+}
+
 static BOOL x11drv_egl_surface_create( HWND hwnd, int format, struct opengl_drawable **drawable )
 {
     struct opengl_drawable *previous;
     struct client_surface *client;
     struct gl_drawable *gl;
     Window window;
+    int twin;
+
+    /* TEMPORARY issue-250: a per-pixel alpha window needs its GL child on an
+     * alpha capable visual.  The substitution belongs here and not in wined3d's
+     * per-present path: this runs once per drawable, and because the format is
+     * replaced before the comparison below, a repeated call finds the drawable
+     * unchanged instead of tearing it down and building a new client window. */
+    if (window_wants_argb( hwnd ) && (twin = argb_twin_format( format )) && twin != format)
+    {
+        TRACE( "hwnd %p: per-pixel alpha window, using ARGB format %d instead of %d.\n",
+               hwnd, twin, format );
+        format = twin;
+    }
 
     if ((previous = *drawable) && previous->format == format) return TRUE;
     if (!(window = x11drv_client_surface_create( hwnd, format, &client ))) return FALSE;
