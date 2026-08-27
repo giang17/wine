@@ -2370,6 +2370,17 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             }
         }
 
+        /* A window that was drawing straight to the driver window and now gets a
+         * window surface again starts out with a blank surface: the pixels it is
+         * supposed to own live on the driver window, and nothing copies them back
+         * (X11DRV_MoveWindowBits copies within the same window, source == target).
+         * The valid rects still claim the client area is intact, so no repaint is
+         * asked for either, and everything that does not redraw itself of its own
+         * accord stays at the surface fill colour.  Ask for one. */
+        if (!old_surface && new_surface && new_surface != &dummy_surface &&
+            (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
+            NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
+
         if (need_icons && (icon = get_window_icon_info( hwnd, ICON_BIG, icon, &ii )))
         {
             icon_small = get_window_icon_info( hwnd, ICON_SMALL, icon_small, &ii_small );
