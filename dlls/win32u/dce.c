@@ -805,6 +805,32 @@ static void dump_rdw_flags(UINT flags)
 }
 
 /***********************************************************************
+ *           window_clips_clients
+ *
+ * Whether this window has already been marked as owning client surfaces.
+ *
+ * The server learns about a custom pixel format asynchronously: for a window
+ * that belongs to another thread, set_window_pixel_format() only posts
+ * WM_WINE_UPDATEWINDOWSTATE and returns.  A thread that sets the format and
+ * then immediately fetches a DC gets a visible region computed while the
+ * server still reports paint_flags 0, so that DC is bound to the parent
+ * window surface - while the surface region the server hands out a moment
+ * later already excludes the window.  Everything painted through that DC is
+ * then clipped away by the surface flush, silently and at full cost.  The
+ * flag is set synchronously and lives in this process, so ask it directly.
+ */
+static BOOL window_clips_clients( HWND hwnd )
+{
+    WND *win = get_win_ptr( hwnd );
+    BOOL ret;
+
+    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+    ret = !!win->clip_clients;
+    release_win_ptr( win );
+    return ret;
+}
+
+/***********************************************************************
  *           update_visible_region
  *
  * Set the visible region and X11 drawable for the DC associated to
@@ -863,7 +889,8 @@ static void update_visible_region( struct dce *dce )
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
     /* don't use a surface to paint the client area of OpenGL windows */
-    if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT) || (flags & DCX_WINDOW))
+    if ((!(paint_flags & SET_WINPOS_PIXEL_FORMAT) && !window_clips_clients( dce->hwnd )) ||
+        (flags & DCX_WINDOW))
     {
         win = get_win_ptr( top_win );
         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
