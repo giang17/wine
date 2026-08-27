@@ -818,12 +818,26 @@ static void dump_rdw_flags(UINT flags)
  * later already excludes the window.  Everything painted through that DC is
  * then clipped away by the surface flush, silently and at full cost.  The
  * flag is set synchronously and lives in this process, so ask it directly.
+ *
+ * This only applies to a DC that would be bound to an ancestor's surface; see
+ * the top_win check below.
  */
-static BOOL window_clips_clients( HWND hwnd )
+static BOOL window_clips_clients( HWND hwnd, HWND top_win )
 {
-    WND *win = get_win_ptr( hwnd );
+    WND *win;
     BOOL ret;
 
+    /* Only when the DC would be bound to an ancestor's surface.  That is the
+     * case this flag guards against: as soon as the server learns about the
+     * pixel format it subtracts this window's client rect from the ancestor's
+     * surface region, so everything painted through such a DC is clipped away.
+     * A window that would be given its own surface is not in that race - it
+     * loses or keeps that surface in the same apply_window_pos() that tells the
+     * server, and forcing it to direct drawing in the meantime throws away the
+     * one paint that arrives before the server has caught up. */
+    if (hwnd == top_win) return FALSE;
+
+    win = get_win_ptr( hwnd );
     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
     ret = !!win->clip_clients;
     release_win_ptr( win );
@@ -889,7 +903,7 @@ static void update_visible_region( struct dce *dce )
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
     /* don't use a surface to paint the client area of OpenGL windows */
-    if ((!(paint_flags & SET_WINPOS_PIXEL_FORMAT) && !window_clips_clients( dce->hwnd )) ||
+    if ((!(paint_flags & SET_WINPOS_PIXEL_FORMAT) && !window_clips_clients( dce->hwnd, top_win )) ||
         (flags & DCX_WINDOW))
     {
         win = get_win_ptr( top_win );
