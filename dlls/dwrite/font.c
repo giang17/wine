@@ -104,6 +104,7 @@ static struct cache_entry * fontface_get_cache_entry(struct dwrite_fontface *fon
         {
             old_entry = LIST_ENTRY(list_tail(&fontface->cache.mru), struct cache_entry, mru);
             fontface->cache.size -= (old_entry->bitmap_size + sizeof(*old_entry));
+            fontface->cache.entries--;
             wine_rb_remove(&fontface->cache.tree, &old_entry->entry);
             list_remove(&old_entry->mru);
             fontface_release_cache_entry(old_entry);
@@ -117,6 +118,7 @@ static struct cache_entry * fontface_get_cache_entry(struct dwrite_fontface *fon
         }
 
         fontface->cache.size += size;
+        fontface->cache.entries++;
     }
     else
         entry = WINE_RB_ENTRY_VALUE(e, struct cache_entry, entry);
@@ -321,23 +323,37 @@ static int fontface_cache_compare(const void *k, const struct wine_rb_entry *e)
     return 0;
 }
 
-static void fontface_cache_init(struct dwrite_fontface *fontface)
+/* Leave an empty but usable cache behind: callers keep walking the MRU list
+ * afterwards, so a plain memset would hand them a list head with a NULL
+ * successor. */
+void fontface_glyph_cache_reset(struct fontface_glyph_cache *cache)
 {
-    wine_rb_init(&fontface->cache.tree, fontface_cache_compare);
-    list_init(&fontface->cache.mru);
-    fontface->cache.max_size = 0x8000;
+    memset(cache, 0, sizeof(*cache));
+    wine_rb_init(&cache->tree, fontface_cache_compare);
+    list_init(&cache->mru);
+    cache->max_size = 0x8000;
 }
 
-static void fontface_cache_clear(struct dwrite_fontface *fontface)
+void fontface_glyph_cache_release(struct fontface_glyph_cache *cache)
 {
     struct cache_entry *entry, *entry2;
 
-    LIST_FOR_EACH_ENTRY_SAFE(entry, entry2, &fontface->cache.mru, struct cache_entry, mru)
+    LIST_FOR_EACH_ENTRY_SAFE(entry, entry2, &cache->mru, struct cache_entry, mru)
     {
         list_remove(&entry->mru);
         fontface_release_cache_entry(entry);
     }
-    memset(&fontface->cache, 0, sizeof(fontface->cache));
+    fontface_glyph_cache_reset(cache);
+}
+
+static void fontface_cache_init(struct dwrite_fontface *fontface)
+{
+    fontface_glyph_cache_reset(&fontface->cache);
+}
+
+static void fontface_cache_clear(struct dwrite_fontface *fontface)
+{
+    fontface_glyph_cache_release(&fontface->cache);
 }
 
 struct dwrite_font_propvec {
@@ -936,6 +952,11 @@ static ULONG WINAPI dwritefontface_Release(IDWriteFontFace5 *iface)
             factory_unlock(fontface->factory);
             free(fontface->cached);
         }
+
+        /* Hand the glyph cache to the factory while the font file reference is
+         * still valid - it is the key the next fontface looks it up by. */
+        factory_park_glyph_cache(fontface->factory, fontface->file, fontface->index,
+                fontface->simulations, &fontface->cache);
         release_scriptshaping_cache(fontface->shaping_cache);
         if (fontface->vdmx.context)
             IDWriteFontFace5_ReleaseFontTable(iface, fontface->vdmx.context);
@@ -5311,6 +5332,8 @@ HRESULT create_fontface(const struct fontface_desc *desc, struct list *cached_li
     IDWriteFontFileStream_AddRef(fontface->stream);
     InitializeCriticalSection(&fontface->cs);
     fontface_cache_init(fontface);
+    factory_adopt_glyph_cache(fontface->factory, fontface->file, fontface->index,
+            fontface->simulations, &fontface->cache);
 
     stream_desc.stream = fontface->stream;
     stream_desc.face_type = desc->face_type;

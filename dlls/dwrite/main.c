@@ -621,6 +621,13 @@ struct dwritefactory
     IDWriteFontFileLoader *localfontfileloader;
     struct list localfontfaces;
 
+    /* Glyph caches of fontfaces that have already been destroyed. Text layout
+     * creates and drops a fontface per run, so without this the rasteriser
+     * redoes the same glyphs on every frame. Data only - no reference is held
+     * on a fontface, so this cannot make the factory outlive itself. */
+    struct list parked_caches;
+    unsigned int parked_cache_count;
+
     struct list collection_loaders;
     struct list file_loaders;
 
@@ -630,6 +637,143 @@ struct dwritefactory
 static inline struct dwritefactory *impl_from_IDWriteFactory7(IDWriteFactory7 *iface)
 {
     return CONTAINING_RECORD(iface, struct dwritefactory, IDWriteFactory7_iface);
+}
+
+/* Number of (font file, face index, simulations) combinations whose glyph
+ * cache is kept after the last fontface using it went away. A UI draws from a
+ * handful of faces, so this only has to cover that working set. */
+#define MAX_PARKED_CACHES 8
+
+struct parked_cache
+{
+    struct list entry;
+    IDWriteFontFile *file;
+    UINT32 index;
+    USHORT simulations;
+    struct fontface_glyph_cache cache;
+};
+
+static void release_parked_cache(struct parked_cache *parked)
+{
+    list_remove(&parked->entry);
+    fontface_glyph_cache_release(&parked->cache);
+    IDWriteFontFile_Release(parked->file);
+    free(parked);
+}
+
+/* Same identity test the fontface cache uses: loader plus reference key. For a
+ * local file the key carries the write time, so a file that changed on disk
+ * does not match an older cache. */
+static BOOL fontfile_is_same(IDWriteFontFile *a, IDWriteFontFile *b)
+{
+    IDWriteFontFileLoader *loader_a, *loader_b;
+    const void *key_a, *key_b;
+    UINT32 size_a, size_b;
+    BOOL ret = FALSE;
+
+    if (a == b) return TRUE;
+    if (FAILED(IDWriteFontFile_GetLoader(a, &loader_a))) return FALSE;
+    if (FAILED(IDWriteFontFile_GetLoader(b, &loader_b)))
+    {
+        IDWriteFontFileLoader_Release(loader_a);
+        return FALSE;
+    }
+    if (loader_a == loader_b
+            && SUCCEEDED(IDWriteFontFile_GetReferenceKey(a, &key_a, &size_a))
+            && SUCCEEDED(IDWriteFontFile_GetReferenceKey(b, &key_b, &size_b)))
+        ret = size_a == size_b && !memcmp(key_a, key_b, size_a);
+
+    IDWriteFontFileLoader_Release(loader_a);
+    IDWriteFontFileLoader_Release(loader_b);
+    return ret;
+}
+
+static struct parked_cache *find_parked_cache(struct dwritefactory *factory, IDWriteFontFile *file,
+        UINT32 index, USHORT simulations)
+{
+    struct parked_cache *parked;
+
+    LIST_FOR_EACH_ENTRY(parked, &factory->parked_caches, struct parked_cache, entry)
+    {
+        if (parked->index == index && parked->simulations == simulations
+                && fontfile_is_same(parked->file, file))
+            return parked;
+    }
+    return NULL;
+}
+
+/* Hand a dying fontface's glyph cache over to the factory. The cache is left
+ * empty but valid, so the caller's own teardown has nothing left to free. */
+void factory_park_glyph_cache(IDWriteFactory7 *iface, IDWriteFontFile *file, UINT32 index,
+        USHORT simulations, struct fontface_glyph_cache *cache)
+{
+    struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+    struct parked_cache *parked, *old;
+
+    if (!file || !cache->entries) return;
+
+    EnterCriticalSection(&factory->cs);
+
+    if ((old = find_parked_cache(factory, file, index, simulations)))
+    {
+        /* Two fontfaces for the same face were alive at once. Keep whichever
+         * cache holds more, so that parking never loses ground. */
+        if (old->cache.entries >= cache->entries)
+        {
+            LeaveCriticalSection(&factory->cs);
+            return;
+        }
+        release_parked_cache(old);
+        factory->parked_cache_count--;
+    }
+
+    if (!(parked = calloc(1, sizeof(*parked))))
+    {
+        LeaveCriticalSection(&factory->cs);
+        return;
+    }
+
+    while (factory->parked_cache_count >= MAX_PARKED_CACHES && !list_empty(&factory->parked_caches))
+    {
+        release_parked_cache(LIST_ENTRY(list_tail(&factory->parked_caches), struct parked_cache, entry));
+        factory->parked_cache_count--;
+    }
+
+    parked->file = file;
+    IDWriteFontFile_AddRef(parked->file);
+    parked->index = index;
+    parked->simulations = simulations;
+    parked->cache = *cache;
+    list_init(&parked->cache.mru);
+    list_move_head(&parked->cache.mru, &cache->mru);
+    list_add_head(&factory->parked_caches, &parked->entry);
+    factory->parked_cache_count++;
+
+    fontface_glyph_cache_reset(cache);
+    LeaveCriticalSection(&factory->cs);
+}
+
+/* Take a parked cache back for a freshly created fontface. */
+void factory_adopt_glyph_cache(IDWriteFactory7 *iface, IDWriteFontFile *file, UINT32 index,
+        USHORT simulations, struct fontface_glyph_cache *cache)
+{
+    struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+    struct parked_cache *parked;
+
+    if (!file) return;
+
+    EnterCriticalSection(&factory->cs);
+    if ((parked = find_parked_cache(factory, file, index, simulations)))
+    {
+        *cache = parked->cache;
+        list_init(&cache->mru);
+        list_move_head(&cache->mru, &parked->cache.mru);
+
+        fontface_glyph_cache_reset(&parked->cache);
+        release_parked_cache(parked);
+        factory->parked_cache_count--;
+    }
+    LeaveCriticalSection(&factory->cs);
 }
 
 static void release_fontface_cache(struct list *fontfaces)
@@ -668,6 +812,9 @@ static void release_dwritefactory(struct dwritefactory *factory)
 
     EnterCriticalSection(&factory->cs);
     release_fontface_cache(&factory->localfontfaces);
+    while (!list_empty(&factory->parked_caches))
+        release_parked_cache(LIST_ENTRY(list_head(&factory->parked_caches), struct parked_cache, entry));
+    factory->parked_cache_count = 0;
     LeaveCriticalSection(&factory->cs);
 
     LIST_FOR_EACH_ENTRY_SAFE(loader, loader2, &factory->collection_loaders, struct collectionloader, entry) {
@@ -2275,6 +2422,7 @@ static void init_dwritefactory(struct dwritefactory *factory, DWRITE_FACTORY_TYP
     list_init(&factory->collection_loaders);
     list_init(&factory->file_loaders);
     list_init(&factory->localfontfaces);
+    list_init(&factory->parked_caches);
 
     InitializeCriticalSectionEx(&factory->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
     factory->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": dwritefactory.lock");
