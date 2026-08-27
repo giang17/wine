@@ -79,6 +79,25 @@ static inline WCHAR *dwrite_private_wcsdup(const WCHAR *src)
 #define MS_GSUB_TAG DWRITE_MAKE_OPENTYPE_TAG('G','S','U','B')
 #define MS_GPOS_TAG DWRITE_MAKE_OPENTYPE_TAG('G','P','O','S')
 
+/* Glyph advances, bounding boxes and rasterised bitmaps for one (font file,
+ * face index, simulations) combination. Kept separate from the fontface so it
+ * can outlive it - see factory_park_glyph_cache(). */
+struct fontface_glyph_cache
+{
+    struct wine_rb_tree tree;
+    struct list mru;
+    size_t max_size;
+    size_t size;
+    unsigned int entries;
+};
+
+extern void fontface_glyph_cache_reset(struct fontface_glyph_cache *cache);
+extern void fontface_glyph_cache_release(struct fontface_glyph_cache *cache);
+extern void factory_park_glyph_cache(IDWriteFactory7 *factory, IDWriteFontFile *file, UINT32 index,
+        USHORT simulations, struct fontface_glyph_cache *cache);
+extern void factory_adopt_glyph_cache(IDWriteFactory7 *factory, IDWriteFontFile *file, UINT32 index,
+        USHORT simulations, struct fontface_glyph_cache *cache);
+
 typedef struct MATRIX_2X2
 {
     float m11;
@@ -318,13 +337,7 @@ struct dwrite_fontface
     UINT64 font_object;
     void *data_context;
     p_dwrite_fontface_get_font_object get_font_object;
-    struct
-    {
-        struct wine_rb_tree tree;
-        struct list mru;
-        size_t max_size;
-        size_t size;
-    } cache;
+    struct fontface_glyph_cache cache;
     CRITICAL_SECTION cs;
 
     USHORT simulations;
