@@ -1682,6 +1682,43 @@ void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *
 
 
 /***********************************************************************
+ *           inherit_window_surface_bits
+ *
+ * Carry the pixels of a window surface over to its successor.
+ *
+ * Unlike move_window_bits_surface this deliberately does not exclude the update
+ * region.  It is not scheduling a repaint, it is filling a buffer that has just
+ * been allocated and is about to be flushed, and the update region covers
+ * exactly the part the application has not drawn yet - which is the part that
+ * would otherwise reach the screen as the surface fill colour.
+ */
+void inherit_window_surface_bits( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                  const RECT *old_visible_rect, const RECT *rects )
+{
+    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)buffer;
+    HDC hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_WINDOW );
+    RECT dst = rects[0], src = rects[1];
+    void *bits;
+
+    if (!hdc) return;
+
+    TRACE( "inheriting %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ) );
+    OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
+    OffsetRect( &dst, -window_rect->left, -window_rect->top );
+
+    window_surface_lock( old_surface );
+    if ((bits = window_surface_get_color( old_surface, info )))
+        NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                                        src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
+                                        0, old_surface->rect.bottom - old_surface->rect.top,
+                                        bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
+    window_surface_unlock( old_surface );
+    NtUserReleaseDC( hwnd, hdc );
+}
+
+
+/***********************************************************************
  *           move_window_bits_surface
  *
  * Move the window bits from a previous window surface when its surface is recreated.

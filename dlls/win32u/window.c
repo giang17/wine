@@ -2184,6 +2184,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     struct window_rects old_rects;
     RECT extra_rects[3];
     struct window_surface *old_surface;
+    RECT surface_rects[2], *surface_copy = NULL;
     HICON icon, icon_small;
     ICONINFO ii, ii_small;
 
@@ -2196,6 +2197,29 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     get_window_rects( hwnd, COORDS_PARENT, &old_rects, dpi );
     if (IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
+
+    /* A window class that asks for a full redraw on resize (CS_HREDRAW/CS_VREDRAW)
+     * makes WM_NCCALCSIZE return WVR_REDRAW, which clears the valid rects.  That is
+     * the right answer for the application - it will repaint everything - but it
+     * also stops the pixels of the old window surface from being carried over when
+     * the surface object itself is replaced.  The successor then starts out as the
+     * plain fill colour, and the expose events the resize generates flush it before
+     * the repaint arrives: one frame of the whole window in that colour.  Keep a
+     * copy rectangle of our own for that case - stale pixels for one frame are
+     * better than none, and the pending repaint overwrites them anyway. */
+    if (!is_layered)
+    {
+        int cx, cy;
+        surface_rects[0] = new_rects->client;
+        surface_rects[1] = old_rects.client;
+        cx = min( surface_rects[0].right - surface_rects[0].left, surface_rects[1].right - surface_rects[1].left );
+        cy = min( surface_rects[0].bottom - surface_rects[0].top, surface_rects[1].bottom - surface_rects[1].top );
+        surface_rects[0].right = surface_rects[0].left + cx;
+        surface_rects[0].bottom = surface_rects[0].top + cy;
+        surface_rects[1].right = surface_rects[1].left + cx;
+        surface_rects[1].bottom = surface_rects[1].top + cy;
+        if (cx > 0 && cy > 0) surface_copy = surface_rects;
+    }
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
     old_surface = win->surface;
@@ -2310,6 +2334,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
                     move_window_bits( hwnd, new_rects, valid_rects );
                 }
             }
+            else if (surface_copy && old_surface != new_surface && old_surface != &dummy_surface &&
+                     new_surface && new_surface != &dummy_surface)
+                inherit_window_surface_bits( hwnd, &new_rects->window, old_surface, &old_rects.visible, surface_copy );
             window_surface_release( old_surface );
         }
         else if (valid_rects)
