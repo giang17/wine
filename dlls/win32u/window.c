@@ -3981,9 +3981,15 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
      * the position bits: SWP_FRAMECHANGED asks for a non-client repaint and is a
      * reason to invalidate even when nothing moved.  Dropping it as well leaves
      * SynthEdit's canvas background unpainted at startup (blackcheck 18.6 %). */
+    /* SWP_AGG_NOGEOMETRYCHANGE must not be a second exemption here.  It covers size
+     * and z-order but not the move bits, so a window that moves without resizing
+     * masks to exactly SWP_AGG_NOGEOMETRYCHANGE (0x805) and gets skipped - which is
+     * precisely the case move_window_bits BitBlts, and therefore the one this
+     * invalidation was written for (issue 260: dragging SynthEdit's MDI canvas by
+     * its title bar leaves the MDI client stale until something else repaints it).
+     * Only "nothing changed at all" stays exempt. */
     if (!(winpos->flags & (SWP_NOREDRAW | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) &&
-        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE &&
-        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOGEOMETRYCHANGE)
+        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE)
     {
         TRACE( "hwnd %p: post-move invalidation (flags %08x)\n", winpos->hwnd, (int)winpos->flags );
         NtUserRedrawWindow( winpos->hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
