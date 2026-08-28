@@ -3724,9 +3724,14 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         data->pending_state.net_wm_state = data->current_state.net_wm_state;
     }
 
-    /* visible windows are only hidden after SWP_HIDEWINDOW is used */
-    if (data->pending_state.wm_state != WithdrawnState && !(new_style & WS_VISIBLE) &&
-        !(swp_flags & SWP_HIDEWINDOW))
+    /* visible windows are only hidden after SWP_HIDEWINDOW is used -- unless the hide has
+     * already been requested and is only waiting for a pending map to be acknowledged:
+     * desired_state.wm_state then records WithdrawnState, and restoring WS_VISIBLE here
+     * would make the window_set_wm_state() call below overwrite it with NormalState.  The
+     * replay in window_wm_state_notify() only restores what desired_state remembers, so
+     * the hide would be lost and the window would stay mapped for good. */
+    if (data->pending_state.wm_state != WithdrawnState && data->desired_state.wm_state != WithdrawnState &&
+        !(new_style & WS_VISIBLE) && !(swp_flags & SWP_HIDEWINDOW))
     {
         WARN( "win %p/%lx not yet hidden, delaying unmapping\n", hwnd, data->whole_window );
         new_style |= WS_VISIBLE;
