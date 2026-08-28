@@ -864,7 +864,6 @@ void d2d_command_list_fill_geometry(struct d2d_command_list *command_list,
             orig_opacity_brush, &opacity_brush)))
     {
         command_list->state = D2D_COMMAND_LIST_STATE_ERROR;
-        ID2D1Brush_Release(brush);
         return;
     }
 
