@@ -1169,7 +1169,9 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
     HANDLE sync_event;
     NTSTATUS status;
 
-    const int bind_len = len;
+    const struct sockaddr *req_addr = addr;
+    struct sockaddr_un sun = { 0 };
+    int req_len = len;
     char *unix_path = NULL;
     int unix_varargs_size = 0;
 
@@ -1239,11 +1241,44 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
 
     if (!(sync_event = get_sync_event())) return -1;
 
-    if (addr->sa_family == AF_UNIX && *addr->sa_data)
+    if (addr->sa_family == AF_UNIX)
     {
-        struct sockaddr_un sun = { 0 };
         WCHAR *sun_pathW;
-        memcpy(&sun, addr, len);
+
+        memcpy( &sun, addr, min( len, (int)sizeof(sun) ));
+
+        if (len <= offsetof(struct sockaddr_un, sun_path))
+        {
+            /* An address carrying only sun_family requests an autobind. Windows
+             * has no abstract sockets, so it assigns a path; do the same, or
+             * getsockname() would hand the caller an address it cannot connect to. */
+            static LONG autobind_seq;
+            WCHAR pathW[MAX_PATH];
+            DWORD dir_len = GetTempPathW( ARRAY_SIZE(pathW), pathW );
+
+            if (!dir_len || dir_len + 40 >= ARRAY_SIZE(pathW))
+            {
+                SetLastError( WSAEFAULT );
+                return -1;
+            }
+            swprintf( pathW + dir_len, ARRAY_SIZE(pathW) - dir_len, L"wine-autobind-%08x-%08x.sock",
+                      (unsigned int)GetCurrentProcessId(),
+                      (unsigned int)InterlockedIncrement( &autobind_seq ) );
+            /* Nothing removes the socket file when the socket goes away, and process
+             * ids are reused, so a previous run may have left this name behind. Since
+             * that run cannot still hold it - its id is ours now - drop the stale file
+             * instead of failing with WSAEADDRINUSE. This also bounds how many of them
+             * can accumulate. */
+            DeleteFileW( pathW );
+            if (!WideCharToMultiByte( CP_ACP, 0, pathW, -1, sun.sun_path, sizeof(sun.sun_path), NULL, NULL ))
+            {
+                SetLastError( WSAEFAULT );
+                return -1;
+            }
+            req_addr = (const struct sockaddr *)&sun;
+            req_len = offsetof(struct sockaddr_un, sun_path) + strlen( sun.sun_path ) + 1;
+        }
+
         if (strlen( sun.sun_path ))
         {
             sun_pathW = strdupAtoW( sun.sun_path );
@@ -1273,7 +1308,7 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
     params->unknown = 0;
     if (addr->sa_family == AF_UNIX)
         memset( &params->addr, 0, len );
-    memcpy( &params->addr, addr, bind_len );
+    memcpy( &params->addr, req_addr, req_len );
     if (unix_path)
         memcpy( (char *)&params->addr + len, unix_path, unix_varargs_size );
 
