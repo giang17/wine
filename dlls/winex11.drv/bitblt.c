@@ -1860,7 +1860,12 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
                    dirty->right - dirty->left, dirty->bottom - dirty->top );
 
-    XFlush( gdi_display );
+    /* The surface bitmap lives in the shared memory segment XShmPutImage reads
+     * from, and the server only reads it when it gets to the request.  Anything
+     * painted into the surface before then - typically a background erase that
+     * follows a resize - is what the server puts on screen, not what was there
+     * when the flush was issued.  Wait for the request to complete. */
+    XSync( gdi_display, False );
 
     return TRUE;
 }
