@@ -53,6 +53,18 @@ static struct list dce_list = LIST_INIT(dce_list);
 static struct list window_surfaces = LIST_INIT( window_surfaces );
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* A background erase that reaches the screen before the repaint that follows it
+ * shows as a flicker: erase_now() paints the erase synchronously from
+ * set_window_pos(), the repaint only arrives with the next WM_PAINT, and any
+ * surface flush in between hands the erased state to the compositor on its own.
+ * Remember the surface an erase went to and hold its flushes back while the
+ * window's thread still has paint work queued, for a bounded time. */
+static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags );
+static pthread_mutex_t erase_hold_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct window_surface *erase_hold_surface;  /* identity only, never dereferenced */
+static DWORD erase_hold_until;
+#define ERASE_HOLD_MS 500
+
 /*******************************************************************
  * Dummy window surface for windows that shouldn't get painted.
  */
@@ -608,6 +620,52 @@ void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info
     return gdi_bits.ptr;
 }
 
+/* an erase_now() erase went to the window's surface: hold that surface's flushes
+ * until the repaint has been queued out, see erase_hold_surface */
+static void hold_surface_after_erase( HWND hwnd )
+{
+    struct window_surface *surface;
+    HWND root = NtUserGetAncestor( hwnd, GA_ROOT );
+    WND *win;
+
+    if (!(win = get_win_ptr( root )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    surface = win->surface;
+    release_win_ptr( win );
+    if (!surface || surface == &dummy_surface) return;
+
+    pthread_mutex_lock( &erase_hold_lock );
+    erase_hold_surface = surface;
+    erase_hold_until = NtGetTickCount() + ERASE_HOLD_MS;
+    pthread_mutex_unlock( &erase_hold_lock );
+}
+
+/* does the window or any window below it still have an update region? */
+static BOOL window_tree_needs_paint( HWND hwnd )
+{
+    UINT flags = UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_ALLCHILDREN;
+    HWND child = 0;
+
+    return get_update_flags( hwnd, &child, &flags ) && flags;
+}
+
+static BOOL surface_flush_held( struct window_surface *surface )
+{
+    BOOL held = FALSE;
+
+    pthread_mutex_lock( &erase_hold_lock );
+    if (erase_hold_surface == surface)
+    {
+        if ((int)(NtGetTickCount() - erase_hold_until) >= 0) erase_hold_surface = NULL;
+        /* a non-client area is validated before WM_NCPAINT is sent, so a paint
+         * message still being handled on this thread counts as queued work too */
+        else if (!get_user_thread_info()->paint_depth && !window_tree_needs_paint( surface->hwnd ))
+            erase_hold_surface = NULL;
+        else held = TRUE;
+    }
+    pthread_mutex_unlock( &erase_hold_lock );
+    return held;
+}
+
 W32KAPI void window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -616,6 +674,12 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     RECT dirty = surface->rect, bounds;
     void *color_bits;
+
+    if (surface_flush_held( surface ))
+    {
+        TRACE( "holding flush of hwnd %p, surface %p: repaint still pending\n", surface->hwnd, surface );
+        return;
+    }
 
     window_surface_lock( surface );
 
@@ -1647,7 +1711,9 @@ static HRGN send_ncpaint( HWND hwnd, HWND *child, UINT *flags )
                 if (style & WS_VSCROLL)
                     set_standard_scroll_painted( hwnd, SB_VERT, FALSE );
 
+                get_user_thread_info()->paint_depth++;
                 send_message( hwnd, WM_NCPAINT, (WPARAM)whole_rgn, 0 );
+                get_user_thread_info()->paint_depth--;
             }
             if (whole_rgn > (HRGN)1) NtGdiDeleteObjectApp( whole_rgn );
         }
@@ -1684,7 +1750,13 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
             {
                 /* don't erase if the clip box is empty */
                 if (type != NULLREGION)
+                {
+                    get_user_thread_info()->paint_depth++;
                     need_erase = !send_message( hwnd, WM_ERASEBKGND, (WPARAM)hdc, 0 );
+                    get_user_thread_info()->paint_depth--;
+                    /* erase_now() path: the repaint only comes with the next WM_PAINT */
+                    if (!hdc_ret) hold_surface_after_erase( hwnd );
+                }
             }
             if (!hdc_ret) release_dc( hwnd, hdc, TRUE );
         }
