@@ -3157,6 +3157,7 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         socklen_t unix_len;
         int v6only = 1;
         int unix_path_len = 0;
+        const char *sun_path = NULL;
 
         /* the ioctl is METHOD_NEITHER, so ntdll gives us the output buffer as
          * input */
@@ -3166,8 +3167,15 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             return;
         }
         in_size = get_req_data_size() - get_reply_max_size();
-        if (params->addr.sa_family == WS_AF_UNIX)
+        if (params->addr.sa_family == WS_AF_UNIX
+                && in_size >= sizeof(params->unknown) + sizeof(struct WS_sockaddr_un))
+        {
+            /* a shorter request carries only sun_family, i.e. it asks for an
+             * autobind; sun_path and the appended Unix path are both absent then,
+             * and computing a length from it would go negative */
+            sun_path = params->addr.sa_data;
             unix_path_len = in_size - sizeof(params->unknown) - sizeof(struct WS_sockaddr_un);
+        }
         if (in_size < offsetof(struct afd_bind_params, addr.sa_data)
                 || get_reply_max_size() < in_size - sizeof(int) - unix_path_len)
         {
@@ -3183,7 +3191,7 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         if (sock->family == WS_AF_UNIX)
         {
-            if (*params->addr.sa_data)
+            if (sun_path && *sun_path)
             {
                 char *unix_path;
                 char *base_name;
@@ -3309,10 +3317,10 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             /* Windows' AF_UNIX implementation has an edge case allowing for a socket to bind to
              * an empty path. Linux doesn't, so it throws EINVAL. We check for this situation
              * here and avoid early-exiting if it's the case. */
-            if (!(errno == EINVAL && sock->family == WS_AF_UNIX && !*params->addr.sa_data))
+            if (!(errno == EINVAL && sock->family == WS_AF_UNIX && (!sun_path || !*sun_path)))
             {
                 set_error( sock_get_ntstatus( errno ) );
-                if (sock->family == WS_AF_UNIX && *params->addr.sa_data)
+                if (sock->family == WS_AF_UNIX && sun_path && *sun_path)
                     fchdir(server_dir_fd);
                 return;
             }
@@ -3330,7 +3338,10 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             if (bind_addr.addr.sa_family == AF_UNIX)
             {
                 sock->addr.un.sun_family = WS_AF_UNIX;
-                memcpy(sock->addr.un.sun_path, params->addr.sa_data, sizeof(sock->addr.un.sun_path));
+                if (sun_path)
+                    memcpy(sock->addr.un.sun_path, sun_path, sizeof(sock->addr.un.sun_path));
+                else
+                    memset(sock->addr.un.sun_path, 0, sizeof(sock->addr.un.sun_path));
                 sock->addr_len = sizeof(sock->addr.un);
             }
             else
@@ -3342,7 +3353,7 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         if (get_reply_max_size() >= sock->addr_len)
             set_reply_data( &sock->addr, sock->addr_len );
 
-        if (sock->family == WS_AF_UNIX && *params->addr.sa_data)
+        if (sock->family == WS_AF_UNIX && sun_path && *sun_path)
             fchdir(server_dir_fd);
         return;
     }
