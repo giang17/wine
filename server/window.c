@@ -22,6 +22,7 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -1337,9 +1338,46 @@ error:
 }
 
 
+/* A child window never gets a window surface of its own, it draws into the one
+ * of its top-level ancestor.  That only holds while both live in the same
+ * process: for a child of a foreign process update_visible_region() cannot
+ * reach that surface at all, since get_win_ptr( top_win ) returns
+ * WND_OTHER_PROCESS and no surface is bound to the DC.  Its drawing then falls
+ * through to the graphics driver, which hands out the top-level's drawable
+ * across the process boundary, so the child paints straight into it while the
+ * owner still collects into its surface and flushes with a delay.  The surface
+ * holds no content for the child's area, so every flush overlapping it
+ * overwrites the child's pixels with the owner's background.
+ *
+ * This is the same problem a GL or Vulkan child has, and it gets the same
+ * treatment: subtract the child's client rect from the surface region, which
+ * the graphics driver turns into a clip on the flush.  Only the client rect is
+ * subtracted, so the non-client frame around the child stays with the owner.
+ *
+ * WINE_DISABLE_FOREIGN_CHILD_CLIP=1 restores the previous behaviour. */
+static int foreign_child_clip_disabled(void)
+{
+    static int disabled = -1;
+
+    if (disabled < 0)
+    {
+        const char *str = getenv( "WINE_DISABLE_FOREIGN_CHILD_CLIP" );
+        disabled = (str && atoi( str )) ? 1 : 0;
+    }
+    return disabled;
+}
+
+static int child_draws_from_foreign_process( struct window *child, struct process *owner )
+{
+    if (foreign_child_clip_disabled()) return 0;
+    if (!owner || !child->thread) return 0;
+    return child->thread->process != owner;
+}
+
 /* clip all children with a custom pixel format out of the visible region */
 static struct region *clip_pixel_format_children( struct window *parent, struct region *parent_clip,
-                                                  struct region *region, int offset_x, int offset_y )
+                                                  struct region *region, int offset_x, int offset_y,
+                                                  struct process *owner )
 {
     struct window *ptr;
     struct region *clip = create_empty_region();
@@ -1357,7 +1395,33 @@ static struct region *clip_pixel_format_children( struct window *parent, struct 
         offset_region( clip, offset_x, offset_y );
         if (!intersect_region( clip, clip, parent_clip )) break;
         if (!union_region( region, region, clip )) break;
-        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))) continue;
+
+        /* a child of a foreign process draws into our drawable behind our back,
+         * exactly like a pixel format child - subtract it for the same reason.
+         * The whole foreign subtree lives inside the rect removed here, so there
+         * is nothing below it left to clip. */
+        if (child_draws_from_foreign_process( ptr, owner ))
+        {
+            set_region_rect( clip, &ptr->client_rect );
+            if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
+            offset_region( clip, offset_x, offset_y );
+            if (!intersect_region( clip, clip, parent_clip )) break;
+            if (!subtract_region( region, region, clip )) break;
+            continue;
+        }
+
+        /* The descent below is normally taken only for a subtree known to hold a
+         * pixel format child, since PAINT_PIXEL_FORMAT_CHILD is maintained on the
+         * parents.  There is no equivalent flag for "a foreign window hangs below
+         * me", and a foreign child need not be a direct child of the top-level,
+         * so descend unconditionally.  This costs one tree walk per surface
+         * region recomputation - server-local pointer chasing on geometry
+         * changes, not per frame.  A parent flag maintained like
+         * PAINT_PIXEL_FORMAT_CHILD would avoid it and is the natural next step if
+         * this ever shows up in a profile. */
+        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD)) &&
+            foreign_child_clip_disabled())
+            continue;
 
         /* subtract the client rect if it uses a custom pixel format */
         set_region_rect( clip, &ptr->client_rect );
@@ -1368,7 +1432,7 @@ static struct region *clip_pixel_format_children( struct window *parent, struct 
             break;
 
         if (!clip_pixel_format_children( ptr, clip, region, offset_x + ptr->client_rect.left,
-                                         offset_y + ptr->client_rect.top ))
+                                         offset_y + ptr->client_rect.top, owner ))
             break;
     }
     free_region( clip );
@@ -1403,7 +1467,8 @@ static struct region *get_surface_region( struct window *win )
     }
     else offset_x = offset_y = 0;
 
-    if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y )) goto error;
+    if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y,
+                                     win->thread ? win->thread->process : NULL )) goto error;
 
     free_region( clip );
     return region;

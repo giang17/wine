@@ -51,6 +51,8 @@ extern struct window_surface *get_driver_window_surface( struct window_surface *
 extern void erase_now( HWND hwnd, UINT rdw_flags );
 extern void flush_window_surfaces( BOOL idle );
 extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects );
+extern void inherit_window_surface_bits( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                        const RECT *old_visible_rect, const RECT *rects );
 extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
                                       const RECT *old_visible_rect, const RECT *valid_rects );
 extern void register_window_surface( struct window_surface *old,

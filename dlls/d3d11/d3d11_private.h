@@ -521,6 +521,13 @@ struct d3d_query
 HRESULT d3d_query_create(struct d3d_device *device, const D3D11_QUERY_DESC *desc, BOOL predicate,
         struct d3d_query **query);
 struct d3d_query *unsafe_impl_from_ID3D11Query(ID3D11Query *iface);
+
+/* ID3D11Fence, CPU timeline semantics (fence.c) */
+HRESULT d3d11_fence_create(ID3D11Device5 *device, UINT64 initial_value,
+        D3D11_FENCE_FLAG flags, REFIID iid, void **fence);
+HRESULT d3d11_fence_open_shared(HANDLE handle, REFIID iid, void **fence);
+HRESULT d3d11_fence_signal(ID3D11Fence *fence, UINT64 value);
+HRESULT d3d11_fence_wait(ID3D11Fence *fence, UINT64 value);
 struct d3d_query *unsafe_impl_from_ID3D10Query(ID3D10Query *iface);
 struct d3d_query *unsafe_impl_from_ID3D11Asynchronous(ID3D11Asynchronous *iface);
 

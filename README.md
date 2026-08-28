@@ -1,3 +1,8 @@
+> **This fork** contains D2D1 rendering fixes and DirectComposition (DComp) patches for Wine 11.0.
+> See **[PATCHES.md](PATCHES.md)** for details on the patch series, branches, and tested applications.
+
+---
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs

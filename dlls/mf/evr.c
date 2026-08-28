@@ -96,6 +96,7 @@ struct video_renderer
     IUnknown *device_manager;
     unsigned int flags;
     unsigned int state;
+    float rate;
 
     struct video_stream **streams;
     size_t stream_size;
@@ -407,7 +408,16 @@ static HRESULT WINAPI video_stream_sink_ProcessSample(IMFStreamSink *iface, IMFS
     {
         WARN("No sample timestamp, hr %#lx.\n", hr);
     }
-    else if (stream->parent->state == EVR_STATE_RUNNING || stream->flags & EVR_STREAM_PREROLLING)
+    /* A sample that arrives while the renderer is paused still has to be taken.
+     * Seeking the timeline is a scrub: the session starts the clock at the new
+     * position, the sink asks the source for one sample, and the session pauses
+     * again a few dozen milliseconds later.  Whenever the source needs longer
+     * than that to deliver -- which it regularly does, having to seek the file --
+     * the sample lands here in the paused state.  Dropping it silently left the
+     * picture on the frame it had shown before, so the jump was invisible even
+     * though the position had moved.  Only a stopped renderer has nothing to show
+     * a sample on. */
+    else if (stream->parent->state != EVR_STATE_STOPPED || stream->flags & EVR_STREAM_PREROLLING)
     {
         if (!(stream->flags & EVR_STREAM_STARTED))
         {
@@ -1928,22 +1938,44 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockStart(IMFClockStateSink *
     {
         IMFTransform_ProcessMessage(renderer->mixer, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         IMFVideoPresenter_ProcessMessage(renderer->presenter, MFVP_MESSAGE_BEGINSTREAMING, 0);
+    }
 
-        for (i = 0; i < renderer->stream_count; ++i)
+    for (i = 0; i < renderer->stream_count; ++i)
+    {
+        struct video_stream *stream = renderer->streams[i];
+
+        EnterCriticalSection(&stream->cs);
+        if (state == EVR_STATE_STOPPED)
         {
-            struct video_stream *stream = renderer->streams[i];
-
-            EnterCriticalSection(&stream->cs);
             request_sample = !(stream->flags & EVR_STREAM_PREROLLED) || (stream->flags & EVR_STREAM_SAMPLE_NEEDED);
             stream->flags |= EVR_STREAM_PREROLLED;
-            stream->flags &= ~EVR_STREAM_SAMPLE_NEEDED;
-            LeaveCriticalSection(&stream->cs);
-
-            IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkStarted, &GUID_NULL, S_OK, NULL);
-            if (request_sample)
-                IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkRequestSample,
-                        &GUID_NULL, S_OK, NULL);
         }
+        else
+        {
+            /* A request the mixer made while the renderer was not running yet -
+             * after a flush, for instance - was only recorded, not sent. */
+            request_sample = !!(stream->flags & EVR_STREAM_SAMPLE_NEEDED);
+        }
+        stream->flags &= ~EVR_STREAM_SAMPLE_NEEDED;
+        LeaveCriticalSection(&stream->cs);
+
+        /* Starting the clock while it is not advancing is a scrub: the renderer is
+         * asked to show the frame at the new position and to stay there.  Applications
+         * that position a video this way wait for the completion event before they
+         * issue their next transport command, so it has to be sent here - the sample
+         * grabber sink does the same. */
+        if (renderer->rate == 0.0f)
+            IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkScrubSampleComplete,
+                    &GUID_NULL, S_OK, NULL);
+
+        /* The session waits for MEStreamSinkStarted from every output node before it
+         * completes a start command.  Seeking from the paused state starts the clock
+         * without going through OnClockRestart(), so the event is sent for every
+         * previous state here, not just when starting from stopped. */
+        IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkStarted, &GUID_NULL, S_OK, NULL);
+        if (request_sample)
+            IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkRequestSample,
+                    &GUID_NULL, S_OK, NULL);
     }
 
     IMFVideoPresenter_OnClockStart(renderer->presenter, systime, offset);
@@ -2031,7 +2063,23 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockRestart(IMFClockStateSink
     for (i = 0; i < renderer->stream_count; ++i)
     {
         struct video_stream *stream = renderer->streams[i];
+        unsigned int request_sample;
+
+        EnterCriticalSection(&stream->cs);
+        /* A request the mixer made while the renderer was paused was only
+         * recorded, not sent.  OnClockStart() hands those out again, and a
+         * restart has to do the same: the mixer keeps at most one request
+         * outstanding, so a dropped one is never repeated and the video branch
+         * stops asking for samples altogether - the picture stands still while
+         * the transport carries on. */
+        request_sample = !!(stream->flags & EVR_STREAM_SAMPLE_NEEDED);
+        stream->flags &= ~EVR_STREAM_SAMPLE_NEEDED;
+        LeaveCriticalSection(&stream->cs);
+
         IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkStarted, &GUID_NULL, S_OK, NULL);
+        if (request_sample)
+            IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEStreamSinkRequestSample,
+                    &GUID_NULL, S_OK, NULL);
     }
     renderer->state = EVR_STATE_RUNNING;
 
@@ -2049,6 +2097,7 @@ static HRESULT WINAPI video_renderer_clock_sink_OnClockSetRate(IMFClockStateSink
 
     EnterCriticalSection(&renderer->cs);
 
+    renderer->rate = rate;
     IMFVideoPresenter_OnClockSetRate(renderer->presenter, systime, rate);
     if (SUCCEEDED(IMFTransform_QueryInterface(renderer->mixer, &IID_IMFClockStateSink, (void **)&sink)))
     {
@@ -2865,6 +2914,7 @@ static HRESULT evr_create_object(IMFAttributes *attributes, void *user_context, 
     object->IMFQualityAdvise_iface.lpVtbl = &video_renderer_quality_advise_vtbl;
     object->IMFRateSupport_iface.lpVtbl = &video_renderer_rate_support_vtbl;
     object->refcount = 1;
+    object->rate = 1.0f;
     InitializeCriticalSection(&object->cs);
 
     if (FAILED(hr = MFCreateEventQueue(&object->event_queue)))

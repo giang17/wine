@@ -573,7 +573,7 @@ struct window_surface *window_surface_create( UINT size, const struct window_sur
 
     pthread_mutex_init( &surface->mutex, NULL );
 
-    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
+    memset( window_surface_get_color( surface, info ), 0x00, info->bmiHeader.biSizeImage );
 
     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
     return surface;
@@ -807,6 +807,46 @@ static void dump_rdw_flags(UINT flags)
 }
 
 /***********************************************************************
+ *           window_clips_clients
+ *
+ * Whether this window has already been marked as owning client surfaces.
+ *
+ * The server learns about a custom pixel format asynchronously: for a window
+ * that belongs to another thread, set_window_pixel_format() only posts
+ * WM_WINE_UPDATEWINDOWSTATE and returns.  A thread that sets the format and
+ * then immediately fetches a DC gets a visible region computed while the
+ * server still reports paint_flags 0, so that DC is bound to the parent
+ * window surface - while the surface region the server hands out a moment
+ * later already excludes the window.  Everything painted through that DC is
+ * then clipped away by the surface flush, silently and at full cost.  The
+ * flag is set synchronously and lives in this process, so ask it directly.
+ *
+ * This only applies to a DC that would be bound to an ancestor's surface; see
+ * the top_win check below.
+ */
+static BOOL window_clips_clients( HWND hwnd, HWND top_win )
+{
+    WND *win;
+    BOOL ret;
+
+    /* Only when the DC would be bound to an ancestor's surface.  That is the
+     * case this flag guards against: as soon as the server learns about the
+     * pixel format it subtracts this window's client rect from the ancestor's
+     * surface region, so everything painted through such a DC is clipped away.
+     * A window that would be given its own surface is not in that race - it
+     * loses or keeps that surface in the same apply_window_pos() that tells the
+     * server, and forcing it to direct drawing in the meantime throws away the
+     * one paint that arrives before the server has caught up. */
+    if (hwnd == top_win) return FALSE;
+
+    win = get_win_ptr( hwnd );
+    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+    ret = !!win->clip_clients;
+    release_win_ptr( win );
+    return ret;
+}
+
+/***********************************************************************
  *           update_visible_region
  *
  * Set the visible region and X11 drawable for the DC associated to
@@ -865,7 +905,8 @@ static void update_visible_region( struct dce *dce )
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
     /* don't use a surface to paint the client area of OpenGL windows */
-    if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW))
+    if (!(((paint_flags & SET_WINPOS_PIXEL_FORMAT) || window_clips_clients( dce->hwnd, top_win )) &&
+          user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW))
     {
         win = get_win_ptr( top_win );
         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
@@ -1249,7 +1290,22 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
     }
     user_unlock();
 
-    release_opengl_drawables( &drawables );
+    /* issue-250: a cache DC drops its drawable on every ReleaseDC, and
+     * the next GetDC then has to build a whole new X client window.  An
+     * application that redraws per frame while dragging does that once a frame --
+     * measured 54 new client windows during a 20 s drag, and the child being
+     * swapped underneath is what makes the dragged bitmap drop out.  Park the
+     * drawable on its window instead so the next DC can pick it up.  With
+     * WINE_ARGB_PIXFMT=0 this is exactly release_opengl_drawables(). */
+    {
+        struct opengl_drawable *drawable, *next;
+
+        LIST_FOR_EACH_ENTRY_SAFE( drawable, next, &drawables, struct opengl_drawable, entry )
+        {
+            list_remove( &drawable->entry );
+            release_dc_opengl_drawable( drawable );
+        }
+    }
     return ret;
 }
 
@@ -1665,6 +1721,43 @@ void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *
                          hdc, src.left, src.top, src.right - src.left, src.bottom - src.top, SRCCOPY, 0 );
         NtUserReleaseDC( hwnd, hdc );
     }
+}
+
+
+/***********************************************************************
+ *           inherit_window_surface_bits
+ *
+ * Carry the pixels of a window surface over to its successor.
+ *
+ * Unlike move_window_bits_surface this deliberately does not exclude the update
+ * region.  It is not scheduling a repaint, it is filling a buffer that has just
+ * been allocated and is about to be flushed, and the update region covers
+ * exactly the part the application has not drawn yet - which is the part that
+ * would otherwise reach the screen as the surface fill colour.
+ */
+void inherit_window_surface_bits( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                  const RECT *old_visible_rect, const RECT *rects )
+{
+    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)buffer;
+    HDC hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_WINDOW );
+    RECT dst = rects[0], src = rects[1];
+    void *bits;
+
+    if (!hdc) return;
+
+    TRACE( "inheriting %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ) );
+    OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
+    OffsetRect( &dst, -window_rect->left, -window_rect->top );
+
+    window_surface_lock( old_surface );
+    if ((bits = window_surface_get_color( old_surface, info )))
+        NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                                        src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
+                                        0, old_surface->rect.bottom - old_surface->rect.top,
+                                        bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
+    window_surface_unlock( old_surface );
+    NtUserReleaseDC( hwnd, hdc );
 }
 
 
