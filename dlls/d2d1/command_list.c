@@ -920,11 +920,11 @@ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
         DWRITE_MEASURING_MODE measuring_mode)
 {
     struct d2d_command_draw_glyph_run *command;
+    size_t size, locale_name_size = 0;
     DWRITE_GLYPH_RUN_DESCRIPTION *d;
     DWRITE_GLYPH_RUN *r;
     UINT32 glyph_count;
     ID2D1Brush *brush;
-    size_t size;
     BYTE *data;
 
     if (FAILED(d2d_command_list_create_brush(command_list, context, orig_brush, &brush)))
@@ -950,7 +950,11 @@ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
     if (run_desc)
     {
         size += sizeof(*run_desc);
-        if (run_desc->localeName) size += (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName);
+        if (run_desc->localeName)
+        {
+            locale_name_size = (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName);
+            size += locale_name_size;
+        }
         if (run_desc->string) size += run_desc->stringLength * sizeof(*run_desc->string);
         if (run_desc->clusterMap) size += run_desc->stringLength * sizeof(*run_desc->clusterMap);
         size += sizeof(run_desc->stringLength);
@@ -982,7 +986,7 @@ void d2d_command_list_draw_glyph_run(struct d2d_command_list *command_list,
         memset(d, 0, sizeof(*d));
         data += sizeof(*d);
 
-        d2d_command_list_write_field(&data, &d->localeName, run_desc->localeName, (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName));
+        d2d_command_list_write_field(&data, &d->localeName, run_desc->localeName, locale_name_size);
         d2d_command_list_write_field(&data, &d->string, run_desc->string, run_desc->stringLength * sizeof(*run_desc->string));
         d->stringLength = run_desc->stringLength;
         d2d_command_list_write_field(&data, &d->clusterMap, run_desc->clusterMap, run_desc->stringLength * sizeof(*run_desc->clusterMap));
