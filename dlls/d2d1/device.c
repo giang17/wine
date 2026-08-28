@@ -4284,10 +4284,40 @@ static void STDMETHODCALLTYPE d2d_device_context_GetDevice(ID2D1DeviceContext6 *
     ID2D1Device_AddRef(*device);
 }
 
+/* Drop the target's views from the context's private D3D state. The state
+ * keeps them bound after a draw, and a bound view keeps the wined3d resource
+ * alive past the last D2D or D3D11 reference to it. A swapchain back buffer
+ * released this way is still held when the application calls
+ * IDXGISwapChain::ResizeBuffers() after SetTarget(NULL), and wined3d then
+ * orphans it until the next draw rebinds the state. */
+static void d2d_device_context_unbind_target(struct d2d_device_context *context)
+{
+    ID3DDeviceContextState *prev_state;
+    ID3D11DeviceContext1 *d3d_context;
+
+    if (!context->d3d_state)
+        return;
+
+    if (context->cs)
+        EnterCriticalSection(context->cs);
+
+    ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
+    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &prev_state);
+    ID3D11DeviceContext1_OMSetRenderTargets(d3d_context, 0, NULL, NULL);
+    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, prev_state, NULL);
+    ID3DDeviceContextState_Release(prev_state);
+    ID3D11DeviceContext1_Release(d3d_context);
+
+    if (context->cs)
+        LeaveCriticalSection(context->cs);
+}
+
 static void d2d_device_context_reset_target(struct d2d_device_context *context)
 {
     if (!context->target.object)
         return;
+
+    d2d_device_context_unbind_target(context);
 
     IUnknown_Release(context->target.object);
     memset(&context->target, 0, sizeof(context->target));
