@@ -1183,7 +1183,7 @@ static void serialize_methodimpl_table( void )
 
     for (i = 0; i < tables[TABLE_METHODIMPL].count; i++)
     {
-        serialize_table_idx( row->class, row->class );
+        serialize_table_idx( row->class, TABLE_TYPEDEF );
         serialize_table_idx( row->body, methoddef_or_ref_to_table(row->body) );
         serialize_table_idx( row->declaration, methoddef_or_ref_to_table(row->declaration) );
         row++;
