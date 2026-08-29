@@ -4757,19 +4757,13 @@ static void d2d_device_context_draw_effect_bitmap(struct d2d_device_context *con
     }
 }
 
-static HRESULT d2d_convolve_matrix_readback_bitmap(struct d2d_device_context *context,
+static HRESULT d2d_effect_readback_bitmap(struct d2d_device_context *context,
         struct d2d_bitmap *bitmap, ID3D11Texture2D **texture, D3D11_MAPPED_SUBRESOURCE *mapped)
 {
     D3D11_TEXTURE2D_DESC desc;
     ID3D11DeviceContext *d3d_context;
     ID3D11Texture2D *src_texture;
     HRESULT hr;
-
-    if (bitmap->format.format != DXGI_FORMAT_A8_UNORM)
-    {
-        FIXME("Unhandled ConvolveMatrix bitmap format %#x.\n", bitmap->format.format);
-        return E_NOTIMPL;
-    }
 
     if (FAILED(hr = ID3D11Resource_QueryInterface(bitmap->resource, &IID_ID3D11Texture2D, (void **)&src_texture)))
         return hr;
@@ -4801,7 +4795,7 @@ static HRESULT d2d_convolve_matrix_readback_bitmap(struct d2d_device_context *co
     return hr;
 }
 
-static void d2d_convolve_matrix_unmap_bitmap(struct d2d_device_context *context, ID3D11Texture2D *texture)
+static void d2d_effect_unmap_bitmap(struct d2d_device_context *context, ID3D11Texture2D *texture)
 {
     ID3D11DeviceContext *d3d_context;
 
@@ -4811,7 +4805,7 @@ static void d2d_convolve_matrix_unmap_bitmap(struct d2d_device_context *context,
     ID3D11Texture2D_Release(texture);
 }
 
-static BYTE d2d_convolve_matrix_clamp(float value)
+static BYTE d2d_effect_clamp_byte(float value)
 {
     if (value < 0.0f)
         return 0;
@@ -4862,7 +4856,7 @@ static void d2d_convolve_matrix_apply_pass(const BYTE *src, BYTE *dst, UINT32 wi
                 }
             }
 
-            dst[y * width + x] = d2d_convolve_matrix_clamp(sum / divisor + pass->bias * 255.0f);
+            dst[y * width + x] = d2d_effect_clamp_byte(sum / divisor + pass->bias * 255.0f);
         }
     }
 }
@@ -5018,7 +5012,17 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
         return E_INVALIDARG;
     }
 
-    if (FAILED(hr = d2d_convolve_matrix_readback_bitmap(context, src_bitmap, &staging, &mapped)))
+    /* The pass loop below convolves single bytes, so the single channel format
+     * JUCE's box blur uses is the only one it can consume. */
+    if (format.format != DXGI_FORMAT_A8_UNORM)
+    {
+        FIXME("Unhandled ConvolveMatrix bitmap format %#x.\n", format.format);
+        ID2D1Bitmap_Release(bitmap);
+        free(passes);
+        return E_NOTIMPL;
+    }
+
+    if (FAILED(hr = d2d_effect_readback_bitmap(context, src_bitmap, &staging, &mapped)))
     {
         ID2D1Bitmap_Release(bitmap);
         free(passes);
@@ -5027,7 +5031,7 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
 
     if (size.height && size.width > ~(size_t)0 / size.height)
     {
-        d2d_convolve_matrix_unmap_bitmap(context, staging);
+        d2d_effect_unmap_bitmap(context, staging);
         ID2D1Bitmap_Release(bitmap);
         free(passes);
         return E_OUTOFMEMORY;
@@ -5035,7 +5039,7 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
 
     if (!(buffers[0] = malloc(size.width * size.height)) || !(buffers[1] = malloc(size.width * size.height)))
     {
-        d2d_convolve_matrix_unmap_bitmap(context, staging);
+        d2d_effect_unmap_bitmap(context, staging);
         ID2D1Bitmap_Release(bitmap);
         free(buffers[0]);
         free(passes);
@@ -5045,7 +5049,7 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
     for (y = 0; y < size.height; ++y)
         memcpy(buffers[0] + y * size.width, (BYTE *)mapped.pData + y * mapped.RowPitch, size.width);
 
-    d2d_convolve_matrix_unmap_bitmap(context, staging);
+    d2d_effect_unmap_bitmap(context, staging);
     ID2D1Bitmap_Release(bitmap);
 
     i = pass_count - 1;
@@ -5076,6 +5080,256 @@ static HRESULT d2d_device_context_draw_convolve_matrix(struct d2d_device_context
     ID2D1Bitmap1_Release(&result_impl->ID2D1Bitmap1_iface);
 
     return S_OK;
+}
+
+/* GaussianBlur is evaluated on the CPU for the same reason ConvolveMatrix above
+ * is: the effect runs on a bitmap the application hands us, a handful of times
+ * per paint rather than per primitive, so a readback costs less than a
+ * dedicated shader plus the intermediate render targets a separable GPU blur
+ * would need. */
+#define D2D_GAUSSIAN_BLUR_MAX_SIGMA 100.0f
+
+/* Only the 8 bits per channel formats an application is going to blur. The
+ * samples are treated as opaque bytes, so BGRA and RGBA differ merely in which
+ * channel is which and both work unchanged. */
+static unsigned int d2d_effect_bitmap_channels(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+        case DXGI_FORMAT_A8_UNORM:
+            return 1;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+/* D2D derives the kernel extent from the standard deviation. Three sigma covers
+ * 99.7% of the distribution and is also the amount by which the effect inflates
+ * its own output rectangle. */
+static unsigned int d2d_gaussian_blur_kernel_radius(float sigma)
+{
+    return ceilf(3.0f * sigma);
+}
+
+static float *d2d_gaussian_blur_build_kernel(float sigma, unsigned int radius)
+{
+    unsigned int i, size = 2 * radius + 1;
+    float *kernel, sum = 0.0f, denominator;
+
+    if (!(kernel = malloc(size * sizeof(*kernel))))
+        return NULL;
+
+    denominator = 2.0f * sigma * sigma;
+    for (i = 0; i < size; ++i)
+    {
+        float d = (float)i - (float)radius;
+
+        kernel[i] = expf(-(d * d) / denominator);
+        sum += kernel[i];
+    }
+    for (i = 0; i < size; ++i)
+        kernel[i] /= sum;
+
+    return kernel;
+}
+
+/* One pass of the separable convolution over interleaved 8 bit channels.
+ * Samples outside the input count as transparent black, so the blur fades out
+ * at the image border instead of smearing the edge pixels outward - the same
+ * convention the ConvolveMatrix path uses. Blurring the channels independently
+ * is what premultiplied alpha is for. */
+static void d2d_gaussian_blur_apply_pass(const BYTE *src, BYTE *dst, unsigned int width,
+        unsigned int height, unsigned int channels, const float *kernel, unsigned int radius,
+        BOOL horizontal)
+{
+    unsigned int x, y, c, i, limit = horizontal ? width : height;
+    int stride = (horizontal ? 1 : (int)width) * (int)channels;
+
+    for (y = 0; y < height; ++y)
+    {
+        for (x = 0; x < width; ++x)
+        {
+            const BYTE *centre = &src[(y * width + x) * channels];
+            BYTE *out = &dst[(y * width + x) * channels];
+            int pos = horizontal ? (int)x : (int)y;
+            float sum[4] = {0.0f};
+
+            for (i = 0; i <= 2 * radius; ++i)
+            {
+                int offset = (int)i - (int)radius;
+                const BYTE *sample;
+
+                if (pos + offset < 0 || pos + offset >= (int)limit)
+                    continue;
+
+                sample = centre + offset * stride;
+                for (c = 0; c < channels; ++c)
+                    sum[c] += sample[c] * kernel[i];
+            }
+
+            for (c = 0; c < channels; ++c)
+                out[c] = d2d_effect_clamp_byte(sum[c]);
+        }
+    }
+}
+
+static HRESULT d2d_device_context_draw_gaussian_blur(struct d2d_device_context *context, ID2D1Effect *effect,
+        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
+        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
+{
+    D2D1_GAUSSIANBLUR_OPTIMIZATION optimization = D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED;
+    D2D1_BORDER_MODE border_mode = D2D1_BORDER_MODE_SOFT;
+    struct d2d_bitmap *src_bitmap, *result_impl;
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    ID3D11Texture2D *staging = NULL;
+    unsigned int channels, radius;
+    ID2D1Bitmap *bitmap = NULL;
+    BYTE *buffers[2] = {NULL};
+    float sigma = 3.0f;
+    float *kernel = NULL;
+    D2D1_PIXEL_FORMAT format;
+    float dpi_x, dpi_y;
+    ID2D1Image *input;
+    D2D1_SIZE_U size;
+    size_t pitch;
+    HRESULT hr;
+    UINT32 y;
+
+    ID2D1Effect_GetValue(effect, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+            D2D1_PROPERTY_TYPE_FLOAT, (BYTE *)&sigma, sizeof(sigma));
+    ID2D1Effect_GetValue(effect, D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION,
+            D2D1_PROPERTY_TYPE_ENUM, (BYTE *)&optimization, sizeof(optimization));
+    ID2D1Effect_GetValue(effect, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+            D2D1_PROPERTY_TYPE_ENUM, (BYTE *)&border_mode, sizeof(border_mode));
+
+    ID2D1Effect_GetInput(effect, 0, &input);
+    if (!input)
+        return E_INVALIDARG;
+    hr = ID2D1Image_QueryInterface(input, &IID_ID2D1Bitmap, (void **)&bitmap);
+    if (FAILED(hr))
+        FIXME("Unhandled GaussianBlur input %p, only bitmaps are supported.\n", input);
+    ID2D1Image_Release(input);
+    if (FAILED(hr))
+        return E_NOTIMPL;
+
+    if (!(src_bitmap = unsafe_impl_from_ID2D1Bitmap(bitmap)))
+    {
+        ID2D1Bitmap_Release(bitmap);
+        return E_INVALIDARG;
+    }
+
+    size = src_bitmap->pixel_size;
+    format = src_bitmap->format;
+    dpi_x = src_bitmap->dpi_x;
+    dpi_y = src_bitmap->dpi_y;
+
+    if (!size.width || !size.height)
+    {
+        ID2D1Bitmap_Release(bitmap);
+        return E_INVALIDARG;
+    }
+
+    if (!(channels = d2d_effect_bitmap_channels(format.format)))
+    {
+        FIXME("Unhandled GaussianBlur bitmap format %#x.\n", format.format);
+        ID2D1Bitmap_Release(bitmap);
+        return E_NOTIMPL;
+    }
+
+    /* Three deliberate simplifications, reported once per process rather than
+     * per paint. The output rectangle is not inflated by the blur extent, so
+     * the halo D2D1_BORDER_MODE_SOFT would let spill past the input rectangle
+     * is cut off - which is what an application blurring an image in place
+     * expects, and what the ConvolveMatrix path already does. The optimization
+     * property only picks between approximations of the same curve, and the
+     * full kernel is always evaluated. Straight alpha would have to be
+     * premultiplied before the channels may be blurred separately. */
+    if (border_mode != D2D1_BORDER_MODE_HARD || optimization != D2D1_GAUSSIANBLUR_OPTIMIZATION_QUALITY
+            || (channels > 1 && format.alphaMode == D2D1_ALPHA_MODE_STRAIGHT))
+    {
+        static BOOL warned;
+
+        if (!warned)
+        {
+            warned = TRUE;
+            WARN("Approximating GaussianBlur: border mode %#x, optimization %#x, alpha mode %#x.\n",
+                    border_mode, optimization, format.alphaMode);
+        }
+    }
+
+    if (!(sigma > 0.0f))
+        sigma = 0.0f;
+    else if (sigma > D2D_GAUSSIAN_BLUR_MAX_SIGMA)
+        sigma = D2D_GAUSSIAN_BLUR_MAX_SIGMA;
+
+    /* A standard deviation of zero passes the input through unchanged. */
+    if (!(radius = d2d_gaussian_blur_kernel_radius(sigma)))
+    {
+        d2d_device_context_draw_effect_bitmap(context, bitmap, 1.0f, interpolation_mode,
+                image_rect, target_offset, composite_mode);
+        ID2D1Bitmap_Release(bitmap);
+        return S_OK;
+    }
+
+    if (FAILED(hr = d2d_effect_readback_bitmap(context, src_bitmap, &staging, &mapped)))
+    {
+        ID2D1Bitmap_Release(bitmap);
+        return hr;
+    }
+
+    pitch = (size_t)size.width * channels;
+    if (size.height > ~(size_t)0 / pitch)
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+
+    if (!(buffers[0] = malloc(pitch * size.height)) || !(buffers[1] = malloc(pitch * size.height))
+            || !(kernel = d2d_gaussian_blur_build_kernel(sigma, radius)))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+
+    for (y = 0; y < size.height; ++y)
+        memcpy(buffers[0] + y * pitch, (BYTE *)mapped.pData + y * mapped.RowPitch, pitch);
+
+    d2d_effect_unmap_bitmap(context, staging);
+    staging = NULL;
+
+    d2d_gaussian_blur_apply_pass(buffers[0], buffers[1], size.width, size.height,
+            channels, kernel, radius, TRUE);
+    d2d_gaussian_blur_apply_pass(buffers[1], buffers[0], size.width, size.height,
+            channels, kernel, radius, FALSE);
+
+    bitmap_desc.pixelFormat = format;
+    bitmap_desc.dpiX = dpi_x;
+    bitmap_desc.dpiY = dpi_y;
+    bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+    bitmap_desc.colorContext = NULL;
+
+    if (SUCCEEDED(hr = d2d_bitmap_create(context, size, buffers[0], (UINT32)pitch, &bitmap_desc, &result_impl)))
+    {
+        d2d_device_context_draw_effect_bitmap(context, (ID2D1Bitmap *)&result_impl->ID2D1Bitmap1_iface,
+                1.0f, interpolation_mode, image_rect, target_offset, composite_mode);
+        ID2D1Bitmap1_Release(&result_impl->ID2D1Bitmap1_iface);
+    }
+
+done:
+    if (staging)
+        d2d_effect_unmap_bitmap(context, staging);
+    ID2D1Bitmap_Release(bitmap);
+    free(kernel);
+    free(buffers[0]);
+    free(buffers[1]);
+
+    return hr;
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_DrawGlyphRun(ID2D1DeviceContext6 *iface,
@@ -5264,6 +5518,16 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
                             target_offset, image_rect, interpolation_mode, composite_mode)))
                     {
                         FIXME("Failed to draw ConvolveMatrix effect, hr %#lx.\n", hr);
+                    }
+                }
+                else if (IsEqualGUID(&clsid, &CLSID_D2D1GaussianBlur))
+                {
+                    HRESULT hr;
+
+                    if (FAILED(hr = d2d_device_context_draw_gaussian_blur(context, effect,
+                            target_offset, image_rect, interpolation_mode, composite_mode)))
+                    {
+                        FIXME("Failed to draw GaussianBlur effect, hr %#lx.\n", hr);
                     }
                 }
                 else if (IsEqualGUID(&clsid, &CLSID_D2D1ColorManagement))
