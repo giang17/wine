@@ -2346,6 +2346,7 @@ static const char *debugstr_wsaioctl(DWORD code)
         /* IOCTL_NAME(SIO_ACQUIRE_PORT_RESERVATION); */
         IOCTL_NAME(SIO_ADDRESS_LIST_CHANGE);
         IOCTL_NAME(SIO_ADDRESS_LIST_QUERY);
+        IOCTL_NAME(SIO_ADDRESS_LIST_SORT);
         IOCTL_NAME(SIO_ASSOCIATE_HANDLE);
         /* IOCTL_NAME(SIO_ASSOCIATE_PORT_RESERVATION);
         IOCTL_NAME(SIO_BASE_HANDLE);
@@ -2498,6 +2499,232 @@ static DWORD server_ioctl_sock( SOCKET s, DWORD code, LPVOID in_buff, DWORD in_s
 
     TRACE( "status %#lx.\n", status );
     return NtStatusToWSAError( status );
+}
+
+
+/* Destination address selection for SIO_ADDRESS_LIST_SORT, following RFC 6724
+ * section 6. The rules that need per-interface state (3: deprecated addresses,
+ * 4: home addresses, 7: native transport) are not applied. */
+
+enum sort_address_state
+{
+    SORT_ADDRESS_UNREACHABLE,   /* no route; the address is dropped from the list */
+    SORT_ADDRESS_UNKNOWN,       /* no source address could be determined */
+    SORT_ADDRESS_REACHABLE,
+};
+
+struct sort_address
+{
+    SOCKET_ADDRESS entry;       /* the caller's entry, moved as a whole */
+    unsigned int index;         /* original position, keeps the sort stable */
+    IN6_ADDR dst;               /* destination, IPv4 as an IPv4-mapped IPv6 address */
+    IN6_ADDR src;               /* source address the system would use for it */
+    enum sort_address_state state;
+    BOOL ipv4;
+    USHORT port;
+    ULONG scope_id;
+    unsigned int dst_scope, dst_precedence, dst_label;
+    unsigned int src_scope, src_label;
+    unsigned int common_prefix;
+};
+
+static BOOL prefix_matches( const IN6_ADDR *addr, const IN6_ADDR *prefix, unsigned int len )
+{
+    unsigned int bytes = len / 8, bits = len % 8;
+
+    if (memcmp( addr->s6_bytes, prefix->s6_bytes, bytes )) return FALSE;
+    if (!bits) return TRUE;
+    return !((addr->s6_bytes[bytes] ^ prefix->s6_bytes[bytes]) & (0xff << (8 - bits)));
+}
+
+/* RFC 6724 section 2.2: only the network part counts, not the interface identifier */
+static unsigned int common_prefix_len( const IN6_ADDR *a, const IN6_ADDR *b )
+{
+    unsigned int i, len = 0;
+
+    for (i = 0; i < 8; i++)
+    {
+        unsigned char diff = a->s6_bytes[i] ^ b->s6_bytes[i];
+
+        if (!diff)
+        {
+            len += 8;
+            continue;
+        }
+        while (!(diff & 0x80))
+        {
+            diff <<= 1;
+            len++;
+        }
+        break;
+    }
+    return len;
+}
+
+/* RFC 6724 section 3 */
+static unsigned int address_scope( const IN6_ADDR *addr )
+{
+    if (IN6_IS_ADDR_MULTICAST( addr )) return addr->s6_bytes[1] & 0xf;
+    if (IN6_IS_ADDR_LOOPBACK( addr ) || IN6_IS_ADDR_LINKLOCAL( addr )) return 0x2;
+    if (IN6_IS_ADDR_SITELOCAL( addr )) return 0x5;
+    if (IN6_IS_ADDR_V4MAPPED( addr ))
+    {
+        /* only the IPv4 loopback and link-local blocks are not global (section 3.2) */
+        if (addr->s6_bytes[12] == 127 || (addr->s6_bytes[12] == 169 && addr->s6_bytes[13] == 254)) return 0x2;
+    }
+    return 0xe;
+}
+
+/* RFC 6724 section 2.1; the same as the default prefix policy table on Windows */
+static void address_policy( const IN6_ADDR *addr, unsigned int *precedence, unsigned int *label )
+{
+    static const struct
+    {
+        IN6_ADDR prefix;
+        unsigned int len, precedence, label;
+    }
+    policy[] =
+    {
+        { {{{ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 }}}, 128, 50,  0 },  /* ::1/128 */
+        { {{{ 0 }}},                                 0, 40,  1 },  /* ::/0 */
+        { {{{ 0,0,0,0,0,0,0,0,0,0,0xff,0xff }}},    96, 35,  4 },  /* ::ffff:0:0/96 */
+        { {{{ 0x20,0x02 }}},                        16, 30,  2 },  /* 2002::/16 */
+        { {{{ 0x20,0x01 }}},                        32,  5,  5 },  /* 2001::/32 */
+        { {{{ 0xfc }}},                              7,  3, 13 },  /* fc00::/7 */
+        { {{{ 0 }}},                                96,  1,  3 },  /* ::/96 */
+        { {{{ 0xfe,0xc0 }}},                        10,  1, 11 },  /* fec0::/10 */
+        { {{{ 0x3f,0xfe }}},                        16,  1, 12 },  /* 3ffe::/16 */
+    };
+    unsigned int i, best = 1; /* ::/0 always matches */
+
+    for (i = 0; i < ARRAY_SIZE(policy); i++)
+    {
+        if (policy[i].len > policy[best].len && prefix_matches( addr, &policy[i].prefix, policy[i].len ))
+            best = i;
+    }
+    *precedence = policy[best].precedence;
+    *label = policy[best].label;
+}
+
+static BOOL init_sort_address( struct sort_address *addr, const SOCKET_ADDRESS *entry, unsigned int index )
+{
+    const struct sockaddr *sa = entry->lpSockaddr;
+
+    memset( addr, 0, sizeof(*addr) );
+    addr->entry = *entry;
+    addr->index = index;
+    if (!sa) return FALSE;
+
+    if (sa->sa_family == AF_INET6 && entry->iSockaddrLength >= sizeof(struct sockaddr_in6))
+    {
+        const struct sockaddr_in6 *sa6 = (const struct sockaddr_in6 *)sa;
+
+        addr->dst = sa6->sin6_addr;
+        addr->port = sa6->sin6_port;
+        addr->scope_id = sa6->sin6_scope_id;
+        addr->ipv4 = IN6_IS_ADDR_V4MAPPED( &addr->dst );
+    }
+    else if (sa->sa_family == AF_INET && entry->iSockaddrLength >= sizeof(struct sockaddr_in))
+    {
+        const struct sockaddr_in *sa4 = (const struct sockaddr_in *)sa;
+
+        addr->dst.s6_bytes[10] = addr->dst.s6_bytes[11] = 0xff;
+        memcpy( addr->dst.s6_bytes + 12, &sa4->sin_addr, sizeof(sa4->sin_addr) );
+        addr->port = sa4->sin_port;
+        addr->ipv4 = TRUE;
+    }
+    else return FALSE;
+
+    addr->dst_scope = address_scope( &addr->dst );
+    address_policy( &addr->dst, &addr->dst_precedence, &addr->dst_label );
+    return TRUE;
+}
+
+/* Connecting a datagram socket to the destination makes the system pick the
+ * source address it would use, without sending anything. */
+static void find_source_address( struct sort_address *addr )
+{
+    struct sockaddr_in6 sa6 = { .sin6_family = AF_INET6 };
+    struct sockaddr_in sa4 = { .sin_family = AF_INET };
+    struct sockaddr *sa;
+    int len, family;
+    unsigned int precedence;
+    SOCKET sock;
+    DWORD err;
+
+    if (addr->ipv4)
+    {
+        family = AF_INET;
+        sa4.sin_port = addr->port ? addr->port : htons( 9 );
+        memcpy( &sa4.sin_addr, addr->dst.s6_bytes + 12, sizeof(sa4.sin_addr) );
+        sa = (struct sockaddr *)&sa4;
+        len = sizeof(sa4);
+    }
+    else
+    {
+        family = AF_INET6;
+        sa6.sin6_port = addr->port ? addr->port : htons( 9 );
+        sa6.sin6_addr = addr->dst;
+        sa6.sin6_scope_id = addr->scope_id;
+        sa = (struct sockaddr *)&sa6;
+        len = sizeof(sa6);
+    }
+
+    addr->state = SORT_ADDRESS_UNKNOWN;
+    if ((sock = socket( family, SOCK_DGRAM, IPPROTO_UDP )) == INVALID_SOCKET) return;
+
+    if (connect( sock, sa, len ))
+    {
+        err = GetLastError();
+        if (err == WSAENETUNREACH || err == WSAEHOSTUNREACH || err == WSAEADDRNOTAVAIL)
+            addr->state = SORT_ADDRESS_UNREACHABLE;
+        TRACE( "%s is not reachable, error %lu\n", debugstr_sockaddr( addr->entry.lpSockaddr ), err );
+    }
+    else if (!getsockname( sock, sa, &len ))
+    {
+        if (addr->ipv4)
+        {
+            addr->src.s6_bytes[10] = addr->src.s6_bytes[11] = 0xff;
+            memcpy( addr->src.s6_bytes + 12, &sa4.sin_addr, sizeof(sa4.sin_addr) );
+        }
+        else addr->src = sa6.sin6_addr;
+
+        addr->state = SORT_ADDRESS_REACHABLE;
+        addr->src_scope = address_scope( &addr->src );
+        address_policy( &addr->src, &precedence, &addr->src_label );
+        addr->common_prefix = common_prefix_len( &addr->src, &addr->dst );
+        TRACE( "%s via %s\n", debugstr_sockaddr( addr->entry.lpSockaddr ), debugstr_sockaddr( sa ) );
+    }
+    closesocket( sock );
+}
+
+static int __cdecl compare_sort_address( const void *p1, const void *p2 )
+{
+    const struct sort_address *a = p1, *b = p2;
+    BOOL a_match, b_match;
+
+    /* Rule 1: avoid unusable destinations */
+    if (a->state != b->state) return a->state > b->state ? -1 : 1;
+    if (a->state == SORT_ADDRESS_REACHABLE)
+    {
+        /* Rule 2: prefer matching scope */
+        a_match = a->dst_scope == a->src_scope;
+        b_match = b->dst_scope == b->src_scope;
+        if (a_match != b_match) return a_match ? -1 : 1;
+        /* Rule 5: prefer matching label */
+        a_match = a->dst_label == a->src_label;
+        b_match = b->dst_label == b->src_label;
+        if (a_match != b_match) return a_match ? -1 : 1;
+    }
+    /* Rule 6: prefer higher precedence */
+    if (a->dst_precedence != b->dst_precedence) return a->dst_precedence > b->dst_precedence ? -1 : 1;
+    /* Rule 8: prefer smaller scope */
+    if (a->dst_scope != b->dst_scope) return a->dst_scope < b->dst_scope ? -1 : 1;
+    /* Rule 9: use longest matching prefix, IPv6 only */
+    if (a->state == SORT_ADDRESS_REACHABLE && !a->ipv4 && !b->ipv4 && a->common_prefix != b->common_prefix)
+        return a->common_prefix > b->common_prefix ? -1 : 1;
+    /* Rule 10: otherwise leave the order unchanged */
+    return a->index < b->index ? -1 : 1;
 }
 
 
@@ -2687,6 +2914,62 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
             SetLastError( WSAEINVAL );
             return -1;
         }
+    }
+
+    case SIO_ADDRESS_LIST_SORT:
+    {
+        const SOCKET_ADDRESS_LIST *in_list = in_buff;
+        SOCKET_ADDRESS_LIST *out_list = out_buff;
+        NTSTATUS status = STATUS_SUCCESS;
+        struct sort_address *addrs;
+        unsigned int i, count, kept;
+        DWORD ret;
+
+        if (!in_buff || in_size < FIELD_OFFSET(SOCKET_ADDRESS_LIST, Address[0]) || in_list->iAddressCount < 0 ||
+            in_list->iAddressCount > (in_size - FIELD_OFFSET(SOCKET_ADDRESS_LIST, Address[0])) / sizeof(SOCKET_ADDRESS))
+        {
+            SetLastError( WSAEINVAL );
+            return -1;
+        }
+        count = in_list->iAddressCount;
+        TRACE( "-> SIO_ADDRESS_LIST_SORT request, %u addresses\n", count );
+
+        if (!out_buff || out_size < FIELD_OFFSET(SOCKET_ADDRESS_LIST, Address[count]))
+        {
+            SetLastError( WSAEFAULT );
+            return -1;
+        }
+        if (!(addrs = calloc( count ? count : 1, sizeof(*addrs) )))
+        {
+            SetLastError( WSAENOBUFS );
+            return -1;
+        }
+        for (i = 0; i < count; i++)
+        {
+            if (!init_sort_address( &addrs[i], &in_list->Address[i], i ))
+            {
+                free( addrs );
+                SetLastError( WSAEINVAL );
+                return -1;
+            }
+        }
+        for (i = 0; i < count; i++) find_source_address( &addrs[i] );
+        qsort( addrs, count, sizeof(*addrs), compare_sort_address );
+
+        /* The entries were copied above, so the output may be the input buffer. */
+        for (i = 0, kept = 0; i < count; i++)
+        {
+            if (addrs[i].state == SORT_ADDRESS_UNREACHABLE) continue;
+            out_list->Address[kept++] = addrs[i].entry;
+        }
+        out_list->iAddressCount = kept;
+        free( addrs );
+
+        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_COMPLETE_ASYNC, &status, sizeof(status),
+                                 NULL, 0, ret_size, overlapped, completion );
+        if (!ret) *ret_size = FIELD_OFFSET(SOCKET_ADDRESS_LIST, Address[kept]);
+        SetLastError( ret );
+        return ret ? -1 : 0;
     }
 
     case SIO_GET_EXTENSION_FUNCTION_POINTER:
