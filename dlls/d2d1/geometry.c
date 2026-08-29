@@ -4668,9 +4668,11 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetBounds(ID2D1PathGeometry1 
     for (i = 0; i < geometry->u.path.figure_count; ++i)
     {
         const struct d2d_figure *figure = &geometry->u.path.figures[i];
+        struct d2d_quadratic_bezier quadratics[D2D_BEZIER_MAX_QUADRATICS];
         enum d2d_vertex_type type = D2D_VERTEX_TYPE_NONE;
+        unsigned int k, quadratic_count;
         D2D1_RECT_F bezier_bounds;
-        D2D1_POINT_2F p, p1, p2;
+        D2D1_POINT_2F p, cubic[4];
         size_t j, bezier_idx;
 
         if (figure->flags & D2D_FIGURE_FLAG_HOLLOW)
@@ -4705,22 +4707,26 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetBounds(ID2D1PathGeometry1 
                     break;
 
                 case D2D_VERTEX_TYPE_BEZIER:
-                    /* FIXME: This attempts to approximate a cubic Bézier with
-                     * a quadratic one. */
-                    p1 = figure->original_bezier_controls[bezier_idx++];
-                    d2d_point_transform(&p1, transform, p1.x, p1.y);
-                    p2 = figure->original_bezier_controls[bezier_idx++];
-                    d2d_point_transform(&p2, transform, p2.x, p2.y);
-                    p1.x = (p1.x + p2.x) * 0.75f;
-                    p1.y = (p1.y + p2.y) * 0.75f;
-                    p2 = figure->vertices[j];
-                    d2d_point_transform(&p2, transform, p2.x, p2.y);
-                    p1.x -= (p.x + p2.x) * 0.25f;
-                    p1.y -= (p.y + p2.y) * 0.25f;
+                    cubic[0] = p;
+                    cubic[1] = figure->original_bezier_controls[bezier_idx++];
+                    d2d_point_transform(&cubic[1], transform, cubic[1].x, cubic[1].y);
+                    cubic[2] = figure->original_bezier_controls[bezier_idx++];
+                    d2d_point_transform(&cubic[2], transform, cubic[2].x, cubic[2].y);
+                    cubic[3] = figure->vertices[j];
+                    d2d_point_transform(&cubic[3], transform, cubic[3].x, cubic[3].y);
 
-                    d2d_rect_get_bezier_bounds(&bezier_bounds, &p, &p1, &p2);
-                    d2d_rect_union(bounds, &bezier_bounds);
-                    p = p2;
+                    /* Bound the same chain of quadratics the figure itself is
+                     * built from. A single reduced quadratic cannot follow the
+                     * cubic through an inflection, so the rectangle it reports
+                     * can leave part of the curve outside. */
+                    quadratic_count = d2d_cubic_bezier_to_quadratics(cubic, quadratics);
+                    for (k = 0; k < quadratic_count; ++k)
+                    {
+                        d2d_rect_get_bezier_bounds(&bezier_bounds, &quadratics[k].p0,
+                                &quadratics[k].control, &quadratics[k].p2);
+                        d2d_rect_union(bounds, &bezier_bounds);
+                    }
+                    p = cubic[3];
                     break;
 
                 default:
