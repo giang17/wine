@@ -193,7 +193,8 @@ struct d2d_brush_cb
         } radial;
         struct
         {
-            float _11, _21, _31, pad;
+            float _11, _21, _31;
+            unsigned int extend_modes; /* D2D1_EXTEND_MODE x in bits 0-7, y in bits 8-15 */
             float _12, _22, _32;
             BOOL ignore_alpha;
             float source_left, source_top, source_right, source_bottom;
