@@ -1077,11 +1077,109 @@ static BOOL d2d_figure_add_original_bezier_controls(struct d2d_figure *figure, s
     return TRUE;
 }
 
+/* Reducing a cubic Bézier to the quadratic that shares its end points places the
+ * quadratic control at (3 * (p1 + p2) - (p0 + p3)) / 4. The deviation that leaves
+ * is exactly |p3 - 3 * p2 + 3 * p1 - p0| / (12 * sqrt(3)) - the third difference of
+ * the control points times a constant - and it is signed, so a quadratic cannot
+ * follow a cubic through an inflection at all: an S shaped curve reduces to an arc.
+ *
+ * Subdividing the cubic first and reducing each piece separately fixes both, because
+ * de Casteljau subdivision into n pieces scales the third difference by 1 / n^3.
+ * That cube root is what keeps the piece count small even for very large curves. */
+#define D2D_BEZIER_REDUCTION_DEVIATION 0.0481125f
+/* The quadratics are rendered as curves and the world transform is applied after
+ * this, so the error budget here has to be tighter than a flattening tolerance
+ * would be; a tenth of it costs only cbrt(10) times as many pieces. */
+#define D2D_BEZIER_REDUCTION_TOLERANCE D2D1_DEFAULT_FLATTENING_TOLERANCE
+/* Bounds the pathological cases; a curve big enough to need this is already far
+ * outside anything the rest of the pipeline handles gracefully. */
+#define D2D_BEZIER_MAX_QUADRATICS 32
+
+static void d2d_cubic_bezier_reduce(D2D1_POINT_2F *control, const D2D1_POINT_2F *p)
+{
+    control->x = (p[1].x + p[2].x) * 0.75f - (p[0].x + p[3].x) * 0.25f;
+    control->y = (p[1].y + p[2].y) * 0.75f - (p[0].y + p[3].y) * 0.25f;
+}
+
+/* Split a cubic Bézier at t into the piece before t and the piece after it. Either
+ * output may alias the input, which is what lets a caller peel pieces off the front
+ * of a curve in place. */
+static void d2d_cubic_bezier_split(D2D1_POINT_2F *before, D2D1_POINT_2F *after,
+        const D2D1_POINT_2F *p, float t)
+{
+    D2D1_POINT_2F p0 = p[0], p3 = p[3], a, b, c, d, e, f;
+
+    d2d_point_lerp(&a, &p[0], &p[1], t);
+    d2d_point_lerp(&b, &p[1], &p[2], t);
+    d2d_point_lerp(&c, &p[2], &p[3], t);
+    d2d_point_lerp(&d, &a, &b, t);
+    d2d_point_lerp(&e, &b, &c, t);
+    d2d_point_lerp(&f, &d, &e, t);
+
+    before[0] = p0; before[1] = a; before[2] = d; before[3] = f;
+    after[0] = f; after[1] = e; after[2] = c; after[3] = p3;
+}
+
+static unsigned int d2d_cubic_bezier_quadratic_count(const D2D1_POINT_2F *p)
+{
+    float deviation, count;
+    D2D1_POINT_2F e;
+
+    e.x = p[3].x - 3.0f * p[2].x + 3.0f * p[1].x - p[0].x;
+    e.y = p[3].y - 3.0f * p[2].y + 3.0f * p[1].y - p[0].y;
+    deviation = sqrtf(e.x * e.x + e.y * e.y) * D2D_BEZIER_REDUCTION_DEVIATION;
+
+    /* Negated so that a deviation that is not a number ends up with one piece. */
+    if (!(deviation > D2D_BEZIER_REDUCTION_TOLERANCE))
+        return 1;
+
+    count = ceilf(powf(deviation / D2D_BEZIER_REDUCTION_TOLERANCE, 1.0f / 3.0f));
+    if (count >= (float)D2D_BEZIER_MAX_QUADRATICS)
+        return D2D_BEZIER_MAX_QUADRATICS;
+
+    return count;
+}
+
+struct d2d_quadratic_bezier
+{
+    D2D1_POINT_2F p0, control, p2;
+};
+
+/* Express a cubic Bézier as a chain of quadratics, subdividing it as far as the
+ * tolerance requires. Returns the number written; the caller provides room for
+ * D2D_BEZIER_MAX_QUADRATICS of them. */
+static unsigned int d2d_cubic_bezier_to_quadratics(const D2D1_POINT_2F *p,
+        struct d2d_quadratic_bezier *quadratics)
+{
+    D2D1_POINT_2F cubic[4], piece[4];
+    unsigned int count, i;
+
+    memcpy(cubic, p, sizeof(cubic));
+    count = d2d_cubic_bezier_quadratic_count(cubic);
+
+    for (i = 0; i < count; ++i)
+    {
+        /* Peel the next piece off the front of what is left of the curve. The
+         * last piece is the remainder, so its end point stays bit exact. */
+        if (i + 1 < count)
+            d2d_cubic_bezier_split(piece, cubic, cubic, 1.0f / (float)(count - i));
+        else
+            memcpy(piece, cubic, sizeof(piece));
+
+        quadratics[i].p0 = piece[0];
+        d2d_cubic_bezier_reduce(&quadratics[i].control, piece);
+        quadratics[i].p2 = piece[3];
+    }
+
+    return count;
+}
+
 static bool d2d_figure_add_beziers(struct d2d_figure *figure, const D2D1_BEZIER_SEGMENT *beziers,
         UINT32 count)
 {
-    D2D1_POINT_2F p;
-    unsigned int i;
+    struct d2d_quadratic_bezier quadratics[D2D_BEZIER_MAX_QUADRATICS];
+    unsigned int i, j, quadratic_count;
+    D2D1_POINT_2F cubic[4];
 
     for (i = 0; i < count; ++i)
     {
@@ -1093,23 +1191,33 @@ static bool d2d_figure_add_beziers(struct d2d_figure *figure, const D2D1_BEZIER_
             return false;
         }
 
-        /* FIXME: This tries to approximate a cubic Bézier with a quadratic one. */
-        p.x = (beziers[i].point1.x + beziers[i].point2.x) * 0.75f;
-        p.y = (beziers[i].point1.y + beziers[i].point2.y) * 0.75f;
-        p.x -= (figure->vertices[figure->vertex_count - 1].x + beziers[i].point3.x) * 0.25f;
-        p.y -= (figure->vertices[figure->vertex_count - 1].y + beziers[i].point3.y) * 0.25f;
-        figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_BEZIER;
+        cubic[0] = figure->vertices[figure->vertex_count - 1];
+        cubic[1] = beziers[i].point1;
+        cubic[2] = beziers[i].point2;
+        cubic[3] = beziers[i].point3;
+        quadratic_count = d2d_cubic_bezier_to_quadratics(cubic, quadratics);
 
-        d2d_rect_get_bezier_bounds(&bezier_bounds, &figure->vertices[figure->vertex_count - 1],
-                &p, &beziers[i].point3);
+        for (j = 0; j < quadratic_count; ++j)
+        {
+            /* Only the first piece opens the segment the application added. The
+             * others are marked as splits, which is the same thing the tessellator
+             * does when it subdivides a quadratic - Simplify(), Widen(), the dash
+             * and outline code all skip those and keep seeing one cubic per
+             * segment, with its original control points. */
+            figure->vertex_types[figure->vertex_count - 1] = j ? D2D_VERTEX_TYPE_SPLIT_BEZIER
+                    : D2D_VERTEX_TYPE_BEZIER;
 
-        if (!d2d_figure_add_bezier_controls(figure, 1, &p))
-            return false;
+            d2d_rect_get_bezier_bounds(&bezier_bounds, &quadratics[j].p0,
+                    &quadratics[j].control, &quadratics[j].p2);
 
-        if (!d2d_figure_add_vertex(figure, beziers[i].point3))
-            return false;
+            if (!d2d_figure_add_bezier_controls(figure, 1, &quadratics[j].control))
+                return false;
 
-        d2d_rect_union(&figure->bounds, &bezier_bounds);
+            if (!d2d_figure_add_vertex(figure, quadratics[j].p2))
+                return false;
+
+            d2d_rect_union(&figure->bounds, &bezier_bounds);
+        }
     }
 
     return true;
