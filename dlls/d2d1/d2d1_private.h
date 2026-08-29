@@ -275,6 +275,40 @@ struct d2d_scratch_buffer
     unsigned int size;
 };
 
+/* Batched DrawLine(). Consecutive lines drawn with a solid brush, no stroke
+ * style and the same transform and stroke width are collected here and drawn
+ * with a single buffer upload; a colour change only opens a new run (an
+ * index range with its own pixel shader constants), not a new draw setup.
+ * Anything else that draws or changes the state the outline shaders read has
+ * to flush the batch first, see d2d_device_context_flush_lines(). */
+struct d2d_outline_vertex;
+struct d2d_face;
+
+struct d2d_line_run
+{
+    D2D1_COLOR_F colour;
+    float opacity;
+    unsigned int face_start;
+    unsigned int face_count;
+};
+
+struct d2d_line_batch
+{
+    struct d2d_outline_vertex *vertices;
+    size_t vertices_size;
+    size_t vertex_count;
+    struct d2d_face *faces;
+    size_t faces_size;
+    size_t face_count;
+    struct d2d_line_run *runs;
+    size_t runs_size;
+    size_t run_count;
+    D2D1_MATRIX_3X2_F transform;
+    float stroke_width;
+    float miter_limit;
+    BOOL flushing;
+};
+
 struct d2d_device_context
 {
     ID2D1DeviceContext6 ID2D1DeviceContext6_iface;
@@ -344,6 +378,7 @@ struct d2d_device_context
     float text_dst_scale_y, text_dst_offset_y;
     struct d2d_scratch_buffer scratch_vb[D2D_SHAPE_TYPE_COUNT];
     struct d2d_scratch_buffer scratch_ib[D2D_SHAPE_TYPE_COUNT];
+    struct d2d_line_batch line_batch;
     /* Session 6 (C1): persistent scratch rectangle geometry for FillRectangle.
      * Eliminates per-call calloc(struct d2d_geometry) + Release churn (~1.5M
      * allocs/min in Serum2 GUI workload). Reused across FillRectangle calls;
