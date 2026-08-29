@@ -3998,9 +3998,21 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
      * precisely the case move_window_bits BitBlts, and therefore the one this
      * invalidation was written for (issue 260: dragging SynthEdit's MDI canvas by
      * its title bar leaves the MDI client stale until something else repaints it).
-     * Only "nothing changed at all" stays exempt. */
+     * Only "nothing changed at all" stays exempt.
+     *
+     * That plain-move case is a child's, though: only a child window has its bits
+     * inside an ancestor's surface for move_window_bits to BitBlt.  A top-level
+     * window that moves without resizing has its own X window, which carries its
+     * pixels along - there is nothing to repaint, but the erase this invalidation
+     * queues paints the MDI client over its children once per motion event, and a
+     * window-manager drag delivers one such SetWindowPos per motion event (issue
+     * 281: SynthEdit's canvas captions flicker while the main window is dragged;
+     * 40 moves -> 40 invalidations -> 8 frames showing the 0x404040 erase).  So a
+     * plain move invalidates child windows only. */
     if (!(winpos->flags & (SWP_NOREDRAW | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) &&
-        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE)
+        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE &&
+        ((winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOGEOMETRYCHANGE ||
+         (get_window_long( winpos->hwnd, GWL_STYLE ) & WS_CHILD)))
     {
         TRACE( "hwnd %p: post-move invalidation (flags %08x)\n", winpos->hwnd, (int)winpos->flags );
         NtUserRedrawWindow( winpos->hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
