@@ -6002,6 +6002,25 @@ void __thiscall basic_ios_char_swap(basic_ios_char *this, basic_ios_char *r)
     this->fillch ^= r->fillch;
 }
 
+#if _MSVCP_VER >= 110
+/* ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEX$$QAV12@@Z */
+/* ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEXAAV12@@Z */
+/* ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAX$$QEAV12@@Z */
+/* ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAXAEAV12@@Z */
+DEFINE_THISCALL_WRAPPER(basic_ios_char_move, 8)
+void __thiscall basic_ios_char_move(basic_ios_char *this, basic_ios_char *r)
+{
+    TRACE("(%p %p)\n", this, r);
+
+    if(this == r)
+        return;
+
+    this->strbuf = NULL;
+    this->stream = NULL;
+    basic_ios_char_swap(this, r);
+}
+#endif
+
 /* ??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@IAE@XZ */
 /* ??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@IEAA@XZ */
 DEFINE_THISCALL_WRAPPER(basic_ios_wchar_ctor, 4)
@@ -6298,6 +6317,29 @@ void __thiscall basic_ios_wchar_swap(basic_ios_wchar *this, basic_ios_wchar *r)
     r->fillch ^= this->fillch;
     this->fillch ^= r->fillch;
 }
+
+#if _MSVCP_VER >= 110
+/* ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEX$$QAV12@@Z */
+/* ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEXAAV12@@Z */
+/* ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QEAAX$$QEAV12@@Z */
+/* ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QEAAXAEAV12@@Z */
+/* ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAEX$$QAV12@@Z */
+/* ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAEXAAV12@@Z */
+/* ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAX$$QEAV12@@Z */
+/* ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAXAEAV12@@Z */
+DEFINE_THISCALL_WRAPPER(basic_ios_wchar_move, 8)
+void __thiscall basic_ios_wchar_move(basic_ios_wchar *this, basic_ios_wchar *r)
+{
+    TRACE("(%p %p)\n", this, r);
+
+    if(this == r)
+        return;
+
+    this->strbuf = NULL;
+    this->stream = NULL;
+    basic_ios_wchar_swap(this, r);
+}
+#endif
 
 /* Caution: basic_ostream uses virtual inheritance.
  * All constructors have additional parameter that says if base class should be initialized.
@@ -7129,6 +7171,44 @@ void __thiscall basic_ostream_char_swap(basic_ostream_char *this, basic_ostream_
     basic_ios_char_swap(basic_ostream_char_get_basic_ios(this),
             basic_ostream_char_get_basic_ios(r));
 }
+
+#if _MSVCP_VER >= 110
+/* ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_ostream_char_move_ctor, 12)
+basic_ostream_char* __thiscall basic_ostream_char_move_ctor(basic_ostream_char *this,
+        basic_ostream_char *r, bool virt_init)
+{
+    basic_ios_char *base;
+
+    TRACE("(%p %p %d)\n", this, r, virt_init);
+
+    if(virt_init) {
+        this->vbtable = basic_ostream_char_vbtable;
+        base = basic_ostream_char_get_basic_ios(this);
+        INIT_BASIC_IOS_VTORDISP(base);
+        basic_ios_char_ctor(base);
+    }else {
+        base = basic_ostream_char_get_basic_ios(this);
+    }
+
+    base->base.vtable = &basic_ostream_char_vtable;
+    basic_ios_char_init(base, NULL, FALSE);
+    basic_ios_char_move(base, basic_ostream_char_get_basic_ios(r));
+    return this;
+}
+
+/* ??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_ostream_char_op_assign, 8)
+basic_ostream_char* __thiscall basic_ostream_char_op_assign(basic_ostream_char *this, basic_ostream_char *r)
+{
+    TRACE("(%p %p)\n", this, r);
+
+    basic_ostream_char_swap(this, r);
+    return this;
+}
+#endif
 
 /* Caution: basic_ostream uses virtual inheritance. */
 static inline basic_ios_wchar* basic_ostream_wchar_get_basic_ios(basic_ostream_wchar *this)
@@ -8181,6 +8261,57 @@ void __thiscall basic_ostream_wchar_swap(basic_ostream_wchar *this, basic_ostrea
     basic_ios_wchar_swap(basic_ostream_wchar_get_basic_ios(this),
             basic_ostream_wchar_get_basic_ios(r));
 }
+
+#if _MSVCP_VER >= 110
+/* ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_ostream_wchar_move_ctor, 12)
+basic_ostream_wchar* __thiscall basic_ostream_wchar_move_ctor(basic_ostream_wchar *this,
+        basic_ostream_wchar *r, bool virt_init)
+{
+    basic_ios_wchar *base;
+
+    TRACE("(%p %p %d)\n", this, r, virt_init);
+
+    if(virt_init) {
+        this->vbtable = basic_ostream_wchar_vbtable;
+        base = basic_ostream_wchar_get_basic_ios(this);
+        INIT_BASIC_IOS_VTORDISP(base);
+        basic_ios_wchar_ctor(base);
+    }else {
+        base = basic_ostream_wchar_get_basic_ios(this);
+    }
+
+    base->base.vtable = &basic_ostream_wchar_vtable;
+    basic_ios_wchar_init(base, NULL, FALSE);
+    basic_ios_wchar_move(base, basic_ostream_wchar_get_basic_ios(r));
+    return this;
+}
+
+/* ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_ostream_short_move_ctor, 12)
+basic_ostream_wchar* __thiscall basic_ostream_short_move_ctor(basic_ostream_wchar *this,
+        basic_ostream_wchar *r, bool virt_init)
+{
+    basic_ostream_wchar_move_ctor(this, r, virt_init);
+    basic_ostream_wchar_get_basic_ios(this)->base.vtable = &basic_ostream_short_vtable;
+    return this;
+}
+
+/* ??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+/* ??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_ostream_wchar_op_assign, 8)
+basic_ostream_wchar* __thiscall basic_ostream_wchar_op_assign(basic_ostream_wchar *this, basic_ostream_wchar *r)
+{
+    TRACE("(%p %p)\n", this, r);
+
+    basic_ostream_wchar_swap(this, r);
+    return this;
+}
+#endif
 
 /* Caution: basic_istream uses virtual inheritance. */
 static inline basic_ios_char* basic_istream_char_get_basic_ios(basic_istream_char *this)
@@ -9668,6 +9799,46 @@ void __thiscall basic_istream_char_swap(basic_istream_char *this, basic_istream_
     r->count ^= this->count;
     this->count ^= r->count;
 }
+
+#if _MSVCP_VER >= 110
+/* ??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_istream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_istream_char_move_ctor, 12)
+basic_istream_char* __thiscall basic_istream_char_move_ctor(basic_istream_char *this,
+        basic_istream_char *r, bool virt_init)
+{
+    basic_ios_char *base;
+
+    TRACE("(%p %p %d)\n", this, r, virt_init);
+
+    if(virt_init) {
+        this->vbtable = basic_istream_char_vbtable;
+        base = basic_istream_char_get_basic_ios(this);
+        INIT_BASIC_IOS_VTORDISP(base);
+        basic_ios_char_ctor(base);
+    }else {
+        base = basic_istream_char_get_basic_ios(this);
+    }
+
+    base->base.vtable = &basic_istream_char_vtable;
+    this->count = r->count;
+    basic_ios_char_init(base, NULL, FALSE);
+    basic_ios_char_move(base, basic_istream_char_get_basic_ios(r));
+    r->count = 0;
+    return this;
+}
+
+/* ??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_istream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_istream_char_op_assign, 8)
+basic_istream_char* __thiscall basic_istream_char_op_assign(basic_istream_char *this, basic_istream_char *r)
+{
+    TRACE("(%p %p)\n", this, r);
+
+    basic_istream_char_swap(this, r);
+    return this;
+}
+#endif
 
 /* Caution: basic_istream uses virtual inheritance. */
 static inline basic_ios_wchar* basic_istream_wchar_get_basic_ios(basic_istream_wchar *this)
@@ -11268,6 +11439,59 @@ void __thiscall basic_istream_wchar_swap(basic_istream_wchar *this, basic_istrea
     this->count ^= r->count;
 }
 
+#if _MSVCP_VER >= 110
+/* ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_istream_wchar_move_ctor, 12)
+basic_istream_wchar* __thiscall basic_istream_wchar_move_ctor(basic_istream_wchar *this,
+        basic_istream_wchar *r, bool virt_init)
+{
+    basic_ios_wchar *base;
+
+    TRACE("(%p %p %d)\n", this, r, virt_init);
+
+    if(virt_init) {
+        this->vbtable = basic_istream_wchar_vbtable;
+        base = basic_istream_wchar_get_basic_ios(this);
+        INIT_BASIC_IOS_VTORDISP(base);
+        basic_ios_wchar_ctor(base);
+    }else {
+        base = basic_istream_wchar_get_basic_ios(this);
+    }
+
+    base->base.vtable = &basic_istream_wchar_vtable;
+    this->count = r->count;
+    basic_ios_wchar_init(base, NULL, FALSE);
+    basic_ios_wchar_move(base, basic_istream_wchar_get_basic_ios(r));
+    r->count = 0;
+    return this;
+}
+
+/* ??0?$basic_istream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_istream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_istream_short_move_ctor, 12)
+basic_istream_wchar* __thiscall basic_istream_short_move_ctor(basic_istream_wchar *this,
+        basic_istream_wchar *r, bool virt_init)
+{
+    basic_istream_wchar_move_ctor(this, r, virt_init);
+    basic_istream_wchar_get_basic_ios(this)->base.vtable = &basic_istream_short_vtable;
+    return this;
+}
+
+/* ??4?$basic_istream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_istream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+/* ??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_istream_wchar_op_assign, 8)
+basic_istream_wchar* __thiscall basic_istream_wchar_op_assign(basic_istream_wchar *this, basic_istream_wchar *r)
+{
+    TRACE("(%p %p)\n", this, r);
+
+    basic_istream_wchar_swap(this, r);
+    return this;
+}
+#endif
+
 static inline basic_ios_char* basic_iostream_char_to_basic_ios(basic_iostream_char *ptr)
 {
     return (basic_ios_char*)((char*)ptr+basic_iostream_char_vbtable1[1]);
@@ -11364,6 +11588,47 @@ void __thiscall basic_iostream_char_swap(basic_iostream_char *this, basic_iostre
     basic_ios_char_swap(basic_istream_char_get_basic_ios(&this->base1),
             basic_istream_char_get_basic_ios(&r->base1));
 }
+
+#if _MSVCP_VER >= 110
+/* ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_iostream_char_move_ctor, 12)
+basic_iostream_char* __thiscall basic_iostream_char_move_ctor(basic_iostream_char *this,
+        basic_iostream_char *r, bool virt_init)
+{
+    basic_ios_char *basic_ios;
+
+    TRACE("(%p %p %d)\n", this, r, virt_init);
+
+    if(virt_init) {
+        this->base1.vbtable = basic_iostream_char_vbtable1;
+        this->base2.vbtable = basic_iostream_char_vbtable2;
+        basic_ios = basic_istream_char_get_basic_ios(&this->base1);
+        INIT_BASIC_IOS_VTORDISP(basic_ios);
+        basic_ios_char_ctor(basic_ios);
+    }else {
+        basic_ios = basic_istream_char_get_basic_ios(&this->base1);
+    }
+
+    basic_istream_char_ctor_init(&this->base1, NULL, FALSE, TRUE, FALSE);
+    basic_ostream_char_ctor_uninitialized(&this->base2, 0, FALSE, FALSE);
+    basic_ios->base.vtable = &basic_iostream_char_vtable;
+    basic_ios_char_init(basic_ios, NULL, FALSE);
+    basic_ios_char_move(basic_ios, basic_istream_char_get_basic_ios(&r->base1));
+    return this;
+}
+
+/* ??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_iostream_char_op_assign, 8)
+basic_iostream_char* __thiscall basic_iostream_char_op_assign(basic_iostream_char *this, basic_iostream_char *r)
+{
+    TRACE("(%p %p)\n", this, r);
+
+    basic_iostream_char_swap(this, r);
+    return this;
+}
+#endif
 
 static inline basic_ios_wchar* basic_iostream_wchar_to_basic_ios(basic_iostream_wchar *ptr)
 {
@@ -11480,6 +11745,60 @@ void __thiscall basic_iostream_wchar_swap(basic_iostream_wchar *this, basic_iost
     basic_ios_wchar_swap(basic_istream_wchar_get_basic_ios(&this->base1),
             basic_istream_wchar_get_basic_ios(&r->base1));
 }
+
+#if _MSVCP_VER >= 110
+/* ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_iostream_wchar_move_ctor, 12)
+basic_iostream_wchar* __thiscall basic_iostream_wchar_move_ctor(basic_iostream_wchar *this,
+        basic_iostream_wchar *r, bool virt_init)
+{
+    basic_ios_wchar *basic_ios;
+
+    TRACE("(%p %p %d)\n", this, r, virt_init);
+
+    if(virt_init) {
+        this->base1.vbtable = basic_iostream_wchar_vbtable1;
+        this->base2.vbtable = basic_iostream_wchar_vbtable2;
+        basic_ios = basic_istream_wchar_get_basic_ios(&this->base1);
+        INIT_BASIC_IOS_VTORDISP(basic_ios);
+        basic_ios_wchar_ctor(basic_ios);
+    }else {
+        basic_ios = basic_istream_wchar_get_basic_ios(&this->base1);
+    }
+
+    basic_istream_wchar_ctor_init(&this->base1, NULL, FALSE, TRUE, FALSE);
+    basic_ostream_wchar_ctor_uninitialized(&this->base2, 0, FALSE, FALSE);
+    basic_ios->base.vtable = &basic_iostream_wchar_vtable;
+    basic_ios_wchar_init(basic_ios, NULL, FALSE);
+    basic_ios_wchar_move(basic_ios, basic_istream_wchar_get_basic_ios(&r->base1));
+    return this;
+}
+
+/* ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z */
+/* ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_iostream_short_move_ctor, 12)
+basic_iostream_wchar* __thiscall basic_iostream_short_move_ctor(basic_iostream_wchar *this,
+        basic_iostream_wchar *r, bool virt_init)
+{
+    basic_iostream_wchar_move_ctor(this, r, virt_init);
+    basic_istream_wchar_get_basic_ios(&this->base1)->base.vtable = &basic_iostream_short_vtable;
+    return this;
+}
+
+/* ??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+/* ??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z */
+/* ??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z */
+DEFINE_THISCALL_WRAPPER(basic_iostream_wchar_op_assign, 8)
+basic_iostream_wchar* __thiscall basic_iostream_wchar_op_assign(basic_iostream_wchar *this, basic_iostream_wchar *r)
+{
+    TRACE("(%p %p)\n", this, r);
+
+    basic_iostream_wchar_swap(this, r);
+    return this;
+}
+#endif
 
 static inline basic_ios_char* basic_ofstream_char_to_basic_ios(basic_ofstream_char *ptr)
 {
