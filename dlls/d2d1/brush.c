@@ -1563,6 +1563,17 @@ BOOL d2d_brush_fill_cb(const struct d2d_brush *brush, struct d2d_brush_cb *cb)
 
             cb->u.bitmap.ignore_alpha = bitmap->format.alphaMode == D2D1_ALPHA_MODE_IGNORE;
 
+            /* The shader applies the extend modes relative to source_rect
+             * (see brush_bitmap() in device.c); the sampler address modes
+             * alone would not do, because the coordinates are confined to
+             * source_rect before sampling. */
+            if (brush->type == D2D_BRUSH_TYPE_IMAGE)
+                cb->u.bitmap.extend_modes = (brush->u.image.extend_mode_x & 0xff)
+                        | ((brush->u.image.extend_mode_y & 0xff) << 8);
+            else
+                cb->u.bitmap.extend_modes = (brush->u.bitmap.extend_mode_x & 0xff)
+                        | ((brush->u.bitmap.extend_mode_y & 0xff) << 8);
+
             /* Set source_rect as UV coordinates (0..1 range).
              * For bitmap brushes: full texture (0,0)-(1,1).
              * For image brushes: map source_rect pixels to UV. */
