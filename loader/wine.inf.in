@@ -432,6 +432,14 @@ HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Lite.exe","HideWineVersion",2,"Y
 HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Standard.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Suite.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Trial.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\yabridge-host.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\yabridge-host-32.exe","HideWineVersion",2,"Y"
+; Bitwig runs plug-ins in its audio engine or in separate plug-in hosts, named per CPU variant
+HKCU,"Software\Wine\AppDefaults\BitwigAudioEngine-X64-AVX2.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\BitwigAudioEngine-X64-SSE41.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X64-AVX2.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X64-SSE41.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X86-SSE41.exe","HideWineVersion",2,"Y"
 
 [DirectX]
 HKLM,Software\Microsoft\DirectX,"Version",,"4.09.00.0904"
