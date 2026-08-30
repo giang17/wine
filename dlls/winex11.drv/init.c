@@ -371,6 +371,26 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     XConfigureWindow( gdi_display, surface->window, mask, &changes );
 }
 
+/* set a client surface up for offscreen rendering: presenting it then blits the
+ * composite-redirected client window into the top-level through hdc_src/hdc_dst */
+static void client_surface_redirect_offscreen( struct x11drv_client_surface *surface )
+{
+    static const WCHAR displayW[] = {'D','I','S','P','L','A','Y', 0};
+    UNICODE_STRING device_str = RTL_CONSTANT_STRING(displayW);
+    RECT rect = surface->client.virtual_rect;
+
+    OffsetRect( &rect, -rect.left, -rect.top );
+    surface->hdc_dst = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+    surface->hdc_src = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+    set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
+#ifdef SONAME_LIBXCOMPOSITE
+    /* A second Manual redirect of the same window is a BadAccess, and an X error
+     * on gdi_display that is not ignored takes the process down: redirect once. */
+    if (usexcomposite && !InterlockedExchange( &surface->redirected, TRUE ))
+        pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+#endif
+}
+
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
     BOOL offscreen = needs_offscreen_rendering( hwnd );
@@ -403,7 +423,8 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     if (!offscreen)
     {
 #ifdef SONAME_LIBXCOMPOSITE
-        if (usexcomposite) pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+        if (usexcomposite && InterlockedExchange( &surface->redirected, FALSE ))
+            pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
 #endif
         if (surface->hdc_dst)
         {
@@ -416,21 +437,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
             surface->hdc_src = NULL;
         }
     }
-    else
-    {
-        static const WCHAR displayW[] = {'D','I','S','P','L','A','Y', 0};
-        UNICODE_STRING device_str = RTL_CONSTANT_STRING(displayW);
-        RECT rect = surface->client.virtual_rect;
-
-        OffsetRect( &rect, -rect.left, -rect.top );
-        surface->hdc_dst = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
-        surface->hdc_src = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
-        set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
-
-#ifdef SONAME_LIBXCOMPOSITE
-        if (usexcomposite) pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
-#endif
-    }
+    else client_surface_redirect_offscreen( surface );
 
     if ((data = get_win_data( hwnd )))
     {
@@ -446,6 +453,13 @@ static void x11drv_client_surface_update( struct client_surface *client )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd;
+
+    /* The surface is on the client surface list before its X window exists
+     * (client_surface_create() publishes it, the window is created after).  An
+     * update that gets here in between has nothing to work on - and would
+     * redirect the window a second time once it appears, see
+     * client_surface_redirect_offscreen(). */
+    if (!surface->window) return;
 
     client_surface_update_geometry( hwnd, surface );
     client_surface_update_offscreen( hwnd, surface );
@@ -483,6 +497,7 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     HRGN region;
 
     if (!hdc) return;
+    if (!surface->window) return; /* not created yet, see x11drv_client_surface_update() */
     if (!surface->hdc_dst) return; /* non-offscreen, GL presents directly */
     window = X11DRV_get_whole_window( toplevel );
 
@@ -543,6 +558,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format )
     XVisualInfo visual = default_visual;
     Colormap colormap;
     int visual_format;
+    BOOL offscreen;
 
     /* issue-250: a per-pixel alpha window needs its GL child on an alpha capable
      * visual.  Only the X window (here) and the EGL config (x11drv_egl_surface_create)
@@ -558,7 +574,19 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format )
     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_funcs, hwnd, format ))) goto failed;
     surface->colormap = colormap;
     surface->visual_format = visual_format;
-    if (!(surface->window = create_client_window( hwnd, surface->client.virtual_rect, &visual, colormap ))) goto failed;
+
+    /* Decide up front whether the window is going to render offscreen, so that
+     * it is never attached to the top-level only to be taken away again at the
+     * next update, see create_client_window(). */
+    offscreen = needs_offscreen_rendering( hwnd );
+    /* Mark the surface offscreen before the window exists: a concurrent
+     * client_surface_update_offscreen() then takes its "unchanged" path instead
+     * of setting the window up for offscreen rendering itself, alongside the
+     * setup below. */
+    if (offscreen) InterlockedExchange( &surface->client.offscreen, TRUE );
+    if (!(surface->window = create_client_window( hwnd, surface->client.virtual_rect, &visual, colormap,
+                                                  offscreen ))) goto failed;
+    if (offscreen) client_surface_redirect_offscreen( surface );
 
     TRACE( "Created %s for client window %lx\n", debugstr_client_surface( &surface->client ), surface->window );
     return &surface->client;

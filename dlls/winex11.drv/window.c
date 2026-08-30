@@ -2730,16 +2730,33 @@ void destroy_client_window( HWND hwnd, Window client_window )
 /**********************************************************************
  *		create_client_window
  */
-Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap )
+Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap,
+                             BOOL offscreen )
 {
     struct x11drv_win_data *data = get_win_data( hwnd ), dummy = {0};
     XSetWindowAttributes attr;
-    Window ret;
+    Window parent, ret;
     int x, y, cx, cy;
 
     if (!data) data = &dummy; /* use a dummy window data for HWND_MESSAGE and foreign windows, to create an offscreen client window */
 
-    detach_client_window( data, data->client_window );
+    /* A client window that is going to render offscreen never belongs under the
+     * whole window: client_surface_update_offscreen() reparents it away as soon
+     * as it looks at it.  Until then it sits attached, and an attached client
+     * window is what makes X11DRV_CreateWindowSurface() hand the top-level over
+     * to direct drawing - the window surface is dropped, and with it the surface
+     * region that keeps the parent's background erase out of the client rects of
+     * its pixel-format children.  Detaching the window then exposes the area it
+     * covered, and the repaint of the whole tree that follows goes straight to
+     * the X window, erase included: the children lose their content until they
+     * present again (SynthEdit's MDI canvases while WPF recreates its D3D9
+     * swapchain during a resize).  Create the window where it is going to stay. */
+    if (offscreen) parent = get_dummy_parent();
+    else
+    {
+        detach_client_window( data, data->client_window );
+        parent = data->whole_window ? data->whole_window : get_dummy_parent();
+    }
 
     attr.colormap = colormap;
     attr.bit_gravity = NorthWestGravity;
@@ -2753,20 +2770,22 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
     cy = min( max( 1, client_rect.bottom - client_rect.top ), 65535 );
 
     XSync( gdi_display, False ); /* make sure whole_window is known from gdi_display */
-    ret = data->client_window = XCreateWindow( gdi_display,
-                                               data->whole_window ? data->whole_window : get_dummy_parent(),
-                                               x, y, cx, cy, 0, visual->depth, InputOutput,
-                                               visual->visual, CWBitGravity | CWWinGravity |
-                                               CWBackingStore | CWColormap | CWBorderPixel, &attr );
-    if (data->client_window)
+    ret = XCreateWindow( gdi_display, parent, x, y, cx, cy, 0, visual->depth, InputOutput,
+                         visual->visual, CWBitGravity | CWWinGravity |
+                         CWBackingStore | CWColormap | CWBorderPixel, &attr );
+    if (ret)
     {
-        XMapWindow( gdi_display, data->client_window );
-        if (data->whole_window)
+        XMapWindow( gdi_display, ret );
+        if (!offscreen)
         {
-            XFlush( gdi_display ); /* make sure client_window is created for XSelectInput */
-            client_window_events_enable( data, data->client_window );
+            data->client_window = ret;
+            if (data->whole_window)
+            {
+                XFlush( gdi_display ); /* make sure client_window is created for XSelectInput */
+                client_window_events_enable( data, ret );
+            }
         }
-        TRACE( "%p xwin %lx/%lx\n", data->hwnd, data->whole_window, data->client_window );
+        TRACE( "%p xwin %lx/%lx offscreen %u\n", data->hwnd, data->whole_window, ret, offscreen );
     }
 
     if (data != &dummy) release_win_data( data );
