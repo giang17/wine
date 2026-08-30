@@ -158,8 +158,9 @@ This is the recommended branch. What it changes, by subsystem:
   are sorted per RFC 6724 §6 with the default policy table
 - **msvcp**: the stream classes' move constructors and move assignment were exported as
   stubs, so a C++ application calling one aborted with "Call to unimplemented function" —
-  Ableton Live's indexer did, on startup in a fresh prefix. Implemented for msvcp110,
-  msvcp120, msvcp140 and msvcp_win
+  Ableton Live's indexer did, on startup in a fresh prefix, so Live restarted it in a loop
+  and its browser stayed empty. Implemented for msvcp110, msvcp120, msvcp140 and msvcp_win;
+  Live no longer needs a native VC runtime in the prefix
 - **Virtual-desktop compositor (winex11)**: windows inside a Wine virtual desktop get
   real per-pixel alpha, which the plain desktop drawable cannot provide. A small
   XDamage-driven compositor assembles frames off screen and composites them through an
@@ -345,7 +346,7 @@ these were developed against, but they are not specific to it.
 | FL Studio 2026 (Wine + ntsync) | Custom | Runs without xruns at 64 samples / 48 kHz; Cloud plugins install (needs the AF_UNIX patches) and stream |
 | UVI Portal | WebView2 | Installs and signs in, including special characters typed into the login fields |
 | WineSynth (custom VSTGUI plugin) | VSTGUI + DComp | 18k+ partial redraws without crash |
-| Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing, Splice view. See *Ableton Live 12 Setup* below |
+| Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing, Splice view; the content indexer (`Ableton Index.exe`) runs on the built-in VC runtime |
 | Fender Studio Pro 8 | CCL (DXGI + DWrite + DComp) | Fully functional — the song view draws completely and stays stable, no stale tool bar or transport and no flicker; the transport playhead and the selection rectangle no longer flicker while the transport runs, and video on the timeline plays, seeks, loops and jumps without stalling or going black. Starting at all needs the `UIAnimationManager2` and `UIAnimationTransitionLibrary2` implementation from this branch; without it the CCL framework aborts with "requires Windows 10 or later" |
 
 ## Font Setup
@@ -364,7 +365,9 @@ documentation/wine-font-setup.sh --prefix ~/.wine --check   # report only
 It locates the fonts through fontconfig (so distribution paths do not matter),
 copies them into the prefix, registers the MS Core Fonts for GDI, writes the
 `FontLink` fallback chain and switches on this branch's text rendering. It is
-idempotent, and `--check` shows whether everything is still in place.
+idempotent, and `--check` shows whether everything is still in place — worth running
+after a prefix update: Wine rewrites the FontLink chain with its own defaults whenever
+its stored codepage record does not match the running process.
 
 Three of those steps matter more than they look:
 
@@ -514,36 +517,6 @@ Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
 fallback through `GetGlyphIndices`. That one has its own project:
 [giang17/flstudio-wine-font-fix](https://github.com/giang17/flstudio-wine-font-fix).
-
-## Ableton Live 12 Setup
-
-Live runs its content indexer as a separate process (`Ableton Index.exe`). Earlier
-revisions of this branch needed a native VC runtime for it: the built-in `msvcp140`
-exported the stream classes' move operators as stubs, and the indexer aborted on the
-first call, so Live restarted it in a loop and the browser stayed empty. Since the
-`msvcp` fix above the indexer runs on the built-in DLL (measured 2026-08-30: three
-starts, none stopped prematurely).
-
-**[documentation/ableton-live-12-setup.sh](documentation/ableton-live-12-setup.sh)**
-is kept for a prefix that still shows
-
-```
-Indexer: process stopped prematurely [1]. Restart
-```
-
-in `Preferences/Log.txt`: it sets `native,builtin` for the VC runtime DLLs for that one
-executable only (`HKCU\Software\Wine\AppDefaults\Ableton Index.exe\DllOverrides`) and
-tells you the `winetricks` command when the native runtime is missing — `native,builtin`
-silently falls back to the built-in DLL when no native one is present. `--check` reads
-the prefix without starting Wine; `--wine /path/to/wine` if this fork is not the `wine`
-in your `PATH`. When checking which DLL a prefix actually has, do not compare file sizes:
-Wine's built-in PE carries debug symbols and is roughly 5 MB, *larger* than the native
-DLL (~550 KB) — check the origin string instead:
-
-```bash
-strings -a "$WINEPREFIX/drive_c/windows/system32/msvcp140.dll" \
-    | grep -m1 -E "Wine builtin DLL|Microsoft Corporation"
-```
 
 ## D2D1 Patches Only (Branch: `d2d1-v6`) — DEPRECATED
 

@@ -21,8 +21,10 @@
 #
 # Fonts are located through fontconfig, so distribution paths do not matter.
 #
-# NOTE: `wineboot -u` resets the FontLink entries to Wine's defaults and undoes
-# step 2.  Re-run this script after a prefix update; it is idempotent.
+# NOTE: Wine rewrites the FontLink entries with its own defaults whenever the
+# codepage record under HKCU\Software\Wine\Fonts\Codepages does not match the
+# running process (fresh prefix, locale change; seen after a `wineboot -u` too),
+# which undoes step 2.  Re-run this script then; it is idempotent.
 #
 # Usage:
 #   wine-font-setup.sh [--prefix DIR] [--wine BINARY] [--check] [--no-mscore]
