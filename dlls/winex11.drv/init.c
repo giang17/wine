@@ -453,6 +453,22 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     BOOL offscreen = needs_offscreen_rendering( hwnd );
     struct x11drv_win_data *data;
 
+    /* A top-level renders offscreen while a child clips its client area, and
+     * that answer can change with the focus: Studio Pro's Add Tracks dialog
+     * shows its inline EDIT only while it has the focus, so every focus change
+     * re-parented the GL client window between offscreen and attached.  Each
+     * re-parent leaves the window's pixmap undefined on NVIDIA - black, or a
+     * stale frame of another window - and nothing presents again until the
+     * application draws (issue 291).  Once a top-level has gone offscreen,
+     * keep it there for the lifetime of the client surface: the blit it pays
+     * per present is what it paid while it had the focus anyway. */
+    if (!offscreen && InterlockedCompareExchange( &surface->client.offscreen, 0, 0 )
+        && NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow())
+    {
+        TRACE( "%s stays offscreen\n", debugstr_client_surface( &surface->client ) );
+        offscreen = TRUE;
+    }
+
     TRACE( "%s offscreen %u\n", debugstr_client_surface( &surface->client ), offscreen );
 
     if (InterlockedExchange( &surface->client.offscreen, offscreen ) == offscreen)
