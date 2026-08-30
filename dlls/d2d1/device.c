@@ -6049,6 +6049,96 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateSpriteBatch(ID2D1Devic
     return hr;
 }
 
+/* Draw a single sprite of a sprite batch onto a bitmap target.
+ *
+ * Sprite colours modulate the source bitmap. The shader combines the primary
+ * brush with the alpha of the opacity brush only, so the colour is supplied as
+ * a solid brush masked by the bitmap. That is exact for the mask-style sources
+ * sprite batches are normally used with (a white or single channel bitmap, as
+ * produced by text atlases and by JUCE's rectangle batching); an RGB source
+ * that is additionally tinted by a non-white colour is approximated. */
+static void d2d_device_context_draw_sprite(struct d2d_device_context *context, ID2D1Bitmap *bitmap,
+        const D2D1_RECT_F *dst_rect, const D2D1_RECT_U *src_rect, const D2D1_COLOR_F *color,
+        D2D1_INTERPOLATION_MODE interpolation_mode)
+{
+    D2D1_BITMAP_BRUSH_PROPERTIES1 bitmap_brush_desc;
+    struct d2d_brush *brush, *opacity_brush;
+    D2D1_BRUSH_PROPERTIES brush_desc;
+    struct d2d_geometry *geometry;
+    D2D1_SIZE_F size;
+    D2D1_RECT_F s, d;
+    HRESULT hr;
+
+    d = *dst_rect;
+    if (d.left == d.right || d.top == d.bottom)
+        return;
+
+    /* Sprites default to the whole bitmap, expressed as an unbounded source
+     * rectangle by d2d_sprite_batch_AddSprites(). */
+    size = ID2D1Bitmap_GetSize(bitmap);
+    d2d_rect_set(&s, 0.0f, 0.0f, size.width, size.height);
+    if (src_rect->left <= src_rect->right && src_rect->top <= src_rect->bottom)
+    {
+        D2D1_RECT_F src;
+
+        d2d_rect_set(&src, (float)src_rect->left, (float)src_rect->top,
+                (float)src_rect->right, (float)src_rect->bottom);
+        d2d_rect_intersect(&s, &src);
+    }
+
+    if (s.left == s.right || s.top == s.bottom)
+        return;
+
+    bitmap_brush_desc.extendModeX = D2D1_EXTEND_MODE_CLAMP;
+    bitmap_brush_desc.extendModeY = D2D1_EXTEND_MODE_CLAMP;
+    bitmap_brush_desc.interpolationMode = interpolation_mode;
+
+    brush_desc.opacity = 1.0f;
+    brush_desc.transform._11 = fabsf((d.right - d.left) / (s.right - s.left));
+    brush_desc.transform._21 = 0.0f;
+    brush_desc.transform._31 = min(d.left, d.right) - min(s.left, s.right) * brush_desc.transform._11;
+    brush_desc.transform._12 = 0.0f;
+    brush_desc.transform._22 = fabsf((d.bottom - d.top) / (s.bottom - s.top));
+    brush_desc.transform._32 = min(d.top, d.bottom) - min(s.top, s.bottom) * brush_desc.transform._22;
+
+    if (FAILED(hr = d2d_bitmap_brush_create(context->factory, bitmap, &bitmap_brush_desc,
+            &brush_desc, &opacity_brush)))
+    {
+        ERR("Failed to create sprite bitmap brush, hr %#lx.\n", hr);
+        return;
+    }
+
+    brush_desc.transform = identity;
+    if (FAILED(hr = d2d_solid_color_brush_create(context->factory, color, &brush_desc, &brush)))
+    {
+        ERR("Failed to create sprite colour brush, hr %#lx.\n", hr);
+        ID2D1Brush_Release(&opacity_brush->ID2D1Brush_iface);
+        return;
+    }
+
+    if (!(geometry = calloc(1, sizeof(*geometry))))
+    {
+        ERR("Failed to allocate sprite geometry.\n");
+        goto done;
+    }
+
+    if (FAILED(hr = d2d_rectangle_geometry_init(geometry, context->factory, &d)))
+    {
+        ERR("Failed to initialise sprite geometry, hr %#lx.\n", hr);
+        free(geometry);
+        goto done;
+    }
+
+    d2d_device_context_fill_geometry(context, geometry, brush, opacity_brush);
+
+    d2d_geometry_cleanup(geometry);
+    free(geometry);
+
+done:
+    ID2D1Brush_Release(&brush->ID2D1Brush_iface);
+    ID2D1Brush_Release(&opacity_brush->ID2D1Brush_iface);
+}
+
 static void STDMETHODCALLTYPE d2d_device_context_DrawSpriteBatch(ID2D1DeviceContext6 *iface,
         ID2D1SpriteBatch *sprite_batch, UINT32 start_index, UINT32 sprite_count, ID2D1Bitmap *bitmap,
         D2D1_BITMAP_INTERPOLATION_MODE interpolation_mode, D2D1_SPRITE_OPTIONS sprite_options)
@@ -6079,7 +6169,26 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawSpriteBatch(ID2D1DeviceCont
     }
     else
     {
-        FIXME("Unimplemented for bitmap render target.\n");
+        D2D1_MATRIX_3X2_F prev_transform = context->drawing_state.transform;
+        unsigned int i;
+
+        if (sprite_options != D2D1_SPRITE_OPTIONS_NONE)
+            FIXME("Ignoring sprite options %#x.\n", sprite_options);
+
+        for (i = start_index; i < start_index + sprite_count; ++i)
+        {
+            const struct d2d_sprite *sprite = &batch->sprites[i];
+            D2D1_MATRIX_3X2_F transform = sprite->transform;
+
+            /* Per-sprite transforms apply on top of the context transform. */
+            d2d_matrix_multiply(&transform, &prev_transform);
+            context->drawing_state.transform = transform;
+
+            d2d_device_context_draw_sprite(context, bitmap, &sprite->dest, &sprite->source,
+                    &sprite->color, d2d1_1_interp_mode_from_d2d1(interpolation_mode));
+        }
+
+        context->drawing_state.transform = prev_transform;
     }
 }
 
