@@ -226,6 +226,8 @@ branch has it without further setup:
 
 ```
 reaper.exe · FL64.exe · Studio Pro.exe · Ableton Live 12 {Intro,Lite,Standard,Suite,Trial}.exe
+yabridge-host.exe · yabridge-host-32.exe
+BitwigAudioEngine-X64-{AVX2,SSE41}.exe · BitwigPluginHost-{X64-AVX2,X64-SSE41,X86-SSE41}.exe
 ```
 
 The entries use the INF "do not overwrite" flag, so a value you set yourself — including
@@ -248,14 +250,18 @@ HKCU\Software\Wine\HideWineVersion = "Y"
 The per-application value wins over the global one, so `"N"` can carve out an exception
 where the global switch is on. **It keys on the process name, not on the plug-in**: a
 plug-in that renders correctly in one host and loses its artwork in another has simply
-landed in a host without the value. Bridged hosting (yabridge, FL Studio's `ilbridge.exe`)
-runs the plug-in in a different process, which then needs its own entry.
+landed in a host without the value. Bridged hosting runs the plug-in in a different
+process, which needs its own entry: yabridge's hosts are in the list (checked with JUCE
+8.0.13 plug-ins in a Linux DAW), FL Studio's `ilbridge.exe` is not. The Bitwig entries
+name the processes Bitwig runs plug-ins in; they were added by name and have not been
+exercised here yet.
 
 **Why not system-wide:** the switch applies to the whole process, so anything else probing
 for Wine stops finding it — and some software depends on the answer. PACE/iLok protected
 *standalone* applications fail to start with *"Error 2000: An iLok background component
 required to validate the license for this product is not running"*; PACE-protected
-plug-ins inside a host are not affected. Ableton Live's embedded Splice view stopped
+plug-ins inside a host are not affected (checked with UVI Workstation as a plug-in, both
+in Reaper and under yabridge). Ableton Live's embedded Splice view stopped
 loading with the global switch, which also hides Wine from the `msedgewebview2.exe`
 child processes Splice renders in — with the per-host entry that `wine.inf` now sets, Live
 runs and Splice loads. Standalone JUCE applications are deliberately not in the list; add
