@@ -198,11 +198,12 @@ This is the recommended branch. It includes all 15 D2D1 patches plus:
   picture after a window toggle in Fender Studio Pro 8
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
-- **Direct2D for JUCE 8.0.13+ (ntdll)**: JUCE 8.0.13 and later pick their renderer with
-  `GetProcAddress(GetModuleHandleA("ntdll"), "wine_get_version") != nullptr` and fall back
-  to GDI whenever that succeeds, which bypasses this entire stack — a JUCE plugin then
-  never creates a device context and never gets a composition swapchain. This branch can
-  hide that one export so those plugins take the Direct2D path again. **Opt-in**, see the
+- **Direct2D for JUCE 8.0.13+ (ntdll, wine.inf)**: JUCE 8.0.13 and later pick their
+  renderer with `GetProcAddress(GetModuleHandleA("ntdll"), "wine_get_version") != nullptr`
+  and fall back to GDI whenever that succeeds, which bypasses this entire stack — a JUCE
+  plugin then never creates a device context and never gets a composition swapchain. This
+  branch hides that one export inside the plug-in hosts, so those plugins take the Direct2D
+  path again. **On by default for the DAWs listed in `wine.inf`**, off elsewhere — see the
   note below
 
 ### Note: JUCE 8.0.13+ and the hidden `wine_get_version` export
@@ -211,14 +212,26 @@ Since JUCE 8.0.13 (upstream commit `5179690ff7`, "Restore Wine functionality") e
 plugin falls back to the GDI renderer as soon as it detects Wine. That fallback exists
 because stock Wine does not implement the Direct2D 1.3 / DirectComposition surface JUCE
 needs — but this branch does, so the fallback only costs functionality here. Measured with
-one plugin: 23 d2d1 calls with the fallback, 2.6 million without it.
+one plugin: 23 d2d1 calls with the fallback, 2.6 million without it. What the GDI path
+loses is bitmaps: background artwork, icons and keyboard graphics vanish while text and
+vector shapes survive, which is the fingerprint to look for.
 
-This branch can therefore hide `wine_get_version` from `GetProcAddress`. Doing so restored
+This branch therefore hides `wine_get_version` from `GetProcAddress`. Doing so restored
 the complete UI of a WebView2-based JUCE plugin whose artwork, icons and content had been
 missing, and removed flicker that had been chased for weeks in the wrong place.
 
-It is **off by default** and meant to be enabled for the hosts that actually run JUCE
-plug-ins, not system-wide — see the caveat below.
+The switch is a per-process registry value. `wine.inf` (section `[JuceHosts]`) sets it for
+the plug-in hosts that have been checked here, so a prefix created or updated with this
+branch has it without further setup:
+
+```
+reaper.exe · FL64.exe · Studio Pro.exe · Ableton Live 12 {Intro,Lite,Standard,Suite,Trial}.exe
+```
+
+The entries use the INF "do not overwrite" flag, so a value you set yourself — including
+`"N"` to turn the switch off for one of these hosts — survives every prefix update.
+Existing prefixes pick the defaults up on their next start after the branch is installed
+(the usual `wineboot` update). For any other host, or for a single run:
 
 ```bash
 # single run
@@ -226,29 +239,27 @@ WINE_HIDE_WINE_VERSION=1 wine your-host.exe
 ```
 
 ```
-# per application, the usual case
+# per application
 HKCU\Software\Wine\AppDefaults\your-host.exe\HideWineVersion = "Y"
-# globally, if you know what runs in this prefix
+# globally, if you know what runs in this prefix (not recommended, see below)
 HKCU\Software\Wine\HideWineVersion = "Y"
 ```
 
 The per-application value wins over the global one, so `"N"` can carve out an exception
-where the global switch is on.
-
-**The switch lives in the prefix, not in the build.** It is a registry value, so a fresh
-prefix does not have it: installing or rebuilding this branch does not carry it over, and
-neither does creating a second prefix for testing. When a JUCE plug-in that used to work
-renders nothing in a new prefix, check this first — the symptom looks like a broken build
-or a regression in the stack, but the renderer has simply fallen back to GDI again. Seen
-here on a freshly set up test prefix, where a WebView2-based plug-in stayed blank until
-the value was added for the host.
+where the global switch is on. **It keys on the process name, not on the plug-in**: a
+plug-in that renders correctly in one host and loses its artwork in another has simply
+landed in a host without the value. Bridged hosting (yabridge, FL Studio's `ilbridge.exe`)
+runs the plug-in in a different process, which then needs its own entry.
 
 **Why not system-wide:** the switch applies to the whole process, so anything else probing
-for Wine stops finding it — and some software depends on the answer. Two cases seen here:
-PACE/iLok protected software fails to start with *"Error 2000: An iLok background component
-required to validate the license for this product is not running"*, and Ableton Live's
-embedded Splice view stops loading. Both fail in a way that points anywhere but at Wine,
-which is exactly why the default is off.
+for Wine stops finding it — and some software depends on the answer. PACE/iLok protected
+*standalone* applications fail to start with *"Error 2000: An iLok background component
+required to validate the license for this product is not running"*; PACE-protected
+plug-ins inside a host are not affected. Ableton Live's embedded Splice view stopped
+loading with the global switch, which also hides Wine from the `msedgewebview2.exe`
+child processes Splice renders in — with the per-host entry that `wine.inf` now sets, Live
+runs and Splice loads. Standalone JUCE applications are deliberately not in the list; add
+them per application.
 
 An upstream fix is proposed as [juce-framework/JUCE#1701](https://github.com/juce-framework/JUCE/pull/1701),
 which would add the same opt-in inside JUCE and make this workaround unnecessary.
