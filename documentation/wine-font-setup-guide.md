@@ -1,50 +1,60 @@
-# Wine Font Setup Guide (Container + Host)
+# Wine Font Setup Guide
 
-Guide for setting up fonts for correct Unicode symbol rendering in Wine
-(Serum2 rating stars, menu arrows, etc.) and for preventing plugin crashes
-caused by missing system fonts.
+Fonts a Wine prefix needs for plugin GUIs: correct Unicode symbol rendering
+(Serum 2 rating stars, menu arrows) and no crashes from plugins that expect
+system font files to exist.
+
+**[wine-font-setup.sh](wine-font-setup.sh)** does the routine part — MS Core Fonts,
+the symbol fallback fonts with their FontLink entries, and this branch's text
+rendering switches — and `--check` reports without changing anything:
+
+```bash
+documentation/wine-font-setup.sh --prefix ~/.wine
+documentation/wine-font-setup.sh --prefix ~/.wine --check
+```
+
+This guide explains what the script sets and why, shows the manual commands, and
+covers the one thing it deliberately leaves out (the Serum 2 tooltip font).
 
 ## Prerequisites
 
-Required font files (available on the host):
+Required font files on the host:
 - `DejaVuSans.ttf` — `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`
 - `NotoSansSymbols2-Regular.ttf` — `/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf`
-- **MS Core Fonts** (Arial, Verdana, Times New Roman, etc.) — `/usr/share/fonts/truetype/msttcorefonts/`
+- **MS Core Fonts** (Arial, Verdana, Times New Roman, ...) — `/usr/share/fonts/truetype/msttcorefonts/`
 
 If not present:
 ```bash
 sudo apt install fonts-dejavu-core fonts-noto-core ttf-mscorefonts-installer
 ```
 
-## 0. MS Core Fonts (Arial, Verdana, etc.) — CRITICAL for Plugin Stability
+The script locates them through fontconfig, so other distribution paths work too.
 
-**Problem (discovered 2026-04-03):** Some plugins ship their own D3D9/OpenGL rendering
+## 0. MS Core Fonts (Arial, Verdana, etc.) — plugin stability
+
+**Problem (discovered 2026-04-03):** some plugins ship their own D3D9/OpenGL rendering
 engine (`engine_x64.dll`) that loads fonts directly by file path from
-`C:\windows\Fonts\` during DLL initialization. If the expected font file is missing,
-the engine returns a NULL font object and crashes immediately with an Access Violation
+`C:\windows\Fonts\` during DLL initialisation. If the expected font file is missing,
+the engine returns a NULL font object and crashes immediately with an access violation
 (`c0000005`) before any rendering occurs. The plugin reports as "failed to initialize"
 with no useful error message.
 
-**Known affected plugin:** FL Studio "Fruity Delay 3" — `engine_x64.dll` requires
-`Arialbd.ttf` (Arial Bold) and `Verdana.ttf`. Without these fonts, the plugin crashes
-on load.
+**Known affected plugin:** FL Studio "Fruity Delay 3" — `engine_x64.dll` checks for
+`Arialbd.ttf` (Arial Bold) and `Verdana.ttf` with `PathFileExistsW` and `CreateFileW`,
+direct file system access rather than GDI/DWrite enumeration. The files must physically
+exist in the prefix' Fonts directory.
 
-**Root cause:** The engine uses `PathFileExistsW("C:/windows/Fonts/Arialbd.ttf")` and
-`CreateFileW("C:\\windows\\Fonts\\Verdana.ttf")` — direct file system access, not
-GDI/DWrite font enumeration. The font files must physically exist in the Wine Fonts
-directory.
+**Important:** Wine does not auto-register fonts from the Fonts directory into the
+registry, and `wineboot -u` does not pick them up either. Programs using GDI font APIs
+need the registry entries.
 
-**Important:** Wine does NOT auto-register fonts from the Fonts directory into the
-registry. `wineboot -u` does not pick them up either. Manual registry entries are needed
-for programs using GDI font APIs.
-
-### Fix (Host)
+### Fix
 
 ```bash
-# 1. Copy all MS Core Fonts to Wine prefix:
+# 1. Copy the MS Core Fonts into the prefix:
 cp /usr/share/fonts/truetype/msttcorefonts/*.ttf ~/.wine/drive_c/windows/Fonts/
 
-# 2. Register in Windows Font registry (for GDI/DWrite access):
+# 2. Register them for GDI/DWrite:
 for f in /usr/share/fonts/truetype/msttcorefonts/*.ttf; do
   name=$(basename "$f" .ttf)
   wine reg add "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" \
@@ -52,36 +62,15 @@ for f in /usr/share/fonts/truetype/msttcorefonts/*.ttf; do
 done
 ```
 
-### Fix (Container)
-
-```bash
-# 1. Copy fonts into container:
-for f in /usr/share/fonts/truetype/msttcorefonts/*.ttf; do
-  docker cp "$f" wine-test-11.0-container:/home/wine/.wine/drive_c/windows/Fonts/
-done
-
-# 2. Register in registry:
-docker exec wine-test-11.0-container bash -c '
-  for f in /home/wine/.wine/drive_c/windows/Fonts/[Aa]rial*.ttf \
-           /home/wine/.wine/drive_c/windows/Fonts/[Vv]erdana*.ttf \
-           /home/wine/.wine/drive_c/windows/Fonts/[Tt]imes*.ttf \
-           /home/wine/.wine/drive_c/windows/Fonts/[Cc]our*.ttf; do
-    name=$(basename "$f" .ttf)
-    wine reg add "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" \
-      /v "$name (TrueType)" /t REG_SZ /d "$(basename "$f")" /f 2>/dev/null
-  done
-'
-```
-
 ### Debugging font-related plugin crashes
 
-If a plugin fails to initialize with no error message, check for missing fonts:
+If a plugin fails to initialise with no error message, check for missing fonts:
 
 ```bash
 # Run with relay trace, filter for the plugin's thread:
 WINEDEBUG=+relay,+loaddll,+seh wine "/path/to/DAW.exe" 2>&1 | tee /tmp/debug.log
 
-# After crash, look for PathFileExistsW/CreateFileW calls to Fonts/:
+# After the crash, look for PathFileExistsW/CreateFileW calls to Fonts/:
 grep "PathFileExistsW\|CreateFileW.*Fonts" /tmp/debug.log | grep "retval=00000000\|retval=fffff"
 ```
 
@@ -133,37 +122,60 @@ Two warnings in that log read like causes and are not:
 - Hundreds of `warn:font:... unable to parse font, falling back to FreeType`
   for `.fon` files — Wine parses those on every start, in every prefix.
 
-## 1. Installing Fonts into the Test Container
+## 1. Symbol fallback fonts and GDI FontLink
 
-### fontconfig path (for DWrite/D2D1)
+Serum 2's rating stars (U+2B50 range) and menu arrows are drawn through two different
+paths: the VSTGUI interface goes through DirectWrite, where this branch's fallback
+mapping for Miscellaneous Symbols and Arrows (U+2B00-2BFF, commit `31a86766fe5`) finds a
+symbol font by itself; the native Win32 menus go through GDI, which resolves missing
+glyphs through the `FontLink\SystemLink` registry chain of the menu font, Tahoma. That
+chain needs the fallback fonts in the prefix and two registry entries.
 
 ```bash
-docker cp /usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf \
-  wine-test-11.0-container:/home/wine/.local/share/fonts/
-docker exec wine-test-11.0-container fc-cache -fv
+# Fonts into the prefix (GDI reads them from here):
+cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ~/.wine/drive_c/windows/Fonts/
+cp /usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf ~/.wine/drive_c/windows/Fonts/
+
+# Tahoma (menu font) -> DejaVu Sans (arrows) + Noto Sans Symbols2 (stars),
+# placed BEFORE Wine's standard CJK fallbacks so they are tried first:
+wine reg add \
+  "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" \
+  /v "Tahoma" /t REG_MULTI_SZ \
+  /d "DejaVuSans.ttf,DejaVu Sans\0NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2\0MSGOTHIC.TTC,MS UI Gothic\0MINGLIU.TTC,PMingLiU\0SIMSUN.TTC,SimSun\0GULIM.TTC,Gulim\0YUGOTHM.TTC,Yu Gothic UI\0MSJH.TTC,Microsoft JhengHei UI\0MSYH.TTC,Microsoft YaHei UI\0MALGUN.TTF,Malgun Gothic\0SEGUISYM.TTF,Segoe UI Symbol" /f
+
+# DejaVu Sans itself -> Noto Sans Symbols2 (for the symbols it lacks):
+wine reg add \
+  "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" \
+  /v "DejaVu Sans" /t REG_MULTI_SZ \
+  /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f
 ```
 
-### BarlowSemiCondensed — No manual copying needed anymore
+> **The entries can be reset by Wine itself.** `win32u` rewrites the `SystemLink`
+> chain with its own defaults (CJK fallbacks only) whenever the codepage record it
+> keeps under `HKCU\Software\Wine\Fonts\Codepages` does not match the running process
+> (`update_codepage()` in `dlls/win32u/font.c`) — in a fresh prefix, after a locale
+> change, and it was observed here after a `wineboot -u` on 2026-04-03. The stars then
+> revert to tofu boxes. `wine-font-setup.sh --check` tells whether the entries are still
+> in place; re-running the script restores them, it is idempotent.
 
-Previously, BarlowSemiCondensed had to be copied manually to `~/.local/share/fonts/`
-and `fc-cache -fv` had to be run (documented as "Serum 2 font fix" in yabridge guides).
+### BarlowSemiCondensed — no manual copying needed
 
-**Since commit `5ade4a2`** (`dwrite: Implement IDWriteFontSet::GetMatchingFonts`) this is
-**no longer necessary**. Wine now finds BarlowSemiCondensed directly from the Serum2
-skin folder (`Skins/Default/Fonts/`) because VSTGUI's Custom Font Collection works
-correctly. Tested: fonts deleted from `~/.local/share/fonts/` → Serum2 still displays
-them correctly.
+Older guides had BarlowSemiCondensed copied to `~/.local/share/fonts/` by hand (the
+"Serum 2 font fix" in yabridge guides). Since commit `5ade4a26d7d` (`dwrite: Implement
+IDWriteFontSet::GetMatchingFonts`) this is not necessary: Wine finds the font in Serum 2's
+skin folder (`Skins/Default/Fonts/`) through VSTGUI's custom font collection. Verified
+with the fonts deleted from `~/.local/share/fonts/` — Serum 2 still displays them.
 
-### BitPDisp-10 Tooltip Font (Serum2-specific)
+### BitPDisp-10 tooltip font (Serum 2)
 
-Serum2 uses the proprietary bitmap font `BitPDisp-10` for tooltips. This font is
-provided by the Windows installer and is missing in a manual installation. Without it,
-DWrite falls back to Tahoma (pixelated/aliased).
-
-**Workaround:** DejaVu Sans Mono with a renamed family name as a substitute:
+Serum 2 draws its tooltips in the proprietary bitmap font `BitPDisp-10`, which the
+Windows installer provides and a manual installation lacks. Without it DirectWrite falls
+back to Tahoma, pixelated and aliased. The setup script leaves this one out on purpose:
+it is a renamed substitute, not a font the prefix is missing. Workaround — DejaVu Sans
+Mono with the family name changed:
 
 ```bash
-# 1. Generate font (once on the host):
+# 1. Generate the font (needs python3-fonttools):
 python3 -c "
 from fontTools.ttLib import TTFont
 font = TTFont('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf')
@@ -173,135 +185,55 @@ for rec in font['name'].names:
 font.save('/tmp/BitPDisp-10.ttf')
 "
 
-# 2. Copy to Serum2 skin fonts folder (VSTGUI Custom Collection):
-SKIN_FONTS="/home/wine/.wine/drive_c/users/wine/Documents/Xfer/Serum 2 Presets/Skins/Default/Fonts"
-docker cp /tmp/BitPDisp-10.ttf "wine-test-11.0-container:${SKIN_FONTS}/BitPDisp-10.ttf"
+# 2. Into Serum 2's skin fonts folder (VSTGUI custom collection):
+SKIN_FONTS="$HOME/.wine/drive_c/users/$USER/Documents/Xfer/Serum 2 Presets/Skins/Default/Fonts"
+cp /tmp/BitPDisp-10.ttf "$SKIN_FONTS/BitPDisp-10.ttf"
 
-# 3. Copy to fontconfig path (DWrite System Collection):
-docker cp /tmp/BitPDisp-10.ttf \
-  wine-test-11.0-container:/home/wine/.local/share/fonts/BitPDisp-10.ttf
-docker exec wine-test-11.0-container fc-cache -fv
+# 3. And into fontconfig (DirectWrite's system collection):
+cp /tmp/BitPDisp-10.ttf ~/.local/share/fonts/BitPDisp-10.ttf
+fc-cache -f
 ```
 
-Background and root-cause analysis: see `docs/wine-serum2-tooltip-gray-box.md` (Session 11).
+## 2. Text rendering switches
 
-### Windows Fonts directory (for GDI FontLink)
-
-```bash
-docker exec wine-test-11.0-container bash -c '
-  cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
-     /home/wine/.wine/drive_c/windows/Fonts/
-  cp /home/wine/.local/share/fonts/NotoSansSymbols2-Regular.ttf \
-     /home/wine/.wine/drive_c/windows/Fonts/
-'
-```
-
-## 2. Setting GDI FontLink Registry Entries
-
-> **WARNING: `wineboot -u` overwrites FontLink entries!**
-> Wine's `wineboot -u` resets the Tahoma FontLink to Windows defaults (CJK fallbacks
-> only), removing our DejaVu Sans / Noto Sans Symbols2 entries. This causes Serum2
-> rating stars to revert to tofu boxes. **Re-run the commands below after every
-> `wineboot -u`** (discovered 2026-04-03 on the host after MS Core Font registration
-> triggered a wineboot).
-
-The commands below place our custom entries **before** the standard CJK fallbacks,
-so they are tried first for symbol glyphs (stars, arrows).
-
-### Container
-
-```bash
-docker exec wine-test-11.0-container bash -c '
-  # Tahoma (system menu font) → DejaVu Sans (arrows) + Noto Sans Symbols2 (stars)
-  # followed by standard CJK fallbacks
-  wine reg add \
-    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" \
-    /v "Tahoma" /t REG_MULTI_SZ \
-    /d "DejaVuSans.ttf,DejaVu Sans\0NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2\0MSGOTHIC.TTC,MS UI Gothic\0MINGLIU.TTC,PMingLiU\0SIMSUN.TTC,SimSun\0GULIM.TTC,Gulim\0YUGOTHM.TTC,Yu Gothic UI\0MSJH.TTC,Microsoft JhengHei UI\0MSYH.TTC,Microsoft YaHei UI\0MALGUN.TTF,Malgun Gothic\0SEGUISYM.TTF,Segoe UI Symbol" /f
-
-  # DejaVu Sans itself → Noto Sans Symbols2 (for missing symbols)
-  wine reg add \
-    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" \
-    /v "DejaVu Sans" /t REG_MULTI_SZ \
-    /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f
-'
-```
-
-### Host
-
-```bash
-wine reg add \
-  "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" \
-  /v "Tahoma" /t REG_MULTI_SZ \
-  /d "DejaVuSans.ttf,DejaVu Sans\0NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2\0MSGOTHIC.TTC,MS UI Gothic\0MINGLIU.TTC,PMingLiU\0SIMSUN.TTC,SimSun\0GULIM.TTC,Gulim\0YUGOTHM.TTC,Yu Gothic UI\0MSJH.TTC,Microsoft JhengHei UI\0MSYH.TTC,Microsoft YaHei UI\0MALGUN.TTF,Malgun Gothic\0SEGUISYM.TTF,Segoe UI Symbol" /f
-
-wine reg add \
-  "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" \
-  /v "DejaVu Sans" /t REG_MULTI_SZ \
-  /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f
-```
+The subpixel, linear-blend, outline and enhanced-contrast switches of this branch are
+registry values read once at startup and therefore live in the prefix; the script sets
+them, and `--contrast N` picks the enhanced-contrast value. What each does, with the
+measurements, is in `PATCHES.md` under *Font Setup*.
 
 ## 3. Verification
 
 ```bash
-# Check FontLink entries:
-docker exec wine-test-11.0-container bash -c '
-  echo "=== Tahoma FontLink ==="
-  wine reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" /v "Tahoma"
-  echo "=== DejaVu Sans FontLink ==="
-  wine reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" /v "DejaVu Sans"
-  echo "=== Fonts in Windows/Fonts ==="
-  ls -la /home/wine/.wine/drive_c/windows/Fonts/{DejaVuSans,NotoSansSymbols2}*.ttf
-  echo "=== fontconfig ==="
-  fc-list | grep -i "noto.*symbol"
-'
+documentation/wine-font-setup.sh --prefix ~/.wine --check
+
+# or by hand:
+wine reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "Tahoma"
+wine reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "DejaVu Sans"
+ls -la ~/.wine/drive_c/windows/Fonts/{DejaVuSans,NotoSansSymbols2}*.ttf
+fc-list | grep -i "noto.*symbol"
 ```
 
 ## 4. Testing
 
-```bash
-# Start Serum2 in Reaper (WineD3D, no DXVK):
-docker exec wine-test-11.0-container bash -c \
-  'WINEDLLOVERRIDES="d3d11,dxgi,d3d10core,d2d1=b" wine \
-  "/home/wine/.wine/drive_c/Program Files/REAPER (x64)/reaper.exe"'
+Start Serum 2 in Reaper and check:
 
-# Check:
-# 1. Open Preset Browser → RATING column: stars instead of tofu boxes
-# 2. Open rating dropdown "(any rating)" → stars in the list
-# 3. MENU button → "Note Exp.: XYZ → Macro 1, 2, 3": arrows instead of tofu
-```
+1. Preset Browser → RATING column: stars instead of tofu boxes
+2. Rating dropdown "(any rating)" → stars in the list
+3. MENU button → "Note Exp.: XYZ → Macro 1, 2, 3": arrows instead of tofu
 
-## Host Setup
-
-On the host, fonts are typically already installed. Only the DWrite patch
-(`dlls/dwrite/analyzer.c`, commit `31a8676`) needs to be included in the Wine
-installation.
-
-FontLink entries for the host: see Section 2 above (Host subsection).
-The same `wineboot -u` caveat applies — re-run after any wineboot.
-
-## Rollback (in Case of Problems)
+## Rollback
 
 ```bash
-# Remove FontLink entries:
-docker exec wine-test-11.0-container bash -c '
-  wine reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" /v "Tahoma" /f
-  wine reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontLink\SystemLink" /v "DejaVu Sans" /f
-'
-
-# Remove fonts from Windows/Fonts:
-docker exec wine-test-11.0-container bash -c '
-  rm -f /home/wine/.wine/drive_c/windows/Fonts/DejaVuSans.ttf
-  rm -f /home/wine/.wine/drive_c/windows/Fonts/NotoSansSymbols2-Regular.ttf
-'
+wine reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "Tahoma" /f
+wine reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "DejaVu Sans" /f
+rm -f ~/.wine/drive_c/windows/Fonts/DejaVuSans.ttf ~/.wine/drive_c/windows/Fonts/NotoSansSymbols2-Regular.ttf
 ```
 
-
-**Summary:** Three separate rendering paths, three separate fixes:
+**Summary:** four rendering paths, four separate fixes:
 
 | Path | Font | Fix |
 |------|------|-----|
-| Direct file access (plugin engines) | Arial, Verdana, etc. | Copy MS Core Fonts to `Fonts/` + registry |
-| DWrite/D2D1 (VSTGUI GUI) | BarlowSemiCondensed | `analyzer.c` fallback mapping 2B00–2BFF |
+| Direct file access (plugin engines) | Arial, Verdana, ... | MS Core Fonts into `Fonts/` + registry |
+| DWrite/D2D1 (VSTGUI GUI) | BarlowSemiCondensed, symbols | `analyzer.c` fallback mapping U+2B00-2BFF (in the branch) |
 | GDI (native Win32 menus) | Tahoma → DejaVu Sans | FontLink registry → Noto Sans Symbols2 |
-| Serum2 tooltips | BitPDisp-10 (proprietary) | DejaVu Sans Mono with renamed family name |
+| Serum 2 tooltips | BitPDisp-10 (proprietary) | DejaVu Sans Mono with a renamed family |
