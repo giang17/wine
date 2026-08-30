@@ -285,6 +285,13 @@ sudo make install
 64-bit DLLs (including d2d1) will be missing. Use a separate `--prefix` to avoid overwriting
 your distro's Wine installation.
 
+**`wine.inf` is part of the install.** `make install` also puts `loader/wine.inf` into
+`<prefix>/share/wine/`; it carries this branch's registry defaults — the `HideWineVersion`
+entries for the plug-in hosts, see the JUCE note above. New prefixes get them at creation,
+existing ones at their next start. If you update an installation by copying DLLs rather
+than running `make install`, copy `loader/wine.inf` as well: nothing fails when it is
+missing, the plug-in hosts simply keep rendering with GDI.
+
 **ntsync** (recommended): If your kernel has the `ntsync` module (Linux 6.12+), make sure
 `/usr/include/linux/ntsync.h` exists before running `./configure`. This enables kernel-level
 NT synchronization primitives, significantly reducing audio latency (stable at 64 samples /
