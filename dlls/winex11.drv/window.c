@@ -544,7 +544,8 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
     attr->backing_store     = NotUseful;
     attr->border_pixel      = 0;
     attr->event_mask        = (ExposureMask | KeyPressMask | KeyReleaseMask |
-                               FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask);
+                               FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask |
+                               VisibilityChangeMask);
     /* for transparent windows, exclude mouse events to allow mouse pass-through */
     if (!(ex_style & WS_EX_TRANSPARENT)) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
                                                               ButtonReleaseMask | EnterWindowMask);

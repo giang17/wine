@@ -334,7 +334,17 @@ struct x11drv_client_surface
     HDC hdc_src;
     HDC hdc_dst;
     LONG redirected;  /* XCompositeRedirectWindow() is in effect on the client window */
+
+    struct list entry;   /* in client_surfaces_x11 */
+    LONG listed;
+    LONG blit_pending;   /* an offscreen present blit went to the top-level since the last VisibilityNotify */
+    LONG reblitting;     /* x11drv_client_surface_reblit() is presenting this surface */
 };
+
+/* every x11drv client surface, so that a top-level's VisibilityNotify can find
+ * the offscreen surfaces presenting into it, see x11drv_client_surface_reblit() */
+static struct list client_surfaces_x11 = LIST_INIT( client_surfaces_x11 );
+static pthread_mutex_t client_surfaces_x11_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client )
 {
@@ -347,6 +357,13 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     HWND hwnd = client->hwnd;
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
+
+    if (InterlockedExchange( &surface->listed, FALSE ))
+    {
+        pthread_mutex_lock( &client_surfaces_x11_lock );
+        list_remove( &surface->entry );
+        pthread_mutex_unlock( &client_surfaces_x11_lock );
+    }
 
     /* destroy the window before its colormap: freeing a colormap that is still
      * installed in a live window leaves the server holding it until the window
@@ -590,6 +607,12 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
                      surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
     XFlush( gdi_display );
 
+    /* The top-level may not be viewable yet - the window manager is still
+     * mapping its frame - and the server then drops the blit.  Remember that
+     * one went out, so the VisibilityNotify that follows can repeat it. */
+    if (!InterlockedCompareExchange( &surface->reblitting, 0, 0 ))
+        InterlockedExchange( &surface->blit_pending, TRUE );
+
 done:
     if (region) NtGdiDeleteObjectApp( region );
 }
@@ -638,6 +661,12 @@ Window x11drv_client_surface_create( HWND hwnd, int format, struct client_surfac
     if (offscreen) client_surface_redirect_offscreen( surface );
 
     TRACE( "Created %s for client window %lx\n", debugstr_client_surface( &surface->client ), surface->window );
+
+    pthread_mutex_lock( &client_surfaces_x11_lock );
+    list_add_tail( &client_surfaces_x11, &surface->entry );
+    InterlockedExchange( &surface->listed, TRUE );
+    pthread_mutex_unlock( &client_surfaces_x11_lock );
+
     *client = &surface->client;
     return surface->window;
 
@@ -645,6 +674,47 @@ failed:
     if (surface) client_surface_release( &surface->client );
     else if (colormap != default_colormap) XFreeColormap( gdi_display, colormap );
     return None;
+}
+
+/* A top-level has just become viewable.  An offscreen client surface below it
+ * that presented while the top-level was not viewable yet - the window manager
+ * was still mapping its frame - had that blit dropped by the server, and nothing
+ * presents again until the application draws a new frame: the window comes up
+ * black until the pointer hovers a control (issue 290, Studio Pro's Add Tracks
+ * dialog).  The frame is still in the client window, so repeat the blit. */
+void x11drv_client_surface_reblit( HWND toplevel )
+{
+    struct x11drv_client_surface *surface, *pending[16];
+    unsigned int i, count = 0;
+
+    if (!X11DRV_get_whole_window( toplevel )) return;
+
+    pthread_mutex_lock( &client_surfaces_x11_lock );
+    LIST_FOR_EACH_ENTRY( surface, &client_surfaces_x11, struct x11drv_client_surface, entry )
+    {
+        if (count == ARRAY_SIZE(pending)) break;
+        if (!surface->client.hwnd || !surface->hdc_dst) continue;
+        if (!InterlockedCompareExchange( &surface->client.offscreen, 0, 0 )) continue;
+        if (!InterlockedCompareExchange( &surface->blit_pending, 0, 0 )) continue;
+        client_surface_add_ref( &surface->client );
+        pending[count++] = surface;
+    }
+    pthread_mutex_unlock( &client_surfaces_x11_lock );
+
+    for (i = 0; i < count; i++)
+    {
+        surface = pending[i];
+        if (surface->client.hwnd && NtUserGetAncestor( surface->client.hwnd, GA_ROOT ) == toplevel)
+        {
+            TRACE( "repeating the present blit of %s for top-level %p\n",
+                   debugstr_client_surface( &surface->client ), toplevel );
+            InterlockedExchange( &surface->reblitting, TRUE );
+            InterlockedExchange( &surface->blit_pending, FALSE );
+            client_surface_present( &surface->client );
+            InterlockedExchange( &surface->reblitting, FALSE );
+        }
+        client_surface_release( &surface->client );
+    }
 }
 
 /**********************************************************************
