@@ -2782,12 +2782,12 @@ static void STDMETHODCALLTYPE d3d11_device_context_UpdateSubresource1(ID3D11Devi
 static void STDMETHODCALLTYPE d3d11_device_context_DiscardResource(ID3D11DeviceContext4 *iface,
         ID3D11Resource *resource)
 {
-    FIXME("iface %p, resource %p stub!\n", iface, resource);
+    TRACE("iface %p, resource %p.\n", iface, resource);
 }
 
 static void STDMETHODCALLTYPE d3d11_device_context_DiscardView(ID3D11DeviceContext4 *iface, ID3D11View *view)
 {
-    FIXME("iface %p, view %p stub!\n", iface, view);
+    TRACE("iface %p, view %p.\n", iface, view);
 }
 
 static void STDMETHODCALLTYPE d3d11_device_context_VSSetConstantBuffers1(ID3D11DeviceContext4 *iface,
@@ -2968,7 +2968,7 @@ static void STDMETHODCALLTYPE d3d11_device_context_ClearView(ID3D11DeviceContext
 static void STDMETHODCALLTYPE d3d11_device_context_DiscardView1(ID3D11DeviceContext4 *iface, ID3D11View *view,
         const D3D11_RECT *rects, UINT num_rects)
 {
-    FIXME("iface %p, view %p, rects %p, num_rects %u stub!\n", iface, view, rects, num_rects);
+    TRACE("iface %p, view %p, rects %p, num_rects %u.\n", iface, view, rects, num_rects);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_device_context_UpdateTileMappings(ID3D11DeviceContext4 *iface,
