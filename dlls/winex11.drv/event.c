@@ -83,6 +83,7 @@ void (*pXFreeEventData)( Display *display, XEvent /*XGenericEventCookie*/ *event
 static BOOL X11DRV_FocusIn( HWND hwnd, XEvent *event );
 static BOOL X11DRV_FocusOut( HWND hwnd, XEvent *event );
 static BOOL X11DRV_Expose( HWND hwnd, XEvent *event );
+static BOOL X11DRV_VisibilityNotify( HWND hwnd, XEvent *event );
 static BOOL X11DRV_MapNotify( HWND hwnd, XEvent *event );
 static BOOL X11DRV_UnmapNotify( HWND hwnd, XEvent *event );
 static BOOL X11DRV_ReparentNotify( HWND hwnd, XEvent *event );
@@ -108,7 +109,7 @@ static x11drv_event_handler handlers[MAX_EVENT_HANDLERS] =
     X11DRV_Expose,            /* 12 Expose */
     NULL,                     /* 13 GraphicsExpose */
     NULL,                     /* 14 NoExpose */
-    NULL,                     /* 15 VisibilityNotify */
+    X11DRV_VisibilityNotify,  /* 15 VisibilityNotify */
     NULL,                     /* 16 CreateNotify */
     X11DRV_DestroyNotify,     /* 17 DestroyNotify */
     X11DRV_UnmapNotify,       /* 18 UnmapNotify */
@@ -887,6 +888,24 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     release_win_data( data );
 
     NtUserExposeWindowSurface( hwnd, flags, &rect );
+    return TRUE;
+}
+
+
+/**********************************************************************
+ *		X11DRV_VisibilityNotify
+ *
+ * Selected on top-level windows for the offscreen client surfaces presenting
+ * into them, see x11drv_client_surface_reblit().
+ */
+static BOOL X11DRV_VisibilityNotify( HWND hwnd, XEvent *xev )
+{
+    XVisibilityEvent *event = &xev->xvisibility;
+
+    TRACE( "win %p (%lx) state %d\n", hwnd, event->window, event->state );
+
+    if (event->state == VisibilityFullyObscured) return FALSE;
+    x11drv_client_surface_reblit( hwnd );
     return TRUE;
 }
 

@@ -380,6 +380,11 @@ struct x11drv_client_surface
     HDC hdc_src;
     HDC hdc_dst;
     LONG redirected;  /* XCompositeRedirectWindow() is in effect on the client window */
+
+    struct list entry;   /* in client_surfaces_x11 (init.c) */
+    LONG listed;
+    LONG blit_pending;   /* an offscreen present blit went to the top-level since the last VisibilityNotify */
+    LONG reblitting;     /* x11drv_client_surface_reblit() is presenting this surface */
 };
 
 extern struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client );
@@ -388,6 +393,7 @@ extern BOOL needs_offscreen_rendering( HWND hwnd );
 extern void set_dc_drawable( HDC hdc, Drawable drawable, const RECT *rect, int mode );
 extern Drawable get_dc_drawable( HDC hdc, RECT *rect );
 extern HRGN get_dc_monitor_region( HWND hwnd, HDC hdc );
+extern void x11drv_client_surface_reblit( HWND toplevel );
 
 /**************************************************************************
  * X11 USER driver
