@@ -2733,21 +2733,20 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
 static void dcomp_surface_readback_region(struct dcomp_surface *surface,
         LONG l, LONG t, LONG r, LONG b);
 
-/* What the serialization actually wrote, for the commit log.  Two things are
- * invisible without it: the leaf kinds -- only swapchain leaves survive the
- * wined3d reader, surface and texture leaves are dropped there -- and an
- * overflow, because __wine_dcomp_child_count carries the capped value and a
- * tree of 40 leaves is indistinguishable from one of exactly 16.  'total'
- * therefore counts every content-bearing leaf, including the ones past the
- * limit; the per-kind counts describe what was serialized. */
+/* What the tree holds, for the commit log -- not what was written.  The counts
+ * are deliberately independent of the serialization: only swapchain leaves are
+ * serialized at all (see dcomp_serialize_visual_leaves below), and only the
+ * first DCOMP_MAX_SERIALIZED_LEAVES of those, so a count of what was written
+ * would say nothing about the tree.  __wine_dcomp_child_count carries the
+ * written number and cannot tell 40 leaves from exactly 16. */
 struct dcomp_leaf_stats
 {
-    unsigned int surface;       /* serialized: DComp surface bits */
-    unsigned int texture;       /* serialized: composition-texture readback */
-    unsigned int swapchain;     /* serialized: composition window */
+    unsigned int surface;       /* DComp surface leaves in the tree */
+    unsigned int texture;       /* composition-texture leaves in the tree */
+    unsigned int swapchain;     /* composition-swapchain leaves in the tree */
     unsigned int total;         /* content-bearing leaves in the tree, uncapped */
+    unsigned int over_limit;    /* swapchain leaves past the serialization limit */
     unsigned int no_comp_wnd;   /* swapchain leaf, composition window not found */
-    unsigned int no_tex_bits;   /* texture leaf, readback produced no bits */
 };
 
 /* Depth-first leaf serialization with accumulated offsets. The visual's own
@@ -2755,9 +2754,24 @@ struct dcomp_leaf_stats
  * entry. A content-bearing visual is serialized before its children (children
  * render on top). Container visuals (no content) only pass offsets down.
  *
- * Past DCOMP_MAX_SERIALIZED_LEAVES the walk continues in counting mode: it
- * writes no properties and reads back no textures, it only keeps stats->total
- * honest so the commit log can say how much was dropped. */
+ * Only swapchain leaves are serialized.  DComp surfaces and composition
+ * textures used to be written here as well -- a null window handle plus bits,
+ * size and offset -- for a reader that never looked at them: the direct-bits
+ * branch in wined3d's swapchain_composite_children() sat behind a continue that
+ * dropped every leaf without a window handle, and had done so since it was
+ * added (e99905af0dd, 31.03.2026).  A measurement over eight configurations on
+ * 01.09.2026 found no application in the field that reaches the combination,
+ * so the writes were removed rather than the reader repaired.
+ *
+ * The consumer of these leaves is the other compositing path:
+ * dcomp_target_composite_leaves() walks the visual tree itself, knows all three
+ * kinds and does its own texture readback.  It drives every rootless tree, which
+ * is where surface and texture leaves actually occur.
+ *
+ * Every leaf is still counted, by kind and uncapped -- see dcomp_leaf_stats and
+ * the report in dcomp_commit_visual_tree().  That count is what is left of the
+ * removed code: an application that does build such a tree says so in the log
+ * instead of losing its pixels in silence. */
 static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp_visual *visual,
         int base_x, int base_y, unsigned int idx, struct dcomp_leaf_stats *stats)
 {
@@ -2765,131 +2779,70 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
     struct dcomp_visual *child;
     int vx = base_x + (int)visual->offset_x;
     int vy = base_y + (int)visual->offset_y;
-    BOOL counting = idx >= DCOMP_MAX_SERIALIZED_LEAVES;
 
-    if (counting)
-    {
-        /* Count what would have been serialized, then walk on for the children. */
-        if (visual->surface_content || dcomp_visual_effective_texture(visual) || visual->content)
-            ++stats->total;
-        for (child = visual->children; child; child = child->next_sibling)
-            idx = dcomp_serialize_visual_leaves(target_hwnd, child, vx, vy, idx, stats);
-        return idx;
-    }
-
-    /* Surface content: store bits pointer and size directly.
-     * No window indirection needed — wined3d reads bits directly. */
     if (visual->surface_content)
     {
-        struct dcomp_surface *surf = visual->surface_content;
-
-        swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_child_%u_wnd", idx);
-        SetPropW(target_hwnd, prop_name, (HANDLE)0);
-
-        swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_child_%u_bits", idx);
-        SetPropW(target_hwnd, prop_name, (HANDLE)surf->bits);
-
-        swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_child_%u_size", idx);
-        SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(surf->width, surf->height));
-
-        /* Pack offset as two signed 16-bit values */
-        swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_child_%u_offset", idx);
-        SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
-
+        /* Counted, not serialized: composited by dcomp_target_composite_leaves(). */
         ++stats->surface;
         ++stats->total;
-        ++idx;
     }
     else if (dcomp_visual_effective_texture(visual))
     {
         /* Composition texture (issue 90) or dynamic texture's current frame
-         * (issue 95): serialize the throttled CPU readback like surface
-         * bits — wined3d consumes it unchanged. */
-        struct dcomp_texture *tex = dcomp_visual_effective_texture(visual);
-
-        dcomp_texture_ensure_bits(tex);
-        if (tex->bits)
-        {
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_wnd", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)0);
-
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_bits", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)tex->bits);
-
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_size", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(tex->bits_width, tex->bits_height));
-
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_offset", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
-
-            ++stats->texture;
-            ++stats->total;
-            ++idx;
-        }
-        else
-        {
-            /* The readback produced nothing, so the leaf is dropped: its pixels
-             * are on the GPU and nothing downstream can reach them.  Throttled,
-             * this runs per commit. */
-            static unsigned int no_bits_count;
-
-            ++stats->no_tex_bits;
-            ++stats->total;
-            if (++no_bits_count <= 5 || !(no_bits_count % 200))
-                FIXME("Leaf dropped #%u: texture %p on visual %p has no readback bits "
-                        "after ensure_bits, target %p.\n",
-                        no_bits_count, tex, visual, target_hwnd);
-        }
+         * (issue 95).  Counted, not serialized -- and no dcomp_texture_ensure_bits()
+         * here, so the throttled GPU->CPU readback no longer runs for a consumer
+         * that does not exist.  The compositing path does its own. */
+        ++stats->texture;
+        ++stats->total;
     }
     else if (visual->content)
     {
         /* Swapchain content: look up the visual's composition window */
         HWND child_comp_wnd;
 
-        swprintf(prop_name, ARRAY_SIZE(prop_name),
-                WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)visual->content);
-        child_comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
-        if (child_comp_wnd)
+        ++stats->swapchain;
+        ++stats->total;
+
+        if (idx >= DCOMP_MAX_SERIALIZED_LEAVES)
         {
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_wnd", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)child_comp_wnd);
-
-            /* Pack offset as two signed 16-bit values */
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_offset", idx);
-            SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
-
-            ++stats->swapchain;
-            ++stats->total;
-            ++idx;
+            /* Past the limit the walk only counts, so the commit log can say how
+             * much was dropped.  It keeps descending: the children are counted too. */
+            ++stats->over_limit;
         }
         else
         {
-            /* No composition window behind the swapchain: the leaf cannot be
-             * addressed and is dropped.  Either dxgi has not created the window
-             * yet or the desktop property was lost. */
-            static unsigned int no_wnd_count;
+            swprintf(prop_name, ARRAY_SIZE(prop_name),
+                    WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)visual->content);
+            child_comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name);
+            if (child_comp_wnd)
+            {
+                swprintf(prop_name, ARRAY_SIZE(prop_name),
+                        L"__wine_dcomp_child_%u_wnd", idx);
+                SetPropW(target_hwnd, prop_name, (HANDLE)child_comp_wnd);
 
-            ++stats->no_comp_wnd;
-            ++stats->total;
-            if (++no_wnd_count <= 5 || !(no_wnd_count % 200))
-                FIXME("Leaf dropped #%u: no composition window for swapchain content %p "
-                        "on visual %p, target %p.\n",
-                        no_wnd_count, visual->content, visual, target_hwnd);
+                /* Pack offset as two signed 16-bit values */
+                swprintf(prop_name, ARRAY_SIZE(prop_name),
+                        L"__wine_dcomp_child_%u_offset", idx);
+                SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
+
+                ++idx;
+            }
+            else
+            {
+                /* No composition window behind the swapchain: the leaf cannot be
+                 * addressed and is dropped.  Either dxgi has not created the window
+                 * yet or the desktop property was lost. */
+                static unsigned int no_wnd_count;
+
+                ++stats->no_comp_wnd;
+                if (++no_wnd_count <= 5 || !(no_wnd_count % 200))
+                    FIXME("Leaf dropped #%u: no composition window for swapchain content %p "
+                            "on visual %p, target %p.\n",
+                            no_wnd_count, visual->content, visual, target_hwnd);
+            }
         }
     }
 
-    /* Keep walking past the limit -- the loop guard is inside the callee, which
-     * switches to counting mode and writes nothing. */
     for (child = visual->children; child; child = child->next_sibling)
         idx = dcomp_serialize_visual_leaves(target_hwnd, child, vx, vy, idx, stats);
 
@@ -3029,7 +2982,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
      * swapchain Present path handles compositing. */
     /* The mode is a property of the root, not of the leaf count: a rootless tree
      * that serialized nothing this commit is still rootless, its timer is merely
-     * idle.  The timer condition below therefore carries the extra idx > 0. */
+     * idle.  The timer condition below therefore carries the extra leaf test. */
     rootless = !root->content && !root->surface_content;
 
     /* A target that changes mode changes which code composites its leaves, and
@@ -3045,7 +2998,13 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
                     dcomp_commit_note_text(prev), dcomp_commit_note_text(note));
     }
 
-    if (idx > 0 && rootless)
+    /* stats.total, not idx: what has to drive the timer is whether the tree has
+     * content-bearing leaves at all, and idx counts only the serialized ones.
+     * Since surface and texture leaves stopped being serialized, idx is zero for
+     * exactly the trees this path exists for -- a rootless tree of texture
+     * leaves would get neither the timer nor the composite below, and its
+     * picture would never arrive.  Caught by dcomp-texture-test. */
+    if (stats.total > 0 && rootless)
     {
         struct dcomp_target *target = (struct dcomp_target *)GetPropW(target_hwnd, dcomp_target_prop);
         DWORD now = GetTickCount();
@@ -3067,9 +3026,9 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
      * one measures past the application (issue 178 cost four rounds that way).
      * The kinds matter for the same reason: only swapchain leaves survive the
      * wined3d reader, surface and texture leaves are dropped there. */
-    if (stats.total > idx)
+    if (stats.over_limit)
     {
-        /* Own throttle: an overflow that first appears at commit #1234 has to be
+        /* Own throttle: an overflow that first appears at commit 1234 has to be
          * reported then, not at the next multiple of 100. */
         static unsigned int overflow_count;
 
@@ -3077,7 +3036,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
             FIXME("Commit overflow #%u: target %p mode=%s serialized=%u total=%u limit=%u "
                     "dropped=%u surface=%u texture=%u swapchain=%u.\n",
                     overflow_count, target_hwnd, rootless ? "rootless" : "content-root",
-                    idx, stats.total, DCOMP_MAX_SERIALIZED_LEAVES, stats.total - idx,
+                    idx, stats.total, DCOMP_MAX_SERIALIZED_LEAVES, stats.over_limit,
                     stats.surface, stats.texture, stats.swapchain);
     }
     else
@@ -3089,6 +3048,28 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
                     "surface=%u texture=%u swapchain=%u.\n",
                     commit_count, target_hwnd, rootless ? "rootless" : "content-root",
                     idx, stats.total, stats.surface, stats.texture, stats.swapchain);
+    }
+
+    /* Under a content-bearing root the wined3d Present path is what composites
+     * the tree, and it takes swapchain leaves only.  Surface and texture leaves
+     * are therefore not drawn at all here -- pixels missing from the frame with
+     * no error anywhere, and a search that starts in dcomp, where everything
+     * looks right.  This line is what replaces the serialization removed on
+     * 01.09.2026: the measurement of that day found no application in the field
+     * that builds this combination, but the next one to build it says so here
+     * instead of quietly losing its content.
+     *
+     * Rootless trees are not affected -- dcomp_target_composite_leaves() drives
+     * them and knows all three kinds. */
+    if (!rootless && (stats.surface || stats.texture))
+    {
+        static unsigned int uncomposited_count;
+
+        if (++uncomposited_count <= 5 || !(uncomposited_count % 200))
+            FIXME("Leaves not composited #%u: target %p carries %u surface and %u texture "
+                    "leaves under a content-bearing root; the wined3d present path takes "
+                    "swapchain leaves only, so their pixels never reach the frame.\n",
+                    uncomposited_count, target_hwnd, stats.surface, stats.texture);
     }
 }
 

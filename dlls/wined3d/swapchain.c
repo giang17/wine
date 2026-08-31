@@ -685,7 +685,12 @@ static void composite_over_premul(DWORD *dst, const DWORD *src,
 #define WINED3D_DCOMP_MAX_LEAVES 16
 
 /* Composite child visuals onto root's comp buffer.
- * Reads child info from window properties set by dcomp Commit(). */
+ * Reads child info from window properties set by dcomp Commit().
+ *
+ * One kind of leaf arrives here: a composition swapchain, addressed through its
+ * hidden composition window.  DComp surfaces and composition textures are
+ * composited by dcomp itself (dcomp_target_composite_leaves), which walks the
+ * visual tree rather than these properties. */
 static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         unsigned int dst_w, unsigned int dst_h)
 {
@@ -727,39 +732,24 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         child_wnd = (HWND)GetPropW(swapchain->win_handle, prop_name);
         if (!child_wnd)
         {
-            /* dcomp serializes DComp surfaces and composition textures with a
-             * null window handle and their bits in __wine_dcomp_child_%u_bits.
-             * This continue drops them before the direct-bits branch below can
-             * read them, which is why that branch has never run since it was
-             * added (e99905af0dd, 31.03.2026).  The leaf is simply absent from
-             * the frame -- no error anywhere, and the search starts in dcomp,
-             * where everything looks right. */
+            /* Every serialized leaf carries a composition window since dcomp
+             * stopped writing surface and texture leaves, so a null handle means
+             * the two halves disagree -- a half-deployed build.  Until then the
+             * null handle was how dcomp announced a DComp surface or composition
+             * texture, and this continue dropped it before the direct-bits branch
+             * that would have read it; that branch never ran once between
+             * e99905af0dd (31.03.2026) and its removal, and has been deleted. */
             static unsigned int no_wnd_count;
 
             if (++no_wnd_count <= 5 || !(no_wnd_count % 200))
-                FIXME("Leaf #%u dropped on %p (report #%u): no window handle, so it is a "
-                        "DComp surface or composition texture; the direct-bits path is "
-                        "unreachable.\n", i, swapchain->win_handle, no_wnd_count);
+                FIXME("Leaf #%u dropped on %p (report #%u): no composition window on the "
+                        "leaf, which no current dcomp writes -- the two halves disagree.\n",
+                        i, swapchain->win_handle, no_wnd_count);
             continue;
         }
 
-        /* Two paths: swapchain children have a window with comp_bits,
-         * surface children have direct bits stored as properties on target. */
-        if (child_wnd)
-        {
-            child_bits = (DWORD *)GetPropW(child_wnd, L"__wine_dcomp_comp_bits");
-            child_dims = (LPARAM)GetPropW(child_wnd, L"__wine_dcomp_comp_size");
-        }
-        else
-        {
-            /* Direct-bits path for DComp surface children */
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_bits", i);
-            child_bits = (DWORD *)GetPropW(swapchain->win_handle, prop_name);
-            swprintf(prop_name, ARRAY_SIZE(prop_name),
-                    L"__wine_dcomp_child_%u_size", i);
-            child_dims = (LPARAM)GetPropW(swapchain->win_handle, prop_name);
-        }
+        child_bits = (DWORD *)GetPropW(child_wnd, L"__wine_dcomp_comp_bits");
+        child_dims = (LPARAM)GetPropW(child_wnd, L"__wine_dcomp_comp_size");
         if (!child_bits || !child_dims)
         {
             /* The window is there but carries no composite buffer yet -- the
@@ -792,7 +782,6 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         }
 
         /* Flush GDI operations on child's comp_dc before reading bits */
-        if (child_wnd)
         {
             HDC child_dc = (HDC)GetPropW(child_wnd, L"__wine_dcomp_comp_dc");
             if (child_dc)
