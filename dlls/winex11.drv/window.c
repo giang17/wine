@@ -2118,7 +2118,7 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
 {
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
     struct x11drv_win_data *data;
-    HWND old_foreground;
+    HWND old_foreground, anchor;
 
     if (!state_cmd)
     {
@@ -2134,9 +2134,15 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
     *state_cmd = *swp_flags = 0;
     *foreground = 0;
 
-    if (!(old_foreground = NtUserGetForegroundWindow())) old_foreground = NtUserGetDesktopWindow();
-    if (!is_virtual_desktop() && NtUserGetWindowThread( old_foreground, NULL ) == GetCurrentThreadId() &&
-        !window_has_pending_wm_state( old_foreground, NormalState ) && !window_is_reparenting( old_foreground ) &&
+    /* With no foreground window the desktop owner thread is responsible for the
+     * sync (net_active_window_notify posts here in that case), but the change
+     * comparison below must use the real (null) foreground: masking it with the
+     * desktop makes a switch to a non-Wine window look like a no-op and the
+     * foreground then never leaves the null state. */
+    old_foreground = NtUserGetForegroundWindow();
+    if (!(anchor = old_foreground)) anchor = NtUserGetDesktopWindow();
+    if (!is_virtual_desktop() && NtUserGetWindowThread( anchor, NULL ) == GetCurrentThreadId() &&
+        !window_has_pending_wm_state( anchor, NormalState ) && !window_is_reparenting( anchor ) &&
         !thread_data->net_active_window_serial)
     {
         *foreground = hwnd_from_window( thread_data->display, thread_data->current_state.net_active_window );
@@ -2308,7 +2314,7 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
     Window *desired = &data->desired_state.net_active_window, *pending = &data->pending_state.net_active_window, *current = &data->current_state.net_active_window;
     unsigned long *expect_serial = &data->net_active_window_serial;
     const char *expected, *received;
-    HWND current_hwnd, pending_hwnd;
+    HWND current_hwnd, pending_hwnd, foreground;
 
     current_hwnd = hwnd_from_window( data->display, value );
     pending_hwnd = hwnd_from_window( data->display, *pending );
@@ -2319,7 +2325,13 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
                               current, expected, "", received, NULL ))
         return;
 
-    NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
+    /* When there is no foreground window this would become a thread message to
+     * whichever x11drv thread noticed the change, where the ownership check in
+     * X11DRV_GetWindowStateUpdates can never pass, so the foreground would stay
+     * out of sync with X for good.  Post to the desktop window instead: its
+     * owner thread passes that check through the same desktop fallback. */
+    if (!(foreground = NtUserGetForegroundWindow())) foreground = NtUserGetDesktopWindow();
+    NtUserPostMessage( foreground, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
 }
 
 Window get_net_active_window( Display *display )
