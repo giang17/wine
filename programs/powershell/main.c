@@ -36,6 +36,43 @@ static WCHAR *strip_quotes( WCHAR *str )
     return str;
 }
 
+/* Split one command string into tokens, honouring double quotes.  A command
+ * passed as `-Command "start \"C:\\path\\app.exe\""` arrives as a single
+ * argument, unlike the parameter form where the shell already split them. */
+static int tokenize( WCHAR *cmd, WCHAR **argv, int max )
+{
+    int argc = 0;
+    WCHAR *p = cmd;
+
+    while (*p && argc < max)
+    {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        if (*p == '"' || *p == '\'')
+        {
+            /* PowerShell quotes with either character; -ArgumentList in
+             * particular is usually written with single quotes. */
+            WCHAR quote = *p;
+            argv[argc++] = ++p;
+            while (*p && *p != quote) p++;
+        }
+        else
+        {
+            argv[argc++] = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+        }
+        if (*p) *p++ = 0;
+    }
+    return argc;
+}
+
+/* `start` is PowerShell's alias for Start-Process; applications use it far more
+ * often than the full name (Native Access launches its products that way). */
+static BOOL is_start_process( const WCHAR *word )
+{
+    return !wcsicmp( word, L"Start-Process" ) || !wcsicmp( word, L"start" );
+}
+
 /* Minimal Start-Process implementation, sufficient for elevation helpers
  * (e.g. node's sudo-prompt) that invoke
  *   powershell.exe Start-Process -FilePath <file> -WindowStyle hidden -Verb runAs
@@ -137,9 +174,19 @@ int __cdecl wmain(int argc, WCHAR *argv[])
                 }
                 return 0;
             }
-            if (!wcsicmp( strip_quotes( argv[i + 1] ), L"Start-Process" )
+            /* Parameter form: powershell Start-Process -FilePath <file> ... */
+            if (is_start_process( strip_quotes( argv[i + 1] ) )
                 && (ret = start_process( argc, argv, i + 1 )) >= 0)
                 return ret;
+            {
+                /* Inline form: the whole command sits in one argument. */
+                WCHAR *tok[32];
+                int n = tokenize( argv[i + 1], tok, ARRAY_SIZE(tok) );
+
+                if (n && is_start_process( tok[0] )
+                    && (ret = start_process( n, tok, 0 )) >= 0)
+                    return ret;
+            }
             /* An inline command we did not execute must not report success:
              * installers use these as yes/no probes, and a blanket 0 traps
              * them in impossible states (e.g. "app is running, close it"). */
