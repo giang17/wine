@@ -345,8 +345,8 @@ these were developed against, but they are not specific to it.
 | Pianoteq 9 (standalone + VST3) | JUCE 8.0.10 + DComp | Fully functional |
 | FL Studio 2026 (Wine + ntsync) | Custom | Runs without xruns at 64 samples / 48 kHz; Cloud plugins install (needs the AF_UNIX patches) and stream |
 | UVI Portal | WebView2 | Installs and signs in, including special characters typed into the login fields |
-| WineSynth (custom VSTGUI plugin) | VSTGUI + DComp | 18k+ partial redraws without crash |
 | Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing, Splice view; the content indexer (`Ableton Index.exe`) runs on the built-in VC runtime |
+| Native Access 3.25.2 | Electron/Chromium (D3D11 + DComp) | Installs, signs in and installs products (verified with a Kontakt 7 update, Supercharger and the bundled NTKDaemon). Needs the `powershell` patch from this branch: without it the installer loops forever on "Native Access is running" and the bundled NTKDaemon is never installed, leaving the app stuck at "grant permission to install dependencies". Kontakt 8's own installer aborts under Wine for unrelated reasons (InstallAware) |
 | Fender Studio Pro 8 | CCL (DXGI + DWrite + DComp) | Fully functional — the song view draws completely and stays stable, no stale tool bar or transport and no flicker; the transport playhead and the selection rectangle no longer flicker while the transport runs, and video on the timeline plays, seeks, loops and jumps without stalling or going black. Starting at all needs the `UIAnimationManager2` and `UIAnimationTransitionLibrary2` implementation from this branch; without it the CCL framework aborts with "requires Windows 10 or later" |
 
 ## Font Setup
