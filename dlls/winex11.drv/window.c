@@ -110,13 +110,36 @@ static const WCHAR *dcomp_swapchain_prop = dcomp_swapchain_propW;
 static const WCHAR dcomp_popup_parent_propW[] =
     {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','o','p','u','p','_','p','a','r','e','n','t',0};
 static const WCHAR *dcomp_popup_parent_prop = dcomp_popup_parent_propW;
-/* Set on the desktop window by dxgi while a DComp plugin GUI is hosted in this
- * session.  Used to mark embedded ownerless TOOLWINDOW popups as DROPDOWN_MENU
+/* Set on the desktop window by dxgi while a DComp plugin GUI is hosted in THIS
+ * process.  Used to mark embedded ownerless TOOLWINDOW popups as DROPDOWN_MENU
  * (see set_style_hints) — they anchor to the host window, so the per-window
- * dcomp discriminators below cannot see they belong to a DComp plugin. */
-static const WCHAR dcomp_active_propW[] =
-    {'_','_','w','i','n','e','_','d','c','o','m','p','_','a','c','t','i','v','e',0};
-static const WCHAR *dcomp_active_prop = dcomp_active_propW;
+ * dcomp discriminators below cannot see they belong to a DComp plugin.
+ * The name is per-process, __wine_dcomp_active_<pid:08x> (issue 74): under a
+ * session-wide name the flag also mis-typed borderless tool popups of
+ * unrelated non-DComp processes.  set_style_hints runs in the process that
+ * owns the window, so building the name from the current pid asks exactly
+ * "does the popup's own process host a DComp GUI".  Lazy init is safe: callers
+ * hold the win_data lock, and rebuilding writes identical bytes anyway. */
+static const WCHAR dcomp_active_prop_prefixW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','a','c','t','i','v','e','_',0};
+
+static const WCHAR *dcomp_active_prop(void)
+{
+    static WCHAR name[ARRAY_SIZE(dcomp_active_prop_prefixW) + 8];
+
+    if (!name[0])
+    {
+        static const char hex[] = "0123456789abcdef";
+        DWORD pid = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
+        WCHAR *p = name + ARRAY_SIZE(dcomp_active_prop_prefixW) - 1;
+        int i;
+
+        memcpy( name, dcomp_active_prop_prefixW, sizeof(dcomp_active_prop_prefixW) );
+        for (i = 28; i >= 0; i -= 4) *p++ = hex[(pid >> i) & 0xf];
+        *p = 0;
+    }
+    return name;
+}
 
 static const char *debugstr_mwm_hints( const MwmHints *hints )
 {
@@ -1291,17 +1314,19 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
          * stays managed (no override_redirect → embedded-safe) but is excluded
          * from focus rotation.
          *
-         * Third discriminator (embedded, broad): a DComp plugin GUI is hosted in
-         * this session (dxgi published __wine_dcomp_active on the desktop). In the
-         * embedded case (plugin in a Windows host under Wine) the in-plugin popups
-         * anchor to the host window, not to a DComp swapchain — so neither the
-         * popup-parent property nor anchor_is_dcomp fires, and they stayed UTILITY
-         * → the same focus war among themselves (Trinity IFX list flicker). This
-         * flag catches them. It is deliberately broad (any TOOLWINDOW popup while
-         * a DComp GUI is open) — validated against Serum2 (embedded dropdowns must
-         * not regress). */
+         * Third discriminator (embedded, per-process): THIS process hosts a DComp
+         * plugin GUI (dxgi published __wine_dcomp_active_<pid> on the desktop).
+         * In the embedded case (plugin in a Windows host under Wine) the in-plugin
+         * popups anchor to the host window, not to a DComp swapchain — so neither
+         * the popup-parent property nor anchor_is_dcomp fires, and they stayed
+         * UTILITY → the same focus war among themselves (Trinity IFX list
+         * flicker). This flag catches them: the in-plugin popups live in the same
+         * process as the plugin GUI. Originally the name was session-wide
+         * ("deliberately broad") and mis-typed borderless tool popups of unrelated
+         * non-DComp processes as DROPDOWN_MENU while any DComp GUI was open
+         * elsewhere — issue 74, repro scripts/repro-74-mixed-popup.sh. */
         if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ) || anchor_is_dcomp
-                || NtUserGetProp( NtUserGetDesktopWindow(), dcomp_active_prop ))
+                || NtUserGetProp( NtUserGetDesktopWindow(), dcomp_active_prop() ))
             window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
         else
             /* Issue 84: ownerless TOOLWINDOW popups of non-DComp apps (KM88

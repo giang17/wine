@@ -449,14 +449,37 @@ LONG dcomp_subclassed_target_count;
  * (activatable) → focus war with the plugin's other popups → flicker (Trinity
  * IFX list, embedded).  This flag lets winex11 mark them DROPDOWN_MENU instead.
  * Set while count > 0, removed at 0 (SetProp with value 0 is not distinguishable
- * from "unset" — see the SetPropW (HANDLE)1/2 lesson). */
+ * from "unset" — see the SetPropW (HANDLE)1/2 lesson).
+ *
+ * The property name carries this process's pid (__wine_dcomp_active_<pid:08x>)
+ * and winex11 only honours the name built from the popup's own process (issue
+ * 74): the signal is process-wide, but under a session-wide name it also
+ * mis-typed borderless tool popups of unrelated non-DComp processes as
+ * DROPDOWN_MENU.  The embedded case that motivated the flag (in-process VST3
+ * popups, Trinity IFX under Windows Reaper) shares the plugin GUI's process,
+ * so it keeps firing.  Per-process names also stop two DComp-hosting processes
+ * from overwriting each other's count in a single shared property. */
 static void dcomp_update_active_prop(void)
 {
+    static WCHAR name[40];
     LONG count = dcomp_subclassed_target_count;
+
+    if (!name[0])
+    {
+        static const WCHAR hex[] = L"0123456789abcdef";
+        DWORD pid = GetCurrentProcessId();
+        WCHAR *p;
+        int i;
+
+        lstrcpyW(name, L"__wine_dcomp_active_");
+        p = name + lstrlenW(name);
+        for (i = 28; i >= 0; i -= 4) *p++ = hex[(pid >> i) & 0xf];
+        *p = 0;
+    }
     if (count > 0)
-        SetPropW(GetDesktopWindow(), L"__wine_dcomp_active", (HANDLE)(LONG_PTR)count);
+        SetPropW(GetDesktopWindow(), name, (HANDLE)(LONG_PTR)count);
     else
-        RemovePropW(GetDesktopWindow(), L"__wine_dcomp_active");
+        RemovePropW(GetDesktopWindow(), name);
 }
 
 /* Popup transient-parent stack: the open DComp targets in open order
