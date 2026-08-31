@@ -2265,6 +2265,12 @@ static const WCHAR dcomp_present_flush_prop[] = L"__wine_dcomp_present_flush";
  * are skipped by readers via IsWindow(). */
 #define DCOMP_TARGET_REGISTRY_SLOTS 16
 
+/* The same 16 as the slots above, and something else entirely: the number of
+ * leaves dcomp_serialize_visual_leaves() writes to the target window.  Kept as
+ * a name so the commit log can say which limit it hit; wined3d has its own copy
+ * of the number in swapchain_composite_children(). */
+#define DCOMP_MAX_SERIALIZED_LEAVES 16
+
 static void dcomp_target_registry_set(HWND hwnd, BOOL add)
 {
     HWND desktop = GetDesktopWindow();
@@ -2713,20 +2719,47 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
 static void dcomp_surface_readback_region(struct dcomp_surface *surface,
         LONG l, LONG t, LONG r, LONG b);
 
+/* What the serialization actually wrote, for the commit log.  Two things are
+ * invisible without it: the leaf kinds -- only swapchain leaves survive the
+ * wined3d reader, surface and texture leaves are dropped there -- and an
+ * overflow, because __wine_dcomp_child_count carries the capped value and a
+ * tree of 40 leaves is indistinguishable from one of exactly 16.  'total'
+ * therefore counts every content-bearing leaf, including the ones past the
+ * limit; the per-kind counts describe what was serialized. */
+struct dcomp_leaf_stats
+{
+    unsigned int surface;       /* serialized: DComp surface bits */
+    unsigned int texture;       /* serialized: composition-texture readback */
+    unsigned int swapchain;     /* serialized: composition window */
+    unsigned int total;         /* content-bearing leaves in the tree, uncapped */
+};
+
 /* Depth-first leaf serialization with accumulated offsets. The visual's own
  * offset positions its whole subtree (DComp semantics), so it is added on
  * entry. A content-bearing visual is serialized before its children (children
- * render on top). Container visuals (no content) only pass offsets down. */
+ * render on top). Container visuals (no content) only pass offsets down.
+ *
+ * Past DCOMP_MAX_SERIALIZED_LEAVES the walk continues in counting mode: it
+ * writes no properties and reads back no textures, it only keeps stats->total
+ * honest so the commit log can say how much was dropped. */
 static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp_visual *visual,
-        int base_x, int base_y, unsigned int idx)
+        int base_x, int base_y, unsigned int idx, struct dcomp_leaf_stats *stats)
 {
     WCHAR prop_name[64];
     struct dcomp_visual *child;
     int vx = base_x + (int)visual->offset_x;
     int vy = base_y + (int)visual->offset_y;
+    BOOL counting = idx >= DCOMP_MAX_SERIALIZED_LEAVES;
 
-    if (idx >= 16)
+    if (counting)
+    {
+        /* Count what would have been serialized, then walk on for the children. */
+        if (visual->surface_content || dcomp_visual_effective_texture(visual) || visual->content)
+            ++stats->total;
+        for (child = visual->children; child; child = child->next_sibling)
+            idx = dcomp_serialize_visual_leaves(target_hwnd, child, vx, vy, idx, stats);
         return idx;
+    }
 
     /* Surface content: store bits pointer and size directly.
      * No window indirection needed — wined3d reads bits directly. */
@@ -2751,6 +2784,8 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
                 L"__wine_dcomp_child_%u_offset", idx);
         SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
 
+        ++stats->surface;
+        ++stats->total;
         ++idx;
     }
     else if (dcomp_visual_effective_texture(visual))
@@ -2779,6 +2814,8 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
                     L"__wine_dcomp_child_%u_offset", idx);
             SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
 
+            ++stats->texture;
+            ++stats->total;
             ++idx;
         }
     }
@@ -2801,18 +2838,24 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
                     L"__wine_dcomp_child_%u_offset", idx);
             SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
 
+            ++stats->swapchain;
+            ++stats->total;
             ++idx;
         }
     }
 
-    for (child = visual->children; child && idx < 16; child = child->next_sibling)
-        idx = dcomp_serialize_visual_leaves(target_hwnd, child, vx, vy, idx);
+    /* Keep walking past the limit -- the loop guard is inside the callee, which
+     * switches to counting mode and writes nothing. */
+    for (child = visual->children; child; child = child->next_sibling)
+        idx = dcomp_serialize_visual_leaves(target_hwnd, child, vx, vy, idx, stats);
 
     return idx;
 }
 
 static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root)
 {
+    struct dcomp_leaf_stats stats = {0};
+    BOOL rootless = FALSE;
     unsigned int idx = 0;
 
     if (!root || !root->children || !target_hwnd)
@@ -2830,9 +2873,9 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
      * start the walk at its children. */
     {
         struct dcomp_visual *child;
-        for (child = root->children; child && idx < 16; child = child->next_sibling)
+        for (child = root->children; child; child = child->next_sibling)
             idx = dcomp_serialize_visual_leaves(target_hwnd, child,
-                    (int)root->offset_x, (int)root->offset_y, idx);
+                    (int)root->offset_x, (int)root->offset_y, idx, &stats);
     }
 
     SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)(ULONG_PTR)idx);
@@ -2844,7 +2887,11 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
      * also runs for in-process targets — rate-limited to ~60 Hz — so page
      * updates don't wait for the timer. With a content-bearing root the
      * swapchain Present path handles compositing. */
-    if (idx > 0 && !root->content && !root->surface_content)
+    /* The mode is a property of the root, not of the leaf count: a rootless tree
+     * that serialized nothing this commit is still rootless, its timer is merely
+     * idle.  The timer condition below therefore carries the extra idx > 0. */
+    rootless = !root->content && !root->surface_content;
+    if (idx > 0 && rootless)
     {
         struct dcomp_target *target = (struct dcomp_target *)GetPropW(target_hwnd, dcomp_target_prop);
         DWORD now = GetTickCount();
@@ -2860,11 +2907,34 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
     else
         KillTimer(target_hwnd, DCOMP_TREE_TIMER);
 
+    /* The first question of every DComp diagnosis is which path this application
+     * takes -- a rootless tree is driven by the timer and the SetContent hook,
+     * a content-bearing root by the swapchain Present.  Instrumenting the wrong
+     * one measures past the application (issue 178 cost four rounds that way).
+     * The kinds matter for the same reason: only swapchain leaves survive the
+     * wined3d reader, surface and texture leaves are dropped there. */
+    if (stats.total > idx)
+    {
+        /* Own throttle: an overflow that first appears at commit #1234 has to be
+         * reported then, not at the next multiple of 100. */
+        static unsigned int overflow_count;
+
+        if (++overflow_count <= 5 || !(overflow_count % 100))
+            FIXME("Commit overflow #%u: target %p mode=%s serialized=%u total=%u limit=%u "
+                    "dropped=%u surface=%u texture=%u swapchain=%u.\n",
+                    overflow_count, target_hwnd, rootless ? "rootless" : "content-root",
+                    idx, stats.total, DCOMP_MAX_SERIALIZED_LEAVES, stats.total - idx,
+                    stats.surface, stats.texture, stats.swapchain);
+    }
+    else
     {
         static unsigned int commit_count;
+
         if (++commit_count <= 5 || !(commit_count % 100))
-            FIXME("Commit #%u: serialized %u child visuals for target %p.\n",
-                    commit_count, idx, target_hwnd);
+            FIXME("Commit #%u: target %p mode=%s serialized=%u total=%u "
+                    "surface=%u texture=%u swapchain=%u.\n",
+                    commit_count, target_hwnd, rootless ? "rootless" : "content-root",
+                    idx, stats.total, stats.surface, stats.texture, stats.swapchain);
     }
 }
 
