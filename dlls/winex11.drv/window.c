@@ -2937,6 +2937,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     memset( &data->current_state, 0, sizeof(data->current_state) );
     data->wm_state_serial = 0;
     data->net_wm_state_serial = 0;
+    data->wm_hints_serial = 0;
     data->mwm_hints_serial = 0;
     data->wm_normal_hints_serial = 0;
     data->configure_serial = 0;
@@ -3255,6 +3256,8 @@ BOOL X11DRV_CreateWindow( HWND hwnd )
  *		get_win_data
  *
  * Lock and return the X11 data structure associated with a window.
+ * This takes the global win_data_mutex; despite the get/release naming
+ * there is no per-window refcounting.
  */
 struct x11drv_win_data *get_win_data( HWND hwnd )
 {
