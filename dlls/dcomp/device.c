@@ -2896,6 +2896,76 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
     return idx;
 }
 
+/* What a target last reported about itself.  Two reports must not repeat every
+ * commit -- the early exit below, which is the most frequent outcome of all, and
+ * a change of operating mode -- so each target remembers its last note.
+ *
+ * The table is kept in process memory and keyed by the target window rather than
+ * held on struct dcomp_target, because the early exit has nothing but the HWND:
+ * resolving the target there means a GetPropW, and that is a wineserver round
+ * trip in a path that runs once per present.  Unlocked, like the throttle
+ * counters next to it; the worst outcome is one duplicated or one missing
+ * diagnostic line. */
+#define DCOMP_COMMIT_NOTE_SLOTS 16
+
+enum dcomp_commit_note
+{
+    DCOMP_NOTE_NONE,                /* nothing reported yet, or a free slot */
+    DCOMP_NOTE_NO_TARGET,           /* commit without a target window */
+    DCOMP_NOTE_NO_ROOT,             /* target has no root visual */
+    DCOMP_NOTE_CONTENT_ROOT_ALONE,  /* root carries content but has no children */
+    DCOMP_NOTE_EMPTY_ROOT,          /* root has neither content nor children */
+    DCOMP_NOTE_ROOTLESS,            /* committed, rootless tree */
+    DCOMP_NOTE_CONTENT_ROOT,        /* committed, content-bearing root */
+};
+
+static const char *dcomp_commit_note_text(enum dcomp_commit_note note)
+{
+    switch (note)
+    {
+        case DCOMP_NOTE_NO_TARGET:          return "no target window";
+        case DCOMP_NOTE_NO_ROOT:            return "no root visual";
+        case DCOMP_NOTE_CONTENT_ROOT_ALONE: return "content-root without children";
+        case DCOMP_NOTE_EMPTY_ROOT:         return "root without content and without children";
+        case DCOMP_NOTE_ROOTLESS:           return "rootless";
+        case DCOMP_NOTE_CONTENT_ROOT:       return "content-root";
+        default:                            return "none";
+    }
+}
+
+/* Store this target's note and hand back the one it carried before, so callers
+ * can report a first sighting and a change but stay quiet on a repeat. */
+static enum dcomp_commit_note dcomp_commit_note_set(HWND hwnd, enum dcomp_commit_note note)
+{
+    static struct { HWND hwnd; enum dcomp_commit_note note; } notes[DCOMP_COMMIT_NOTE_SLOTS];
+    static unsigned int next_slot;
+    unsigned int i;
+
+    for (i = 0; i < DCOMP_COMMIT_NOTE_SLOTS; ++i)
+    {
+        if (notes[i].note != DCOMP_NOTE_NONE && notes[i].hwnd == hwnd)
+        {
+            enum dcomp_commit_note prev = notes[i].note;
+
+            notes[i].note = note;
+            return prev;
+        }
+    }
+    for (i = 0; i < DCOMP_COMMIT_NOTE_SLOTS; ++i)
+    {
+        if (notes[i].note == DCOMP_NOTE_NONE)
+            break;
+    }
+    /* More targets than slots: reuse round-robin.  A reused slot reports its new
+     * owner once more than necessary, which is the failure direction to prefer --
+     * silence is what this table exists to remove. */
+    if (i == DCOMP_COMMIT_NOTE_SLOTS)
+        i = next_slot++ % DCOMP_COMMIT_NOTE_SLOTS;
+    notes[i].hwnd = hwnd;
+    notes[i].note = note;
+    return DCOMP_NOTE_NONE;
+}
+
 static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root)
 {
     struct dcomp_leaf_stats stats = {0};
@@ -2904,11 +2974,37 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
 
     if (!root || !root->children || !target_hwnd)
     {
+        enum dcomp_commit_note note;
+
         if (target_hwnd)
         {
             SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)0);
             KillTimer(target_hwnd, DCOMP_TREE_TIMER);
         }
+
+        /* This return is the most frequent outcome in production and the only one
+         * that said nothing at all.  Serum 2 and Trinity sit here permanently --
+         * a content-bearing root with no children -- and telling that apart from
+         * an empty tree had to be read off SetRoot/SetContent by hand during the
+         * measurement series of 31.08.2026, because this path was silent.  The
+         * distinction matters: "content-root without children" is a working tree
+         * with nothing to composite under it, "root without content and without
+         * children" is a tree that has not been built yet.
+         *
+         * The root predicate is deliberately the same two terms as the rootless
+         * test further down, so the two reports cannot contradict each other. */
+        if (!target_hwnd)
+            note = DCOMP_NOTE_NO_TARGET;
+        else if (!root)
+            note = DCOMP_NOTE_NO_ROOT;
+        else if (root->content || root->surface_content)
+            note = DCOMP_NOTE_CONTENT_ROOT_ALONE;
+        else
+            note = DCOMP_NOTE_EMPTY_ROOT;
+
+        if (dcomp_commit_note_set(target_hwnd, note) != note)
+            FIXME("Commit skipped on target %p: %s -- nothing serialized, tree timer off.\n",
+                    target_hwnd, dcomp_commit_note_text(note));
         return;
     }
 
@@ -2935,6 +3031,20 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
      * that serialized nothing this commit is still rootless, its timer is merely
      * idle.  The timer condition below therefore carries the extra idx > 0. */
     rootless = !root->content && !root->surface_content;
+
+    /* A target that changes mode changes which code composites its leaves, and
+     * the throttled commit line below is silent from #6 to #100 -- a switch at
+     * commit #20 would never show up there.  Reported on the change itself, so
+     * the first commit stays the business of that line. */
+    {
+        enum dcomp_commit_note note = rootless ? DCOMP_NOTE_ROOTLESS : DCOMP_NOTE_CONTENT_ROOT;
+        enum dcomp_commit_note prev = dcomp_commit_note_set(target_hwnd, note);
+
+        if ((prev == DCOMP_NOTE_ROOTLESS || prev == DCOMP_NOTE_CONTENT_ROOT) && prev != note)
+            FIXME("Mode switch on target %p: %s -> %s.\n", target_hwnd,
+                    dcomp_commit_note_text(prev), dcomp_commit_note_text(note));
+    }
+
     if (idx > 0 && rootless)
     {
         struct dcomp_target *target = (struct dcomp_target *)GetPropW(target_hwnd, dcomp_target_prop);
