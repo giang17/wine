@@ -670,6 +670,10 @@ static void composite_over_premul(DWORD *dst, const DWORD *src,
     }
 }
 
+/* Must match DCOMP_MAX_SERIALIZED_LEAVES in dlls/dcomp/device.c -- the two are
+ * separate copies of the same contract, and nothing checks that they agree. */
+#define WINED3D_DCOMP_MAX_LEAVES 16
+
 /* Composite child visuals onto root's comp buffer.
  * Reads child info from window properties set by dcomp Commit(). */
 static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
@@ -688,7 +692,19 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
     if (!child_count)
         return;
 
-    for (i = 0; i < child_count && i < 16; ++i)
+    if (child_count > WINED3D_DCOMP_MAX_LEAVES)
+    {
+        /* dcomp caps at the same number, so this means the two halves disagree
+         * -- a half-deployed build.  The leaves past the limit are dropped. */
+        static unsigned int over_count;
+
+        if (++over_count <= 5 || !(over_count % 200))
+            FIXME("Leaf count %u exceeds the reader limit of %u on %p #%u: dropping %u leaves.\n",
+                    child_count, WINED3D_DCOMP_MAX_LEAVES, swapchain->win_handle,
+                    over_count, child_count - WINED3D_DCOMP_MAX_LEAVES);
+    }
+
+    for (i = 0; i < child_count && i < WINED3D_DCOMP_MAX_LEAVES; ++i)
     {
         HWND child_wnd;
         DWORD *child_bits;
@@ -700,7 +716,22 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
                 L"__wine_dcomp_child_%u_wnd", i);
         child_wnd = (HWND)GetPropW(swapchain->win_handle, prop_name);
         if (!child_wnd)
+        {
+            /* dcomp serializes DComp surfaces and composition textures with a
+             * null window handle and their bits in __wine_dcomp_child_%u_bits.
+             * This continue drops them before the direct-bits branch below can
+             * read them, which is why that branch has never run since it was
+             * added (e99905af0dd, 31.03.2026).  The leaf is simply absent from
+             * the frame -- no error anywhere, and the search starts in dcomp,
+             * where everything looks right. */
+            static unsigned int no_wnd_count;
+
+            if (++no_wnd_count <= 5 || !(no_wnd_count % 200))
+                FIXME("Leaf #%u dropped on %p (report #%u): no window handle, so it is a "
+                        "DComp surface or composition texture; the direct-bits path is "
+                        "unreachable.\n", i, swapchain->win_handle, no_wnd_count);
             continue;
+        }
 
         /* Two paths: swapchain children have a window with comp_bits,
          * surface children have direct bits stored as properties on target. */
@@ -720,7 +751,18 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
             child_dims = (LPARAM)GetPropW(swapchain->win_handle, prop_name);
         }
         if (!child_bits || !child_dims)
+        {
+            /* The window is there but carries no composite buffer yet -- the
+             * child swapchain has not presented once.  Persisting past the first
+             * frames means the leaf never arrives. */
+            static unsigned int no_bits_count;
+
+            if (++no_bits_count <= 5 || !(no_bits_count % 200))
+                FIXME("Leaf #%u dropped on %p (report #%u): child window %p has bits=%p "
+                        "dims=%#Ix.\n", i, swapchain->win_handle, no_bits_count,
+                        child_wnd, child_bits, (ULONG_PTR)child_dims);
             continue;
+        }
 
         cw = LOWORD(child_dims);
         ch = HIWORD(child_dims);
