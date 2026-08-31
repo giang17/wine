@@ -421,14 +421,28 @@ static void dcomp_reblit_comp_buffer(HWND hwnd, const char *reason)
             BitBlt(hdc, 0, 0, w, h, comp_dc, 0, 0, SRCCOPY);
             ReleaseDC(hwnd, hdc);
         }
+        else
+        {
+            /* Without a DC the composition content stays in its buffer and the
+             * window keeps whatever overwrote it -- the symptom is a stale or
+             * blank area that no repaint fixes. */
+            static unsigned int no_dc_count;
+
+            if (++no_dc_count <= 5 || !(no_dc_count % 200))
+                FIXME("Re-blit skipped #%u: GetDC failed on hwnd %p %ux%u reason=%s.\n",
+                        no_dc_count, hwnd, w, h, reason);
+        }
     }
     else
     {
+        /* Three reports per process was nothing for a fault that persists: from
+         * minute ten on the log said the problem had stopped.  Same throttle as
+         * the success path above. */
         static unsigned int null_count;
-        ++null_count;
-        if (null_count <= 3)
-            FIXME("Re-blit skipped: hwnd %p comp_dc=%p dims=%#Ix reason=%s.\n",
-                    hwnd, comp_dc, (ULONG_PTR)dims, reason);
+
+        if (++null_count <= 5 || !(null_count % 200))
+            FIXME("Re-blit skipped #%u: hwnd %p comp_dc=%p dims=%#Ix reason=%s.\n",
+                    null_count, hwnd, comp_dc, (ULONG_PTR)dims, reason);
     }
 }
 

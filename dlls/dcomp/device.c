@@ -2298,6 +2298,20 @@ static void dcomp_target_registry_set(HWND hwnd, BOOL add)
         swprintf(prop, ARRAY_SIZE(prop), L"__wine_dcomp_target_%u", free_slot);
         SetPropW(desktop, prop, (HANDLE)hwnd);
     }
+    else if (add)
+    {
+        /* The registry sits on the desktop window and is shared by every DComp
+         * process of the session, so this limit is reachable from outside this
+         * process -- several plugin GUIs in a DAW will do it.  An unregistered
+         * target is one that other modules cannot exclude from their window
+         * blits, so the symptom is an overpainted area in a foreign window. */
+        static unsigned int full_count;
+
+        if (++full_count <= 5 || !(full_count % 200))
+            FIXME("Target registry full #%u: no free slot for %p, limit is %u "
+                    "and desktop-wide across all processes.\n",
+                    full_count, hwnd, DCOMP_TARGET_REGISTRY_SLOTS);
+    }
 }
 
 /* The application's own wndproc, stashed on the window when it is first
@@ -2732,6 +2746,8 @@ struct dcomp_leaf_stats
     unsigned int texture;       /* serialized: composition-texture readback */
     unsigned int swapchain;     /* serialized: composition window */
     unsigned int total;         /* content-bearing leaves in the tree, uncapped */
+    unsigned int no_comp_wnd;   /* swapchain leaf, composition window not found */
+    unsigned int no_tex_bits;   /* texture leaf, readback produced no bits */
 };
 
 /* Depth-first leaf serialization with accumulated offsets. The visual's own
@@ -2818,6 +2834,20 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
             ++stats->total;
             ++idx;
         }
+        else
+        {
+            /* The readback produced nothing, so the leaf is dropped: its pixels
+             * are on the GPU and nothing downstream can reach them.  Throttled,
+             * this runs per commit. */
+            static unsigned int no_bits_count;
+
+            ++stats->no_tex_bits;
+            ++stats->total;
+            if (++no_bits_count <= 5 || !(no_bits_count % 200))
+                FIXME("Leaf dropped #%u: texture %p on visual %p has no readback bits "
+                        "after ensure_bits, target %p.\n",
+                        no_bits_count, tex, visual, target_hwnd);
+        }
     }
     else if (visual->content)
     {
@@ -2841,6 +2871,20 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
             ++stats->swapchain;
             ++stats->total;
             ++idx;
+        }
+        else
+        {
+            /* No composition window behind the swapchain: the leaf cannot be
+             * addressed and is dropped.  Either dxgi has not created the window
+             * yet or the desktop property was lost. */
+            static unsigned int no_wnd_count;
+
+            ++stats->no_comp_wnd;
+            ++stats->total;
+            if (++no_wnd_count <= 5 || !(no_wnd_count % 200))
+                FIXME("Leaf dropped #%u: no composition window for swapchain content %p "
+                        "on visual %p, target %p.\n",
+                        no_wnd_count, visual->content, visual, target_hwnd);
         }
     }
 
@@ -3918,6 +3962,17 @@ static unsigned int dcomp_layer_region_rects(HRGN rgn, RECT *out, const RECT *cl
     }
 
     /* Too many rectangles, or the region data could not be had: one box. */
+    {
+        /* The bounding box covers area the region did not, so the layer delivers
+         * pixels it does not own -- visible as content bleeding into a gap
+         * between two covered strips. */
+        static unsigned int box_count;
+
+        if (++box_count <= 5 || !(box_count % 200))
+            FIXME("Layer region collapsed to its bounding box #%u: more than %u rectangles "
+                    "or region data unavailable, box %s.\n",
+                    box_count, WINE_DCOMP_LAYER_MAX_RECTS, wine_dbgstr_rect(&box));
+    }
     if (!IntersectRect(&out[0], &box, clip))
         return 0;
     return 1;
