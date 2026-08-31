@@ -17675,7 +17675,7 @@ static void test_combine_geometry(BOOL d3d11)
     ID2D1TransformedGeometry *transformed_geometry;
     ID2D1RectangleGeometry *rect1, *rect2;
     ID2D1EllipseGeometry *ellipse_geometry;
-    ID2D1PathGeometry *path, *result;
+    ID2D1PathGeometry *path, *path2, *result;
     struct d2d1_test_context ctx;
     D2D1_MATRIX_3X2_F matrix;
     ID2D1GeometrySink *sink;
@@ -17924,13 +17924,7 @@ static void test_combine_geometry(BOOL d3d11)
     ID2D1RectangleGeometry_Release(rect1);
     ID2D1PathGeometry_Release(path);
 
-    /* Every mode other than INTERSECT is implemented for axis-aligned
-     * rectangles only, so a single convex operand that is not one already
-     * leaves the implemented set - being convex is not enough outside
-     * INTERSECT. The cases below pin that boundary, and their values are the
-     * target once the general case lands.
-     *
-     * A square and the same square rotated by 45 degrees meet in a regular
+    /* A square and the same square rotated by 45 degrees meet in a regular
      * octagon of 2 * a^2 * (sqrt(2) - 1), which is 331.370850 for a side of
      * 20 and is what INTERSECT returns above. The union is therefore
      * 800 - 331.370850, the exclusive or 800 - 2 * 331.370850, and the
@@ -17946,28 +17940,22 @@ static void test_combine_geometry(BOOL d3d11)
 
     hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
             D2D1_COMBINE_MODE_UNION, NULL, &result);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-        check_combined_geometry(result, 468.629150f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
+    check_combined_geometry(result, 468.629150f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
     ID2D1PathGeometry_Release(result);
 
     hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
             D2D1_COMBINE_MODE_XOR, NULL, &result);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-        check_combined_geometry(result, 137.258300f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
+    check_combined_geometry(result, 137.258300f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
     ID2D1PathGeometry_Release(result);
 
     /* The difference stays inside the calling geometry, so the bounds do not
      * grow to the diagonal here. */
     hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
             D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-        check_combined_geometry(result, 68.629150f, -10.0f, -10.0f, 10.0f, 10.0f);
+    check_combined_geometry(result, 68.629150f, -10.0f, -10.0f, 10.0f, 10.0f);
     ID2D1PathGeometry_Release(result);
 
     ID2D1TransformedGeometry_Release(transformed_geometry);
@@ -17989,27 +17977,23 @@ static void test_combine_geometry(BOOL d3d11)
 
     hr = combine_geometry(ctx.factory, (ID2D1Geometry *)ellipse_geometry,
             (ID2D1Geometry *)transformed_geometry, D2D1_COMBINE_MODE_UNION, NULL, &result);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-    if (SUCCEEDED(hr))
-    {
-        hr = ID2D1PathGeometry_ComputeArea(result, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, &area);
-        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-        ok(area > 565.0f && area < 575.0f, "Got unexpected area %.8e.\n", area);
-        hr = ID2D1PathGeometry_GetBounds(result, NULL, &rect);
-        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
-        ok(compare_rect(&rect, 0.0f, 0.0f, 30.0f, 30.0f, 64),
-                "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n",
-                rect.left, rect.top, rect.right, rect.bottom);
-    }
+    hr = ID2D1PathGeometry_ComputeArea(result, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, &area);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(area > 565.0f && area < 575.0f, "Got unexpected area %.8e.\n", area);
+    hr = ID2D1PathGeometry_GetBounds(result, NULL, &rect);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(compare_rect(&rect, 0.0f, 0.0f, 30.0f, 30.0f, 64),
+            "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n",
+            rect.left, rect.top, rect.right, rect.bottom);
     ID2D1PathGeometry_Release(result);
 
     ID2D1TransformedGeometry_Release(transformed_geometry);
     ID2D1EllipseGeometry_Release(ellipse_geometry);
 
-    /* Two non-convex polygons. Neither side is convex, so the general boolean
-     * case applies, which is not implemented yet. Two L shapes overlapping in
-     * their long arms: 300 each, overlapping in 100. */
+    /* Two non-convex polygons: an L shape and the same shape mirrored through
+     * the centre of its bounding box. Each arm of one crosses an arm of the
+     * other, so the intersection is two disconnected 10x10 squares. */
     hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
     hr = ID2D1PathGeometry_Open(path, &sink);
@@ -18036,8 +18020,11 @@ static void test_combine_geometry(BOOL d3d11)
 
     hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)transformed_geometry,
             D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
-    todo_wine
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 200.0f, 0.0f, 0.0f, 30.0f, 50.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Got unexpected figure count %u.\n", count);
     ID2D1PathGeometry_Release(result);
 
     ID2D1TransformedGeometry_Release(transformed_geometry);
@@ -18141,6 +18128,96 @@ static void test_combine_geometry(BOOL d3d11)
     ID2D1PathGeometry_Release(result);
     ID2D1RectangleGeometry_Release(rect2);
     ID2D1RectangleGeometry_Release(rect1);
+
+    /* Excluding an oblique operand cuts a hole with oblique edges. */
+    set_rect(&rect, -100.0f, -100.0f, 100.0f, 100.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_rect(&rect, -10.0f, -10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_matrix_identity(&matrix);
+    rotate_matrix(&matrix, M_PI / 4.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)rect2,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 39600.0f, -100.0f, -100.0f, 100.0f, 100.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Got unexpected figure count %u.\n", count);
+    point.x = 0.0f;
+    point.y = 0.0f;
+    hr = ID2D1PathGeometry_FillContainsPoint(result, point, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "The hole is filled.\n");
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1RectangleGeometry_Release(rect2);
+    ID2D1RectangleGeometry_Release(rect1);
+
+    /* Two triangles sharing their oblique hypotenuse make a square. The
+     * shared edge is coincident but wound in opposite directions, and has to
+     * cancel out instead of surviving as an interior edge. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 0.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 10.0f, 0.0f);
+    line_to(sink, 0.0f, 10.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path2, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 10.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 10.0f, 10.0f);
+    line_to(sink, 0.0f, 10.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)path2,
+            D2D1_COMBINE_MODE_UNION, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 100.0f, 0.0f, 0.0f, 10.0f, 10.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path2);
+
+    /* A geometry XORed with itself is empty, one united with itself is the
+     * geometry - every edge here is coincident with its counterpart. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_XOR, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 0.0f, INFINITY, INFINITY, FLT_MAX, FLT_MAX);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_UNION, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 50.0f, 0.0f, 0.0f, 10.0f, 10.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path);
 
     release_test_context(&ctx);
 }
