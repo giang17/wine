@@ -2258,61 +2258,10 @@ static const WCHAR dcomp_target_prop[] = L"__wine_dcomp_target";
  * targets have no subclass of ours, so they are never signalled. */
 static const WCHAR dcomp_present_flush_prop[] = L"__wine_dcomp_present_flush";
 
-/* Global composition-target registry on the desktop window, so presenters in
- * other modules/processes (wined3d) can exclude target areas from their window
- * blits without knowing the window hierarchy — WebView2 reparents its target
- * between top levels at runtime (issue 121). Slots stale after window death
- * are skipped by readers via IsWindow(). */
-#define DCOMP_TARGET_REGISTRY_SLOTS 16
-
-/* The same 16 as the slots above, and something else entirely: the number of
- * leaves dcomp_serialize_visual_leaves() writes to the target window.  Kept as
- * a name so the commit log can say which limit it hit; wined3d has its own copy
- * of the number in swapchain_composite_children(). */
+/* The number of leaves dcomp_serialize_visual_leaves() writes to the target
+ * window.  Kept as a name so the commit log can say which limit it hit;
+ * wined3d has its own copy of the number in swapchain_composite_children(). */
 #define DCOMP_MAX_SERIALIZED_LEAVES 16
-
-static void dcomp_target_registry_set(HWND hwnd, BOOL add)
-{
-    HWND desktop = GetDesktopWindow();
-    WCHAR prop[32];
-    unsigned int i;
-    int free_slot = -1;
-
-    for (i = 0; i < DCOMP_TARGET_REGISTRY_SLOTS; ++i)
-    {
-        HWND cur;
-
-        swprintf(prop, ARRAY_SIZE(prop), L"__wine_dcomp_target_%u", i);
-        cur = (HWND)GetPropW(desktop, prop);
-        if (cur == hwnd)
-        {
-            if (!add)
-                RemovePropW(desktop, prop);
-            return;
-        }
-        if (add && free_slot < 0 && (!cur || !IsWindow(cur)))
-            free_slot = (int)i;
-    }
-    if (add && free_slot >= 0)
-    {
-        swprintf(prop, ARRAY_SIZE(prop), L"__wine_dcomp_target_%u", free_slot);
-        SetPropW(desktop, prop, (HANDLE)hwnd);
-    }
-    else if (add)
-    {
-        /* The registry sits on the desktop window and is shared by every DComp
-         * process of the session, so this limit is reachable from outside this
-         * process -- several plugin GUIs in a DAW will do it.  An unregistered
-         * target is one that other modules cannot exclude from their window
-         * blits, so the symptom is an overpainted area in a foreign window. */
-        static unsigned int full_count;
-
-        if (++full_count <= 5 || !(full_count % 200))
-            FIXME("Target registry full #%u: no free slot for %p, limit is %u "
-                    "and desktop-wide across all processes.\n",
-                    full_count, hwnd, DCOMP_TARGET_REGISTRY_SLOTS);
-    }
-}
 
 /* The application's own wndproc, stashed on the window when it is first
  * subclassed so later targets can restore the chain (issue 98). */
@@ -2532,7 +2481,6 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
             {
                 RemovePropW(target->hwnd, dcomp_target_prop);
                 RemovePropW(target->hwnd, dcomp_present_flush_prop);
-                dcomp_target_registry_set(target->hwnd, FALSE);
             }
         }
 
@@ -5436,7 +5384,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
      * windows sharing the class. */
     previous = (struct dcomp_target *)GetPropW(hwnd, dcomp_target_prop);
     SetPropW(hwnd, dcomp_target_prop, (HANDLE)object);
-    dcomp_target_registry_set(hwnd, TRUE);
 
     /* Cross-process targets (e.g. Tauri/WebView2 helper targeting a window
      * owned by the main process, issue 88): do NOT subclass. The installed
