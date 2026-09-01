@@ -2872,6 +2872,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
     struct dcomp_leaf_stats stats = {0};
     BOOL rootless = FALSE;
     unsigned int idx = 0;
+    ULONG_PTR gen;
 
     if (!root || !root->children || !target_hwnd)
     {
@@ -2909,6 +2910,16 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
         return;
     }
 
+    /* The leaf set is several properties written one by one, and wined3d reads
+     * them from another thread: a reader can land between two of the writes and
+     * take half of one commit and half of another.  The generation brackets the
+     * set like a seqlock -- odd while this rewrite runs, advanced to the next
+     * even value after the count -- so a reader can at least tell a torn set
+     * from a settled one, and the absence of the property tells a new wined3d
+     * that it is reading an old dcomp. */
+    gen = (ULONG_PTR)GetPropW(target_hwnd, WINE_DCOMP_CHILD_GEN_PROP) | 1;
+    SetPropW(target_hwnd, WINE_DCOMP_CHILD_GEN_PROP, (HANDLE)gen);
+
     /* The root's own content is presented by its swapchain/surface path and
      * must NOT be serialized as a child (it would composite onto itself) —
      * start the walk at its children. */
@@ -2920,6 +2931,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
     }
 
     SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)(ULONG_PTR)idx);
+    SetPropW(target_hwnd, WINE_DCOMP_CHILD_GEN_PROP, (HANDLE)(gen + 1));
 
     /* Rootless tree (Chromium): no root Present will ever composite the
      * leaves. In-process targets get the 100ms timer as backstop; foreign-

@@ -728,12 +728,18 @@ static void composite_over_premul(DWORD *dst, const DWORD *src,
 static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         unsigned int dst_w, unsigned int dst_h)
 {
-    ULONG_PTR child_count_val;
+    ULONG_PTR child_count_val, gen_before, gen_after;
     unsigned int child_count, i;
     WCHAR prop_name[64];
 
     if (!swapchain->comp_bits)
         return;
+
+    /* Read the commit generation around the whole set (see dcomp_layer.h): it
+     * tells a settled set from one dcomp is rewriting right now, and its
+     * absence tells this reader it is talking to a dcomp from before the
+     * generation existed. */
+    gen_before = (ULONG_PTR)GetPropW(swapchain->win_handle, WINE_DCOMP_CHILD_GEN_PROP);
 
     child_count_val = (ULONG_PTR)GetPropW(swapchain->win_handle,
             L"__wine_dcomp_child_count");
@@ -826,6 +832,31 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
                 dst_w, cw,
                 ox, oy, cw, ch,
                 dst_w, dst_h);
+    }
+
+    gen_after = (ULONG_PTR)GetPropW(swapchain->win_handle, WINE_DCOMP_CHILD_GEN_PROP);
+    if (!gen_before && !gen_after)
+    {
+        /* Leaves without a generation: the dcomp half predates the protocol.
+         * Detection only -- the set was composited above as it always was. */
+        static unsigned int no_gen_count;
+
+        if (++no_gen_count <= 5 || !(no_gen_count % 200))
+            FIXME("Composited %u leaves on %p without a commit generation (report #%u): "
+                    "the dcomp half predates the bus check -- a half-deployed build.\n",
+                    child_count, swapchain->win_handle, no_gen_count);
+    }
+    else if ((gen_before & 1) || gen_before != gen_after)
+    {
+        /* dcomp rewrote the set while it was read: parts of two commits may
+         * have been mixed.  The next present reads a settled set; today's
+         * behavior (use what was read) is unchanged, but no longer silent. */
+        static unsigned int torn_count;
+
+        if (++torn_count <= 5 || !(torn_count % 200))
+            FIXME("The leaf set on %p was rewritten while it was composited "
+                    "(report #%u): generation %Iu -> %Iu.\n",
+                    swapchain->win_handle, torn_count, gen_before, gen_after);
     }
 }
 
