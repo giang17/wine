@@ -1619,7 +1619,21 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
     funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
 
     if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
+    {
+        /* An offscreen drawable is presented by blitting its client window, and the
+         * blit below reads the window straight after the swap.  eglSwapBuffers()
+         * returns before the swap has landed in the composite-redirected window on
+         * NVIDIA - measured with a fence sync right here, the wait takes 3 ms on
+         * average - and the blit then copies what the window held before it, which
+         * after a move offscreen is undefined.  Nothing presents again until the
+         * application draws: the Studio Assistant popup of issue 308 came up black
+         * in half of its openings, healed by hovering a control.
+         *
+         * Wait for the swap, the way the GLX path does with glXWaitForSbcOML(), and
+         * the way the flush path above already does with glFinish(). */
+        funcs->p_eglWaitClient();
         XFlush( gdi_display );
+    }
 
     client_surface_present( base->client );
     return TRUE;
