@@ -3705,6 +3705,24 @@ static void dcomp_target_update_covered(struct dcomp_target *target, const RECT 
         dcomp_target_collect_covered(child, (int)target->root_visual->offset_x,
                 (int)target->root_visual->offset_y, current, &unresolved);
 
+    /* Only the part inside the client area counts (issue 298, review C5).  A
+     * leaf larger than the window, at a negative offset or reaching past the
+     * right or bottom edge used to contribute area nobody can see, and the
+     * takeover threshold compared that area against the client size: 50%
+     * could be crossed with next to nothing visibly covered, and
+     * covers_window never goes back.  The delivery cannot paint outside the
+     * window either, so every consumer of this region wants the clipped one.
+     * The unresolved fallback below is built from client_rc and needs none. */
+    {
+        HRGN client_rgn = CreateRectRgn(0, 0, client_rc->right, client_rc->bottom);
+
+        if (client_rgn)
+        {
+            CombineRgn(current, current, client_rgn, RGN_AND);
+            DeleteObject(client_rgn);
+        }
+    }
+
     /* Keep this frame's own leaf region (issue 190), taken before the
      * unresolved fallback below widens it to the whole client area: it is
      * exactly the area we can put pixels into, and the delivery path needs it
