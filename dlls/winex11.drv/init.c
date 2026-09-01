@@ -403,10 +403,51 @@ static void client_surface_redirect_offscreen( struct x11drv_client_surface *sur
 #endif
 }
 
+static int ignore_x_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return 1;
+}
+
+/* copy the content of a viewable client window into a pixmap of the same depth,
+ * see client_surface_update_offscreen() */
+static Pixmap client_surface_save_content( struct x11drv_client_surface *surface, GC *gc, RECT *rect )
+{
+    XWindowAttributes attr;
+    Pixmap pixmap = 0;
+
+    X11DRV_expect_error( gdi_display, ignore_x_error, NULL );
+    if (XGetWindowAttributes( gdi_display, surface->window, &attr ) && attr.map_state == IsViewable
+        && attr.width > 0 && attr.height > 0)
+    {
+        if ((pixmap = XCreatePixmap( gdi_display, surface->window, attr.width, attr.height, attr.depth )))
+        {
+            *gc = XCreateGC( gdi_display, pixmap, 0, NULL );
+            XSetSubwindowMode( gdi_display, *gc, IncludeInferiors );
+            XSetGraphicsExposures( gdi_display, *gc, False );
+            XCopyArea( gdi_display, surface->window, pixmap, *gc, 0, 0, attr.width, attr.height, 0, 0 );
+            SetRect( rect, 0, 0, attr.width, attr.height );
+        }
+    }
+    if (X11DRV_check_error())
+    {
+        if (pixmap)
+        {
+            XFreeGC( gdi_display, *gc );
+            XFreePixmap( gdi_display, pixmap );
+        }
+        pixmap = 0;
+    }
+    TRACE( "%s window %lx -> pixmap %lx\n", debugstr_client_surface( &surface->client ), surface->window, pixmap );
+    return pixmap;
+}
+
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
     BOOL offscreen = needs_offscreen_rendering( hwnd );
     struct x11drv_win_data *data;
+    Pixmap saved = 0;
+    GC saved_gc = NULL;
+    RECT saved_rect;
 
     /* A top-level renders offscreen while a child clips its client area, and
      * that answer can change with the focus: Studio Pro's Add Tracks dialog
@@ -450,6 +491,15 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
      * the background across both requests and restore it right after. */
     if (offscreen) set_expose_background_suppressed( hwnd, TRUE );
 
+    /* Moving the client window under the dummy parent and redirecting it leaves
+     * its pixmap undefined on NVIDIA: the frame the application last drew is
+     * gone, and every present blit until it draws again copies that undefined
+     * content over the top-level (issue 308: Studio Pro's Studio Assistant,
+     * whose D3D swapchain exists before the EDIT that makes the window render
+     * offscreen).  Keep a copy of the window's content across the move and put
+     * it back into the redirected window, so the blits carry the last frame. */
+    if (offscreen) saved = client_surface_save_content( surface, &saved_gc, &saved_rect );
+
     if (!offscreen)
     {
 #ifdef SONAME_LIBXCOMPOSITE
@@ -476,7 +526,23 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         release_win_data( data );
     }
 
+    if (saved)
+    {
+        XCopyArea( gdi_display, saved, surface->window, saved_gc, 0, 0,
+                   saved_rect.right - saved_rect.left, saved_rect.bottom - saved_rect.top, 0, 0 );
+        XFreeGC( gdi_display, saved_gc );
+        XFreePixmap( gdi_display, saved );
+        TRACE( "restored %s content from pixmap %lx\n", debugstr_client_surface( &surface->client ), saved );
+    }
+
     if (offscreen) set_expose_background_suppressed( hwnd, FALSE );
+
+    /* An application that only draws on demand does not draw again after the
+     * move on its own: Studio Pro's main window, whose Assistant panel makes it
+     * render offscreen, stayed black until the pointer hovered a control.  Ask
+     * for a repaint, as a change of client window does (see
+     * X11DRV_client_surface_present()). */
+    if (offscreen) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN );
 }
 
 static void x11drv_client_surface_update( struct client_surface *client )
