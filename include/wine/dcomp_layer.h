@@ -69,13 +69,39 @@
  * dcomp frees the pixel buffers under the exclusive lock and leaves bits NULL,
  * but the structure itself stays for as long as the window does (a later
  * target on the same window picks it up again through the property).  That
- * leaks one structure per window that ever hosted a target -- 48 bytes,
- * bounded by the number of such windows, and the price of a reader that never
- * has to take a heavier lock than a property lookup.
+ * leaks one structure per window that ever hosted a target -- a few hundred
+ * bytes, bounded by the number of such windows, and the price of a reader that
+ * never has to take a heavier lock than a property lookup.
+ *
+ * Layout drift.  The structure crosses a DLL boundary with no link between the
+ * halves: dcomp and wined3d each carry their own build of this header, and a
+ * half-deployed pair reads pointers and dimensions through the wrong layout --
+ * not a load error, not a log line, but an access to memory the layer does not
+ * own.  Two defenses, both checked by every reader:
+ *
+ *   - magic and size lead the structure.  A reader that finds anything else
+ *     reports the mismatch and ignores the layer; dcomp, which owns the
+ *     property, replaces the rejected structure with a fresh one.
+ *   - The property name carries the layout generation (the "2" below).  A
+ *     reader built against an older layout looks up the old name, finds
+ *     nothing, and simply never composites the layer -- the drawn-liveness in
+ *     dcomp then falls back to blitting on its own.  Bump the name together
+ *     with any change to this structure.
  */
 
-#define WINE_DCOMP_LAYER_PROP       L"__wine_dcomp_layer"
+#define WINE_DCOMP_LAYER_PROP       L"__wine_dcomp_layer2"
 #define WINE_DCOMP_LAYER_SINK_PROP  L"__wine_dcomp_layer_sink"
+
+#define WINE_DCOMP_LAYER_MAGIC      0x4c434457 /* "WDCL" */
+
+/* The commit generation of the __wine_dcomp_child_* leaf properties, on the
+ * target window.  dcomp holds it odd while it rewrites the set and advances it
+ * to the next even value after __wine_dcomp_child_count; wined3d reads it
+ * before and after consuming the set.  An odd or a moved value marks a torn
+ * read, a missing one under a non-zero child count marks a dcomp half that
+ * predates this protocol -- both worth a log line, neither a reason to change
+ * behavior. */
+#define WINE_DCOMP_CHILD_GEN_PROP   L"__wine_dcomp_child_gen"
 
 /* Rectangles carried per frame before the region is given up on and its
  * bounding box published instead.  A tree of a transport playhead and a
@@ -87,6 +113,8 @@
 
 struct wine_dcomp_layer
 {
+    DWORD magic;                /* WINE_DCOMP_LAYER_MAGIC */
+    DWORD size;                 /* sizeof(struct wine_dcomp_layer): the layout fingerprint */
     SRWLOCK lock;
     /* All of the following are valid only while the lock is held. */
     DWORD *bits;                /* premultiplied BGRA, 0 = fully transparent, NULL = nothing published */
