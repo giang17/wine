@@ -791,6 +791,47 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 : DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
+/* Tear down the composition-target subclass from d3d11_swapchain_Release.
+ *
+ * Restore GWLP_WNDPROC only while one of our own procedures is the installed
+ * one, mirroring the check dcomp does in dcomp_target_Release: a third party
+ * (comctl32's SetWindowSubclass, a host hook) may have subclassed on top of
+ * us after we did, and restoring the saved original then drops that party
+ * from the chain without a word.  In that case our procedure stays in the
+ * chain and keeps __wine_dcomp_orig_wndproc for its delegation; the
+ * bookkeeping (count, active property, popup stack) is deferred to its
+ * WM_NCDESTROY handler -- the same handover a cross-thread Release already
+ * relies on, and the reason the bookkeeping must not also run here: it would
+ * be decremented twice.
+ *
+ * The comp buffer properties always go: the swapchain that owned the buffer
+ * is being freed, and both wndprocs tolerate their absence. */
+void dcomp_swapchain_subclass_teardown(HWND hwnd)
+{
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+    WNDPROC installed = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+
+    KillTimer(hwnd, DCOMP_REBLIT_TIMER_ID);
+    KillTimer(hwnd, DCOMP_POPUP_REBLIT_TIMER_ID);
+
+    if (orig && (installed == dcomp_popup_wndproc || installed == dcomp_target_wndproc))
+    {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig);
+        RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
+        RemovePropW(hwnd, L"__wine_dcomp_subclass_proc");
+        InterlockedDecrement(&dcomp_subclassed_target_count);
+        dcomp_update_active_prop();
+        dcomp_popup_stack_remove(hwnd);
+    }
+    else if (orig)
+        FIXME("DComp: hwnd %p runs wndproc %p, not ours -- leaving the chain alone, "
+                "bookkeeping deferred to WM_NCDESTROY.\n", hwnd, installed);
+
+    RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
+    RemovePropW(hwnd, L"__wine_dcomp_comp_size");
+    RemovePropW(hwnd, L"__wine_dcomp_comp_bits");
+}
+
 static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg)

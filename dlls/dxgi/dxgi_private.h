@@ -179,6 +179,7 @@ struct dxgi_adapter *unsafe_impl_from_IDXGIAdapter(IDXGIAdapter *iface);
  * Controls full-vs-popup mode; d3d11_swapchain_Release() decrements it when it
  * un-subclasses a target on its own UI thread. */
 extern LONG dcomp_subclassed_target_count;
+extern void dcomp_swapchain_subclass_teardown(HWND hwnd);
 
 /* IDXGISwapChain */
 struct d3d11_swapchain
