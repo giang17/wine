@@ -879,14 +879,33 @@ static struct wine_dcomp_layer *swapchain_poll_layer(struct wined3d_swapchain *s
         return NULL;
     if (!swapchain->layer)
     {
+        struct wine_dcomp_layer *l;
+
         if (swapchain->layer_lookup)
         {
             --swapchain->layer_lookup;
             return NULL;
         }
         swapchain->layer_lookup = WINED3D_LAYER_LOOKUP_INTERVAL - 1;
-        swapchain->layer = (struct wine_dcomp_layer *)GetPropW(swapchain->win_handle,
-                WINE_DCOMP_LAYER_PROP);
+        if ((l = (struct wine_dcomp_layer *)GetPropW(swapchain->win_handle,
+                WINE_DCOMP_LAYER_PROP))
+                && (l->magic != WINE_DCOMP_LAYER_MAGIC || l->size != sizeof(*l)))
+        {
+            /* Published by a dcomp built against another layout of the layer.
+             * Taking it would mean reading pixel pointers through the wrong
+             * fields; not taking it means the blit route, which dcomp falls
+             * back to on its own when the drawn count never moves.  Not cached,
+             * so the next lookup picks up the replacement dcomp publishes. */
+            static unsigned int bad_count;
+
+            if (++bad_count <= 5 || !(bad_count % 200))
+                ERR("Rejecting the layer on hwnd %p (report #%u): magic %#lx, size %lu, "
+                        "expected %#x, %Iu -- the dcomp half was built against another layout.\n",
+                        swapchain->win_handle, bad_count, l->magic, l->size,
+                        WINE_DCOMP_LAYER_MAGIC, sizeof(*l));
+            l = NULL;
+        }
+        swapchain->layer = l;
     }
     return swapchain->layer;
 }

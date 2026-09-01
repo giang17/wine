@@ -4083,10 +4083,24 @@ static void dcomp_target_publish_layer(struct dcomp_target *target, const RECT *
     {
         /* Pick up the one an earlier target on this window left behind: it is
          * deliberately never freed, see dcomp_layer.h. */
-        if (!(layer = (struct wine_dcomp_layer *)GetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP)))
+        if ((layer = (struct wine_dcomp_layer *)GetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP))
+                && (layer->magic != WINE_DCOMP_LAYER_MAGIC || layer->size != sizeof(*layer)))
+        {
+            /* Left behind by a dcomp built against another layout.  We own the
+             * property, so replace it; the old structure stays unfreed like any
+             * other -- a reader of its vintage may still hold a pointer. */
+            ERR("Replacing the layer on hwnd %p: magic %#lx, size %lu, expected %#x, %Iu "
+                    "-- it was published by a dcomp built against another layout.\n",
+                    target->hwnd, layer->magic, layer->size,
+                    WINE_DCOMP_LAYER_MAGIC, sizeof(*layer));
+            layer = NULL;
+        }
+        if (!layer)
         {
             if (!(layer = calloc(1, sizeof(*layer))))
                 return;
+            layer->magic = WINE_DCOMP_LAYER_MAGIC;
+            layer->size = sizeof(*layer);
             if (!SetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP, (HANDLE)layer))
             {
                 WARN("Failed to publish the layer property on hwnd %p.\n", target->hwnd);
