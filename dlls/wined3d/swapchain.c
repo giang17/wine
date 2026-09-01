@@ -232,6 +232,7 @@ ULONG CDECL wined3d_swapchain_decref(struct wined3d_swapchain *swapchain)
     if (!refcount)
     {
         struct wined3d_device *device;
+        unsigned int i;
 
         wined3d_mutex_lock();
 
@@ -239,6 +240,39 @@ ULONG CDECL wined3d_swapchain_decref(struct wined3d_swapchain *swapchain)
         if (device->swapchain_count && device->swapchains[0] == swapchain)
             wined3d_device_uninit_3d(device);
         wined3d_cs_finish(device->cs, WINED3D_CS_QUEUE_DEFAULT);
+
+        /* Contexts hold a bare pointer to the swapchain they last drew to, set
+         * in wined3d_context_gl_activate() whenever a texture belongs to a
+         * different one.  Nothing used to clear it when the swapchain went
+         * away first, and the context is not destroyed with it: only
+         * wined3d_context_gl_destroy() ever resets the field, which is exactly
+         * where the long-standing FIXME asking for this pointer to disappear
+         * sits.  A context that outlives its swapchain then keeps reading
+         * win_handle and dc out of freed memory on every acquire.
+         *
+         * The reads are not harmless in practice.  What comes back decides the
+         * code path: with a recycled NULL in win_handle the pixel format call
+         * goes through and prints an error per acquire, with garbage in it the
+         * window comparison fails one line earlier and the same defect passes
+         * silently.  A measurement on the same binary produced 6525, 4 and 0
+         * occurrences in three runs for that reason alone.
+         *
+         * Clearing the field here is safe: every reader either tests it first
+         * (wined3d_context_gl_update_window(), wined3d_context_gl_activate())
+         * or runs while the context is being created and the swapchain is
+         * known good (wined3d_context_gl_init()).  A context whose swapchain
+         * is NULL simply keeps the device context it currently holds until it
+         * is activated for a live swapchain again.
+         *
+         * The command stream has been drained above and the wined3d mutex is
+         * held, so no CS work can touch device->contexts while this runs. */
+        for (i = 0; i < device->context_count; ++i)
+        {
+            if (device->contexts[i]->swapchain != swapchain)
+                continue;
+            TRACE("Clearing swapchain %p from context %p.\n", swapchain, device->contexts[i]);
+            device->contexts[i]->swapchain = NULL;
+        }
 
         if (swapchain->dc)
             wined3d_release_dc(swapchain->win_handle, swapchain->dc);
