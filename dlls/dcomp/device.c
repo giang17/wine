@@ -2769,6 +2769,19 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
                 SetPropW(target_hwnd, prop_name, (HANDLE)child_comp_wnd);
 
                 /* Pack offset as two signed 16-bit values */
+                if ((short)vx != vx || (short)vy != vy)
+                {
+                    /* The pack wraps: the reader sees a different, valid-looking
+                     * offset and clips the leaf away without a trace.  Noted since
+                     * 03/2026, never seen -- the offsets only accumulate parent
+                     * offsets -- but a tree deep enough would hit it silently. */
+                    static unsigned int wrap_count;
+
+                    if (++wrap_count <= 5 || !(wrap_count % 200))
+                        FIXME("Leaf offset (%d,%d) on target %p does not survive the 16-bit "
+                                "pack (report #%u): the reader will place the leaf at (%d,%d).\n",
+                                vx, vy, target_hwnd, wrap_count, (short)vx, (short)vy);
+                }
                 swprintf(prop_name, ARRAY_SIZE(prop_name),
                         L"__wine_dcomp_child_%u_offset", idx);
                 SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
