@@ -255,19 +255,7 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
 
             RemovePropW(t, L"__wine_dcomp_swapchain");
             if (IsWindow(t) && GetWindowThreadProcessId(t, NULL) == GetCurrentThreadId())
-            {
-                WNDPROC orig = (WNDPROC)GetPropW(t, L"__wine_dcomp_orig_wndproc");
-
-                KillTimer(t, DCOMP_REBLIT_TIMER_ID);
-                KillTimer(t, DCOMP_POPUP_REBLIT_TIMER_ID);
-                if (orig)
-                    SetWindowLongPtrW(t, GWLP_WNDPROC, (LONG_PTR)orig);
-                RemovePropW(t, L"__wine_dcomp_orig_wndproc");
-                RemovePropW(t, L"__wine_dcomp_comp_dc");
-                RemovePropW(t, L"__wine_dcomp_comp_size");
-                RemovePropW(t, L"__wine_dcomp_comp_bits");
-                InterlockedDecrement(&dcomp_subclassed_target_count);
-            }
+                dcomp_swapchain_subclass_teardown(t);
             swapchain->target_hwnd = NULL;
         }
         if (swapchain->comp_wnd)
