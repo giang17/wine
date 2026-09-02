@@ -97,6 +97,12 @@ BOOL WINAPI DllMain (HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
         case DLL_PROCESS_ATTACH:
             __wine_init_unix_call();
             DisableThreadLibraryCalls(hinstDLL);
+            /* Asynchronous NCBs run in nbCmdThread inside this module, and
+             * applications that reach Netbios() through a transient
+             * LoadLibrary/FreeLibrary pair (JUCE's MACAddress::findAllAddresses)
+             * would otherwise reload the whole import chain on every call.
+             * Never unload, like msvcrt does. */
+            LdrAddRefDll( LDR_ADDREF_DLL_PIN, hinstDLL );
             NetBIOSInit();
             NetBTInit();
             break;
