@@ -322,6 +322,9 @@ system_fallback_config[] =
 
     /* Dingbats - 2700-27BF */
     { "2700-27BF",              L"Noto Sans Symbols2, Noto Sans Symbols 2" },
+    /* Geometric Shapes - 25A0-25FF. U+25CF BLACK CIRCLE is the password mask of
+     * DirectWrite edit controls; Windows falls back to Segoe UI Symbol here. */
+    { "25A0-25FF",              L"Noto Sans Symbols2, Noto Sans Symbols 2, DejaVu Sans, Symbola" },
 
     /* Misc Symbols and Arrows - 2B00-2BFF (includes U+2B50 star)
        Supplemental Arrows-C   - 1F800-1F8FF */
