@@ -366,8 +366,12 @@ It locates the fonts through fontconfig (so distribution paths do not matter),
 copies them into the prefix, registers the MS Core Fonts for GDI, writes the
 `FontLink` fallback chain and switches on this branch's text rendering. It is
 idempotent, and `--check` shows whether everything is still in place — worth running
-after a prefix update: Wine rewrites the FontLink chain with its own defaults whenever
-its stored codepage record does not match the running process.
+after a prefix update. Wine rewrites the FontLink chain with its own defaults whenever
+its stored codepage record does not match the running process, and one process
+started under `LC_ALL=C` already triggers that; since 2026-09-02 this branch therefore
+carries the two fallback entries in win32u's own defaults, so the rewrite no longer
+loses them. The fonts themselves still have to be in the prefix, which is this
+script's job.
 
 Three of those steps matter more than they look:
 
@@ -392,9 +396,11 @@ Three of those steps matter more than they look:
   The values themselves are `text_enhanced_contrast` and `text_linear_blend`
   under `HKCU\Software\Wine\Direct2D`, and `outline_in_natural_modes` under
   `HKCU\Software\Wine\DirectWrite`. Enhanced contrast is also in winecfg's
-  graphics tab (*Off* / *Medium (50)* / *Strong (70)*); the script leaves an
-  existing value alone unless `--contrast N` is given, so a choice made there
-  survives a re-run.
+  graphics tab (*Off* / *Medium (50)* / *Strong (70)*). winecfg stores *Off* as
+  the absence of the value, so the script writes a contrast only on its first run
+  (when no switch is set yet) or when `--contrast N` is given; a choice made
+  there, *Off* included, survives a re-run, and `--check` does not count a
+  missing contrast as a gap.
 
 See **[documentation/wine-font-setup-guide.md](documentation/wine-font-setup-guide.md)**
 for the full guide, including working around the missing `BitPDisp-10` tooltip font in

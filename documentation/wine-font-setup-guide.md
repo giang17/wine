@@ -151,12 +151,19 @@ wine reg add \
 ```
 
 > **The entries can be reset by Wine itself.** `win32u` rewrites the `SystemLink`
-> chain with its own defaults (CJK fallbacks only) whenever the codepage record it
-> keeps under `HKCU\Software\Wine\Fonts\Codepages` does not match the running process
+> chain with its own defaults whenever the codepage record it keeps under
+> `HKCU\Software\Wine\Fonts\Codepages` does not match the running process
 > (`update_codepage()` in `dlls/win32u/font.c`) — in a fresh prefix, after a locale
-> change, and it was observed here after a `wineboot -u` on 2026-04-03. The stars then
-> revert to tofu boxes. `wine-font-setup.sh --check` tells whether the entries are still
-> in place; re-running the script restores them, it is idempotent.
+> change, and it was observed here after a `wineboot -u` on 2026-04-03. The code page
+> follows `LC_CTYPE`, so a single Wine process started under `LC_ALL=C` (or `LANG=en_US`
+> on a `de_DE` desktop) is enough: it records `1252,437`, the next process records
+> `1252,850` again, and each rewrite drops the entries (measured 2026-09-02 in a scratch
+> prefix; the culprits here were measurement scripts exporting `LC_ALL=C` for `awk`).
+> Since 2026-09-02 this branch therefore carries the two entries in win32u's own
+> defaults (`system_link_tahoma_symbols_non_cjk`), so the rewrite keeps them. On stock
+> Wine the stars revert to tofu boxes; `wine-font-setup.sh --check` tells whether the
+> entries are still in place, and re-running the script restores them, it is
+> idempotent.
 
 ### BarlowSemiCondensed — no manual copying needed
 

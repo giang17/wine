@@ -23,8 +23,13 @@
 #
 # NOTE: Wine rewrites the FontLink entries with its own defaults whenever the
 # codepage record under HKCU\Software\Wine\Fonts\Codepages does not match the
-# running process (fresh prefix, locale change; seen after a `wineboot -u` too),
-# which undoes step 2.  Re-run this script then; it is idempotent.
+# running process (fresh prefix, locale change; seen after a `wineboot -u` too).
+# The code page follows LC_CTYPE, so one Wine process started under LC_ALL=C
+# (or LANG=en_US on a de_DE desktop) is enough: it records 1252,437, the next
+# process records 1252,850 again, and both rewrites drop step 2.  Since
+# 2026-09-02 this branch carries the two fallback entries in win32u's own
+# defaults, so the rewrite keeps them; on stock Wine re-run this script, it
+# is idempotent.
 #
 # Usage:
 #   wine-font-setup.sh [--prefix DIR] [--wine BINARY] [--check] [--no-mscore]
@@ -148,9 +153,11 @@ reg_value() {  # <file> <section> <value>
         f && /^\[/ {exit}
         f && index($0, "\"" ENVIRON["RV_VAL"] "\"=") == 1 {print; exit}' "$1" 2>/dev/null
 }
+# text_enhanced_contrast is deliberately not required here: winecfg stores
+# "Off" as the absence of the value (d2d1 then keeps DirectWrite's default),
+# so a missing value is a choice as often as it is a gap.
 have_rendering=0
 {
-    [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_enhanced_contrast)" ] &&
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_linear_blend)" ] &&
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\DirectWrite' outline_in_natural_modes)" ] &&
     [ "$(reg_value "$USERREG" 'Control Panel\\Desktop' FontSmoothingType)" \
@@ -265,16 +272,22 @@ WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add \
 #                             bitmap strike, so hinted fonts keep their shape
 if [ "$DO_RENDERING" -eq 1 ]; then
     echo "  setting the text rendering switches..."
-    # Contrast is a matter of taste — winecfg offers 0/50/70 in the graphics tab.
-    # Never silently overwrite a value somebody chose there; only write it when
-    # nothing is set yet, or when --contrast says so explicitly.
+    # Contrast is a matter of taste — winecfg offers Off/50/70 in the graphics
+    # tab, and stores Off as the absence of the value, which looks exactly like
+    # a prefix this script has never seen.  The other switch tells the two
+    # apart: with text_linear_blend already set this script has run before, and
+    # an absent contrast is somebody's choice.  Never overwrite that silently;
+    # write the contrast on the first run or when --contrast says so explicitly.
     cur_contrast=$(reg_value "$USERREG" 'Software\\Wine\\Direct2D' text_enhanced_contrast)
-    if [ -z "$cur_contrast" ] || [ "$CONTRAST_EXPLICIT" -eq 1 ]; then
+    cur_blend=$(reg_value "$USERREG" 'Software\\Wine\\Direct2D' text_linear_blend)
+    if [ "$CONTRAST_EXPLICIT" -eq 1 ] || { [ -z "$cur_contrast" ] && [ -z "$cur_blend" ]; }; then
         echo "    enhanced contrast: $CONTRAST"
         WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
             /v text_enhanced_contrast /t REG_DWORD /d "$CONTRAST" /f </dev/null >/dev/null 2>&1
-    else
+    elif [ -n "$cur_contrast" ]; then
         echo "    enhanced contrast: keeping $(printf '%d' "0x${cur_contrast##*:}" 2>/dev/null || echo '?') (already set; --contrast N overrides)"
+    else
+        echo "    enhanced contrast: left unset (winecfg Off; --contrast N overrides)"
     fi
     WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
         /v text_linear_blend /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
@@ -314,8 +327,7 @@ if [ "$DO_RENDERING" -eq 1 ]; then
     done
     # Single quotes: in double quotes the shell would collapse the doubled
     # backslashes of a registry path into single ones and nothing would match.
-    for kv in 'Software\\Wine\\Direct2D:text_enhanced_contrast' \
-              'Software\\Wine\\Direct2D:text_linear_blend' \
+    for kv in 'Software\\Wine\\Direct2D:text_linear_blend' \
               'Software\\Wine\\DirectWrite:outline_in_natural_modes' \
               'Control Panel\\Desktop:FontSmoothingType'; do
         [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {
@@ -326,7 +338,7 @@ fi
 echo
 if [ "$ok" -eq 1 ]; then
     echo "Font setup complete."
-    echo "Re-run this after 'wineboot -u' — it resets the FontLink entries."
+    echo "On stock Wine re-run this after 'wineboot -u' — it resets the FontLink entries."
     exit 0
 fi
 exit 1
