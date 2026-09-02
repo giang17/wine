@@ -458,6 +458,15 @@ static inline struct d2d_device_context *impl_from_ID2D1DeviceContext(ID2D1Devic
     return CONTAINING_RECORD(iface, struct d2d_device_context, ID2D1DeviceContext6_iface);
 }
 
+static void d2d_glyph_mask_destroy(struct d2d_glyph_mask *mask)
+{
+    if (mask->brush)
+        ID2D1Brush_Release(&mask->brush->ID2D1Brush_iface);
+    free(mask->coverage);
+    free(mask->data);
+    free(mask);
+}
+
 static HRESULT STDMETHODCALLTYPE d2d_device_context_inner_QueryInterface(IUnknown *iface, REFIID iid, void **out)
 {
     struct d2d_device_context *context = impl_from_IUnknown(iface);
@@ -566,6 +575,8 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
             d2d_geometry_cleanup(context->rect_geometry_cache);
             free(context->rect_geometry_cache);
         }
+        if (context->glyph_mask_cache)
+            d2d_glyph_mask_destroy(context->glyph_mask_cache);
         for (i = 0; i < D2D_SHAPE_TYPE_COUNT; ++i)
         {
             ID3D11VertexShader_Release(context->shape_resources[i].vs);
@@ -948,6 +959,51 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawRectangle(ID2D1DeviceContex
 static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush);
 
+/* Rectangle geometry shared by FillRectangle() and the glyph run paths.
+ * Session 6 (C1): Serum2's GUI hits ~22k FillRectangle/s, each of which was
+ * calloc'ing a ~1600-byte struct d2d_geometry plus ancillary arrays and
+ * freeing them immediately; a single retained object is re-initialised in
+ * place instead. It bypasses the COM factory path and never leaves the
+ * context, so it is claimed and returned around a single fill; a second
+ * claimant while it is out builds its own, and the one displaced when both
+ * come back is destroyed, which keeps the cache bounded at one. */
+static struct d2d_geometry *d2d_device_context_get_rect_geometry(struct d2d_device_context *context,
+        const D2D1_RECT_F *rect)
+{
+    struct d2d_geometry *geometry;
+
+    if ((geometry = InterlockedExchangePointer((void **)&context->rect_geometry_cache, NULL)))
+    {
+        d2d_rectangle_geometry_reinit(geometry, rect);
+        return geometry;
+    }
+
+    if (!(geometry = calloc(1, sizeof(*geometry))))
+    {
+        ERR("Failed to allocate rectangle geometry.\n");
+        return NULL;
+    }
+    if (FAILED(d2d_rectangle_geometry_init(geometry, context->factory, rect)))
+    {
+        free(geometry);
+        return NULL;
+    }
+
+    return geometry;
+}
+
+static void d2d_device_context_put_rect_geometry(struct d2d_device_context *context,
+        struct d2d_geometry *geometry)
+{
+    struct d2d_geometry *displaced;
+
+    if ((displaced = InterlockedExchangePointer((void **)&context->rect_geometry_cache, geometry)))
+    {
+        d2d_geometry_cleanup(displaced);
+        free(displaced);
+    }
+}
+
 static void STDMETHODCALLTYPE d2d_device_context_FillRectangle(ID2D1DeviceContext6 *iface,
         const D2D1_RECT_F *rect, ID2D1Brush *brush)
 {
@@ -967,51 +1023,12 @@ static void STDMETHODCALLTYPE d2d_device_context_FillRectangle(ID2D1DeviceContex
         return;
     }
 
-    /* Session 6 (C1): Reuse a single cached rectangle geometry across
-     * FillRectangle calls. Serum2 GUI hits ~22k FillRectangle/s, each of
-     * which was calloc'ing a ~1600-byte struct d2d_geometry plus ancillary
-     * arrays and freeing them immediately. We bypass the COM factory path
-     * and call d2d_device_context_fill_geometry() directly — FillGeometry
-     * does not hold a reference past the call, so the cached object is
-     * safe to reuse.
-     *
-     * Thread-safety: InterlockedExchangePointer claims the cached geometry
-     * atomically so two concurrent FillRectangle calls on the same context
-     * (MULTI_THREADED factory) each get their own object. On put-back, if
-     * the cache was refilled in the meantime we destroy the one we displaced.
-     */
-    geometry = InterlockedExchangePointer((void **)&context->rect_geometry_cache, NULL);
-    if (geometry)
-    {
-        d2d_rectangle_geometry_reinit(geometry, rect);
-    }
-    else
-    {
-        if (!(geometry = calloc(1, sizeof(*geometry))))
-        {
-            ERR("Failed to allocate rectangle geometry.\n");
-            return;
-        }
-        if (FAILED(d2d_rectangle_geometry_init(geometry, context->factory, rect)))
-        {
-            free(geometry);
-            return;
-        }
-    }
+    if (!(geometry = d2d_device_context_get_rect_geometry(context, rect)))
+        return;
 
     d2d_device_context_fill_geometry(context, geometry, unsafe_impl_from_ID2D1Brush(brush), NULL);
 
-    /* Return to cache. If another thread already put one back, destroy the
-     * displaced object (cache size stays bounded at 1). */
-    {
-        struct d2d_geometry *displaced = InterlockedExchangePointer(
-                (void **)&context->rect_geometry_cache, geometry);
-        if (displaced)
-        {
-            d2d_geometry_cleanup(displaced);
-            free(displaced);
-        }
-    }
+    d2d_device_context_put_rect_geometry(context, geometry);
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_DrawRoundedRectangle(ID2D1DeviceContext6 *iface,
@@ -2758,58 +2775,216 @@ static float d2d_apply_enhanced_contrast(float coverage, float contrast)
     return a * 255.0f;
 }
 
+/* One coverage mask for all the glyph runs a device context draws.
+ *
+ * A run used to get a texture of its own: a D3D texture with an upload, a
+ * shader resource view, the bitmap and bitmap brush wrapping them and a
+ * rectangle geometry, all created and destroyed again for every line of text
+ * on every repaint. Text-heavy windows spent a large part of each repaint on
+ * that churn. The runs of a context share one mask instead: an A8 texture
+ * grown in steps and kept for the lifetime of the context, together with the
+ * objects wrapping it and the CPU buffers the coverage passes through. A run
+ * uploads its coverage into the top-left corner of the texture and draws
+ * before the next run touches it, so nothing is ever shared between two runs
+ * in flight. The mask is claimed and returned around a single run the way the
+ * rectangle geometry is; a second claimant while it is out builds its own. */
+
+#define D2D_GLYPH_MASK_MIN_WIDTH   256
+#define D2D_GLYPH_MASK_MIN_HEIGHT   64
+#define D2D_GLYPH_MASK_MAX_WIDTH  4096
+#define D2D_GLYPH_MASK_MAX_HEIGHT 1024
+
+static struct d2d_glyph_mask *d2d_device_context_get_glyph_mask(struct d2d_device_context *context)
+{
+    struct d2d_glyph_mask *mask;
+
+    if ((mask = InterlockedExchangePointer((void **)&context->glyph_mask_cache, NULL)))
+        return mask;
+
+    return calloc(1, sizeof(*mask));
+}
+
+static void d2d_device_context_put_glyph_mask(struct d2d_device_context *context,
+        struct d2d_glyph_mask *mask)
+{
+    struct d2d_glyph_mask *displaced;
+
+    if ((displaced = InterlockedExchangePointer((void **)&context->glyph_mask_cache, mask)))
+        d2d_glyph_mask_destroy(displaced);
+}
+
+static BYTE *d2d_glyph_mask_reserve(BYTE **buffer, size_t *size, size_t needed)
+{
+    if (needed <= *size)
+        return *buffer;
+
+    /* Nothing in the old buffer is worth carrying over. */
+    free(*buffer);
+    *size = 0;
+    if (!(*buffer = malloc(needed)))
+        return NULL;
+    *size = needed;
+
+    return *buffer;
+}
+
+/* The plane a run is uploaded from: width x height bytes, rows pitch bytes
+ * apart, with a spare column and row for d2d_glyph_mask_upload(). */
+static BYTE *d2d_glyph_mask_get_plane(struct d2d_glyph_mask *mask, unsigned int width,
+        unsigned int height, unsigned int *pitch)
+{
+    *pitch = width + 1;
+    if ((size_t)height + 1 > ~(size_t)0 / *pitch)
+        return NULL;
+
+    return d2d_glyph_mask_reserve(&mask->data, &mask->data_size, (size_t)*pitch * (height + 1));
+}
+
+/* Hand the plane to the shader as an opacity brush placed at run_rect. The
+ * brush is the shared one unless the run does not fit the shared texture, in
+ * which case it is a one-off object the caller has to release. */
+static HRESULT d2d_glyph_mask_upload(struct d2d_device_context *context, struct d2d_glyph_mask *mask,
+        unsigned int width, unsigned int height, const D2D1_RECT_F *run_rect,
+        struct d2d_brush **brush, BOOL *temporary)
+{
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    D2D1_BRUSH_PROPERTIES brush_desc;
+    ID3D11DeviceContext *d3d_context;
+    unsigned int pitch = width + 1;
+    struct d2d_bitmap *bitmap;
+    D2D1_SIZE_U size;
+    unsigned int y;
+    D3D11_BOX box;
+    HRESULT hr;
+
+    bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
+    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bitmap_desc.dpiX = context->desc.dpiX;
+    bitmap_desc.dpiY = context->desc.dpiY;
+    bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+    bitmap_desc.colorContext = NULL;
+
+    brush_desc.opacity = 1.0f;
+    brush_desc.transform = identity;
+    brush_desc.transform._31 = run_rect->left;
+    brush_desc.transform._32 = run_rect->top;
+
+    *temporary = FALSE;
+
+    /* A run the shared texture cannot hold gets a texture of its own, the
+     * way every run used to. */
+    if (width >= D2D_GLYPH_MASK_MAX_WIDTH || height >= D2D_GLYPH_MASK_MAX_HEIGHT)
+    {
+        d2d_size_set(&size, width, height);
+        if (FAILED(hr = d2d_bitmap_create(context, size, mask->data, pitch, &bitmap_desc, &bitmap)))
+            return hr;
+        hr = d2d_bitmap_brush_create(context->factory, (ID2D1Bitmap *)&bitmap->ID2D1Bitmap1_iface,
+                NULL, &brush_desc, brush);
+        ID2D1Bitmap1_Release(&bitmap->ID2D1Bitmap1_iface);
+        *temporary = TRUE;
+        return hr;
+    }
+
+    /* The brush clamps at the edge of its texture, and the antialiased edge
+     * of the run rectangle reaches half a pixel past the run. A texture the
+     * run has to itself clamps at the run; the shared one has to reproduce
+     * that, so the last column and row are replicated once more beyond the
+     * run and those samples stay what they were. */
+    for (y = 0; y < height; ++y)
+        mask->data[y * pitch + width] = mask->data[y * pitch + width - 1];
+    memcpy(&mask->data[height * pitch], &mask->data[(height - 1) * pitch], pitch);
+
+    if (mask->bitmap && (mask->bitmap->pixel_size.width < pitch
+            || mask->bitmap->pixel_size.height < height + 1))
+    {
+        size.width = min(max(2 * mask->bitmap->pixel_size.width, pitch), D2D_GLYPH_MASK_MAX_WIDTH);
+        size.height = min(max(2 * mask->bitmap->pixel_size.height, height + 1), D2D_GLYPH_MASK_MAX_HEIGHT);
+        ID2D1Brush_Release(&mask->brush->ID2D1Brush_iface);
+        mask->brush = NULL;
+        mask->bitmap = NULL;
+    }
+    else if (!mask->bitmap)
+    {
+        size.width = max(pitch, D2D_GLYPH_MASK_MIN_WIDTH);
+        size.height = max(height + 1, D2D_GLYPH_MASK_MIN_HEIGHT);
+    }
+
+    if (!mask->bitmap)
+    {
+        if (FAILED(hr = d2d_bitmap_create(context, size, NULL, 0, &bitmap_desc, &bitmap)))
+            return hr;
+        hr = d2d_bitmap_brush_create(context->factory, (ID2D1Bitmap *)&bitmap->ID2D1Bitmap1_iface,
+                NULL, &brush_desc, &mask->brush);
+        ID2D1Bitmap1_Release(&bitmap->ID2D1Bitmap1_iface);
+        if (FAILED(hr))
+            return hr;
+        mask->bitmap = bitmap;
+    }
+
+    /* The brush maps its bitmap through the bitmap's size in DIPs, so the
+     * bitmap has to follow the context's DPI; the transform places it at the
+     * run. */
+    mask->bitmap->dpi_x = context->desc.dpiX;
+    mask->bitmap->dpi_y = context->desc.dpiY;
+    mask->brush->transform = brush_desc.transform;
+
+    box.left = 0;
+    box.top = 0;
+    box.front = 0;
+    box.right = pitch;
+    box.bottom = height + 1;
+    box.back = 1;
+    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+    ID3D11DeviceContext_UpdateSubresource(d3d_context, mask->bitmap->resource, 0, &box, mask->data, pitch, 0);
+    ID3D11DeviceContext_Release(d3d_context);
+
+    *brush = mask->brush;
+
+    return S_OK;
+}
+
+/* Fill run_rect with the brush, masked by the run's coverage. The caller has
+ * set the identity transform: the glyph run analysis already applied it. */
+static void d2d_device_context_fill_glyph_rect(struct d2d_device_context *context,
+        const D2D1_RECT_F *run_rect, struct d2d_brush *brush, struct d2d_brush *mask_brush)
+{
+    struct d2d_geometry *geometry;
+
+    if (!(geometry = d2d_device_context_get_rect_geometry(context, run_rect)))
+        return;
+    d2d_device_context_fill_geometry(context, geometry, brush, mask_brush);
+    d2d_device_context_put_rect_geometry(context, geometry);
+}
+
 static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_context *context,
-        ID2D1Brush *brush, const BYTE *coverage, unsigned int width, unsigned int height,
+        struct d2d_glyph_mask *mask, ID2D1Brush *brush, unsigned int width, unsigned int height,
         const RECT *bounds, DWRITE_PIXEL_GEOMETRY pixel_geometry, float cleartype_level,
         float enhanced_contrast)
 {
-    ID2D1RectangleGeometry *geometry = NULL;
-    ID2D1BitmapBrush *opacity_brushes[3] = {NULL};
-    ID2D1Bitmap *opacity_bitmaps[3] = {NULL};
-    ID3D11BlendState *blend_states[3];
+    D2D1_ANTIALIAS_MODE antialias_mode = context->drawing_state.antialiasMode;
+    struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
     ID3D11BlendState *prev_bs = context->bs;
-    D2D1_BITMAP_PROPERTIES bitmap_desc;
-    D2D1_BRUSH_PROPERTIES brush_desc;
+    ID3D11BlendState *blend_states[3];
+    const BYTE *coverage = mask->coverage;
     D2D1_MATRIX_3X2_F *transform, m;
-    D2D1_SIZE_U bitmap_size;
+    struct d2d_brush *mask_brush;
+    unsigned int c, x, y, pitch;
     float scale_x, scale_y;
     D2D1_RECT_F run_rect;
-    D2D1_ANTIALIAS_MODE antialias_mode = context->drawing_state.antialiasMode;
-    unsigned int c, i, x, y;
-    BYTE *plane;
-    BOOL linear;
+    BOOL linear, temporary;
     HRESULT hr = S_OK;
+    BYTE *plane;
 
     if (!width || !height)
         return S_OK;
 
-    if (height > ~(size_t)0 / width || !(plane = malloc((size_t)width * height)))
+    if (!(plane = d2d_glyph_mask_get_plane(mask, width, height, &pitch)))
         return E_OUTOFMEMORY;
 
     scale_x = context->desc.dpiX / 96.0f;
     scale_y = context->desc.dpiY / 96.0f;
     d2d_rect_set(&run_rect, bounds->left / scale_x, bounds->top / scale_y,
             bounds->right / scale_x, bounds->bottom / scale_y);
-    d2d_size_set(&bitmap_size, width, height);
-
-    bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
-    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-    bitmap_desc.dpiX = context->desc.dpiX;
-    bitmap_desc.dpiY = context->desc.dpiY;
-
-    brush_desc.opacity = 1.0f;
-    brush_desc.transform._11 = 1.0f;
-    brush_desc.transform._12 = 0.0f;
-    brush_desc.transform._21 = 0.0f;
-    brush_desc.transform._22 = 1.0f;
-    brush_desc.transform._31 = run_rect.left;
-    brush_desc.transform._32 = run_rect.top;
-
-    if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, &run_rect, &geometry)))
-    {
-        ERR("Failed to create geometry, hr %#lx.\n", hr);
-        goto done;
-    }
 
     /* Linear blending needs the destination, which the output merger cannot
      * supply through a transfer function. Take a copy of it and let the shader
@@ -2819,15 +2994,29 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
 
     for (c = 0; c < 3; ++c)
     {
-        unsigned int sample = pixel_geometry == DWRITE_PIXEL_GEOMETRY_BGR ? 2 - c : c;
-
         blend_states[c] = linear ? d2d_device_context_get_subpixel_copy_blend_state(context, c)
                 : d2d_device_context_get_subpixel_blend_state(context, c);
         if (!blend_states[c])
-        {
-            hr = E_OUTOFMEMORY;
-            break;
-        }
+            return E_OUTOFMEMORY;
+    }
+
+    transform = &context->drawing_state.transform;
+    m = *transform;
+    *transform = identity;
+    context->linear_text = linear;
+
+    /* The run rectangle is pixel aligned, so antialiasing its edges gains
+     * nothing — but it costs correctness here: the antialiased fill path
+     * covers the border pixels with partial coverage and scales the shader
+     * result by it. That is harmless while the output merger blends, and
+     * wrong once the shader produces the finished pixel, which is exactly
+     * what the linear path does. Draw the rectangle aliased instead. */
+    if (linear)
+        context->drawing_state.antialiasMode = D2D1_ANTIALIAS_MODE_ALIASED;
+
+    for (c = 0; c < 3; ++c)
+    {
+        unsigned int sample = pixel_geometry == DWRITE_PIXEL_GEOMETRY_BGR ? 2 - c : c;
 
         for (y = 0; y < height; ++y)
             for (x = 0; x < width; ++x)
@@ -2838,63 +3027,26 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
 
                 value = d2d_apply_enhanced_contrast(value, enhanced_contrast);
 
-                plane[y * width + x] = min(max((int)(value + 0.5f), 0), 255);
+                plane[y * pitch + x] = min(max((int)(value + 0.5f), 0), 255);
             }
 
-        if (FAILED(hr = d2d_device_context_CreateBitmap(&context->ID2D1DeviceContext6_iface,
-                bitmap_size, plane, width, &bitmap_desc, &opacity_bitmaps[c])))
+        if (FAILED(hr = d2d_glyph_mask_upload(context, mask, width, height, &run_rect, &mask_brush, &temporary)))
         {
-            ERR("Failed to create opacity bitmap, hr %#lx.\n", hr);
+            ERR("Failed to upload glyph mask, hr %#lx.\n", hr);
             break;
         }
 
-        if (FAILED(hr = d2d_device_context_CreateBitmapBrush(&context->ID2D1DeviceContext6_iface,
-                opacity_bitmaps[c], NULL, &brush_desc, &opacity_brushes[c])))
-        {
-            ERR("Failed to create opacity bitmap brush, hr %#lx.\n", hr);
-            break;
-        }
+        context->bs = blend_states[c];
+        d2d_device_context_fill_glyph_rect(context, &run_rect, brush_impl, mask_brush);
+        if (temporary)
+            ID2D1Brush_Release(&mask_brush->ID2D1Brush_iface);
     }
 
-    if (SUCCEEDED(hr))
-    {
-        transform = &context->drawing_state.transform;
-        m = *transform;
-        *transform = identity;
-        context->linear_text = linear;
+    context->drawing_state.antialiasMode = antialias_mode;
+    context->linear_text = FALSE;
+    context->bs = prev_bs;
+    *transform = m;
 
-        /* The run rectangle is pixel aligned, so antialiasing its edges gains
-         * nothing — but it costs correctness here: the antialiased fill path
-         * covers the border pixels with partial coverage and scales the shader
-         * result by it. That is harmless while the output merger blends, and
-         * wrong once the shader produces the finished pixel, which is exactly
-         * what the linear path does. Draw the rectangle aliased instead. */
-        if (linear)
-            context->drawing_state.antialiasMode = D2D1_ANTIALIAS_MODE_ALIASED;
-
-        for (c = 0; c < 3; ++c)
-        {
-            context->bs = blend_states[c];
-            d2d_device_context_fill_geometry(context,
-                    unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
-                    unsafe_impl_from_ID2D1Brush(brush),
-                    unsafe_impl_from_ID2D1Brush((ID2D1Brush *)opacity_brushes[c]));
-        }
-
-        context->drawing_state.antialiasMode = antialias_mode;
-        context->linear_text = FALSE;
-        context->bs = prev_bs;
-        *transform = m;
-    }
-
-done:
-    for (i = 0; i < ARRAY_SIZE(opacity_brushes); ++i)
-    {
-        if (opacity_brushes[i]) ID2D1BitmapBrush_Release(opacity_brushes[i]);
-        if (opacity_bitmaps[i]) ID2D1Bitmap_Release(opacity_bitmaps[i]);
-    }
-    if (geometry) ID2D1RectangleGeometry_Release(geometry);
-    free(plane);
     return hr;
 }
 
@@ -2903,20 +3055,17 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
         DWRITE_RENDERING_MODE rendering_mode, DWRITE_MEASURING_MODE measuring_mode,
         DWRITE_TEXT_ANTIALIAS_MODE antialias_mode, IDWriteRenderingParams *rendering_params)
 {
-    ID2D1RectangleGeometry *geometry = NULL;
-    ID2D1BitmapBrush *opacity_brush = NULL;
-    D2D1_BITMAP_PROPERTIES bitmap_desc;
-    ID2D1Bitmap *opacity_bitmap = NULL;
+    unsigned int width, height, pitch, y;
+    struct d2d_glyph_mask *mask = NULL;
     IDWriteGlyphRunAnalysis *analysis;
     DWRITE_TEXTURE_TYPE texture_type;
-    D2D1_BRUSH_PROPERTIES brush_desc;
     D2D1_MATRIX_3X2_F *transform, m;
-    void *opacity_values = NULL;
-    size_t opacity_values_size;
-    unsigned int run_width;
-    D2D1_SIZE_U bitmap_size;
+    struct d2d_brush *mask_brush;
     float scale_x, scale_y;
+    size_t coverage_size;
     D2D1_RECT_F run_rect;
+    BOOL temporary;
+    BYTE *plane;
     RECT bounds;
     HRESULT hr;
 
@@ -2934,25 +3083,33 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
         goto done;
     }
 
-    d2d_size_set(&bitmap_size, bounds.right - bounds.left, bounds.bottom - bounds.top);
-    if (!bitmap_size.width || !bitmap_size.height)
+    width = bounds.right - bounds.left;
+    height = bounds.bottom - bounds.top;
+    if (!width || !height)
     {
         /* Empty run, nothing to do. */
         goto done;
     }
 
-    if (texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
-        bitmap_size.width *= 3;
-    if (!(opacity_values = calloc(bitmap_size.height, bitmap_size.width)))
+    if (!(mask = d2d_device_context_get_glyph_mask(context)))
+    {
+        ERR("Failed to allocate glyph mask.\n");
+        goto done;
+    }
+
+    coverage_size = texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1 ? 3 : 1;
+    if (height > ~(size_t)0 / width / coverage_size)
+        goto done;
+    coverage_size *= (size_t)width * height;
+    if (!d2d_glyph_mask_reserve(&mask->coverage, &mask->coverage_size, coverage_size))
     {
         ERR("Failed to allocate opacity values.\n");
         goto done;
     }
-    opacity_values_size = bitmap_size.height * bitmap_size.width;
-    run_width = bounds.right - bounds.left;
 
+    /* dwrite clears the buffer before it writes the run. */
     if (FAILED(hr = IDWriteGlyphRunAnalysis_CreateAlphaTexture(analysis,
-            texture_type, &bounds, opacity_values, opacity_values_size)))
+            texture_type, &bounds, mask->coverage, coverage_size)))
     {
         ERR("Failed to create alpha texture, hr %#lx.\n", hr);
         goto done;
@@ -2990,64 +3147,43 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
 
         TRACE("ClearType blend parameters: gamma %.3f, contrast %.3f, level %.3f, geometry %u.\n",
                 gamma, contrast, cleartype_level, pixel_geometry);
-        hr = d2d_device_context_draw_glyph_run_subpixel(context, brush, opacity_values,
-                run_width, bitmap_size.height, &bounds, pixel_geometry, cleartype_level, contrast);
+        hr = d2d_device_context_draw_glyph_run_subpixel(context, mask, brush,
+                width, height, &bounds, pixel_geometry, cleartype_level, contrast);
         if (FAILED(hr))
             d2d_device_context_set_error(context, hr);
         goto done;
     }
 
-    bitmap_desc.pixelFormat.format = DXGI_FORMAT_A8_UNORM;
-    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-    bitmap_desc.dpiX = context->desc.dpiX;
-    bitmap_desc.dpiY = context->desc.dpiY;
-    if (FAILED(hr = d2d_device_context_CreateBitmap(&context->ID2D1DeviceContext6_iface,
-            bitmap_size, opacity_values, bitmap_size.width, &bitmap_desc, &opacity_bitmap)))
+    if (!(plane = d2d_glyph_mask_get_plane(mask, width, height, &pitch)))
     {
-        ERR("Failed to create opacity bitmap, hr %#lx.\n", hr);
+        ERR("Failed to allocate glyph mask plane.\n");
         goto done;
     }
+    for (y = 0; y < height; ++y)
+        memcpy(&plane[y * pitch], &mask->coverage[(size_t)y * width], width);
 
     scale_x = context->desc.dpiX / 96.0f;
     scale_y = context->desc.dpiY / 96.0f;
     d2d_rect_set(&run_rect, bounds.left / scale_x, bounds.top / scale_y,
             bounds.right / scale_x, bounds.bottom / scale_y);
 
-    brush_desc.opacity = 1.0f;
-    brush_desc.transform._11 = 1.0f;
-    brush_desc.transform._12 = 0.0f;
-    brush_desc.transform._21 = 0.0f;
-    brush_desc.transform._22 = 1.0f;
-    brush_desc.transform._31 = run_rect.left;
-    brush_desc.transform._32 = run_rect.top;
-    if (FAILED(hr = d2d_device_context_CreateBitmapBrush(&context->ID2D1DeviceContext6_iface,
-            opacity_bitmap, NULL, &brush_desc, &opacity_brush)))
+    if (FAILED(hr = d2d_glyph_mask_upload(context, mask, width, height, &run_rect, &mask_brush, &temporary)))
     {
-        ERR("Failed to create opacity bitmap brush, hr %#lx.\n", hr);
-        goto done;
-    }
-
-    if (FAILED(hr = ID2D1Factory_CreateRectangleGeometry(context->factory, &run_rect, &geometry)))
-    {
-        ERR("Failed to create geometry, hr %#lx.\n", hr);
+        ERR("Failed to upload glyph mask, hr %#lx.\n", hr);
         goto done;
     }
 
     transform = &context->drawing_state.transform;
     m = *transform;
     *transform = identity;
-    d2d_device_context_fill_geometry(context, unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry),
-            unsafe_impl_from_ID2D1Brush(brush), unsafe_impl_from_ID2D1Brush((ID2D1Brush *)opacity_brush));
+    d2d_device_context_fill_glyph_rect(context, &run_rect, unsafe_impl_from_ID2D1Brush(brush), mask_brush);
     *transform = m;
+    if (temporary)
+        ID2D1Brush_Release(&mask_brush->ID2D1Brush_iface);
 
 done:
-    if (geometry)
-        ID2D1RectangleGeometry_Release(geometry);
-    if (opacity_brush)
-        ID2D1BitmapBrush_Release(opacity_brush);
-    if (opacity_bitmap)
-        ID2D1Bitmap_Release(opacity_bitmap);
-    free(opacity_values);
+    if (mask)
+        d2d_device_context_put_glyph_mask(context, mask);
     IDWriteGlyphRunAnalysis_Release(analysis);
 }
 
