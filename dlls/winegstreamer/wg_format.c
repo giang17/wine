@@ -624,14 +624,16 @@ void wg_format_from_caps(struct wg_format *format, const GstCaps *caps)
     {
         GstAudioInfo info;
 
-        if (gst_audio_info_from_caps(&info, caps))
+        /* Caps queried from a pad that decodebin has just exposed may still carry
+         * ranges and lists; gst_audio_info_from_caps() asserts on those. */
+        if (gst_caps_is_fixed(caps) && gst_audio_info_from_caps(&info, caps))
             wg_format_from_audio_info(format, &info);
     }
     else if (!strcmp(name, "video/x-raw"))
     {
         GstVideoInfo info;
 
-        if (gst_video_info_from_caps(&info, caps))
+        if (gst_caps_is_fixed(caps) && gst_video_info_from_caps(&info, caps))
             wg_format_from_video_info(format, &info);
     }
     else if (!strcmp(name, "audio/mpeg") && gst_structure_get_boolean(structure, "parsed", &parsed) && parsed)
