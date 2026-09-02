@@ -309,6 +309,18 @@ struct d2d_line_batch
     BOOL flushing;
 };
 
+/* One coverage mask for all the glyph runs a device context draws, see
+ * d2d_device_context_draw_glyph_run_bitmap(). */
+struct d2d_glyph_mask
+{
+    struct d2d_brush *brush;      /* Bitmap brush over the mask; owns the bitmap. */
+    struct d2d_bitmap *bitmap;
+    BYTE *coverage;               /* The run as dwrite delivers it, tightly packed. */
+    size_t coverage_size;
+    BYTE *data;                   /* The plane as it is uploaded, with a spare column and row. */
+    size_t data_size;
+};
+
 struct d2d_device_context
 {
     ID2D1DeviceContext6 ID2D1DeviceContext6_iface;
@@ -384,6 +396,9 @@ struct d2d_device_context
      * allocs/min in Serum2 GUI workload). Reused across FillRectangle calls;
      * freed only in device_context destructor. */
     struct d2d_geometry *rect_geometry_cache;
+    /* Shared glyph coverage mask, claimed and returned around one glyph run
+     * the way the rectangle geometry is. */
+    struct d2d_glyph_mask *glyph_mask_cache;
     ID3D11SamplerState *sampler_states
             [D2D_SAMPLER_INTERPOLATION_MODE_COUNT]
             [D2D_SAMPLER_EXTEND_MODE_COUNT]
