@@ -74,7 +74,9 @@ This is the recommended branch. What it changes, by subsystem:
   graphics engine that did not start, not a version check
 - **DWrite**: `DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC` is accepted instead of rejected,
   IDWriteFontSet::GetMatchingFonts is implemented, and the font fallback maps
-  Miscellaneous Symbols and Arrows (U+2B00-2BFF), which fixes the star ratings in Serum 2.
+  Miscellaneous Symbols and Arrows (U+2B00-2BFF), which fixes the star ratings in Serum 2,
+  and Geometric Shapes (U+25A0-25FF), which fixes the password mask of Fender Studio Pro's
+  login dialog (U+25CF drawn with a private font that lacks it).
   The per-fontface glyph cache used to die with the fontface, and text layout creates one
   per run: 17 208 fontfaces and 111 598 re-rasterisations of 196 distinct glyphs during a
   25 s SynthEdit resize. The cache now outlives the fontface, keyed by font file and face
