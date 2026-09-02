@@ -2852,6 +2852,27 @@ static BOOL d2d_geometry_intersect_bezier_line(struct d2d_geometry *geometry,
     return TRUE;
 }
 
+/* Two quadratic segments describe the same curve, possibly traversed in
+ * opposite directions. The tolerance is a fraction of a DIP well below anything
+ * rasterisation resolves, scaled with the coordinate magnitude so that float
+ * rounding in the caller's own conversion (a cubic converted twice into the
+ * same quadratics) does not defeat the test. */
+static BOOL d2d_point_approx_equal(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b)
+{
+    float eps = 1e-4f * fmaxf(1.0f, fmaxf(fabsf(a->x), fabsf(a->y)));
+
+    return fabsf(a->x - b->x) <= eps && fabsf(a->y - b->y) <= eps;
+}
+
+static BOOL d2d_bezier_segments_coincide(const D2D1_POINT_2F *const p[3], const D2D1_POINT_2F *const q[3])
+{
+    if (!d2d_point_approx_equal(p[1], q[1]))
+        return FALSE;
+    if (d2d_point_approx_equal(p[0], q[0]) && d2d_point_approx_equal(p[2], q[2]))
+        return TRUE;
+    return d2d_point_approx_equal(p[0], q[2]) && d2d_point_approx_equal(p[2], q[0]);
+}
+
 static BOOL d2d_geometry_intersect_bezier_bezier(struct d2d_geometry *geometry,
         struct d2d_geometry_intersections *intersections,
         const struct d2d_segment_idx *idx_p, float start_p, float end_p,
@@ -2880,6 +2901,17 @@ static BOOL d2d_geometry_intersect_bezier_bezier(struct d2d_geometry *geometry,
     d2d_rect_get_bezier_segment_bounds(&q_bounds, q[0], q[1], q[2], start_q, end_q);
 
     if (!d2d_rect_check_overlap(&p_bounds, &q_bounds))
+        return TRUE;
+
+    /* Coincident segments never cross, so there is no intersection to report,
+     * just like d2d_geometry_intersect_line_line() reports none for parallel
+     * lines. Subdividing them instead finds an overlap in all four sub-pairs on
+     * every level, visits 4^10 leaves before the termination below and adds
+     * about two million duplicate intersections, all but a thousand of which
+     * d2d_geometry_apply_intersections() throws away again: a 13 DIP icon whose
+     * figures share a stroke cap took over a second to close. */
+    if (start_p == 0.0f && end_p == 1.0f && start_q == 0.0f && end_q == 1.0f
+            && d2d_bezier_segments_coincide(p, q))
         return TRUE;
 
     centre_p = (start_p + end_p) / 2.0f;
@@ -4211,6 +4243,15 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
     if (!isfinite(ccw_a) || ccw_a == 0.0f || !isfinite(ccw_b) || ccw_b == 0.0f)
         return FALSE;
 
+    /* Coincident segments have the same control triangle. Splitting one of
+     * them would only produce two smaller triangles that still coincide with
+     * the other's halves, and because the two curves would be split in a
+     * different order they would end up with different vertices along the
+     * same curve, leaving slivers between them. Keep them identical instead;
+     * their curve triangles then cancel or add exactly. */
+    if (d2d_bezier_segments_coincide(a, b))
+        return FALSE;
+
     d2d_point_subtract(&v_q[0], b[1], b[0]);
     d2d_point_subtract(&v_q[1], b[2], b[0]);
     d2d_point_subtract(&v_q[2], b[1], b[2]);
@@ -4307,13 +4348,147 @@ static BOOL d2d_geometry_split_bezier(struct d2d_geometry *geometry, const struc
     return TRUE;
 }
 
+struct d2d_bezier_cap
+{
+    D2D1_POINT_2F p[3];     /* Canonical: p[0] is the lesser end point. */
+    size_t ordinal;         /* Position in the bezier segment iteration order. */
+    size_t group;
+    BOOL reversed;
+};
+
+static int d2d_bezier_cap_compare(const void *a, const void *b)
+{
+    const struct d2d_bezier_cap *ca = a, *cb = b;
+
+    if (ca->p[0].x < cb->p[0].x)
+        return -1;
+    return ca->p[0].x > cb->p[0].x;
+}
+
+/* Coincident curve segments of different figures keep the same control
+ * triangle (d2d_geometry_check_bezier_overlap() refuses to split them), so
+ * their curve triangles would be rasterised on top of each other. The fill
+ * rule says how many of them count: two arcs running the same way fill their
+ * side once, an arc and its reverse cancel out, and under the alternate rule
+ * every pair cancels. Emit a single curve triangle for a group with a
+ * non-zero net winding and none otherwise. The chords stay in their figures
+ * and are handled by the triangulation like any other edge, so the polygon
+ * part of the fill is already correct. */
+static BOOL d2d_geometry_shared_bezier_caps(struct d2d_geometry *geometry, BOOL **emit, size_t *emitted)
+{
+    struct d2d_bezier_cap *caps, *ca, *cb;
+    struct d2d_segment_idx idx;
+    const D2D1_POINT_2F *p[3];
+    struct d2d_figure *figure;
+    size_t count, i, j, next;
+    BOOL *e;
+
+    *emit = NULL;
+    *emitted = 0;
+    if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx))
+        return TRUE;
+    count = 1;
+    while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx))
+        ++count;
+    *emitted = count;
+    if (count < 2)
+        return TRUE;
+
+    if (!(caps = calloc(count, sizeof(*caps))))
+        return FALSE;
+    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx);
+    for (i = 0; i < count; ++i, d2d_geometry_get_next_bezier_segment_idx(geometry, &idx))
+    {
+        figure = &geometry->u.path.figures[idx.figure_idx];
+        p[0] = &figure->vertices[idx.vertex_idx];
+        p[1] = &figure->bezier_controls[idx.control_idx];
+        if ((next = idx.vertex_idx + 1) == figure->vertex_count)
+            next = 0;
+        p[2] = &figure->vertices[next];
+
+        ca = &caps[i];
+        ca->ordinal = i;
+        ca->group = i;
+        ca->reversed = p[2]->x < p[0]->x || (p[2]->x == p[0]->x && p[2]->y < p[0]->y);
+        ca->p[0] = ca->reversed ? *p[2] : *p[0];
+        ca->p[1] = *p[1];
+        ca->p[2] = ca->reversed ? *p[0] : *p[2];
+    }
+    qsort(caps, count, sizeof(*caps), d2d_bezier_cap_compare);
+
+    /* Sorted by the lesser end point's x, so coincident segments sit next to
+     * each other, at most a tolerance apart. */
+    for (i = 0; i < count; ++i)
+    {
+        const D2D1_POINT_2F *pa[3], *pb[3];
+
+        ca = &caps[i];
+        if (ca->group != ca->ordinal)
+            continue;
+        pa[0] = &ca->p[0]; pa[1] = &ca->p[1]; pa[2] = &ca->p[2];
+        for (j = i + 1; j < count; ++j)
+        {
+            cb = &caps[j];
+            if (cb->p[0].x - ca->p[0].x > 1e-4f * fmaxf(1.0f, fabsf(ca->p[0].x)))
+                break;
+            if (cb->group != cb->ordinal)
+                continue;
+            pb[0] = &cb->p[0]; pb[1] = &cb->p[1]; pb[2] = &cb->p[2];
+            if (d2d_bezier_segments_coincide(pa, pb))
+                cb->group = ca->ordinal;
+        }
+    }
+
+    if (!(e = malloc(count * sizeof(*e))))
+    {
+        free(caps);
+        return FALSE;
+    }
+    for (i = 0; i < count; ++i)
+        e[i] = TRUE;
+
+    for (i = 0; i < count; ++i)
+    {
+        int net = 0;
+        size_t n = 0;
+
+        ca = &caps[i];
+        if (ca->group != ca->ordinal)
+            continue;
+        for (j = i; j < count; ++j)
+        {
+            cb = &caps[j];
+            if (cb->group != ca->ordinal)
+                continue;
+            net += cb->reversed == ca->reversed ? 1 : -1;
+            ++n;
+            if (j != i)
+                e[cb->ordinal] = FALSE;
+        }
+        if (n < 2)
+            continue;
+        if (geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? !(n & 1) : !net)
+            e[ca->ordinal] = FALSE;
+        TRACE("%Iu coincident bezier segments, net winding %d.\n", n, net);
+    }
+
+    *emitted = 0;
+    for (i = 0; i < count; ++i)
+        if (e[i])
+            ++*emitted;
+    *emit = e;
+    free(caps);
+    return TRUE;
+}
+
 static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
 {
     struct d2d_segment_idx idx_p, idx_q;
     struct d2d_curve_vertex *b;
     const D2D1_POINT_2F *p[3];
     struct d2d_figure *figure;
-    size_t bezier_idx, i;
+    size_t bezier_idx, i, ordinal, emitted;
+    BOOL *emit;
 
     if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
         return S_OK;
@@ -4346,26 +4521,27 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
         }
     }
 
-    for (i = 0; i < geometry->u.path.figure_count; ++i)
-    {
-        if (geometry->u.path.figures[i].flags & D2D_FIGURE_FLAG_HOLLOW)
-            continue;
-        geometry->fill.bezier_vertex_count += 3 * geometry->u.path.figures[i].bezier_control_count;
-    }
+    if (!d2d_geometry_shared_bezier_caps(geometry, &emit, &emitted))
+        return E_OUTOFMEMORY;
+    geometry->fill.bezier_vertex_count = 3 * emitted;
 
-    if (!(geometry->fill.bezier_vertices = calloc(geometry->fill.bezier_vertex_count,
+    if (emitted && !(geometry->fill.bezier_vertices = calloc(geometry->fill.bezier_vertex_count,
             sizeof(*geometry->fill.bezier_vertices))))
     {
         ERR("Failed to allocate bezier vertices array.\n");
         geometry->fill.bezier_vertex_count = 0;
+        free(emit);
         return E_OUTOFMEMORY;
     }
 
     bezier_idx = 0;
-    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
-    for (;;)
+    ordinal = 0;
+    if (d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p)) do
     {
         float sign = -1.0f;
+
+        if (emit && !emit[ordinal++])
+            continue;
 
         figure = &geometry->u.path.figures[idx_p.figure_idx];
         p[0] = &figure->vertices[idx_p.vertex_idx];
@@ -4385,16 +4561,13 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
             i = 0;
         p[2] = &figure->vertices[i];
 
-        b = &geometry->fill.bezier_vertices[bezier_idx * 3];
+        b = &geometry->fill.bezier_vertices[bezier_idx++ * 3];
         d2d_curve_vertex_set(&b[0], p[0], 0.0f, 0.0f, sign);
         d2d_curve_vertex_set(&b[1], p[1], 0.5f, 0.0f, sign);
         d2d_curve_vertex_set(&b[2], p[2], 1.0f, 1.0f, sign);
+    } while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p));
 
-        if (!d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
-            break;
-        ++bezier_idx;
-    }
-
+    free(emit);
     return S_OK;
 }
 
