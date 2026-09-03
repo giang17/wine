@@ -5286,6 +5286,65 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             EndPaint(hwnd, &ps);
             return 0;
         }
+
+        /* Surface-bearing root: the application paints into the composition
+         * surface and treats it as retained -- on Windows the DWM keeps
+         * composing it no matter what the window's own redirection surface
+         * shows.  Here the surface reaches the window through a BitBlt at
+         * present time, and a present that lands before the window is shown
+         * goes into win32u's dummy surface.  The window then comes up with the
+         * surface it got at ShowWindow, and the application, asked to repaint,
+         * repaints nothing: from its side there is nothing to repaint.  So
+         * answer its WM_PAINT the way the DWM would -- let it paint, and if
+         * that did not present anew, put the last composed frame back for the
+         * area the window asked for.  (The Grand 3: the toolbar above the
+         * plug-in view stayed black until a hover repainted it piecewise.) */
+        if (target->root_visual && target->root_visual->surface_content
+                && target->comp_bits && target->last_present_qpc)
+        {
+            LONGLONG present_before = target->last_present_qpc;
+            RECT update;
+            LRESULT ret;
+
+            if (!GetUpdateRect(hwnd, &update, FALSE))
+                break;
+
+            ret = orig_wndproc
+                    ? CallWindowProcW(orig_wndproc, hwnd, msg, wparam, lparam)
+                    : DefWindowProcW(hwnd, msg, wparam, lparam);
+
+            if (target->device && target->last_present_qpc == present_before)
+            {
+                EnterCriticalSection(&target->device->cs);
+                /* A frame that is drawn but still waiting for the coalesced
+                 * present (issue 56) reaches the window through that present;
+                 * only a window with nothing on the way needs the old frame
+                 * back. */
+                if (target->comp_dc && target->comp_bits
+                        && target->root_visual && target->root_visual->surface_content
+                        && !target->root_visual->surface_content->has_pending)
+                {
+                    HDC hdc;
+
+                    if (update.left < 0) update.left = 0;
+                    if (update.top < 0) update.top = 0;
+                    if (update.right > (LONG)target->comp_width) update.right = target->comp_width;
+                    if (update.bottom > (LONG)target->comp_height) update.bottom = target->comp_height;
+                    if (update.right > update.left && update.bottom > update.top
+                            && (hdc = GetDC(hwnd)))
+                    {
+                        TRACE("Restoring %s of the composed frame on hwnd %p after WM_PAINT.\n",
+                                wine_dbgstr_rect(&update), hwnd);
+                        BitBlt(hdc, update.left, update.top, update.right - update.left,
+                                update.bottom - update.top, target->comp_dc,
+                                update.left, update.top, SRCCOPY);
+                        ReleaseDC(hwnd, hdc);
+                    }
+                }
+                LeaveCriticalSection(&target->device->cs);
+            }
+            return ret;
+        }
         break;
 
     case WM_NCDESTROY:
