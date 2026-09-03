@@ -3111,7 +3111,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
      *
      * Rootless trees are not affected -- dcomp_target_composite_leaves() drives
      * them and knows all three kinds. */
-    if (!rootless && (stats.surface || stats.texture))
+    if (!rootless && !root->surface_content && (stats.surface || stats.texture))
     {
         static unsigned int uncomposited_count;
 
@@ -3120,6 +3120,20 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
                     "leaves under a content-bearing root; the wined3d present path takes "
                     "swapchain leaves only, so their pixels never reach the frame.\n",
                     uncomposited_count, target_hwnd, stats.surface, stats.texture);
+    }
+    /* A surface root presents through dcomp_target_present_region(), which
+     * composites its direct surface children itself (Cubase 15: 34 of them
+     * under the project window's root surface, all delivered).  What that
+     * path does not draw are texture leaves. */
+    else if (!rootless && root->surface_content && stats.texture)
+    {
+        static unsigned int uncomposited_count;
+
+        if (++uncomposited_count <= 5 || !(uncomposited_count % 200))
+            FIXME("Leaves not composited #%u: target %p carries %u texture leaves under a "
+                    "surface root; the GDI present composites surface leaves only, so "
+                    "their pixels never reach the frame.\n",
+                    uncomposited_count, target_hwnd, stats.texture);
     }
 }
 
