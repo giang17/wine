@@ -35,6 +35,7 @@
 #include "wine/debug.h"
 #include "wine/winedxgi.h"
 #include "wine/dcomp_layer.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
@@ -2543,6 +2544,24 @@ static const WCHAR dcomp_subclass_proc_prop[] = L"__wine_dcomp_subclass_proc";
 
 static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
+/* Every in-process target, across devices.  A target on a child window is a
+ * layer over the target on its nearest ancestor window (see
+ * dcomp_target_blend_over_ancestor), and Cubase 15 creates the two on
+ * different devices -- a device's own target list cannot connect them.  The
+ * lock also guards the comp_bits of every target on the list: a present reads
+ * another target's frame through it, so that frame must not be replaced
+ * (dcomp_target_ensure_comp_dc) or freed (Release) underneath the reader.
+ * Taken after a device lock, never before one. */
+static struct list dcomp_all_targets = LIST_INIT(dcomp_all_targets);
+static CRITICAL_SECTION dcomp_all_targets_cs;
+static CRITICAL_SECTION_DEBUG dcomp_all_targets_cs_debug =
+{
+    0, 0, &dcomp_all_targets_cs,
+    { &dcomp_all_targets_cs_debug.ProcessLocksList, &dcomp_all_targets_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": dcomp_all_targets_cs") }
+};
+static CRITICAL_SECTION dcomp_all_targets_cs = { &dcomp_all_targets_cs_debug, -1, 0, 0, 0, 0 };
+
 struct dcomp_target
 {
     IDCompositionTarget IDCompositionTarget_iface;
@@ -2551,6 +2570,7 @@ struct dcomp_target
     struct dcomp_visual *root_visual;
     struct dcomp_device *device;          /* back-pointer for target list management */
     struct dcomp_target *next_target;     /* singly-linked list in dcomp_device */
+    struct list all_entry;                /* dcomp_all_targets, under dcomp_all_targets_cs */
     /* Presentation state for surface content → HWND blitting */
     HDC comp_dc;
     HBITMAP comp_bitmap;
@@ -2768,13 +2788,20 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         }
         if (target->save_dc)
             DeleteDC(target->save_dc);
+        /* Off the process-wide list and the frame freed in one step: a present
+         * of a target on a child window reads comp_bits through that list. */
+        EnterCriticalSection(&dcomp_all_targets_cs);
+        if (target->all_entry.next)
+            list_remove(&target->all_entry);
         if (target->comp_bitmap)
         {
             SelectObject(target->comp_dc, NULL);
             DeleteObject(target->comp_bitmap);
+            target->comp_bits = NULL;
         }
         if (target->comp_dc)
             DeleteDC(target->comp_dc);
+        LeaveCriticalSection(&dcomp_all_targets_cs);
         /* The layer structure outlives us on purpose (dcomp_layer.h); only its
          * pixels go.  Under the exclusive lock, so a present reading it right
          * now finishes first and the next one finds bits NULL. */
@@ -2819,18 +2846,25 @@ static void dcomp_window_request_alpha_visual(HWND hwnd, struct dcomp_surface *s
 {
     static const WCHAR glass_prop[] = {'_','_','w','i','n','e','_','d','w','m','_','g','l','a','s','s',0};
     LONG ex_style;
+    HWND top;
 
     if (!hwnd || !surface || surface->alpha_mode != DXGI_ALPHA_MODE_PREMULTIPLIED)
         return;
-    if (GetPropW(hwnd, glass_prop))
+    /* The visual belongs to the top-level: a child window has no X window of
+     * its own, and it is the top-level's redirection bitmap -- or the lack of
+     * one -- that decides whether alpha 0 means "desktop".  Cubase's progress
+     * bar carries the flag as a child window; the splash it sits in does too. */
+    if (!(top = GetAncestor(hwnd, GA_ROOT)))
+        top = hwnd;
+    if (GetPropW(top, glass_prop))
         return;
-    ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    ex_style = GetWindowLongW(top, GWL_EXSTYLE);
     if (!(ex_style & WS_EX_NOREDIRECTIONBITMAP))
         return;
 
-    TRACE("hwnd %p has no redirection bitmap and a premultiplied root surface, "
-            "requesting a per-pixel alpha capable visual.\n", hwnd);
-    SetPropW(hwnd, glass_prop, (HANDLE)(ULONG_PTR)1);
+    TRACE("hwnd %p (top-level %p) has no redirection bitmap and a premultiplied root surface, "
+            "requesting a per-pixel alpha capable visual.\n", hwnd, top);
+    SetPropW(top, glass_prop, (HANDLE)(ULONG_PTR)1);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_target_SetRoot(IDCompositionTarget *iface,
@@ -3392,6 +3426,10 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
     if (target->comp_dc && target->comp_width == width && target->comp_height == height)
         return;
 
+    /* The old frame goes away under the process-wide lock: a present of a
+     * target on a child window may be reading it as its backdrop right now. */
+    EnterCriticalSection(&dcomp_all_targets_cs);
+
     /* Clean up old */
     if (target->comp_bitmap)
     {
@@ -3416,7 +3454,10 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
 
     target->comp_dc = CreateCompatibleDC(NULL);
     if (!target->comp_dc)
+    {
+        LeaveCriticalSection(&dcomp_all_targets_cs);
         return;
+    }
 
     target->comp_bitmap = CreateDIBSection(target->comp_dc, &bmi,
             DIB_RGB_COLORS, (void **)&target->comp_bits, NULL, 0);
@@ -3424,6 +3465,7 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
     {
         DeleteDC(target->comp_dc);
         target->comp_dc = NULL;
+        LeaveCriticalSection(&dcomp_all_targets_cs);
         return;
     }
 
@@ -3434,6 +3476,7 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
     /* Fresh DIB section: zero-initialised, so it holds no usable backdrop yet
      * and must not be kept as one when the next capture fails (issue 116). */
     target->comp_backdrop_valid = FALSE;
+    LeaveCriticalSection(&dcomp_all_targets_cs);
 
     FIXME("Created comp DC %p with %ux%u DIB for target hwnd %p.\n",
             target->comp_dc, width, height, target->hwnd);
@@ -5380,6 +5423,179 @@ static BOOL dcomp_target_children_need_present(const struct dcomp_target *target
     return dcomp_target_children_signature(target) != target->children_sig;
 }
 
+static void dcomp_target_present_region(struct dcomp_target *target,
+        struct dcomp_surface *surface, LONG left, LONG top, LONG right, LONG bottom,
+        BOOL present_dirty);
+
+/* The target on the nearest ancestor window of hwnd that carries one, or NULL.
+ * Caller holds dcomp_all_targets_cs; the pointer is good for as long as it
+ * does.  Not the window property: a target another process created for one
+ * of our windows (issue 88) leaves its pointer there as well. */
+static struct dcomp_target *dcomp_target_ancestor_target(HWND hwnd)
+{
+    HWND desktop = GetDesktopWindow();
+    struct dcomp_target *t;
+
+    while ((hwnd = GetAncestor(hwnd, GA_PARENT)) && hwnd != desktop)
+    {
+        LIST_FOR_EACH_ENTRY(t, &dcomp_all_targets, struct dcomp_target, all_entry)
+            if (t->hwnd == hwnd && !t->foreign)
+                return t;
+    }
+    return NULL;
+}
+
+/* A target on a child window composes over the target on its ancestor.
+ *
+ * On Windows every window that carries a composition target is composed by
+ * the DWM, and the tree of a child window is drawn over the tree of the
+ * ancestor it sits in: what the child leaves at alpha 0 shows the ancestor's
+ * frame.  Here each target reaches its window through a BitBlt of its own
+ * frame, and for a child window that BitBlt lands in the top-level's surface
+ * as a plain copy -- the ancestor's pixels under the child are replaced by the
+ * child's, alpha 0 included.  Cubase 15 keeps the progress bar of its start-up
+ * splash in such a child (585x17 at (8,302) of the 600x326 splash, WS_CHILD,
+ * WS_EX_NOREDIRECTIONBITMAP, a premultiplied root surface of its own, 270
+ * draws while the splash stands): the band came up black, and see-through
+ * once the splash had its alpha visual (issue 335).  The splash cannot paint
+ * there either -- it is WS_CLIPCHILDREN, so its own present is clipped off
+ * the child's rectangle.
+ *
+ * So blend the region this present is about to blit over the ancestor's
+ * frame, in place: comp_bits then holds what the DWM would show there, and
+ * the BitBlt carries it.  The ancestor's comp_bits is its last composed frame
+ * -- root surface plus child visuals, never the nested targets -- which is
+ * exactly the layer beneath.  A present of the ancestor re-presents the
+ * nested targets in turn (dcomp_target_present_nested), so the composed
+ * result follows whichever of the two layers changed.  The `topmost` flag of
+ * CreateTargetForHwnd, which on Windows would put the ancestor's own tree
+ * above its children instead, is not honoured. */
+static BOOL dcomp_target_blend_over_ancestor(struct dcomp_target *target,
+        LONG left, LONG top, LONG right, LONG bottom)
+{
+    struct dcomp_target *anc;
+    POINT origin = { 0, 0 };
+    BOOL blended = FALSE;
+    LONG x, y;
+
+    EnterCriticalSection(&dcomp_all_targets_cs);
+    anc = dcomp_target_ancestor_target(target->hwnd);
+    if (anc && anc->comp_bits && anc->root_visual && anc->root_visual->surface_content)
+    {
+        /* Client origin of the child in the ancestor's client space -- the
+         * space both frames are blitted in. */
+        MapWindowPoints(target->hwnd, anc->hwnd, &origin, 1);
+
+        for (y = top; y < bottom; y++)
+        {
+            LONG ay = origin.y + y;
+            DWORD *row = target->comp_bits + y * target->comp_width;
+            const DWORD *under;
+
+            if (ay < 0 || ay >= (LONG)anc->comp_height)
+                continue;
+            under = anc->comp_bits + ay * anc->comp_width;
+            for (x = left; x < right; x++)
+            {
+                LONG ax = origin.x + x;
+                DWORD s = row[x], d;
+                BYTE sa = s >> 24, ia;
+
+                if (sa == 0xff || ax < 0 || ax >= (LONG)anc->comp_width)
+                    continue;
+                d = under[ax];
+                if (!sa)
+                {
+                    row[x] = d;
+                    continue;
+                }
+                /* Premultiplied alpha: out = src + dst * (1 - sa/255) */
+                ia = 255 - sa;
+                row[x] = ((min(sa + (((d >> 24) * ia + 127) / 255), 255u)) << 24)
+                       | ((((s >> 16) & 0xff) + ((((d >> 16) & 0xff) * ia + 127) / 255)) << 16)
+                       | ((((s >> 8) & 0xff) + ((((d >> 8) & 0xff) * ia + 127) / 255)) << 8)
+                       | (((s & 0xff) + (((d & 0xff) * ia + 127) / 255)));
+            }
+        }
+        blended = TRUE;
+        TRACE("hwnd %p over ancestor target %p (hwnd %p) at origin (%ld,%ld), region (%ld,%ld)-(%ld,%ld).\n",
+                target->hwnd, anc, anc->hwnd, origin.x, origin.y, left, top, right, bottom);
+    }
+    else if (anc)
+        TRACE("hwnd %p: ancestor target %p (hwnd %p) has no frame yet (comp_bits %p, root %p).\n",
+                target->hwnd, anc, anc->hwnd, anc->comp_bits, anc->root_visual);
+    else
+        TRACE("hwnd %p: no ancestor window carries a target.\n", target->hwnd);
+    LeaveCriticalSection(&dcomp_all_targets_cs);
+    return blended;
+}
+
+/* After a present of `target` over [left,right)x[top,bottom): re-present the
+ * targets on child windows of its window that overlap it, so they compose
+ * over the frame just shown and not over the one before.  Where the window
+ * is WS_CLIPCHILDREN the BitBlt could not reach them anyway; where it is not,
+ * it has just painted over them.  Either way the DWM would show the
+ * children's trees over the new frame.  Targets that still owe their window
+ * a full present are left to that present. */
+static void dcomp_target_present_nested(struct dcomp_target *target,
+        LONG left, LONG top, LONG right, LONG bottom)
+{
+    struct { struct dcomp_target *target; RECT rect; } nested[8];
+    RECT region = { left, top, right, bottom };
+    struct dcomp_target *t;
+    unsigned int i, n = 0;
+
+    EnterCriticalSection(&dcomp_all_targets_cs);
+    LIST_FOR_EACH_ENTRY(t, &dcomp_all_targets, struct dcomp_target, all_entry)
+    {
+        RECT rect, overlap;
+
+        if (t == target || t->foreign || !t->comp_bits || !t->last_present_qpc
+                || t->comp_needs_full_present
+                || !t->root_visual || !t->root_visual->surface_content)
+            continue;
+        if (!IsWindowVisible(t->hwnd) || dcomp_target_ancestor_target(t->hwnd) != target)
+            continue;
+        GetClientRect(t->hwnd, &rect);
+        MapWindowPoints(t->hwnd, target->hwnd, (POINT *)&rect, 2);
+        if (!IntersectRect(&overlap, &rect, &region))
+            continue;
+        OffsetRect(&overlap, -rect.left, -rect.top);
+        if (n == ARRAY_SIZE(nested))
+            break;
+        /* Held across the presents below, which run outside this lock. */
+        InterlockedIncrement(&t->refcount);
+        nested[n].target = t;
+        nested[n].rect = overlap;
+        n++;
+    }
+    LeaveCriticalSection(&dcomp_all_targets_cs);
+
+    for (i = 0; i < n; i++)
+    {
+        struct dcomp_target *nt = nested[i].target;
+        struct dcomp_device *device = nt->device;
+        struct dcomp_surface *surface;
+        const RECT *r = &nested[i].rect;
+
+        if (device)
+            EnterCriticalSection(&device->cs);
+        surface = nt->root_visual ? nt->root_visual->surface_content : NULL;
+        if (surface && surface->bits && nt->comp_bits
+                && nt->comp_width == surface->width && nt->comp_height == surface->height
+                && r->right <= (LONG)surface->width && r->bottom <= (LONG)surface->height)
+        {
+            TRACE("Re-presenting %s of nested target %p (hwnd %p) over target %p.\n",
+                    wine_dbgstr_rect(r), nt, nt->hwnd, target);
+            dcomp_target_present_region(nt, surface, r->left, r->top, r->right, r->bottom,
+                    !nt->root_visual->children);
+        }
+        if (device)
+            LeaveCriticalSection(&device->cs);
+        IDCompositionTarget_Release(&nt->IDCompositionTarget_iface);
+    }
+}
+
 /* Present region [left,right)x[top,bottom) of the target's root surface to its HWND.
  * Caller holds device->cs and has validated root_visual/surface->bits/comp_bits. */
 static void dcomp_target_present_region(struct dcomp_target *target,
@@ -5387,6 +5603,7 @@ static void dcomp_target_present_region(struct dcomp_target *target,
         BOOL present_dirty)
 {
     static unsigned int present_log;
+    BOOL over_ancestor;
     HDC hdc;
 
     /* Copy surface bits → DIB.  Dirty rows only when present_dirty; the rest of
@@ -5474,6 +5691,10 @@ static void dcomp_target_present_region(struct dcomp_target *target,
 
     target->children_sig = dcomp_target_children_signature(target);
 
+    /* A target on a child window: what the BitBlt carries is this frame over
+     * the ancestor's, the way the DWM composes the two (issue 335). */
+    over_ancestor = dcomp_target_blend_over_ancestor(target, left, top, right, bottom);
+
     /* BitBlt only the present region to the target window (the rest already shows the
      * prior frame — WM_ERASEBKGND is suppressed). */
     hdc = GetDC(target->hwnd);
@@ -5486,11 +5707,15 @@ static void dcomp_target_present_region(struct dcomp_target *target,
     target->comp_needs_full_present = FALSE;
 
     if (++present_log <= 5)
-        FIXME("Present: %s %ldx%ld@(%ld,%ld) of %ux%u to hwnd %p%s.\n",
+        FIXME("Present: %s %ldx%ld@(%ld,%ld) of %ux%u to hwnd %p%s%s.\n",
                 present_dirty ? "DIRTY" : "FULL",
                 right - left, bottom - top, left, top,
                 surface->width, surface->height, target->hwnd,
-                target->root_visual->children ? " [children]" : "");
+                target->root_visual->children ? " [children]" : "",
+                over_ancestor ? " [over ancestor target]" : "");
+
+    /* The targets on this window's children compose over the frame just shown. */
+    dcomp_target_present_nested(target, left, top, right, bottom);
 
     /* Also serialize child visual tree (for mixed surface+swapchain scenarios) */
     dcomp_commit_visual_tree(target->hwnd, target->root_visual);
@@ -5719,6 +5944,9 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                                 update.bottom - update.top, target->comp_dc,
                                 update.left, update.top, SRCCOPY);
                         ReleaseDC(hwnd, hdc);
+                        /* ... and the targets on child windows over it (issue 335). */
+                        dcomp_target_present_nested(target, update.left, update.top,
+                                update.right, update.bottom);
                     }
                 }
                 LeaveCriticalSection(&target->device->cs);
@@ -5858,6 +6086,12 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
         device->targets = object;
         LeaveCriticalSection(&device->cs);
     }
+
+    /* And into the process-wide list, which is how a target on a child window
+     * finds the one on its ancestor whatever device either was created on. */
+    EnterCriticalSection(&dcomp_all_targets_cs);
+    list_add_tail(&dcomp_all_targets, &object->all_entry);
+    LeaveCriticalSection(&dcomp_all_targets_cs);
 
     /* Phase 5: Subclass target HWND for WM_ERASEBKGND / WM_PAINT protection.
      * The installed WndProc suppresses WM_ERASEBKGND per-window (returns 1), so
