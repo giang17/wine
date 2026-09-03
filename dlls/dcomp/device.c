@@ -2548,6 +2548,7 @@ struct dcomp_target
     DWORD *comp_bits;                     /* DIB section pixel buffer */
     UINT comp_width, comp_height;
     BOOL comp_needs_full_present;         /* force a full BitBlt on first present after DIB (re)create */
+    UINT64 children_sig;                  /* fingerprint of the surface children the last present composited (issue 334) */
     BOOL comp_backdrop_valid;             /* comp_bits holds a backdrop captured successfully at the current size (issue 116) */
     LONGLONG last_present_qpc;            /* QPC of last actual present — drives ~60 Hz coalescing (issue 56) */
     BOOL foreign;                         /* target hwnd belongs to another process — no subclass, hook-driven compositing (issue 88) */
@@ -5282,6 +5283,53 @@ static LONGLONG dcomp_qpc_freq(void)
     return freq;
 }
 
+/* What dcomp_target_present_region() puts on top of the root surface, as one
+ * number: the direct children that carry a surface, which surface, its size and
+ * where it sits.  A child that is added, removed, moved or given another
+ * surface changes the frame without touching the root surface, and only this
+ * fingerprint tells the commit path so. */
+static UINT64 dcomp_target_children_signature(const struct dcomp_target *target)
+{
+    const struct dcomp_visual *child;
+    UINT64 sig = 0;
+
+    for (child = target->root_visual->children; child; child = child->next_sibling)
+    {
+        const struct dcomp_surface *surf = child->surface_content;
+
+        if (!surf)
+            continue;
+        sig = (sig ^ (UINT_PTR)surf) * 1099511628211ull;
+        sig = (sig ^ (UINT32)(int)child->offset_x) * 1099511628211ull;
+        sig = (sig ^ (UINT32)(int)child->offset_y) * 1099511628211ull;
+        sig = (sig ^ ((UINT64)surf->width << 32 | surf->height)) * 1099511628211ull;
+    }
+    return sig;
+}
+
+/* Does a surface root owe its window a present for its children alone?  The
+ * commit path used to ask the root surface and nothing else, so a child that
+ * was drawn into or moved while the root kept quiet reached the window only
+ * with the next root draw -- and with the child never read back (see the
+ * composite below) not even then.  Cubase 15 keeps the arrangement's vertical
+ * scrollbar in such a child, repainting it on every wheel step (issue 334),
+ * and its playhead in two more, moving them ~30 times a second (issue 333). */
+static BOOL dcomp_target_children_need_present(const struct dcomp_target *target)
+{
+    const struct dcomp_visual *child;
+
+    for (child = target->root_visual->children; child; child = child->next_sibling)
+    {
+        const struct dcomp_surface *surf = child->surface_content;
+
+        /* Same gate as the composite: a child it would skip cannot be read back
+         * there, and counting it here would present on every commit for good. */
+        if (surf && surf->has_pending && surf->bits && surf->width && surf->height)
+            return TRUE;
+    }
+    return dcomp_target_children_signature(target) != target->children_sig;
+}
+
 /* Present region [left,right)x[top,bottom) of the target's root surface to its HWND.
  * Caller holds device->cs and has validated root_visual/surface->bits/comp_bits. */
 static void dcomp_target_present_region(struct dcomp_target *target,
@@ -5320,6 +5368,14 @@ static void dcomp_target_present_region(struct dcomp_target *target,
 
             if (!child_surf || !child_surf->bits || !child_surf->width || !child_surf->height)
                 continue;
+
+            /* EndDraw leaves the GPU->CPU readback to the present (issue 56),
+             * and this present read back the root surface only: a child was
+             * composited out of bits nothing had ever filled -- alpha 0, skipped,
+             * whatever the root painted underneath stayed (issues 333/334).  The
+             * rootless path got this call on 13.08.2026 for Studio Pro 8; this
+             * is the same leaf under a surface root. */
+            dcomp_surface_ensure_bits(child_surf);
 
             ox = (int)child->offset_x;
             oy = (int)child->offset_y;
@@ -5365,6 +5421,8 @@ static void dcomp_target_present_region(struct dcomp_target *target,
             }
         }
     }
+
+    target->children_sig = dcomp_target_children_signature(target);
 
     /* BitBlt only the present region to the target window (the rest already shows the
      * prior frame — WM_ERASEBKGND is suppressed). */
@@ -5485,8 +5543,8 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             {
                 struct dcomp_surface *surface = target->root_visual->surface_content;
                 EnterCriticalSection(&target->device->cs);
-                if (surface->has_pending && surface->bits && surface->width
-                        && surface->height && target->comp_bits)
+                if ((surface->has_pending || dcomp_target_children_need_present(target))
+                        && surface->bits && surface->width && surface->height && target->comp_bits)
                     dcomp_target_flush_present(target, surface);
                 LeaveCriticalSection(&target->device->cs);
             }
@@ -5653,6 +5711,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
     struct dcomp_device *device = impl_from_IDCompositionDevice(iface);
     struct dcomp_target *target;
 
+    TRACE("iface %p.\n", iface);
+
     /* Hold the device lock across iteration so a concurrent CreateTargetForHwnd
      * or target Release cannot mutate the list mid-walk (iterator invalidation /
      * use-after-free).  Recursive (same-thread) re-entry via the auto-commit path
@@ -5675,8 +5735,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
         if (!target->comp_bits)
             continue;
 
-        /* Nothing new since the last present and no forced full present pending. */
-        if (!surface->has_pending && !target->comp_needs_full_present)
+        /* Nothing new since the last present, in the root surface or in the
+         * children composited over it, and no forced full present pending. */
+        if (!surface->has_pending && !target->comp_needs_full_present
+                && !dcomp_target_children_need_present(target))
             continue;
 
         /* Coalesce: cap the present (and its deferred ~1.3ms GPU readback) to ~60 Hz.
