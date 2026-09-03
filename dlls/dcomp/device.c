@@ -615,12 +615,193 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_ResumeDraw(IDCompositionSurface *
     return S_OK;
 }
 
+/* Move the pixels of [src_l,src_r)x[src_t,src_b) to (dst_x,dst_y) on every
+ * carrier the surface has.  Source and destination overlap for any scroll
+ * shorter than the scrolled area, and a copy within one D3D11 resource is
+ * undefined for overlapping regions (glCopyImageSubData underneath), so the
+ * GPU carriers go through a scratch resource of the moved size.  The CPU
+ * mirror is moved with memmove, rows in the order that does not overwrite
+ * what is still to be read.  Returns whether a GPU carrier was moved, in
+ * which case the destination has to be read back before the next present. */
+static BOOL dcomp_surface_copy_rect(struct dcomp_surface *surface, LONG src_l, LONG src_t,
+        LONG src_r, LONG src_b, LONG dst_x, LONG dst_y)
+{
+    UINT w = (UINT)(src_r - src_l), h = (UINT)(src_b - src_t), y;
+    BOOL has_gpu = FALSE, gpu_moved = FALSE;
+    HRESULT hr;
+
+    if (surface->d2d1_device && surface->persistent_context && surface->target_bitmap)
+    {
+        D2D1_POINT_2U origin = {0, 0}, dst_point = {(UINT32)dst_x, (UINT32)dst_y};
+        D2D1_RECT_U src_rect = {(UINT32)src_l, (UINT32)src_t, (UINT32)src_r, (UINT32)src_b};
+        D2D1_RECT_U scratch_rect = {0, 0, w, h};
+        D2D1_BITMAP_PROPERTIES1 props;
+        ID2D1Bitmap1 *scratch;
+        D2D1_SIZE_U size;
+
+        has_gpu = TRUE;
+
+        /* Same format as dcomp_surface_create_d2d1_bitmaps(): the copy is a
+         * CopySubresourceRegion and needs matching formats. */
+        memset(&props, 0, sizeof(props));
+        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+        props.dpiX = 96.0f;
+        props.dpiY = 96.0f;
+        props.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+        size.width = w;
+        size.height = h;
+
+        if (FAILED(hr = ID2D1DeviceContext_CreateBitmap(surface->persistent_context, size, NULL, 0,
+                &props, &scratch)))
+            WARN("Could not create the %ux%u scratch bitmap: %#lx.\n", w, h, hr);
+        else
+        {
+            if (FAILED(hr = ID2D1Bitmap1_CopyFromBitmap(scratch, &origin,
+                    (ID2D1Bitmap *)surface->target_bitmap, &src_rect)))
+                WARN("Could not copy the scrolled pixels out: %#lx.\n", hr);
+            else if (FAILED(hr = ID2D1Bitmap1_CopyFromBitmap(surface->target_bitmap, &dst_point,
+                    (ID2D1Bitmap *)scratch, &scratch_rect)))
+                WARN("Could not copy the scrolled pixels back: %#lx.\n", hr);
+            else
+                gpu_moved = TRUE;
+            ID2D1Bitmap1_Release(scratch);
+        }
+    }
+    else if (surface->d3d11_device && surface->texture)
+    {
+        ID3D11DeviceContext *d3d_context;
+        D3D11_TEXTURE2D_DESC desc;
+        ID3D11Texture2D *scratch;
+        D3D11_BOX box;
+
+        has_gpu = TRUE;
+        ID3D11Texture2D_GetDesc(surface->texture, &desc);
+        desc.Width = w;
+        desc.Height = h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+
+        if (FAILED(hr = ID3D11Device_CreateTexture2D(surface->d3d11_device, &desc, NULL, &scratch)))
+            WARN("Could not create the %ux%u scratch texture: %#lx.\n", w, h, hr);
+        else
+        {
+            ID3D11Device_GetImmediateContext(surface->d3d11_device, &d3d_context);
+            box.left = (UINT)src_l; box.top = (UINT)src_t; box.front = 0;
+            box.right = (UINT)src_r; box.bottom = (UINT)src_b; box.back = 1;
+            ID3D11DeviceContext_CopySubresourceRegion(d3d_context, (ID3D11Resource *)scratch, 0,
+                    0, 0, 0, (ID3D11Resource *)surface->texture, 0, &box);
+            box.left = 0; box.top = 0;
+            box.right = w; box.bottom = h;
+            ID3D11DeviceContext_CopySubresourceRegion(d3d_context, (ID3D11Resource *)surface->texture, 0,
+                    (UINT)dst_x, (UINT)dst_y, 0, (ID3D11Resource *)scratch, 0, &box);
+            ID3D11DeviceContext_Release(d3d_context);
+            ID3D11Texture2D_Release(scratch);
+            gpu_moved = TRUE;
+        }
+    }
+
+    /* Keep the CPU mirror where the GPU is: a carrier that could not be moved
+     * leaves the surface as it was, not half scrolled. */
+    if (surface->bits && (gpu_moved || !has_gpu))
+    {
+        if (dst_y <= src_t)
+        {
+            for (y = 0; y < h; ++y)
+                memmove(surface->bits + (dst_y + y) * surface->width + dst_x,
+                        surface->bits + (src_t + y) * surface->width + src_l, w * sizeof(DWORD));
+        }
+        else
+        {
+            for (y = h; y > 0; --y)
+                memmove(surface->bits + (dst_y + y - 1) * surface->width + dst_x,
+                        surface->bits + (src_t + y - 1) * surface->width + src_l, w * sizeof(DWORD));
+        }
+    }
+
+    return gpu_moved;
+}
+
+/* "This method allows an application to blt/copy a sub-rectangle of a
+ * DirectComposition surface object.  This avoids re-rendering content that is
+ * already available.  The bits copied by the scroll operation (source) are
+ * defined by the intersection of the scrollRect and clipRect rectangles.  The
+ * bits shown on the screen (destination) are defined by the intersection of
+ * the offset source rectangle and clipRect."  Cubase 15 scrolls the project
+ * window's arrangement, ruler and track list with it -- two calls per wheel
+ * step -- and then draws only the strip the scroll exposed; with the call a
+ * no-op that strip landed at the same place step after step, next to content
+ * from before the first scroll. */
 static HRESULT STDMETHODCALLTYPE dcomp_surface_Scroll(IDCompositionSurface *iface,
         const RECT *scroll, const RECT *clip, int offset_x, int offset_y)
 {
-    FIXME("iface %p, scroll %s, clip %s, offset %d,%d stub!\n",
-            iface, wine_dbgstr_rect(scroll), wine_dbgstr_rect(clip),
-            offset_x, offset_y);
+    struct dcomp_surface *surface = impl_from_IDCompositionSurface(iface);
+    RECT bounds, scroll_rect, clip_rect, src, dst;
+
+    TRACE("iface %p, scroll %s, clip %s, offset %d,%d.\n",
+            iface, wine_dbgstr_rect(scroll), wine_dbgstr_rect(clip), offset_x, offset_y);
+
+    /* "Scroll operations can only be called before calling BeginDraw or after
+     * calling EndDraw." */
+    if (surface->drawing)
+    {
+        WARN("Scroll during a draw session.\n");
+        return DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED;
+    }
+
+    SetRect(&bounds, 0, 0, (LONG)surface->width, (LONG)surface->height);
+
+    /* "The scrollRect rectangle must be contained in the boundaries of the
+     * surface.  If the scrollRect rectangle goes outside the bounds of the
+     * surface, this method fails." */
+    if (scroll)
+    {
+        if (scroll->left < 0 || scroll->top < 0
+                || scroll->right > bounds.right || scroll->bottom > bounds.bottom)
+        {
+            WARN("Scroll rect %s outside the %ux%u surface.\n",
+                    wine_dbgstr_rect(scroll), surface->width, surface->height);
+            return E_INVALIDARG;
+        }
+        scroll_rect = *scroll;
+    }
+    else
+        scroll_rect = bounds;
+
+    if (!clip)
+        clip_rect = bounds;
+    else if (!IntersectRect(&clip_rect, clip, &bounds))
+        return S_OK;
+
+    if (!offset_x && !offset_y)
+        return S_OK;
+    if (!IntersectRect(&src, &scroll_rect, &clip_rect))
+        return S_OK;
+    dst = src;
+    OffsetRect(&dst, offset_x, offset_y);
+    if (!IntersectRect(&dst, &dst, &clip_rect))
+        return S_OK;
+    /* What lands in the destination comes from the destination shifted back. */
+    src = dst;
+    OffsetRect(&src, -offset_x, -offset_y);
+
+    if (!dcomp_surface_copy_rect(surface, src.left, src.top, src.right, src.bottom, dst.left, dst.top))
+        return S_OK;
+
+    /* The moved pixels live on the GPU; the CPU mirror of the destination is
+     * only right where the source was in sync.  Have the next present read
+     * the destination back, as it does for a drawn region (issue 56) -- that
+     * also makes a Commit without a draw in between present the scroll. */
+    if (surface->has_pending)
+        UnionRect(&surface->pending_dirty, &surface->pending_dirty, &dst);
+    else
+        surface->pending_dirty = dst;
+    surface->has_pending = TRUE;
+
     return S_OK;
 }
 
