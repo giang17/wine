@@ -6473,6 +6473,252 @@ done:
     return hr;
 }
 
+/* Passes a geometry's figures on to the caller's sink as they are, but
+ * announces nonzero winding whatever the geometry's own fill mode is: for a
+ * single figure that does not cross itself the two fill the same region, and
+ * Outline() promises nonzero winding. */
+struct d2d_outline_sink
+{
+    ID2D1SimplifiedGeometrySink ID2D1SimplifiedGeometrySink_iface;
+    ID2D1SimplifiedGeometrySink *sink;
+};
+
+static inline struct d2d_outline_sink *impl_from_outline_sink(ID2D1SimplifiedGeometrySink *iface)
+{
+    return CONTAINING_RECORD(iface, struct d2d_outline_sink, ID2D1SimplifiedGeometrySink_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_outline_sink_QueryInterface(ID2D1SimplifiedGeometrySink *iface,
+        REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_ID2D1SimplifiedGeometrySink)
+            || IsEqualGUID(iid, &IID_IUnknown))
+    {
+        ID2D1SimplifiedGeometrySink_AddRef(iface);
+        *out = iface;
+        return S_OK;
+    }
+
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE d2d_outline_sink_AddRef(ID2D1SimplifiedGeometrySink *iface)
+{
+    return 2;
+}
+
+static ULONG STDMETHODCALLTYPE d2d_outline_sink_Release(ID2D1SimplifiedGeometrySink *iface)
+{
+    return 1;
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_SetFillMode(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_FILL_MODE mode)
+{
+    ID2D1SimplifiedGeometrySink_SetFillMode(impl_from_outline_sink(iface)->sink, D2D1_FILL_MODE_WINDING);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_SetSegmentFlags(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_PATH_SEGMENT flags)
+{
+    ID2D1SimplifiedGeometrySink_SetSegmentFlags(impl_from_outline_sink(iface)->sink, flags);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_BeginFigure(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_POINT_2F start_point, D2D1_FIGURE_BEGIN figure_begin)
+{
+    ID2D1SimplifiedGeometrySink_BeginFigure(impl_from_outline_sink(iface)->sink, start_point,
+            D2D1_FIGURE_BEGIN_FILLED);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_AddLines(ID2D1SimplifiedGeometrySink *iface,
+        const D2D1_POINT_2F *points, UINT32 count)
+{
+    ID2D1SimplifiedGeometrySink_AddLines(impl_from_outline_sink(iface)->sink, points, count);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_AddBeziers(ID2D1SimplifiedGeometrySink *iface,
+        const D2D1_BEZIER_SEGMENT *beziers, UINT32 count)
+{
+    ID2D1SimplifiedGeometrySink_AddBeziers(impl_from_outline_sink(iface)->sink, beziers, count);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_EndFigure(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_FIGURE_END figure_end)
+{
+    ID2D1SimplifiedGeometrySink_EndFigure(impl_from_outline_sink(iface)->sink, D2D1_FIGURE_END_CLOSED);
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_outline_sink_Close(ID2D1SimplifiedGeometrySink *iface)
+{
+    return S_OK;
+}
+
+static const struct ID2D1SimplifiedGeometrySinkVtbl d2d_outline_sink_vtbl =
+{
+    d2d_outline_sink_QueryInterface,
+    d2d_outline_sink_AddRef,
+    d2d_outline_sink_Release,
+    d2d_outline_sink_SetFillMode,
+    d2d_outline_sink_SetSegmentFlags,
+    d2d_outline_sink_BeginFigure,
+    d2d_outline_sink_AddLines,
+    d2d_outline_sink_AddBeziers,
+    d2d_outline_sink_EndFigure,
+    d2d_outline_sink_Close,
+};
+
+static float d2d_outline_turn(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b, const D2D1_POINT_2F *c)
+{
+    return (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+}
+
+/* A proper crossing of the segments ab and cd.  Touching at a point or
+ * overlapping along a line does not count: a contour that touches itself
+ * still encloses one region. */
+static BOOL d2d_outline_segments_cross(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b,
+        const D2D1_POINT_2F *c, const D2D1_POINT_2F *d)
+{
+    float d1 = d2d_outline_turn(c, d, a), d2 = d2d_outline_turn(c, d, b);
+    float d3 = d2d_outline_turn(a, b, c), d4 = d2d_outline_turn(a, b, d);
+
+    return ((d1 > 0.0f && d2 < 0.0f) || (d1 < 0.0f && d2 > 0.0f))
+            && ((d3 > 0.0f && d4 < 0.0f) || (d3 < 0.0f && d4 > 0.0f));
+}
+
+/* Does this closed contour cross itself?  One that turns the same way at
+ * every vertex and comes round exactly once is convex and cannot; the same
+ * turning over two revolutions is a star that overlaps itself.  Anything
+ * else is tested edge against edge, up to a size where that stops being
+ * cheap and the sweep is the better answer anyway. */
+static BOOL d2d_outline_contour_is_simple(const struct d2d_combine_contour *contour)
+{
+    const D2D1_POINT_2F *p = contour->points;
+    size_t n = contour->count, i, j;
+    double turning = 0.0;
+    BOOL convex = TRUE;
+    int sign = 0;
+
+    for (i = 0; i < n; ++i)
+    {
+        const D2D1_POINT_2F *a = &p[i], *b = &p[(i + 1) % n], *c = &p[(i + 2) % n];
+        float cross = d2d_outline_turn(a, b, c);
+        float dot = (b->x - a->x) * (c->x - b->x) + (b->y - a->y) * (c->y - b->y);
+
+        turning += atan2(cross, dot);
+        if (cross == 0.0f)
+            continue;
+        if (!sign)
+            sign = cross > 0.0f ? 1 : -1;
+        else if ((cross > 0.0f) != (sign > 0))
+            convex = FALSE;
+    }
+    if (convex)
+        return fabs(turning) < 3.0 * M_PI;
+
+    if (n > 1024)
+        return FALSE;
+    for (i = 0; i < n; ++i)
+    {
+        for (j = i + 2; j < n; ++j)
+        {
+            if (i == 0 && j == n - 1)
+                continue;   /* neighbours through the closing edge */
+            if (d2d_outline_segments_cross(&p[i], &p[(i + 1) % n], &p[j], &p[(j + 1) % n]))
+                return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* ID2D1Geometry::Outline(): the boundary of what the geometry fills, free of
+ * self-intersections and with nonzero winding, covering the same region the
+ * geometry covers under its own fill mode.
+ *
+ * A single figure that does not cross itself is its own outline, and goes on
+ * with its curves intact: Windows keeps them too, and a wide stroke over the
+ * flattened polygon shows every vertex of the flattening -- measured on the
+ * 10 px frame Cubase draws around its splash, which left single transparent
+ * pixels at the joins.
+ *
+ * Everything else is the boolean union of the geometry with nothing, so it
+ * takes the sweep CombineWithGeometry() runs, with the geometry as the only
+ * operand: the trapezoids the sweep leaves are exactly the filled region, and
+ * tracing their outline cancels the interior edges.  A second, identical
+ * operand would only put coincident edges into the sweep.  Curves come back
+ * flattened to the tolerance there, which the contract allows.
+ *
+ * Cubase 15 draws the rounded corners of its start-up splash by clearing the
+ * four corner squares and stroking the outline of a rounded-rectangle path it
+ * builds itself, 10 px wide in the background colour; on E_NOTIMPL it skipped
+ * that stroke and the corners stayed transparent (issue 335).  Measured over
+ * a start-up: 103 calls, all on path geometries. */
+static HRESULT d2d_geometry_outline(ID2D1Geometry *geometry, const D2D1_MATRIX_3X2_F *transform,
+        float tolerance, ID2D1SimplifiedGeometrySink *sink)
+{
+    struct d2d_combine_trapezoid *traps = NULL;
+    struct d2d_combine_edges edges = {0};
+    struct d2d_combine_shape shape;
+    size_t trap_count = 0;
+    HRESULT hr;
+
+    if (!sink)
+        return E_INVALIDARG;
+
+    if (FAILED(hr = d2d_combine_shape_init(&shape, geometry, transform, tolerance)))
+        return hr;
+
+    if (shape.count == 1 && d2d_outline_contour_is_simple(&shape.contours[0]))
+    {
+        struct d2d_outline_sink wrap =
+        {
+            .ID2D1SimplifiedGeometrySink_iface.lpVtbl = &d2d_outline_sink_vtbl,
+            .sink = sink,
+        };
+
+        TRACE("Single simple figure, passing it on with its curves.\n");
+        hr = ID2D1Geometry_Simplify(geometry, D2D1_GEOMETRY_SIMPLIFICATION_OPTION_CUBICS_AND_LINES,
+                transform, tolerance, &wrap.ID2D1SimplifiedGeometrySink_iface);
+        goto done;
+    }
+
+    if (shape.has_curves)
+    {
+        FIXME("Curves are not handled, ignoring.\n");
+        hr = E_NOTIMPL;
+        goto done;
+    }
+
+    if (!d2d_combine_edges_add_shape(&edges, &shape, 0))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+
+    if (SUCCEEDED(hr = d2d_combine_edges_op(&edges, shape.fill_mode, D2D1_FILL_MODE_ALTERNATE,
+            D2D1_COMBINE_MODE_UNION, &traps, &trap_count)))
+    {
+        struct d2d_combine_shape outline;
+
+        if (d2d_combine_trapezoids_to_outline(traps, trap_count, &outline))
+        {
+            d2d_combine_write_shape(sink, &outline);
+            d2d_combine_shape_cleanup(&outline);
+        }
+        else
+        {
+            d2d_combine_write_trapezoids(sink, traps, trap_count);
+        }
+        free(traps);
+    }
+
+done:
+    free(edges.edges);
+    d2d_combine_shape_cleanup(&shape);
+    return hr;
+}
+
 static HRESULT d2d_geometry_tessellate(ID2D1Geometry *geometry, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, ID2D1TessellationSink *sink)
 {
@@ -6569,9 +6815,11 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_CombineWithGeometry(ID2D1Path
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Outline(ID2D1PathGeometry1 *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1PathGeometry1(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_ComputeArea(ID2D1PathGeometry1 *iface,
@@ -7102,9 +7350,11 @@ static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_CombineWithGeometry(ID2D1E
 static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_Outline(ID2D1EllipseGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1EllipseGeometry(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_ComputeArea(ID2D1EllipseGeometry *iface,
@@ -7567,9 +7817,11 @@ static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_CombineWithGeometry(ID2D
 static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_Outline(ID2D1RectangleGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1RectangleGeometry(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_ComputeArea(ID2D1RectangleGeometry *iface,
@@ -8055,9 +8307,11 @@ static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_CombineWithGeome
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_Outline(ID2D1RoundedRectangleGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1RoundedRectangleGeometry(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_ComputeArea(ID2D1RoundedRectangleGeometry *iface,
@@ -8471,9 +8725,11 @@ static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_CombineWithGeometry(ID
 static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_Outline(ID2D1TransformedGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1TransformedGeometry(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_ComputeArea(ID2D1TransformedGeometry *iface,
