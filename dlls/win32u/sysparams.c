@@ -5111,6 +5111,20 @@ static BOOL get_dword_entry( union sysparam_all_entry *entry, UINT int_param, vo
     return TRUE;
 }
 
+/* load the ClearType contrast from the registry; a stored 0 reads back as the default */
+static BOOL get_contrast_entry( union sysparam_all_entry *entry, UINT int_param, void *ptr_param, UINT dpi )
+{
+    if (!ptr_param) return FALSE;
+
+    if (!entry->hdr.loaded)
+    {
+        DWORD val;
+        if (load_entry( &entry->hdr, &val, sizeof(val) ) == sizeof(DWORD) && val) entry->dword.val = val;
+    }
+    *(DWORD *)ptr_param = entry->dword.val;
+    return TRUE;
+}
+
 /* set a dword (binary) parameter in the registry */
 static BOOL set_dword_entry( union sysparam_all_entry *entry, UINT int_param, void *ptr_param, UINT flags )
 {
@@ -5618,7 +5632,12 @@ static DWORD_ENTRY( CARETWIDTH, 1, DESKTOP_KEY, "CaretWidth" );
 static DWORD_ENTRY( DPISCALINGVER, 0, DESKTOP_KEY, "DpiScalingVer" );
 static DWORD_ENTRY( FOCUSBORDERHEIGHT, 1, DESKTOP_KEY, "FocusBorderHeight" );
 static DWORD_ENTRY( FOCUSBORDERWIDTH, 1, DESKTOP_KEY, "FocusBorderWidth" );
-static DWORD_ENTRY( FONTSMOOTHINGCONTRAST, 0, DESKTOP_KEY, "FontSmoothingGamma" );
+/* SPI_GETFONTSMOOTHINGCONTRAST reports the documented default of 1400 (valid range 1000..2200)
+ * until a value is stored. A stored 0 counts as unset as well: earlier versions wrote their
+ * default of 0 into every new prefix, and applications divide by this value (JavaFX derives
+ * its text gamma from it, and 1/0 turns every LCD glyph into NaN, that is black). */
+static union sysparam_all_entry entry_FONTSMOOTHINGCONTRAST =
+    { .dword = { { get_contrast_entry, set_dword_entry, init_dword_entry, DESKTOP_KEY, "FontSmoothingGamma" }, 1400 } };
 static DWORD_ENTRY( FONTSMOOTHINGORIENTATION, FE_FONTSMOOTHINGORIENTATIONRGB, DESKTOP_KEY, "FontSmoothingOrientation" );
 static DWORD_ENTRY( FONTSMOOTHINGTYPE, FE_FONTSMOOTHINGSTANDARD, DESKTOP_KEY, "FontSmoothingType" );
 static DWORD_ENTRY( FOREGROUNDFLASHCOUNT, 3, DESKTOP_KEY, "ForegroundFlashCount" );
