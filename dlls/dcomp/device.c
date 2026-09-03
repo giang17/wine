@@ -208,6 +208,8 @@ struct dcomp_surface
     BOOL has_pending;                  /* GPU has content not yet read back to surface->bits */
 };
 
+static void dcomp_window_request_alpha_visual(HWND hwnd, struct dcomp_surface *surface);
+
 static inline struct dcomp_surface *impl_from_IDCompositionSurface(IDCompositionSurface *iface)
 {
     return CONTAINING_RECORD(iface, struct dcomp_surface, IDCompositionSurface_iface);
@@ -2269,6 +2271,13 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
             root = root->parent;
         if (root->target_hwnd)
             dcomp_commit_visual_tree(root->target_hwnd, root);
+
+        /* SetRoot asks for the alpha visual with the content the root had at
+         * the time; an application that attaches the surface afterwards would
+         * miss it (issue 335).  Cubase sets the content first, but the API
+         * allows either order. */
+        if (root == visual && root->target_hwnd)
+            dcomp_window_request_alpha_visual(root->target_hwnd, root->surface_content);
     }
 
     return S_OK;
@@ -2785,6 +2794,45 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
     return refcount;
 }
 
+/* A window with WS_EX_NOREDIRECTIONBITMAP has no GDI redirection surface on
+ * Windows at all: the DWM composes its visual tree over the desktop, so pixels
+ * the application leaves at alpha 0 show whatever is behind the window.  Here
+ * the root surface reaches the window through a BitBlt, which carries no alpha,
+ * and the window sits on the default 24-bit visual -- premultiplied alpha 0
+ * arrives as black.  Cubase 15's start-up splash is such a window (600x326,
+ * B8G8R8A8 premultiplied) and came up with black corners where its rounded
+ * shape should have shown the desktop (issue 335).
+ *
+ * winex11 already knows how to put a top-level on a per-pixel alpha capable
+ * visual, and takes the request as a window property -- dwmapi sets it for DWM
+ * glass (issue 250).  The property means "this top-level is per-pixel alpha
+ * capable", which is what this window is, so ask for it the same way.  Setting
+ * it before the window is first shown lets create_whole_window() pick the ARGB
+ * visual straight away, without the destroy/re-create a later switch costs.
+ *
+ * Gated on NOREDIRECTIONBITMAP deliberately: a composition target on an
+ * ordinary window composes over that window's own redirection surface on
+ * Windows too, so alpha 0 there does not mean "desktop" and has to keep
+ * arriving opaque.  Cubase's project window (WS_EX_LAYERED, with a redirection
+ * bitmap) is one of those. */
+static void dcomp_window_request_alpha_visual(HWND hwnd, struct dcomp_surface *surface)
+{
+    static const WCHAR glass_prop[] = {'_','_','w','i','n','e','_','d','w','m','_','g','l','a','s','s',0};
+    LONG ex_style;
+
+    if (!hwnd || !surface || surface->alpha_mode != DXGI_ALPHA_MODE_PREMULTIPLIED)
+        return;
+    if (GetPropW(hwnd, glass_prop))
+        return;
+    ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    if (!(ex_style & WS_EX_NOREDIRECTIONBITMAP))
+        return;
+
+    TRACE("hwnd %p has no redirection bitmap and a premultiplied root surface, "
+            "requesting a per-pixel alpha capable visual.\n", hwnd);
+    SetPropW(hwnd, glass_prop, (HANDLE)(ULONG_PTR)1);
+}
+
 static HRESULT STDMETHODCALLTYPE dcomp_target_SetRoot(IDCompositionTarget *iface,
         IDCompositionVisual *visual)
 {
@@ -2799,6 +2847,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_target_SetRoot(IDCompositionTarget *iface
     visual_impl = impl_from_IDCompositionVisual(visual);
     visual_impl->target_hwnd = target->hwnd;
     target->root_visual = visual_impl;
+
+    dcomp_window_request_alpha_visual(target->hwnd, visual_impl->surface_content);
 
     dcomp_visual_try_reparent(visual_impl);
     return S_OK;
