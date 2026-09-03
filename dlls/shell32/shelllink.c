@@ -1233,11 +1233,32 @@ static ULONG WINAPI IShellLinkA_fnRelease(IShellLinkA *iface)
     return IShellLinkW_Release(&This->IShellLinkW_iface);
 }
 
+/* Return the link target according to the SLGP_* flags.  The stored string
+ * is handed out unchanged for SLGP_RAWPATH.  Otherwise it is normalised the
+ * way Windows does when it resolves the target through the item ID list,
+ * which carries the long name: installers write 8.3 names into links (MSI
+ * "[!file]" shortcut targets), and an application started with that string
+ * sees the short form as its module path. */
+static const WCHAR *shelllink_get_target_path( const IShellLinkImpl *This, WCHAR *buffer, DWORD flags )
+{
+    DWORD len = 0;
+
+    if (!This->sPath) return NULL;
+
+    if (flags & SLGP_SHORTPATH)
+        len = GetShortPathNameW( This->sPath, buffer, MAX_PATH );
+    else if (!(flags & SLGP_RAWPATH))
+        len = GetLongPathNameW( This->sPath, buffer, MAX_PATH );
+
+    return len && len < MAX_PATH ? buffer : This->sPath;
+}
+
 static HRESULT WINAPI IShellLinkA_fnGetPath(IShellLinkA *iface, LPSTR pszFile, INT cchMaxPath,
         WIN32_FIND_DATAA *pfd, DWORD fFlags)
 {
     IShellLinkImpl *This = impl_from_IShellLinkA(iface);
     HRESULT res = S_OK;
+    WCHAR pathW[MAX_PATH];
 
     TRACE("(%p)->(pfile=%p len=%u find_data=%p flags=%lu)(%s)\n",
           This, pszFile, cchMaxPath, pfd, fFlags, debugstr_w(This->sPath));
@@ -1248,7 +1269,7 @@ static HRESULT WINAPI IShellLinkA_fnGetPath(IShellLinkA *iface, LPSTR pszFile, I
     if (cchMaxPath)
         pszFile[0] = 0;
     if (This->sPath && This->sPath[0])
-        WideCharToMultiByte( CP_ACP, 0, This->sPath, -1,
+        WideCharToMultiByte( CP_ACP, 0, shelllink_get_target_path( This, pathW, fFlags ), -1,
                              pszFile, cchMaxPath, NULL, NULL);
     else
         res = S_FALSE;
@@ -1262,7 +1283,8 @@ static HRESULT WINAPI IShellLinkA_fnGetPath(IShellLinkA *iface, LPSTR pszFile, I
             char path[MAX_PATH];
             WIN32_FILE_ATTRIBUTE_DATA fad;
 
-            WideCharToMultiByte(CP_ACP, 0, This->sPath, -1, path, MAX_PATH, NULL, NULL);
+            WideCharToMultiByte(CP_ACP, 0, shelllink_get_target_path( This, pathW, 0 ), -1,
+                                path, MAX_PATH, NULL, NULL);
 
             if (GetFileAttributesExW(This->sPath, GetFileExInfoStandard, &fad))
             {
@@ -1660,6 +1682,7 @@ static HRESULT WINAPI IShellLinkW_fnGetPath(IShellLinkW * iface, LPWSTR pszFile,
 {
     IShellLinkImpl *This = impl_from_IShellLinkW(iface);
     HRESULT res = S_OK;
+    WCHAR path[MAX_PATH];
 
     TRACE("(%p)->(pfile=%p len=%u find_data=%p flags=%lu)(%s)\n",
           This, pszFile, cchMaxPath, pfd, fFlags, debugstr_w(This->sPath));
@@ -1670,7 +1693,7 @@ static HRESULT WINAPI IShellLinkW_fnGetPath(IShellLinkW * iface, LPWSTR pszFile,
     if (cchMaxPath)
         pszFile[0] = 0;
     if (This->sPath)
-        lstrcpynW( pszFile, This->sPath, cchMaxPath );
+        lstrcpynW( pszFile, shelllink_get_target_path( This, path, fFlags ), cchMaxPath );
     else
         res = S_FALSE;
 
@@ -1680,7 +1703,6 @@ static HRESULT WINAPI IShellLinkW_fnGetPath(IShellLinkW * iface, LPWSTR pszFile,
 
         if (res == S_OK)
         {
-            WCHAR path[MAX_PATH];
             WIN32_FILE_ATTRIBUTE_DATA fad;
 
             if (GetFileAttributesExW(This->sPath, GetFileExInfoStandard, &fad))
@@ -1693,7 +1715,7 @@ static HRESULT WINAPI IShellLinkW_fnGetPath(IShellLinkW * iface, LPWSTR pszFile,
                 pfd->nFileSizeLow = fad.nFileSizeLow;
             }
 
-            lstrcpyW(pfd->cFileName, PathFindFileNameW(This->sPath));
+            lstrcpyW(pfd->cFileName, PathFindFileNameW(shelllink_get_target_path( This, path, 0 )));
 
             if (GetShortPathNameW(This->sPath, path, MAX_PATH))
             {
@@ -2474,7 +2496,10 @@ ShellLink_InvokeCommand( IContextMenu* iface, LPCMINVOKECOMMANDINFO lpici )
             return E_FAIL;
     }
     else
-        path = wcsdup( This->sPath );
+    {
+        WCHAR buffer[MAX_PATH];
+        path = wcsdup( shelllink_get_target_path( This, buffer, 0 ) );
+    }
 
     if ( lpici->cbSize == sizeof (CMINVOKECOMMANDINFOEX) &&
          ( lpici->fMask & CMIC_MASK_UNICODE ) )
