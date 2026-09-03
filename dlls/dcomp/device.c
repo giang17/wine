@@ -304,11 +304,58 @@ static UINT dcomp_surface_gdi_flag(DXGI_FORMAT format)
     }
 }
 
-/* Lazy-init the persistent D2D1 context and bitmaps for the D2D1Device path. */
-static HRESULT dcomp_surface_ensure_d2d1_resources(struct dcomp_surface *surface)
+/* The render-target and CPU-readable bitmaps of a D2D1-backed surface at the
+ * given size.  Shared by the lazy first-use path below and by Resize, which
+ * needs the new pair while the old one still exists so that the contents can
+ * be carried across. */
+static HRESULT dcomp_surface_create_d2d1_bitmaps(ID2D1DeviceContext *context, UINT width, UINT height,
+        ID2D1Bitmap1 **target_bitmap, ID2D1Bitmap1 **readback_bitmap)
 {
     D2D1_BITMAP_PROPERTIES1 bmp_props;
     D2D1_SIZE_U size;
+    HRESULT hr;
+
+    *target_bitmap = NULL;
+    *readback_bitmap = NULL;
+
+    size.width = width;
+    size.height = height;
+
+    /* Render-target bitmap (GPU-backed, TARGET flag) */
+    memset(&bmp_props, 0, sizeof(bmp_props));
+    bmp_props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bmp_props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bmp_props.dpiX = 96.0f;
+    bmp_props.dpiY = 96.0f;
+    bmp_props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+
+    hr = ID2D1DeviceContext_CreateBitmap(context, size, NULL, 0, &bmp_props, target_bitmap);
+    if (FAILED(hr))
+    {
+        FIXME("CreateBitmap(TARGET) failed: %#lx.\n", hr);
+        *target_bitmap = NULL;
+        return hr;
+    }
+
+    /* CPU-readable bitmap for readback (CANNOT_DRAW | CPU_READ) */
+    bmp_props.bitmapOptions = D2D1_BITMAP_OPTIONS_CANNOT_DRAW | D2D1_BITMAP_OPTIONS_CPU_READ;
+
+    hr = ID2D1DeviceContext_CreateBitmap(context, size, NULL, 0, &bmp_props, readback_bitmap);
+    if (FAILED(hr))
+    {
+        FIXME("CreateBitmap(CPU_READ) failed: %#lx.\n", hr);
+        ID2D1Bitmap1_Release(*target_bitmap);
+        *target_bitmap = NULL;
+        *readback_bitmap = NULL;
+        return hr;
+    }
+
+    return S_OK;
+}
+
+/* Lazy-init the persistent D2D1 context and bitmaps for the D2D1Device path. */
+static HRESULT dcomp_surface_ensure_d2d1_resources(struct dcomp_surface *surface)
+{
     HRESULT hr;
 
     if (surface->persistent_context)
@@ -322,42 +369,10 @@ static HRESULT dcomp_surface_ensure_d2d1_resources(struct dcomp_surface *surface
         return hr;
     }
 
-    size.width = surface->width;
-    size.height = surface->height;
-
-    /* Render-target bitmap (GPU-backed, TARGET flag) */
-    memset(&bmp_props, 0, sizeof(bmp_props));
-    bmp_props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    bmp_props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-    bmp_props.dpiX = 96.0f;
-    bmp_props.dpiY = 96.0f;
-    bmp_props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-
-    hr = ID2D1DeviceContext_CreateBitmap(surface->persistent_context,
-            size, NULL, 0, &bmp_props, &surface->target_bitmap);
+    hr = dcomp_surface_create_d2d1_bitmaps(surface->persistent_context, surface->width, surface->height,
+            &surface->target_bitmap, &surface->readback_bitmap);
     if (FAILED(hr))
     {
-        FIXME("CreateBitmap(TARGET) failed: %#lx.\n", hr);
-        ID2D1DeviceContext_Release(surface->persistent_context);
-        surface->persistent_context = NULL;
-        return hr;
-    }
-
-    /* CPU-readable bitmap for readback (CANNOT_DRAW | CPU_READ) */
-    memset(&bmp_props, 0, sizeof(bmp_props));
-    bmp_props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    bmp_props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-    bmp_props.dpiX = 96.0f;
-    bmp_props.dpiY = 96.0f;
-    bmp_props.bitmapOptions = D2D1_BITMAP_OPTIONS_CANNOT_DRAW | D2D1_BITMAP_OPTIONS_CPU_READ;
-
-    hr = ID2D1DeviceContext_CreateBitmap(surface->persistent_context,
-            size, NULL, 0, &bmp_props, &surface->readback_bitmap);
-    if (FAILED(hr))
-    {
-        FIXME("CreateBitmap(CPU_READ) failed: %#lx.\n", hr);
-        ID2D1Bitmap1_Release(surface->target_bitmap);
-        surface->target_bitmap = NULL;
         ID2D1DeviceContext_Release(surface->persistent_context);
         surface->persistent_context = NULL;
         return hr;
@@ -627,7 +642,9 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
 {
     struct dcomp_surface *surface = CONTAINING_RECORD(iface, struct dcomp_surface, IDCompositionSurface_iface);
     ID3D11Texture2D *new_texture = NULL, *new_staging = NULL;
+    ID2D1Bitmap1 *new_target_bitmap = NULL, *new_readback_bitmap = NULL;
     IDXGISurface *new_dxgi_surface = NULL;
+    UINT copy_w, copy_h, y;
     DWORD *new_bits;
 
     TRACE("iface %p, %ux%u (old %ux%u).\n", iface, width, height, surface->width, surface->height);
@@ -641,11 +658,12 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
         return DXGI_ERROR_INVALID_CALL;
     }
 
-    /* Two-phase resize: create ALL new resources first; only if everything
-     * succeeds do we release the old ones and swap in the new size.  On any
-     * failure the surface is left fully intact (old bits/textures/dimensions),
-     * so a failed Resize cannot leave new-size metadata with missing GPU
-     * objects (which would make later draws fail unpredictably). */
+    /* Resize in phases: create ALL new resources first, then carry the old
+     * contents across, and only when everything succeeded release the old
+     * resources and swap in the new size.  On any failure the surface is left
+     * fully intact (old bits/textures/dimensions), so a failed Resize cannot
+     * leave new-size metadata with missing GPU objects (which would make later
+     * draws fail unpredictably). */
 
     /* Phase 1 — allocate/create new resources without touching the surface. */
     new_bits = calloc(width * height, sizeof(DWORD));
@@ -704,12 +722,63 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
         }
     }
 
-    /* Phase 2 — everything created: release old resources and swap in the new. */
+    /* On the D2D1 path the drawn pixels live in target_bitmap alone -- there is
+     * no D3D11 texture behind it.  Create the new pair here instead of leaving
+     * it to the next BeginDraw, so the old contents can be carried across
+     * below.  Should that fail, the lazy path still applies: the bitmaps go and
+     * BeginDraw re-creates them empty, as before. */
+    if (surface->d2d1_device && surface->persistent_context && surface->target_bitmap
+            && FAILED(dcomp_surface_create_d2d1_bitmaps(surface->persistent_context, width, height,
+                    &new_target_bitmap, &new_readback_bitmap)))
+        WARN("Could not create the resized D2D1 bitmaps; the contents will not be preserved.\n");
+
+    /* Phase 2 -- "When a virtual surface is resized, its contents are preserved
+     * up to the new boundaries of the surface" (IDCompositionVirtualSurface::Resize).
+     * An application may therefore repaint only what the new layout moved.
+     * Cubase 15 does exactly that on the project window's root surface: after
+     * a resize it redraws the panes below the toolbar and the transport bar,
+     * and the toolbar strip, never drawn again, stayed black here because the
+     * new texture and bits started out empty. */
+    copy_w = min(width, surface->width);
+    copy_h = min(height, surface->height);
+    if (copy_w && copy_h && surface->bits)
+    {
+        for (y = 0; y < copy_h; ++y)
+            memcpy(new_bits + y * width, surface->bits + y * surface->width, copy_w * sizeof(DWORD));
+
+        if (new_texture && surface->texture)
+        {
+            ID3D11DeviceContext *d3d_context;
+            D3D11_BOX box;
+
+            box.left = 0; box.top = 0; box.front = 0;
+            box.right = copy_w; box.bottom = copy_h; box.back = 1;
+            ID3D11Device_GetImmediateContext(surface->d3d11_device, &d3d_context);
+            ID3D11DeviceContext_CopySubresourceRegion(d3d_context, (ID3D11Resource *)new_texture, 0,
+                    0, 0, 0, (ID3D11Resource *)surface->texture, 0, &box);
+            ID3D11DeviceContext_Release(d3d_context);
+        }
+
+        if (new_target_bitmap)
+        {
+            D2D1_POINT_2U dst_point = {0, 0};
+            D2D1_RECT_U src_rect;
+            HRESULT hr;
+
+            src_rect.left = 0; src_rect.top = 0;
+            src_rect.right = copy_w; src_rect.bottom = copy_h;
+            hr = ID2D1Bitmap1_CopyFromBitmap(new_target_bitmap, &dst_point,
+                    (ID2D1Bitmap *)surface->target_bitmap, &src_rect);
+            if (FAILED(hr))
+                WARN("Could not copy the old contents into the resized bitmap: %#lx.\n", hr);
+        }
+    }
+
+    /* Phase 3 -- everything created and copied: release the old resources and
+     * swap in the new. */
     free(surface->bits);
     surface->bits = new_bits;
 
-    /* D2D1 bitmaps are recreated lazily in BeginDraw via
-     * dcomp_surface_ensure_d2d1_resources() at the new dimensions. */
     if (surface->readback_bitmap)
     {
         ID2D1Bitmap1_Release(surface->readback_bitmap);
@@ -720,8 +789,16 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
         ID2D1Bitmap1_Release(surface->target_bitmap);
         surface->target_bitmap = NULL;
     }
-    if (surface->persistent_context)
+    if (new_target_bitmap)
     {
+        /* The device context is not bound to a size; it keeps serving the new
+         * pair, and BeginDraw sets the target as it always did. */
+        surface->target_bitmap = new_target_bitmap;
+        surface->readback_bitmap = new_readback_bitmap;
+    }
+    else if (surface->persistent_context)
+    {
+        /* Re-created lazily in BeginDraw via dcomp_surface_ensure_d2d1_resources(). */
         ID2D1DeviceContext_Release(surface->persistent_context);
         surface->persistent_context = NULL;
     }
