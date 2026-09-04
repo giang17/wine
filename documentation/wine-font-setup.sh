@@ -177,6 +177,19 @@ have_rendering=0
 } 2>/dev/null || true
 [ "$DO_RENDERING" -eq 1 ] || have_rendering=1   # not asked for, do not report it missing
 
+# Segoe UI is proprietary and ships with no distribution, so this script cannot
+# install it.  It is reported anyway, because one application family depends on
+# it in a way that does not fail gracefully: Steinberg's framework looks the
+# family up by name in the DirectWrite system collection and dereferences the
+# result without a check.  Cubase 15 then shows its Hub without any Direct2D
+# text and crashes in hubservice.dll (NULL read) a second after the Hub content
+# has downloaded (issue 345, 2026-09-05).  A prefix cloned from one that never
+# had the family inherits the gap silently.  Copy segoeui*.ttf and segui*.ttf
+# from a prefix that has them and register them under the Fonts key.
+have_segoe=0
+[ -f "$FONTDIR/segoeui.ttf" ] && grep -q '^"Segoe UI (TrueType)"=' "$SYSREG" 2>/dev/null \
+    && have_segoe=1
+
 echo "Current state of the prefix:"
 printf '  %-34s %s\n' "fonts in windows/Fonts" \
     "$( [ "$have_fonts" -eq 1 ] && echo present || echo missing )"
@@ -187,6 +200,9 @@ printf '  %-34s %s\n' "text rendering switches" \
 printf '  %-34s %s\n' "SystemLink values well-formed" \
     "$( [ "$mangled_links" -eq 0 ] && echo yes \
         || echo "no — $mangled_links value(s) encoded twice" )"
+printf '  %-34s %s\n' "Segoe UI (Steinberg applications)" \
+    "$( [ "$have_segoe" -eq 1 ] && echo present \
+        || echo "absent — Cubase 15 Hub crashes without it; not installable by this script" )"
 if [ "$mangled_links" -gt 0 ]; then
     echo
     echo "  These SystemLink values hold one character per entry:"
