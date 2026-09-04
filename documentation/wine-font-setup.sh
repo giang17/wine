@@ -141,6 +141,17 @@ have_link=0
     have_link=1
 } 2>/dev/null || true
 
+# A REG_MULTI_SZ whose entries are all one character long is a string that was
+# encoded to UTF-16 twice: every character ended up followed by a NUL, so
+# load_system_links() reads "SEGUISYM.TTF,Segoe UI Symbol" as 28 separate
+# file,face entries and looks up every one of them.  Nothing fails loudly — the
+# chain is simply empty, and each process start spends 28 lookups per value on
+# it.  Ten values in this state went unnoticed in a prefix for six months, so
+# report them; the correct content cannot be guessed, which is why they are only
+# reported and never rewritten.
+mangled_links=$(printf '%s\n' "$blk" \
+    | grep -cE '^"[^"]+"=str\(7\):"([^\\]\\0){3}' 2>/dev/null) || mangled_links=0
+
 # The rendering switches sit in HKCU, so they are in user.reg.  All three are
 # read once when d2d1/dwrite load, so a running application does not pick up a
 # change — it has to be restarted.
@@ -173,10 +184,23 @@ printf '  %-34s %s\n' "FontLink symbol fallback" \
     "$( [ "$have_link" -eq 1 ] && echo present || echo missing )"
 printf '  %-34s %s\n' "text rendering switches" \
     "$( [ "$have_rendering" -eq 1 ] && echo present || echo missing )"
+printf '  %-34s %s\n' "SystemLink values well-formed" \
+    "$( [ "$mangled_links" -eq 0 ] && echo yes \
+        || echo "no — $mangled_links value(s) encoded twice" )"
+if [ "$mangled_links" -gt 0 ]; then
+    echo
+    echo "  These SystemLink values hold one character per entry:"
+    printf '%s\n' "$blk" | grep -E '^"[^"]+"=str\(7\):"([^\\]\\0){3}' \
+        | cut -d'"' -f2 | sed 's/^/    /'
+    echo "  Delete them, or rewrite them with"
+    echo "    wine reg add 'HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink' \\"
+    echo "      /v '<family>' /t REG_MULTI_SZ /d '<file>,<face>' /f"
+fi
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     echo
-    if [ "$have_fonts" -eq 1 ] && [ "$have_link" -eq 1 ] && [ "$have_rendering" -eq 1 ]; then
+    if [ "$have_fonts" -eq 1 ] && [ "$have_link" -eq 1 ] && [ "$have_rendering" -eq 1 ] &&
+       [ "$mangled_links" -eq 0 ]; then
         echo "Font setup is complete."
         exit 0
     fi
