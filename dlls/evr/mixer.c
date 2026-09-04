@@ -1152,6 +1152,17 @@ static HRESULT WINAPI video_mixer_transform_ProcessMessage(IMFTransform *iface, 
         case MFT_MESSAGE_COMMAND_FLUSH:
             video_mixer_flush_input(mixer);
 
+            /* Flushing drops the pending input together with the request that
+             * was issued for it.  While streaming continues nothing else asks
+             * for input again - ProcessOutput() only requests more after it has
+             * rendered something - so the mixer would sit waiting for a sample
+             * that is never sent. */
+            if (mixer->is_streaming)
+            {
+                for (i = 0; i < mixer->input_count; ++i)
+                    video_mixer_request_sample(mixer, i);
+            }
+
             break;
 
         case MFT_MESSAGE_NOTIFY_BEGIN_STREAMING:
@@ -1450,7 +1461,20 @@ static HRESULT WINAPI video_mixer_transform_ProcessOutput(IMFTransform *iface, D
                 mixer->output_rendered = 1;
             }
 
-            if (SUCCEEDED(hr) && !repaint)
+            /* Ask for input whenever the mixer needs some, not only after it
+             * has rendered something.  ProcessOutput() is the only place that
+             * requests input while streaming, so every call that ends in
+             * MF_E_TRANSFORM_NEED_MORE_INPUT used to leave the mixer waiting
+             * for a sample nobody was going to send: the presenter drives
+             * ProcessOutput() and gives up whenever its three-sample allocator
+             * is exhausted, which happens routinely, and the retry it makes
+             * once a sample is free then finds the pending input already
+             * consumed.  With no request outstanding the video branch of the
+             * pipeline goes quiet for good while the audio branch keeps
+             * running.  The request is idempotent - video_mixer_request_sample()
+             * keeps at most one outstanding per input - so asking here cannot
+             * flood the session. */
+            if (!repaint && (SUCCEEDED(hr) || hr == MF_E_TRANSFORM_NEED_MORE_INPUT))
             {
                 for (i = 0; i < mixer->input_count; ++i)
                     video_mixer_request_sample(mixer, i);

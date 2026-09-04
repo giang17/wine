@@ -2128,6 +2128,34 @@ static HRESULT apply_pixel_aspect_ratio(IMFMediaType *dst_type, IMFMediaType *sr
     return S_OK;
 }
 
+/* The video processor emits bottom-up RGB buffers whenever the requested output type leaves the
+ * row order open, whereas native hands top-down samples to the source reader caller. Native also
+ * keeps MF_MT_DEFAULT_STRIDE off the media type it reports back when advanced video processing is
+ * enabled, so only pin the stride for as long as the transform needs to pick its row order. */
+static HRESULT transform_set_output_type(IMFTransform *transform, const GUID *category, IMFMediaType *output_type)
+{
+    BOOL pinned_stride = FALSE;
+    DWORD sample_size;
+    LONG stride;
+    HRESULT hr;
+
+    if (IsEqualGUID(category, &MFT_CATEGORY_VIDEO_PROCESSOR)
+            && FAILED(IMFMediaType_GetItem(output_type, &MF_MT_DEFAULT_STRIDE, NULL)))
+    {
+        hr = S_OK;
+        mediatype_get_stride_and_sample_size(output_type, &stride, &sample_size, &hr);
+        if (SUCCEEDED(hr))
+            pinned_stride = SUCCEEDED(IMFMediaType_SetUINT32(output_type, &MF_MT_DEFAULT_STRIDE, abs(stride)));
+    }
+
+    hr = IMFTransform_SetOutputType(transform, 0, output_type, 0);
+
+    if (pinned_stride)
+        IMFMediaType_DeleteItem(output_type, &MF_MT_DEFAULT_STRIDE);
+
+    return hr;
+}
+
 static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL decoder, BOOL allow_processor,
         IMFMediaType *input_type, IMFMediaType *output_type, struct transform_entry **out)
 {
@@ -2230,7 +2258,7 @@ static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL
 
                 if (SUCCEEDED(hr) && (!enable_advanced || SUCCEEDED(hr = apply_pixel_aspect_ratio(output_type_copy, media_type)))
                         && (SUCCEEDED(hr = update_media_type(output_type_copy, media_type, enable_advanced)))
-                        && FAILED(hr = IMFTransform_SetOutputType(transform, 0, output_type_copy, 0))
+                        && FAILED(hr = transform_set_output_type(transform, &category, output_type_copy))
                         && FAILED(hr = set_matching_transform_output_type(transform, output_type_copy)) && allow_processor
                         && SUCCEEDED(hr = IMFTransform_GetOutputAvailableType(transform, 0, 0, &media_type)))
                 {

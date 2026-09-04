@@ -66,6 +66,8 @@ AC_ARG_WITH(xcomposite,AS_HELP_STRING([--without-xcomposite],[do not use the Xco
             [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_Xcomposite_h=no; fi])
 AC_ARG_WITH(xcursor,   AS_HELP_STRING([--without-xcursor],[do not use the Xcursor extension]),
             [if test "x$withval" = "xno"; then ac_cv_header_X11_Xcursor_Xcursor_h=no; fi])
+AC_ARG_WITH(xdamage,   AS_HELP_STRING([--without-xdamage],[do not use the Xdamage extension]),
+            [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_Xdamage_h=no; fi])
 AC_ARG_WITH(xfixes,  AS_HELP_STRING([--without-xfixes],[do not use Xfixes for clipboard change notifications]),
             [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_Xfixes_h=no; fi])
 AC_ARG_WITH(xinerama,  AS_HELP_STRING([--without-xinerama],[do not use Xinerama (legacy multi-monitor support)]),
@@ -1397,6 +1399,13 @@ then
                         [$xlib_includes])
         WINE_NOTICE_WITH(xcomposite,[test "x$ac_cv_lib_soname_Xcomposite" = "x"],
                          [libxcomposite ${notice_platform}development files not found, Xcomposite won't be supported.])
+
+        dnl *** Check for X Damage extension
+        AC_CHECK_HEADER([X11/extensions/Xdamage.h],
+                        [WINE_CHECK_SONAME(Xdamage,XDamageCreate,,,[$X_LIBS])],,
+                        [$xlib_includes])
+        WINE_NOTICE_WITH(xdamage,[test "x$ac_cv_lib_soname_Xdamage" = "x"],
+                         [libxdamage ${notice_platform}development files not found, Xdamage won't be supported.])
 
         dnl *** Check for XICCallback struct
         AC_CHECK_MEMBERS([XICCallback.callback, XEvent.xcookie],,,[$xlib_includes])
@@ -3115,6 +3124,7 @@ WINE_CONFIG_MAKEFILE(dlls/psapi/tests)
 WINE_CONFIG_MAKEFILE(dlls/pstorec)
 WINE_CONFIG_MAKEFILE(dlls/pstorec/tests)
 WINE_CONFIG_MAKEFILE(dlls/pwrshplugin)
+WINE_CONFIG_MAKEFILE(dlls/pwrshsip)
 WINE_CONFIG_MAKEFILE(dlls/qasf)
 WINE_CONFIG_MAKEFILE(dlls/qasf/tests)
 WINE_CONFIG_MAKEFILE(dlls/qcap)
@@ -3363,6 +3373,7 @@ WINE_CONFIG_MAKEFILE(dlls/windows.perception.stub)
 WINE_CONFIG_MAKEFILE(dlls/windows.perception.stub/tests)
 WINE_CONFIG_MAKEFILE(dlls/windows.security.authentication.onlineid)
 WINE_CONFIG_MAKEFILE(dlls/windows.security.authentication.onlineid/tests)
+WINE_CONFIG_MAKEFILE(dlls/windows.security.authentication.web.core)
 WINE_CONFIG_MAKEFILE(dlls/windows.security.credentials.ui.userconsentverifier)
 WINE_CONFIG_MAKEFILE(dlls/windows.security.credentials.ui.userconsentverifier/tests)
 WINE_CONFIG_MAKEFILE(dlls/windows.storage.applicationdata)
@@ -3809,7 +3820,7 @@ dnl Rules for generated source files
 
 WINE_APPEND_RULE(
 [dlls/ntdll/unix/version.c: dummy
-	@version=\`(GIT_DIR=${wine_srcdir}.git git describe HEAD 2>/dev/null || echo \"wine-\$(PACKAGE_VERSION)\") | sed -n -e '\$\$s/\(.*\)/const char wine_build[[]] = \"\\1\";/p'\` && (echo \$\$version | cmp -s - \$[@]) || echo \$\$version >\$[@] || (rm -f \$[@] && exit 1)
+	@version=\`(GIT_DIR=${wine_srcdir}.git git describe --match 'wine-*' HEAD 2>/dev/null || echo \"wine-\$(PACKAGE_VERSION)\") | sed -n -e '\$\$s/\(.*\)/const char wine_build[[]] = \"\\1\";/p'\` && (echo \$\$version | cmp -s - \$[@]) || echo \$\$version >\$[@] || (rm -f \$[@] && exit 1)
 programs/winetest/build.rc: dummy
 	@build=\"STRINGTABLE { 1 \\\"\`GIT_DIR=${wine_srcdir}.git git rev-parse HEAD 2>/dev/null\`\\\" }\" && (echo \$\$build | cmp -s - \$[@]) || echo \$\$build >\$[@] || (rm -f \$[@] && exit 1)
 dlls/wineandroid.drv/wine-debug.apk: dlls/wineandroid.drv/build.gradle ${wine_srcdir}dlls/wineandroid.drv/AndroidManifest.xml ${wine_srcdir}dlls/wineandroid.drv/WineActivity.java ${wine_srcdir}dlls/wineandroid.drv/wine.svg

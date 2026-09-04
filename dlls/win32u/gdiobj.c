@@ -479,6 +479,31 @@ static const struct DefaultFontInfo* get_default_fonts(void)
     return &default_fonts[0];
 }
 
+static void apply_desktop_ui_font(LOGFONTW *font)
+{
+    char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[sizeof(font->lfFaceName)])];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
+    HKEY key;
+    ULONG size;
+
+    if (!(key = reg_open_hkcu_key( "Software\\Wine\\Fonts" ))) return;
+    size = query_reg_ascii_value( key, "DesktopUIFont", info, sizeof(buffer) );
+    NtClose( key );
+
+    if (size < 2 * sizeof(WCHAR) || size > sizeof(font->lfFaceName)
+            || size % sizeof(WCHAR) || info->Type != REG_SZ)
+        return;
+    if (info->Data[size - sizeof(WCHAR)] || info->Data[size - 1])
+    {
+        WARN( "Ignoring unterminated DesktopUIFont registry value.\n" );
+        return;
+    }
+
+    memcpy( font->lfFaceName, info->Data, size );
+    memset( (char *)font->lfFaceName + size, 0, sizeof(font->lfFaceName) - size );
+    TRACE( "Using %s for DEFAULT_GUI_FONT.\n", debugstr_w(font->lfFaceName) );
+}
+
 
 /***********************************************************************
  *           GDI_get_ref_count
@@ -612,6 +637,7 @@ HGDIOBJ WINAPI GetStockObject( INT obj )
 static void init_stock_objects( unsigned int dpi )
 {
     const struct DefaultFontInfo *deffonts;
+    LOGFONTW default_gui_font;
     unsigned int i;
     HGDIOBJ obj;
 
@@ -639,13 +665,15 @@ static void init_stock_objects( unsigned int dpi )
 
     /* language-dependent stock fonts */
     deffonts = get_default_fonts();
+    default_gui_font = deffonts->DefaultGuiFont;
+    apply_desktop_ui_font( &default_gui_font );
     create_font( &deffonts->SystemFont );
     create_font( &deffonts->DeviceDefaultFont );
 
     PALETTE_Init();
 
     create_font( &deffonts->SystemFixedFont );
-    create_font( &deffonts->DefaultGuiFont );
+    create_font( &default_gui_font );
 
     create_brush( &DCBrush );
     NtGdiCreatePen( PS_SOLID, 0, RGB(0,0,0), NULL );
@@ -656,7 +684,7 @@ static void init_stock_objects( unsigned int dpi )
 
     create_scaled_font( &deffonts->SystemFont, dpi );
     create_scaled_font( &deffonts->SystemFixedFont, dpi );
-    create_scaled_font( &deffonts->DefaultGuiFont, dpi );
+    create_scaled_font( &default_gui_font, dpi );
 
     /* clear the NOSYSTEM bit on all stock objects*/
     for (i = 0; i < STOCK_LAST + 5; i++)

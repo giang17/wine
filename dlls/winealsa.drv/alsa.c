@@ -710,6 +710,17 @@ static HRESULT map_channels(EDataFlow flow, const WAVEFORMATEX *fmt, int *alsa_c
 {
     BOOL need_remap;
 
+    if(fmt->nChannels > 32){
+        WARN("Channel count %u exceeds map size (32); not remapping.\n", fmt->nChannels);
+        *alsa_channels = 2;
+        map[0] = 0;
+        map[1] = 1;
+        /* Return S_FALSE (consistent with stream-creation's >32 rejection) so the
+         * caller leaves need_remapping FALSE and remap_channels() — which indexes
+         * the fixed alsa_channel_map[32] up to fmt->nChannels — is never reached. */
+        return S_FALSE;
+    }
+
     if(flow != eCapture && (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE || fmt->nChannels > 2) ){
         WAVEFORMATEXTENSIBLE *fmtex = (void*)fmt;
         UINT mask, flag = SPEAKER_FRONT_LEFT;
@@ -1910,6 +1921,11 @@ static NTSTATUS alsa_is_format_supported(void *args)
         params->result = S_FALSE;
     else if(params->fmt_in->nChannels < min)
         params->result = S_FALSE;
+    else if(params->fmt_in->nChannels > 32){
+        WARN("Channel count %u exceeds supported limit.\n", params->fmt_in->nChannels);
+        params->result = S_FALSE;
+        goto exit;
+    }
 
     map_channels(params->flow, params->fmt_in, &alsa_channels, alsa_channel_map);
 

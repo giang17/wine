@@ -29,6 +29,51 @@
 #include <math.h>
 #define COBJMACROS
 #include "d2d1_3.h"
+
+/* Private heap for d2d1 — isolates high-frequency alloc/free churn
+ * (geometry objects, path builders, brush data) from the process heap
+ * to prevent RSS growth from ntdll heap fragmentation. */
+extern HANDLE d2d1_heap;
+
+static inline void *d2d1_private_alloc(size_t size)
+{
+    return HeapAlloc(d2d1_heap, 0, size);
+}
+
+static inline void *d2d1_private_calloc(size_t count, size_t size)
+{
+    if (size && count > (~(size_t)0) / size)
+        return NULL;
+    return HeapAlloc(d2d1_heap, HEAP_ZERO_MEMORY, count * size);
+}
+
+static inline void *d2d1_private_realloc(void *ptr, size_t size)
+{
+    if (!ptr) return HeapAlloc(d2d1_heap, 0, size);
+    return HeapReAlloc(d2d1_heap, 0, ptr, size);
+}
+
+static inline void d2d1_private_free(void *ptr)
+{
+    if (ptr) HeapFree(d2d1_heap, 0, ptr);
+}
+
+static inline WCHAR *d2d1_private_wcsdup(const WCHAR *src)
+{
+    size_t bytes;
+    WCHAR *dst;
+    if (!src) return NULL;
+    bytes = (wcslen(src) + 1) * sizeof(WCHAR);
+    if (!(dst = HeapAlloc(d2d1_heap, 0, bytes))) return NULL;
+    memcpy(dst, src, bytes);
+    return dst;
+}
+
+#define malloc(s)       d2d1_private_alloc(s)
+#define calloc(c, s)    d2d1_private_calloc(c, s)
+#define realloc(p, s)   d2d1_private_realloc(p, s)
+#define free(p)         d2d1_private_free(p)
+#define wcsdup(s)       d2d1_private_wcsdup(s)
 #include "d2d1effectauthor.h"
 #include "d3d11_1.h"
 #ifdef D2D1_INIT_GUID
@@ -53,18 +98,57 @@ enum d2d_shape_type
     D2D_SHAPE_TYPE_ARC_OUTLINE,
     D2D_SHAPE_TYPE_TRIANGLE,
     D2D_SHAPE_TYPE_CURVE,
+    D2D_SHAPE_TYPE_FILL_AA,
     D2D_SHAPE_TYPE_COUNT,
 };
 
 struct d2d_settings
 {
     unsigned int max_version_factory;
+    /* Enhanced contrast for ClearType text, in hundredths. DirectWrite reports
+     * the value through GetAlphaBlendParams(), but Wine's dwrite hardcodes zero
+     * (dlls/dwrite/main.c, "FIXME: use actual per-monitor gamma factor"), so
+     * there is nothing to honour. This overrides it for experiments; Windows
+     * typically runs around 0.5. Absent means "use what DirectWrite said",
+     * which keeps the default behaviour bit-identical. */
+    unsigned int text_enhanced_contrast;
+    BOOL text_enhanced_contrast_set;
+    /* Blend ClearType text in linear space instead of in the target's encoded
+     * space. Off by default: it needs a copy of the destination per glyph run,
+     * and it deliberately departs from what Direct2D does on a plain UNORM
+     * target, where the blend is linear in encoded values. */
+    BOOL text_linear_blend;
 };
 extern struct d2d_settings d2d_settings;
 
 struct d2d_clip_stack
 {
     D2D1_RECT_F *stack;
+    size_t size;
+    size_t count;
+};
+
+struct d2d_layer_info
+{
+    float opacity;
+    struct d2d_bitmap *prev_target;     /* saved original render target */
+    struct d2d_bitmap *layer_bitmap;    /* temporary render surface */
+    ID3D11BlendState *prev_bs;          /* saved blend state */
+    D2D1_SIZE_U prev_pixel_size;        /* saved pixel size */
+    ID2D1Geometry *mask_geometry;       /* geometric mask for compositing */
+    D2D1_MATRIX_3X2_F mask_transform;  /* transform applied to mask */
+    ID2D1Brush *opacity_brush;          /* per-pixel opacity mask brush */
+    BOOL clear_called;                  /* Clear() was called inside this layer */
+    BOOL bypass_layer;                  /* clip-only bypass: render directly on backbuffer */
+    unsigned int clip_push_count;       /* number of clips pushed by this layer; PopLayer pops exactly this many */
+    ID2D1Geometry *stencil_geometry;    /* saved mask geometry for stencil DECR on PopLayer */
+    D2D1_ANTIALIAS_MODE mask_aa_mode;   /* maskAntialiasMode for PopLayer compositing */
+    BOOL ignore_alpha;                  /* D2D1_LAYER_OPTIONS1_IGNORE_ALPHA */
+};
+
+struct d2d_layer_stack
+{
+    struct d2d_layer_info *stack;
     size_t size;
     size_t count;
 };
@@ -109,9 +193,11 @@ struct d2d_brush_cb
         } radial;
         struct
         {
-            float _11, _21, _31, pad;
+            float _11, _21, _31;
+            unsigned int extend_modes; /* D2D1_EXTEND_MODE x in bits 0-7, y in bits 8-15 */
             float _12, _22, _32;
             BOOL ignore_alpha;
+            float source_left, source_top, source_right, source_bottom;
         } bitmap;
     } u;
 };
@@ -120,7 +206,20 @@ struct d2d_ps_cb
 {
     BOOL outline;
     BOOL is_arc;
-    BOOL pad[2];
+    BOOL aa_mode;
+    BOOL srgb_encode;
+    /* Linear text blending. When set, the shader reads the destination copy
+     * from t2 and produces the finished pixel itself, so the output merger
+     * blends nothing. The four scalars map a world position to a texel in that
+     * copy: uv = (p * scale - origin) / size, folded into scale/offset pairs.
+     * Laid out as scalars on purpose — a float4 here would have to start at a
+     * 16 byte boundary and leave a hole this struct would have to mirror. */
+    BOOL linear_text;
+    float dst_scale_x;
+    float dst_offset_x;
+    float dst_scale_y;
+    float dst_offset_y;
+    unsigned int pad[3];
     struct d2d_brush_cb colour_brush;
     struct d2d_brush_cb opacity_brush;
 };
@@ -134,7 +233,7 @@ struct d2d_vs_cb
 {
     struct
     {
-        float _11, _21, _31, pad0;
+        float _11, _21, _31, miter_limit;
         float _12, _22, _32, stroke_width;
     } transform_geometry;
     struct d2d_vec4 transform_rtx;
@@ -170,6 +269,58 @@ struct d2d_indexed_objects
     size_t count;
 };
 
+struct d2d_scratch_buffer
+{
+    ID3D11Buffer *buffer;
+    unsigned int size;
+};
+
+/* Batched DrawLine(). Consecutive lines drawn with a solid brush, no stroke
+ * style and the same transform and stroke width are collected here and drawn
+ * with a single buffer upload; a colour change only opens a new run (an
+ * index range with its own pixel shader constants), not a new draw setup.
+ * Anything else that draws or changes the state the outline shaders read has
+ * to flush the batch first, see d2d_device_context_flush_lines(). */
+struct d2d_outline_vertex;
+struct d2d_face;
+
+struct d2d_line_run
+{
+    D2D1_COLOR_F colour;
+    float opacity;
+    unsigned int face_start;
+    unsigned int face_count;
+};
+
+struct d2d_line_batch
+{
+    struct d2d_outline_vertex *vertices;
+    size_t vertices_size;
+    size_t vertex_count;
+    struct d2d_face *faces;
+    size_t faces_size;
+    size_t face_count;
+    struct d2d_line_run *runs;
+    size_t runs_size;
+    size_t run_count;
+    D2D1_MATRIX_3X2_F transform;
+    float stroke_width;
+    float miter_limit;
+    BOOL flushing;
+};
+
+/* One coverage mask for all the glyph runs a device context draws, see
+ * d2d_device_context_draw_glyph_run_bitmap(). */
+struct d2d_glyph_mask
+{
+    struct d2d_brush *brush;      /* Bitmap brush over the mask; owns the bitmap. */
+    struct d2d_bitmap *bitmap;
+    BYTE *coverage;               /* The run as dwrite delivers it, tightly packed. */
+    size_t coverage_size;
+    BYTE *data;                   /* The plane as it is uploaded, with a spare column and row. */
+    size_t data_size;
+};
+
 struct d2d_device_context
 {
     ID2D1DeviceContext6 ID2D1DeviceContext6_iface;
@@ -201,11 +352,53 @@ struct d2d_device_context
     ID3D11Buffer *vs_cb;
     ID3D11PixelShader *ps;
     ID3D11Buffer *ps_cb;
+    struct d2d_vs_cb vs_cb_cache;
+    BOOL vs_cb_cache_valid;
+    struct d2d_ps_cb ps_cb_cache;
+    BOOL ps_cb_cache_valid;
     ID3D11Buffer *ib;
     unsigned int vb_stride;
     ID3D11Buffer *vb;
     ID3D11RasterizerState *rs;
     ID3D11BlendState *bs;
+    /* Set for the duration of a single draw to make the shape pixel shader
+     * apply the sRGB transfer function to the sampled colour. Used by the
+     * ColorManagement effect to encode a linear (scRGB) source for an
+     * unsigned-normalised, non-sRGB target. */
+    BOOL srgb_encode;
+    /* Same blend as bs, restricted to one subpixel channel, for ClearType
+     * text. Created on first use; index 0 is red, 1 green, 2 blue. */
+    ID3D11BlendState *subpixel_bs[3];
+    /* The same three channel masks with blending switched off, for the linear
+     * text path: there the shader has already combined source and destination,
+     * so anything the output merger did on top would be a second blend. */
+    ID3D11BlendState *subpixel_copy_bs[3];
+    /* Copy of the destination under the current glyph run, and the point
+     * sampler used to read it back. Grown on demand and kept for the lifetime
+     * of the context; text runs recur constantly, so reallocating per run
+     * would churn. */
+    ID3D11Texture2D *text_dst;
+    ID3D11ShaderResourceView *text_dst_srv;
+    ID3D11SamplerState *text_dst_sampler;
+    unsigned int text_dst_width;
+    unsigned int text_dst_height;
+    DXGI_FORMAT text_dst_format;
+    /* Set for the duration of the three text passes; mirrors into the pixel
+     * shader constant buffer. */
+    BOOL linear_text;
+    float text_dst_scale_x, text_dst_offset_x;
+    float text_dst_scale_y, text_dst_offset_y;
+    struct d2d_scratch_buffer scratch_vb[D2D_SHAPE_TYPE_COUNT];
+    struct d2d_scratch_buffer scratch_ib[D2D_SHAPE_TYPE_COUNT];
+    struct d2d_line_batch line_batch;
+    /* Session 6 (C1): persistent scratch rectangle geometry for FillRectangle.
+     * Eliminates per-call calloc(struct d2d_geometry) + Release churn (~1.5M
+     * allocs/min in Serum2 GUI workload). Reused across FillRectangle calls;
+     * freed only in device_context destructor. */
+    struct d2d_geometry *rect_geometry_cache;
+    /* Shared glyph coverage mask, claimed and returned around one glyph run
+     * the way the rectangle geometry is. */
+    struct d2d_glyph_mask *glyph_mask_cache;
     ID3D11SamplerState *sampler_states
             [D2D_SAMPLER_INTERPOLATION_MODE_COUNT]
             [D2D_SAMPLER_EXTEND_MODE_COUNT]
@@ -219,8 +412,21 @@ struct d2d_device_context
     D2D1_RENDER_TARGET_PROPERTIES desc;
     D2D1_SIZE_U pixel_size;
     struct d2d_clip_stack clip_stack;
+    struct d2d_layer_stack layer_stack;
 
     struct d2d_indexed_objects vertex_buffers;
+    BOOL has_element_layers;            /* context has had PushLayer with mask=NULL */
+
+    /* Stencil-based clipping for PushLayer bypass (Option D). */
+    ID3D11Texture2D *stencil_texture;
+    ID3D11DepthStencilView *stencil_dsv;
+    ID3D11DepthStencilState *stencil_write_state;   /* ALWAYS/INCR_SAT: increment stencil */
+    ID3D11DepthStencilState *stencil_test_state;    /* EQUAL/KEEP: pass where stencil==ref */
+    ID3D11DepthStencilState *stencil_decr_state;    /* ALWAYS/DECR_SAT: decrement stencil */
+    D2D1_SIZE_U stencil_size;                       /* current stencil buffer dimensions */
+    unsigned int stencil_depth;                     /* nested stencil layer count (0=off) */
+    BOOL stencil_writing;                           /* stencil INCR pass active */
+    BOOL stencil_decrementing;                      /* stencil DECR pass active */
 };
 
 HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,
@@ -305,17 +511,30 @@ HRESULT d2d_bitmap_render_target_init(struct d2d_bitmap_render_target *render_ta
 
 struct d2d_gradient
 {
-    ID2D1GradientStopCollection ID2D1GradientStopCollection_iface;
+    ID2D1GradientStopCollection1 ID2D1GradientStopCollection1_iface;
     LONG refcount;
 
     ID2D1Factory *factory;
     ID3D11ShaderResourceView *view;
     D2D1_GRADIENT_STOP *stops;
     UINT32 stop_count;
+    D2D1_GAMMA gamma;
+    D2D1_EXTEND_MODE extend_mode;
+    D2D1_COLOR_SPACE preinterpolation_space;
+    D2D1_COLOR_SPACE postinterpolation_space;
+    D2D1_BUFFER_PRECISION buffer_precision;
+    D2D1_COLOR_INTERPOLATION_MODE color_interpolation_mode;
 };
+
+static inline ID2D1GradientStopCollection *d2d_gradient_iface(struct d2d_gradient *gradient)
+{
+    return (ID2D1GradientStopCollection *)&gradient->ID2D1GradientStopCollection1_iface;
+}
 
 HRESULT d2d_gradient_create(ID2D1Factory *factory, ID3D11Device1 *device, const D2D1_GRADIENT_STOP *stops,
         UINT32 stop_count, D2D1_GAMMA gamma, D2D1_EXTEND_MODE extend_mode,
+        D2D1_COLOR_SPACE preinterpolation_space, D2D1_COLOR_SPACE postinterpolation_space,
+        D2D1_BUFFER_PRECISION buffer_precision, D2D1_COLOR_INTERPOLATION_MODE color_interpolation_mode,
         struct d2d_gradient **gradient);
 
 struct d2d_brush
@@ -399,6 +618,31 @@ HRESULT d2d_stroke_style_init(struct d2d_stroke_style *style, ID2D1Factory *fact
         const D2D1_STROKE_STYLE_PROPERTIES1 *desc, const float *dashes, UINT32 dash_count);
 struct d2d_stroke_style *unsafe_impl_from_ID2D1StrokeStyle(ID2D1StrokeStyle *iface);
 
+struct d2d_color_context
+{
+    ID2D1ColorContext1 ID2D1ColorContext1_iface;
+    LONG refcount;
+
+    ID2D1Factory *factory;
+    D2D1_COLOR_CONTEXT_TYPE type;
+    D2D1_COLOR_SPACE space;
+    DXGI_COLOR_SPACE_TYPE dxgi_space;
+    D2D1_SIMPLE_COLOR_PROFILE simple_profile;
+    BYTE *profile;
+    UINT32 profile_size;
+};
+
+HRESULT d2d_color_context_create(ID2D1Factory *factory, D2D1_COLOR_SPACE space,
+        const BYTE *profile, UINT32 profile_size, struct d2d_color_context **out);
+HRESULT d2d_color_context_create_from_filename(ID2D1Factory *factory, const WCHAR *filename,
+        struct d2d_color_context **out);
+HRESULT d2d_color_context_create_from_wic(ID2D1Factory *factory, IWICColorContext *wic_context,
+        struct d2d_color_context **out);
+HRESULT d2d_color_context_create_from_dxgi_space(ID2D1Factory *factory, DXGI_COLOR_SPACE_TYPE dxgi_space,
+        struct d2d_color_context **out);
+HRESULT d2d_color_context_create_from_simple_profile(ID2D1Factory *factory,
+        const D2D1_SIMPLE_COLOR_PROFILE *simple_profile, struct d2d_color_context **out);
+
 struct d2d_layer
 {
     ID2D1Layer ID2D1Layer_iface;
@@ -449,6 +693,7 @@ struct d2d_bitmap
     float dpi_x;
     float dpi_y;
     D2D1_BITMAP_OPTIONS options;
+    ID2D1ColorContext *color_context;
 };
 
 HRESULT d2d_bitmap_create(struct d2d_device_context *context, D2D1_SIZE_U size, const void *src_data,
@@ -647,6 +892,8 @@ HRESULT d2d_ellipse_geometry_init(struct d2d_geometry *geometry,
 void d2d_path_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *factory);
 HRESULT d2d_rectangle_geometry_init(struct d2d_geometry *geometry,
         ID2D1Factory *factory, const D2D1_RECT_F *rect);
+void d2d_rectangle_geometry_reinit(struct d2d_geometry *geometry, const D2D1_RECT_F *rect);
+void d2d_geometry_cleanup(struct d2d_geometry *geometry);
 HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
         ID2D1Factory *factory, const D2D1_ROUNDED_RECT *rounded_rect);
 void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
@@ -682,6 +929,16 @@ struct d2d_device
 
     ID3D10Blob *precompiled_shape_vs[D2D_SHAPE_TYPE_COUNT];
     ID3D10Blob *precompiled_shape_ps;
+
+    /* Shared shape input layouts / vertex + pixel shaders, created lazily once per
+     * device (from the shared ID3D11Device) and referenced by every device context.
+     * Applications that recreate a D2D1 device context per redraw would otherwise
+     * re-create — and wined3d would re-parse — the identical precompiled shape
+     * shaders on every context, churning the process heap and growing RSS. */
+    CRITICAL_SECTION shape_cs;
+    BOOL shape_resources_ready;
+    struct d2d_shape_resources shape_resources[D2D_SHAPE_TYPE_COUNT];
+    ID3D11PixelShader *shape_ps;
 
     struct d2d_indexed_objects shaders;
 };
@@ -869,6 +1126,8 @@ struct d2d_effect
 
 HRESULT d2d_effect_create(struct d2d_device_context *context, const CLSID *effect_id,
         ID2D1Effect **effect);
+BOOL d2d_effect_get_color_management_spaces(ID2D1Effect *iface, D2D1_COLOR_SPACE *source,
+        D2D1_COLOR_SPACE *destination);
 void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
 HRESULT d2d_effect_properties_add(struct d2d_effect_properties *props, const WCHAR *name,
         UINT32 index, D2D1_PROPERTY_TYPE type, const WCHAR *value);

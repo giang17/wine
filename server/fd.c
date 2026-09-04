@@ -1937,6 +1937,34 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
                 fd->unix_fd = open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
         }
 
+        /* POSIX requires that open(2) throws EOPNOTSUPP when `path` is a Unix
+         * socket. *BSD throws EOPNOTSUPP in this case and the additional case of
+         * O_SHLOCK or O_EXLOCK being passed when `path` resides on a filesystem
+         * without lock support.
+         *
+         * Contrary to POSIX, Linux returns ENXIO in this case, so we also check
+         * that error code here. */
+        if (errno == EOPNOTSUPP || errno == ENXIO)
+        {
+            if (!stat(name, &st) && S_ISSOCK(st.st_mode))
+            {
+                if (options & FILE_DELETE_ON_CLOSE) goto skip_open_fail;
+
+                /* Windows exposes a bound AF_UNIX socket as a reparse point: opening it
+                 * without FILE_OPEN_REPARSE_POINT fails with STATUS_IO_REPARSE_TAG_NOT_HANDLED,
+                 * and with the flag it yields a handle that only carries metadata. O_PATH is
+                 * exactly that on Linux; without it we fall through to the errno mapping. */
+                if (!(options & FILE_OPEN_REPARSE_POINT))
+                {
+                    set_error( STATUS_IO_REPARSE_TAG_NOT_HANDLED );
+                    goto error;
+                }
+#ifdef O_PATH
+                fd->unix_fd = open( name, O_PATH );
+#endif
+            }
+        }
+
         if (fd->unix_fd == -1)
         {
             /* check for trailing slash on file path */
@@ -1948,13 +1976,24 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         }
     }
 
+skip_open_fail:
     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
     fd->unix_name = NULL;
-    fstat( fd->unix_fd, &st );
+    if ((path = dup_fd_name( root, name )))
+    {
+        fd->unix_name = realpath( path, NULL );
+        free( path );
+    }
+
+    closed_fd->unix_fd = fd->unix_fd;
+    closed_fd->disp_flags = 0;
+    closed_fd->unix_name = fd->unix_name;
+    if (fd->unix_fd != -1)
+        fstat( fd->unix_fd, &st );
     *mode = st.st_mode;
 
-    /* only bother with an inode for normal files and directories */
-    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))
+    /* only bother with an inode for normal files, directories, and socket files */
+    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode) || S_ISSOCK(st.st_mode))
     {
         unsigned int err;
         struct inode *inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
@@ -2466,6 +2505,7 @@ static void get_reparse_point( struct fd *fd, struct async *async )
     /* we can't just allocate get_reply_max_size() here;
      * Linux won't return any data if the size is too small */
     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    struct stat st;
     int ret;
 
     if (!fd->unix_name)
@@ -2477,6 +2517,26 @@ static void get_reparse_point( struct fd *fd, struct async *async )
     if (!get_reply_max_size())
     {
         set_error( STATUS_INVALID_USER_BUFFER );
+        return;
+    }
+
+    /* A bound AF_UNIX socket carries its reparse tag in the inode type, not in the
+     * name suffix and extended attribute the other reparse points use. Windows
+     * reports IO_REPARSE_TAG_AF_UNIX with no reparse data at all. */
+    if (fd->unix_fd != -1 && !fstat( fd->unix_fd, &st ) && S_ISSOCK( st.st_mode ))
+    {
+        REPARSE_DATA_BUFFER *data = (REPARSE_DATA_BUFFER *)buffer;
+        unsigned int size = sizeof(data->ReparseTag) + sizeof(data->ReparseDataLength)
+                            + sizeof(data->Reserved);
+
+        if (get_reply_max_size() < size)
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+        memset( data, 0, size );
+        data->ReparseTag = IO_REPARSE_TAG_AF_UNIX;
+        set_reply_data( data, size );
         return;
     }
 

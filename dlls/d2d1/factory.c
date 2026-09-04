@@ -1657,6 +1657,7 @@ static void d2d_settings_init(void)
 {
     HKEY default_key, tmp_key, application_key = NULL;
     char buffer[MAX_PATH + 10];
+    unsigned int value;
     DWORD len;
 
     if (RegOpenKeyA(HKEY_CURRENT_USER, "Software\\Wine\\Direct2D", &default_key))
@@ -1687,15 +1688,44 @@ static void d2d_settings_init(void)
     if (get_config_key_u32(default_key, application_key, "max_version_factory", &d2d_settings.max_version_factory))
         ERR_(winediag)("Limiting maximum Direct2D factory version to %#x.\n", d2d_settings.max_version_factory);
 
+    if (get_config_key_u32(default_key, application_key, "text_enhanced_contrast",
+            &d2d_settings.text_enhanced_contrast))
+    {
+        d2d_settings.text_enhanced_contrast_set = TRUE;
+        ERR_(winediag)("Overriding ClearType enhanced contrast with %u/100.\n",
+                d2d_settings.text_enhanced_contrast);
+    }
+
+    if (get_config_key_u32(default_key, application_key, "text_linear_blend", &value) && value)
+    {
+        d2d_settings.text_linear_blend = TRUE;
+        ERR_(winediag)("Blending ClearType text in linear space.\n");
+    }
+
     if (application_key)
         RegCloseKey(application_key);
     if (default_key)
         RegCloseKey(default_key);
 }
 
+HANDLE d2d1_heap;
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
 {
-    if (reason == DLL_PROCESS_ATTACH)
+    switch (reason)
+    {
+    case DLL_PROCESS_ATTACH:
+        d2d1_heap = HeapCreate(0, 0, 0);
+        if (!d2d1_heap) return FALSE;
         d2d_settings_init();
+        break;
+    case DLL_PROCESS_DETACH:
+        if (!reserved && d2d1_heap)
+        {
+            HeapDestroy(d2d1_heap);
+            d2d1_heap = NULL;
+        }
+        break;
+    }
     return TRUE;
 }

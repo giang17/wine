@@ -222,9 +222,54 @@ static BOOL needs_client_window_clipping( HWND hwnd )
 
 static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw )
 {
+    static const WCHAR dcomp_target_propW[] =
+        {'_','_','w','i','n','e','_','d','c','o','m','p','_','t','a','r','g','e','t',0};
+    static const WCHAR d3d_hwnd_target_propW[] =
+        {'_','_','w','i','n','e','_','d','3','d','_','h','w','n','d','_','t','a','r','g','e','t',0};
+
     if (!raw && NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
-    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return TRUE; /* child window, needs compositing */
+    if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow())
+    {
+        /* DComp target windows render via their own BitBlt path (comp_dc → GetDC),
+         * not through the GL client_surface.  Offscreen XComposite compositing is
+         * unnecessary and causes flicker when popups open/close over the plugin.
+         *
+         * NB: this keys off __wine_dcomp_target (set by dcomp/device.c for the
+         * IDCompositionTarget COM-API BitBlt path), deliberately NOT off
+         * __wine_dcomp_swapchain (set by dxgi/factory.c for the composition-
+         * swapchain blit path).  The two markers denote distinct rendering
+         * subsystems, not the same window — neither producer sets the other's
+         * property.  The swapchain blit path presents through its own GDI route,
+         * so swapchain-only windows are not expected to need the offscreen skip
+         * and are left on the normal compositing path.  Do not "unify" the two
+         * markers here without a verified swapchain-child test case: it would
+         * change the offscreen decision for currently-working windows. */
+        if (NtUserGetProp( hwnd, dcomp_target_propW )) return FALSE;
+        /* ID2D1HwndRenderTarget windows (e.g. VSTGUI plugins with DComp disabled)
+         * render via wined3d's swapchain_blit_gdi to the HWND DC, but the GDI
+         * present path never triggers client_surface_present.  When the window
+         * is offscreen-redirected the rendered pixels are stuck in an X11
+         * pixmap that nothing blits to the toplevel — result is a black plugin
+         * window until external events (window move, mouse hover) kick a
+         * repaint.  Skip offscreen for these windows so the plugin's X11 child
+         * is attached directly to the parent and visible without a composite
+         * trigger. */
+        if (NtUserGetProp( hwnd, d3d_hwnd_target_propW )) return FALSE;
+        return TRUE; /* child window, needs compositing */
+    }
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
+    /* A top-level that is not visible has no mapped X window, and an unmapped window
+     * has no backing store: what GL renders into it is undefined, and reading it back
+     * picks up the clear colour or a stale frame of another window - the same undefined
+     * pixmap content the comment in client_surface_update_offscreen() describes for a
+     * re-parent.  HALion Sonic renders the Anima 3D wavetable view into a hidden 260x151
+     * top-level ("OGLWnd") and reads it back with glReadPixels to paint it into the
+     * editor through Direct2D; on Windows a hidden window still has a valid backbuffer,
+     * under X11 it does not, so the view showed a stale desktop frame upside down (GL
+     * rows run bottom-up) or a flat clear colour, and never updated (issue 341).
+     * Render offscreen instead: get_dummy_parent() maps its dummy window, so a client
+     * window redirected there has a valid pixmap. */
+    if (!NtUserIsWindowVisible( hwnd )) return TRUE;
     return FALSE;
 }
 
@@ -237,6 +282,30 @@ void set_dc_drawable( HDC hdc, Drawable drawable, const RECT *rect, int mode )
         .dc_rect = *rect,
         .mode = mode,
     };
+    XWindowAttributes attr;
+
+    /* Report the drawable's visual so xrenderdrv_ExtEscape can pick an XRender
+     * picture format matching the drawable's depth.  Without it the DC keeps the
+     * root window's depth-24 format (a display DC opened via NtGdiOpenDCW starts
+     * on the root format); binding that DC to a depth-32 drawable - e.g. a
+     * layered top-level window that hosts an OpenGL plugin editor being presented
+     * via X11DRV_client_surface_present - makes XRenderCreatePicture fail with
+     * BadMatch, a fatal X error that takes the whole host down.  XGetWindowAttributes
+     * fails for non-window drawables such as GLX pbuffers; leave the visual zeroed
+     * in that case so xrender keeps the current format. */
+    if (XGetWindowAttributes( gdi_display, drawable, &attr ) && attr.class != InputOnly)
+    {
+        escape.visual.visual        = attr.visual;
+        escape.visual.visualid      = XVisualIDFromVisual( attr.visual );
+        escape.visual.screen        = XScreenNumberOfScreen( attr.screen );
+        escape.visual.depth         = attr.depth;
+        escape.visual.class         = attr.visual->class;
+        escape.visual.red_mask      = attr.visual->red_mask;
+        escape.visual.green_mask    = attr.visual->green_mask;
+        escape.visual.blue_mask     = attr.visual->blue_mask;
+        escape.visual.colormap_size = attr.visual->map_entries;
+        escape.visual.bits_per_rgb  = attr.visual->bits_per_rgb;
+    }
     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
 }
 
@@ -258,6 +327,11 @@ HRGN get_dc_monitor_region( HWND hwnd, HDC hdc )
     return 0;
 }
 
+/* every x11drv client surface, so that a top-level's VisibilityNotify can find
+ * the offscreen surfaces presenting into it, see x11drv_client_surface_reblit() */
+static struct list client_surfaces_x11 = LIST_INIT( client_surfaces_x11 );
+static pthread_mutex_t client_surfaces_x11_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void x11drv_client_surface_destroy( struct client_surface *client )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
@@ -265,8 +339,19 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
-    if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
+    if (InterlockedExchange( &surface->listed, FALSE ))
+    {
+        pthread_mutex_lock( &client_surfaces_x11_lock );
+        list_remove( &surface->entry );
+        pthread_mutex_unlock( &client_surfaces_x11_lock );
+    }
+
+    /* destroy the window before its colormap: freeing a colormap that is still
+     * installed in a live window leaves the server holding it until the window
+     * goes away, and the id is then already invalid by the time anything else
+     * touches it -- a BadColor from the default error handler would be fatal */
     if (surface->window) destroy_client_window( hwnd, surface->window );
+    if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
 }
@@ -310,10 +395,97 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     XConfigureWindow( gdi_display, surface->window, mask, &changes );
 }
 
+/* set a client surface up for offscreen rendering: presenting it then blits the
+ * composite-redirected client window into the top-level through hdc_src/hdc_dst */
+static void client_surface_redirect_offscreen( struct x11drv_client_surface *surface )
+{
+    static const WCHAR displayW[] = {'D','I','S','P','L','A','Y', 0};
+    UNICODE_STRING device_str = RTL_CONSTANT_STRING(displayW);
+    RECT rect = surface->client.virtual_rect;
+
+    OffsetRect( &rect, -rect.left, -rect.top );
+    surface->hdc_dst = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+    surface->hdc_src = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+    set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
+#ifdef SONAME_LIBXCOMPOSITE
+    /* A second Manual redirect of the same window is a BadAccess, and an X error
+     * on gdi_display that is not ignored takes the process down: redirect once. */
+    if (usexcomposite && !InterlockedExchange( &surface->redirected, TRUE ))
+        pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+#endif
+}
+
+static int ignore_x_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return 1;
+}
+
+/* copy the content of a viewable client window into a pixmap of the same depth,
+ * see client_surface_update_offscreen() */
+static Pixmap client_surface_save_content( struct x11drv_client_surface *surface, GC *gc, RECT *rect )
+{
+    XWindowAttributes attr;
+    Pixmap pixmap = 0;
+
+    X11DRV_expect_error( gdi_display, ignore_x_error, NULL );
+    if (XGetWindowAttributes( gdi_display, surface->window, &attr ) && attr.map_state == IsViewable
+        && attr.width > 0 && attr.height > 0)
+    {
+        if ((pixmap = XCreatePixmap( gdi_display, surface->window, attr.width, attr.height, attr.depth )))
+        {
+            *gc = XCreateGC( gdi_display, pixmap, 0, NULL );
+            XSetSubwindowMode( gdi_display, *gc, IncludeInferiors );
+            XSetGraphicsExposures( gdi_display, *gc, False );
+            XCopyArea( gdi_display, surface->window, pixmap, *gc, 0, 0, attr.width, attr.height, 0, 0 );
+            SetRect( rect, 0, 0, attr.width, attr.height );
+        }
+    }
+    if (X11DRV_check_error())
+    {
+        if (pixmap)
+        {
+            XFreeGC( gdi_display, *gc );
+            XFreePixmap( gdi_display, pixmap );
+        }
+        pixmap = 0;
+    }
+    TRACE( "%s window %lx -> pixmap %lx\n", debugstr_client_surface( &surface->client ), surface->window, pixmap );
+    return pixmap;
+}
+
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
-    BOOL offscreen = needs_offscreen_rendering( hwnd, surface->client.raw );
+    BOOL offscreen = needs_offscreen_rendering( hwnd, surface->client.raw ), was_hidden;
     struct x11drv_win_data *data;
+    Pixmap saved = 0;
+    GC saved_gc = NULL;
+    RECT saved_rect;
+
+    /* A top-level renders offscreen while a child clips its client area, and
+     * that answer can change with the focus: Studio Pro's Add Tracks dialog
+     * shows its inline EDIT only while it has the focus, so every focus change
+     * re-parented the GL client window between offscreen and attached.  Each
+     * re-parent leaves the window's pixmap undefined on NVIDIA - black, or a
+     * stale frame of another window - and nothing presents again until the
+     * application draws (issue 291).  Once a top-level has gone offscreen,
+     * keep it there for the lifetime of the client surface: the blit it pays
+     * per present is what it paid while it had the focus anyway.
+     *
+     * A window that renders offscreen only because it is not visible is not that
+     * case: it makes the transition back exactly once, when it is shown, instead
+     * of flipping with the focus.  Latching it would put every GL top-level whose
+     * client surface exists before its ShowWindow on the blit path for good, so
+     * remember why the surface went offscreen and let this one return (issue 341). */
+    was_hidden = InterlockedExchange( &surface->offscreen_hidden,
+                                      offscreen && !NtUserIsWindowVisible( hwnd ) );
+    if (!offscreen && InterlockedCompareExchange( &surface->client.offscreen, 0, 0 )
+        && NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow() && !was_hidden)
+    {
+        TRACE( "%s stays offscreen\n", debugstr_client_surface( &surface->client ) );
+        offscreen = TRUE;
+    }
+
+    TRACE( "%s offscreen %u\n", debugstr_client_surface( &surface->client ), offscreen );
 
     if (InterlockedExchange( &surface->client.offscreen, offscreen ) == offscreen)
     {
@@ -329,10 +501,30 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         TRACE( "%s offscreen %u\n", debugstr_client_surface( &surface->client ), offscreen );
     }
 
+    /* Going offscreen takes the client window off the screen twice: the composite
+     * redirect below removes it from the parent's rendering, and detach_client_window()
+     * then reparents it away.  Both expose the area it covered in the top-level's X
+     * window, which the server fills with the opaque black window background before
+     * the offscreen content is blitted in - a black flash over the whole client area
+     * for a GL/D3D top-level (issue 128: Ableton Live 12 switching the Learn View
+     * panel on makes the window need offscreen rendering and lands here).  Suppress
+     * the background across both requests and restore it right after. */
+    if (offscreen) set_expose_background_suppressed( hwnd, TRUE );
+
+    /* Moving the client window under the dummy parent and redirecting it leaves
+     * its pixmap undefined on NVIDIA: the frame the application last drew is
+     * gone, and every present blit until it draws again copies that undefined
+     * content over the top-level (issue 308: Studio Pro's Studio Assistant,
+     * whose D3D swapchain exists before the EDIT that makes the window render
+     * offscreen).  Keep a copy of the window's content across the move and put
+     * it back into the redirected window, so the blits carry the last frame. */
+    if (offscreen) saved = client_surface_save_content( surface, &saved_gc, &saved_rect );
+
     if (!offscreen)
     {
 #ifdef SONAME_LIBXCOMPOSITE
-        if (usexcomposite) pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+        if (usexcomposite && InterlockedExchange( &surface->redirected, FALSE ))
+            pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
 #endif
         if (surface->hdc_dst)
         {
@@ -345,21 +537,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
             surface->hdc_src = NULL;
         }
     }
-    else
-    {
-        static const WCHAR displayW[] = {'D','I','S','P','L','A','Y', 0};
-        UNICODE_STRING device_str = RTL_CONSTANT_STRING(displayW);
-        RECT rect = surface->client.virtual_rect;
-
-        OffsetRect( &rect, -rect.left, -rect.top );
-        surface->hdc_dst = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
-        surface->hdc_src = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
-        set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
-
-#ifdef SONAME_LIBXCOMPOSITE
-        if (usexcomposite) pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
-#endif
-    }
+    else client_surface_redirect_offscreen( surface );
 
     if ((data = get_win_data( hwnd )))
     {
@@ -367,6 +545,27 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         else attach_client_window( data, surface->window );
         release_win_data( data );
     }
+
+    if (saved)
+    {
+        XCopyArea( gdi_display, saved, surface->window, saved_gc, 0, 0,
+                   saved_rect.right - saved_rect.left, saved_rect.bottom - saved_rect.top, 0, 0 );
+        XFreeGC( gdi_display, saved_gc );
+        XFreePixmap( gdi_display, saved );
+        TRACE( "restored %s content from pixmap %lx\n", debugstr_client_surface( &surface->client ), saved );
+    }
+
+    if (offscreen) set_expose_background_suppressed( hwnd, FALSE );
+
+    /* An application that only draws on demand does not draw again after the
+     * move on its own: Studio Pro's main window, whose Assistant panel makes it
+     * render offscreen, stayed black until the pointer hovered a control.  Ask
+     * for a repaint, as a change of client window does (see
+     * X11DRV_client_surface_present()).  The move back leaves the client window's
+     * content just as undefined, and since issue 341 a hidden window actually
+     * makes that transition, so ask in both directions - control only reaches
+     * here when the offscreen state really changed. */
+    NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN );
 }
 
 static void x11drv_client_surface_update( struct client_surface *client )
@@ -374,8 +573,38 @@ static void x11drv_client_surface_update( struct client_surface *client )
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd;
 
+    /* The surface is on the client surface list before its X window exists
+     * (client_surface_create() publishes it, the window is created after).  An
+     * update that gets here in between has nothing to work on - and would
+     * redirect the window a second time once it appears, see
+     * client_surface_redirect_offscreen(). */
+    if (!surface->window) return;
+
     client_surface_update_geometry( hwnd, surface );
     client_surface_update_offscreen( hwnd, surface );
+}
+
+/* Track which client window a top-level was last presented through, so a switch
+ * to a different (and therefore still empty) one can be noticed.  See the comment
+ * in X11DRV_client_surface_present(). */
+static BOOL last_presented_changed( HWND hwnd, Window client_window )
+{
+    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    static struct { HWND hwnd; Window window; } last[32];
+    BOOL changed = FALSE;
+    unsigned int i;
+
+    pthread_mutex_lock( &mutex );
+    for (i = 0; i < ARRAY_SIZE(last); i++) if (!last[i].hwnd || last[i].hwnd == hwnd) break;
+    if (i < ARRAY_SIZE(last))
+    {
+        changed = last[i].hwnd == hwnd && last[i].window != client_window;
+        last[i].hwnd = hwnd;
+        last[i].window = client_window;
+    }
+    pthread_mutex_unlock( &mutex );
+
+    return changed;
 }
 
 static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
@@ -387,6 +616,8 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     HRGN region;
 
     if (!hdc) return;
+    if (!surface->window) return; /* not created yet, see x11drv_client_surface_update() */
+    if (!surface->hdc_dst) return; /* non-offscreen, GL presents directly */
     window = X11DRV_get_whole_window( toplevel );
 
     /* if window is exclusive fullscreen, ignore the window region clipping rules */
@@ -401,9 +632,29 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
 
+    /* A client surface that has just replaced the one this window was presenting
+     * through has never been drawn into: it is a fresh X window, so its content is
+     * the black window background.  The blit below puts that black over the whole
+     * top-level, and only the parts a later window-surface flush happens to cover
+     * come back - anything outside the flush's dirty rectangle stays black until
+     * something forces a repaint (issue 175: SynthEdit's toolbar row and parameter
+     * panel after opening and closing a menu, because the SetWindowPos that closes
+     * it carries SWP_NOREDRAW and no repaint is ever asked for).
+     *
+     * Ask the application to repaint when the presented client window changes, which
+     * is what resizing the window by hand does to heal it. */
+    if (last_presented_changed( hwnd, surface->window ))
+        NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
+
     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                      surface->hdc_src, 0, 0, rect_src.right - rect_src.left, rect_src.bottom - rect_src.top, SRCCOPY, 0 );
     XFlush( gdi_display );
+
+    /* The top-level may not be viewable yet - the window manager is still
+     * mapping its frame - and the server then drops the blit.  Remember that
+     * one went out, so the VisibilityNotify that follows can repeat it. */
+    if (!InterlockedCompareExchange( &surface->reblitting, 0, 0 ))
+        InterlockedExchange( &surface->blit_pending, TRUE );
 
     if (region) NtGdiDeleteObjectApp( region );
 }
@@ -432,9 +683,16 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     struct x11drv_client_surface *surface;
     XVisualInfo visual = default_visual;
     Colormap colormap;
+    int visual_format;
+    BOOL offscreen;
     RECT rect;
 
-    if (format && !visual_from_pixel_format( format, &visual )) return NULL;
+    /* issue-250: a per-pixel alpha window needs its GL child on an alpha capable
+     * visual.  Only the X window (here) and the EGL config (x11drv_egl_surface_create)
+     * move to the ARGB twin; the client surface stays registered under the format
+     * that was asked for so get_unused_client_surface() keeps finding it. */
+    visual_format = x11drv_argb_visual_format( hwnd, format );
+    if (visual_format && !visual_from_pixel_format( visual_format, &visual )) return NULL;
 
     if (visual.visualid == default_visual.visualid) colormap = default_colormap;
     else colormap = XCreateColormap( gdi_display, get_dummy_parent(), visual.visual, visual_class_alloc( visual.class ) );
@@ -442,16 +700,75 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
 
     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_funcs, hwnd, format, raw ))) goto failed;
     surface->colormap = colormap;
+    surface->visual_format = visual_format;
+
+    /* Decide up front whether the window is going to render offscreen, so that
+     * it is never attached to the top-level only to be taken away again at the
+     * next update, see create_client_window(). */
+    offscreen = needs_offscreen_rendering( hwnd, raw );
+    /* Mark the surface offscreen before the window exists: a concurrent
+     * client_surface_update_offscreen() then takes its "unchanged" path instead
+     * of setting the window up for offscreen rendering itself, alongside the
+     * setup below. */
+    if (offscreen) InterlockedExchange( &surface->client.offscreen, TRUE );
     rect = raw ? surface->client.monitor_rect : surface->client.virtual_rect;
-    if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap ))) goto failed;
+    if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap, offscreen ))) goto failed;
+    if (offscreen) client_surface_redirect_offscreen( surface );
 
     TRACE( "Created %s for client window %lx\n", debugstr_client_surface( &surface->client ), surface->window );
+
+    pthread_mutex_lock( &client_surfaces_x11_lock );
+    list_add_tail( &client_surfaces_x11, &surface->entry );
+    InterlockedExchange( &surface->listed, TRUE );
+    pthread_mutex_unlock( &client_surfaces_x11_lock );
+
     return &surface->client;
 
 failed:
     if (surface) client_surface_release( &surface->client );
     else if (colormap != default_colormap) XFreeColormap( gdi_display, colormap );
     return NULL;
+}
+
+/* A top-level has just become viewable.  An offscreen client surface below it
+ * that presented while the top-level was not viewable yet - the window manager
+ * was still mapping its frame - had that blit dropped by the server, and nothing
+ * presents again until the application draws a new frame: the window comes up
+ * black until the pointer hovers a control (issue 290, Studio Pro's Add Tracks
+ * dialog).  The frame is still in the client window, so repeat the blit. */
+void x11drv_client_surface_reblit( HWND toplevel )
+{
+    struct x11drv_client_surface *surface, *pending[16];
+    unsigned int i, count = 0;
+
+    if (!X11DRV_get_whole_window( toplevel )) return;
+
+    pthread_mutex_lock( &client_surfaces_x11_lock );
+    LIST_FOR_EACH_ENTRY( surface, &client_surfaces_x11, struct x11drv_client_surface, entry )
+    {
+        if (count == ARRAY_SIZE(pending)) break;
+        if (!surface->client.hwnd || !surface->hdc_dst) continue;
+        if (!InterlockedCompareExchange( &surface->client.offscreen, 0, 0 )) continue;
+        if (!InterlockedCompareExchange( &surface->blit_pending, 0, 0 )) continue;
+        client_surface_add_ref( &surface->client );
+        pending[count++] = surface;
+    }
+    pthread_mutex_unlock( &client_surfaces_x11_lock );
+
+    for (i = 0; i < count; i++)
+    {
+        surface = pending[i];
+        if (surface->client.hwnd && NtUserGetAncestor( surface->client.hwnd, GA_ROOT ) == toplevel)
+        {
+            TRACE( "repeating the present blit of %s for top-level %p\n",
+                   debugstr_client_surface( &surface->client ), toplevel );
+            InterlockedExchange( &surface->reblitting, TRUE );
+            InterlockedExchange( &surface->blit_pending, FALSE );
+            client_surface_present( &surface->client );
+            InterlockedExchange( &surface->reblitting, FALSE );
+        }
+        client_surface_release( &surface->client );
+    }
 }
 
 /**********************************************************************
@@ -495,6 +812,25 @@ static INT X11DRV_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID in_d
                     return TRUE;
                 }
                 break;
+            case X11DRV_FLUSH_DISPLAY:
+                /* Push everything queued for this DC out to the server now
+                 * (issue 206).  GdiFlush() only drains Wine's own GDI batch;
+                 * the resulting X requests then still sit in Xlib's client-side
+                 * buffer until something forces them out.  A compositor that
+                 * paints into a window another process presents to has to be
+                 * sure its drawing has left the client, or a swap lands in
+                 * between and the frame shows the window without it. */
+                XFlush( gdi_display );
+                return TRUE;
+            case X11DRV_SYNC_DISPLAY:
+                /* Like the above, but also waits until the server has processed
+                 * the requests.  That closes the window between "sent" and
+                 * "executed" in which a swap can still land ahead of us -- the
+                 * measured difference between the two is ~1.5 pp of frames
+                 * (issue 206).  Costs a round trip, but transfers no image, so
+                 * it should be cheaper than reading a pixel back. */
+                XSync( gdi_display, False );
+                return TRUE;
             case X11DRV_GET_DRAWABLE:
                 if (out_count >= sizeof(struct x11drv_escape_get_drawable))
                 {

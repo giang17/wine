@@ -157,6 +157,7 @@ const char * const X11DRV_atom_names[NB_XATOMS - FIRST_XATOM] =
     "_NET_WM_WINDOW_TYPE_DIALOG",
     "_NET_WM_WINDOW_TYPE_NORMAL",
     "_NET_WM_WINDOW_TYPE_UTILITY",
+    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
     "_NET_WORKAREA",
     "_GTK_WORKAREAS_D0",
     "_XEMBED",
@@ -217,7 +218,10 @@ static inline BOOL ignore_error( Display *display, XErrorEvent *event )
     {
         if (event->error_code == BadDrawable ||
             event->error_code == BadGC ||
-            event->error_code == BadWindow)
+            event->error_code == BadWindow ||
+            /* a colormap is released with the window it is installed in, so an
+             * id kept across that window's destruction is already invalid */
+            event->error_code == BadColor)
             return TRUE;
 #ifdef HAVE_X11_EXTENSIONS_XRENDER_H
         if (xrender_error_base)  /* check for XRender errors */

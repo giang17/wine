@@ -93,6 +93,9 @@ struct thiscall_thunk
 
 static void * (WINAPI *call_thiscall_func1)( void *func, void *this );
 static void * (WINAPI *call_thiscall_func2)( void *func, void *this, const void *a );
+static void * (WINAPI *call_thiscall_func3)( void *func, void *this, const void *a, const void *b );
+static void * (WINAPI *call_thiscall_func4)( void *func, void *this, const void *a, const void *b,
+        const void *c );
 static void * (WINAPI *call_thiscall_func5)( void *func, void *this, const void *a, const void *b,
         const void *c, const void *d );
 static void * (WINAPI *call_thiscall_func8)( void *func, void *this, const void *a, const void *b,
@@ -109,12 +112,17 @@ static void init_thiscall_thunk(void)
     thunk->jmp_edx  = 0xe2ff; /* jmp  *%edx */
     call_thiscall_func1 = (void *)thunk;
     call_thiscall_func2 = (void *)thunk;
+    call_thiscall_func3 = (void *)thunk;
+    call_thiscall_func4 = (void *)thunk;
     call_thiscall_func5 = (void *)thunk;
     call_thiscall_func8 = (void *)thunk;
 }
 
 #define call_func1(func,_this) call_thiscall_func1(func,_this)
 #define call_func2(func,_this,a) call_thiscall_func2(func,_this,(const void*)(a))
+#define call_func3(func,_this,a,b) call_thiscall_func3(func,_this,(const void*)(a),(const void*)(b))
+#define call_func4(func,_this,a,b,c) call_thiscall_func4(func,_this,(const void*)(a),(const void*)(b), \
+        (const void*)(c))
 #define call_func5(func,_this,a,b,c,d) call_thiscall_func5(func,_this,(const void*)(a),(const void*)(b), \
         (const void*)(c), (const void*)(d))
 #define call_func8(func,_this,a,b,c,d,e,f,g) call_thiscall_func8(func,_this,(const void*)(a),(const void*)(b), \
@@ -125,6 +133,8 @@ static void init_thiscall_thunk(void)
 #define init_thiscall_thunk()
 #define call_func1(func,_this) func(_this)
 #define call_func2(func,_this,a) func(_this,a)
+#define call_func3(func,_this,a,b) func(_this,a,b)
+#define call_func4(func,_this,a,b,c) func(_this,a,b,c)
 #define call_func5(func,_this,a,b,c,d) func(_this,a,b,c,d)
 #define call_func8(func,_this,a,b,c,d,e,f,g) func(_this,a,b,c,d,e,f,g)
 
@@ -360,6 +370,36 @@ typedef struct
 } exception_ptr;
 
 static void (__cdecl *p___ExceptionPtrSwap)(exception_ptr *a, exception_ptr *b);
+typedef enum {
+    IOSTATE_goodbit = 0x00,
+    IOSTATE_eofbit  = 0x01,
+    IOSTATE_failbit = 0x02,
+    IOSTATE_badbit  = 0x04
+} IOSB_iostate;
+
+static void* (__thiscall *p_basic_streambuf_char_ctor)(void*);
+static void (__thiscall *p_basic_streambuf_char_dtor)(void*);
+static void (__thiscall *p_basic_streambuf_char_setg)(void*, char*, char*, char*);
+static void* (__thiscall *p_basic_ios_char_rdbuf_get)(const void*);
+static char (__thiscall *p_basic_ios_char_fill_get)(const void*);
+static char (__thiscall *p_basic_ios_char_fill_set)(void*, char);
+static void* (__thiscall *p_basic_ios_char_tie_get)(const void*);
+static void* (__thiscall *p_basic_ios_char_tie_set)(void*, void*);
+static int (__thiscall *p_ios_base_rdstate)(const void*);
+static void* (__thiscall *p_basic_istream_char_ctor)(void*, void*, MSVCP_bool, MSVCP_bool);
+static void* (__thiscall *p_basic_istream_char_move_ctor)(void*, void*, MSVCP_bool);
+static void* (__thiscall *p_basic_istream_char_op_assign)(void*, void*);
+static void (__thiscall *p_basic_istream_char_vbase_dtor)(void*);
+static int (__thiscall *p_basic_istream_char_get)(void*);
+static __int64 (__thiscall *p_basic_istream_char_gcount)(const void*);
+static void* (__thiscall *p_basic_ostream_char_ctor)(void*, void*, MSVCP_bool, MSVCP_bool);
+static void* (__thiscall *p_basic_ostream_char_move_ctor)(void*, void*, MSVCP_bool);
+static void* (__thiscall *p_basic_ostream_char_op_assign)(void*, void*);
+static void (__thiscall *p_basic_ostream_char_vbase_dtor)(void*);
+static void* (__thiscall *p_basic_iostream_char_ctor)(void*, void*, MSVCP_bool);
+static void* (__thiscall *p_basic_iostream_char_move_ctor)(void*, void*, MSVCP_bool);
+static void* (__thiscall *p_basic_iostream_char_op_assign)(void*, void*);
+static void (__thiscall *p_basic_iostream_char_vbase_dtor)(void*);
 
 static HMODULE msvcp;
 #define SETNOFAIL(x,y) x = (void*)GetProcAddress(msvcp,y)
@@ -407,6 +447,30 @@ static BOOL init(void)
         SET(p_codecvt_char16_dtor, "??1?$codecvt@_SDU_Mbstatet@@@std@@MEAA@XZ");
         SET(p_codecvt_char16_do_out, "?do_out@?$codecvt@_SDU_Mbstatet@@@std@@MEBAHAEAU_Mbstatet@@PEB_S1AEAPEB_SPEAD3AEAPEAD@Z");
         SET(p_codecvt_char16_do_in, "?do_in@?$codecvt@_SDU_Mbstatet@@@std@@MEBAHAEAU_Mbstatet@@PEBD1AEAPEBDPEA_S3AEAPEA_S@Z");
+
+        SET(p_basic_streambuf_char_ctor, "??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAA@XZ");
+        SET(p_basic_streambuf_char_dtor, "??1?$basic_streambuf@DU?$char_traits@D@std@@@std@@UEAA@XZ");
+        SET(p_basic_streambuf_char_setg, "?setg@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD00@Z");
+        SET(p_basic_ios_char_rdbuf_get, "?rdbuf@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBAPEAV?$basic_streambuf@DU?$char_traits@D@std@@@2@XZ");
+        SET(p_basic_ios_char_fill_get, "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBADXZ");
+        SET(p_basic_ios_char_fill_set, "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAADD@Z");
+        SET(p_basic_ios_char_tie_get, "?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBAPEAV?$basic_ostream@DU?$char_traits@D@std@@@2@XZ");
+        SET(p_basic_ios_char_tie_set, "?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAPEAV?$basic_ostream@DU?$char_traits@D@std@@@2@PEAV32@@Z");
+        SET(p_ios_base_rdstate, "?rdstate@ios_base@std@@QEBAHXZ");
+        SET(p_basic_istream_char_ctor, "??0?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z");
+        SET(p_basic_istream_char_move_ctor, "??0?$basic_istream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z");
+        SET(p_basic_istream_char_op_assign, "??4?$basic_istream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z");
+        SET(p_basic_istream_char_vbase_dtor, "??_D?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAXXZ");
+        SET(p_basic_istream_char_get, "?get@?$basic_istream@DU?$char_traits@D@std@@@std@@QEAAHXZ");
+        SET(p_basic_istream_char_gcount, "?gcount@?$basic_istream@DU?$char_traits@D@std@@@std@@QEBA_JXZ");
+        SET(p_basic_ostream_char_ctor, "??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z");
+        SET(p_basic_ostream_char_move_ctor, "??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z");
+        SET(p_basic_ostream_char_op_assign, "??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z");
+        SET(p_basic_ostream_char_vbase_dtor, "??_D?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAAXXZ");
+        SET(p_basic_iostream_char_ctor, "??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z");
+        SET(p_basic_iostream_char_move_ctor, "??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z");
+        SET(p_basic_iostream_char_op_assign, "??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z");
+        SET(p_basic_iostream_char_vbase_dtor, "??_D?$basic_iostream@DU?$char_traits@D@std@@@std@@QEAAXXZ");
     } else {
 #ifdef __arm__
         SET(p_task_continuation_context_ctor, "??0task_continuation_context@Concurrency@@AAA@XZ");
@@ -426,6 +490,30 @@ static BOOL init(void)
         SET(p_codecvt_char16_dtor, "??1?$codecvt@_SDU_Mbstatet@@@std@@MAA@XZ(ptr)");
         SET(p_codecvt_char16_do_out, "?do_out@?$codecvt@_SDU_Mbstatet@@@std@@MBAHAAU_Mbstatet@@PB_S1AAPB_SPAD3AAPAD@Z");
         SET(p_codecvt_char16_do_in, "?do_in@?$codecvt@_SDU_Mbstatet@@@std@@MBAHAAU_Mbstatet@@PBD1AAPBDPA_S3AAPA_S@Z");
+
+        SET(p_basic_streambuf_char_ctor, "??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IAA@XZ");
+        SET(p_basic_streambuf_char_dtor, "??1?$basic_streambuf@DU?$char_traits@D@std@@@std@@UAA@XZ");
+        SET(p_basic_streambuf_char_setg, "?setg@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IAAXPAD00@Z");
+        SET(p_basic_ios_char_rdbuf_get, "?rdbuf@?$basic_ios@DU?$char_traits@D@std@@@std@@QBAPAV?$basic_streambuf@DU?$char_traits@D@std@@@2@XZ");
+        SET(p_basic_ios_char_fill_get, "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QBADXZ");
+        SET(p_basic_ios_char_fill_set, "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QAADD@Z");
+        SET(p_basic_ios_char_tie_get, "?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QBAPAV?$basic_ostream@DU?$char_traits@D@std@@@2@XZ");
+        SET(p_basic_ios_char_tie_set, "?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QAAPAV?$basic_ostream@DU?$char_traits@D@std@@@2@PAV32@@Z");
+        SET(p_ios_base_rdstate, "?rdstate@ios_base@std@@QBAHXZ");
+        SET(p_basic_istream_char_ctor, "??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z");
+        SET(p_basic_istream_char_move_ctor, "??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z");
+        SET(p_basic_istream_char_op_assign, "??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z");
+        SET(p_basic_istream_char_vbase_dtor, "??_D?$basic_istream@DU?$char_traits@D@std@@@std@@QAAXXZ");
+        SET(p_basic_istream_char_get, "?get@?$basic_istream@DU?$char_traits@D@std@@@std@@QAAHXZ");
+        SET(p_basic_istream_char_gcount, "?gcount@?$basic_istream@DU?$char_traits@D@std@@@std@@QBA_JXZ");
+        SET(p_basic_ostream_char_ctor, "??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z");
+        SET(p_basic_ostream_char_move_ctor, "??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z");
+        SET(p_basic_ostream_char_op_assign, "??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z");
+        SET(p_basic_ostream_char_vbase_dtor, "??_D?$basic_ostream@DU?$char_traits@D@std@@@std@@QAAXXZ");
+        SET(p_basic_iostream_char_ctor, "??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z");
+        SET(p_basic_iostream_char_move_ctor, "??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z");
+        SET(p_basic_iostream_char_op_assign, "??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z");
+        SET(p_basic_iostream_char_vbase_dtor, "??_D?$basic_iostream@DU?$char_traits@D@std@@@std@@QAAXXZ");
 #else
         SET(p_task_continuation_context_ctor, "??0task_continuation_context@Concurrency@@AAE@XZ");
         SET(p__ContextCallback__Assign, "?_Assign@_ContextCallback@details@Concurrency@@AAEXPAX@Z");
@@ -444,6 +532,30 @@ static BOOL init(void)
         SET(p_codecvt_char16_dtor, "??1?$codecvt@_SDU_Mbstatet@@@std@@MAE@XZ");
         SET(p_codecvt_char16_do_out, "?do_out@?$codecvt@_SDU_Mbstatet@@@std@@MBEHAAU_Mbstatet@@PB_S1AAPB_SPAD3AAPAD@Z");
         SET(p_codecvt_char16_do_in, "?do_in@?$codecvt@_SDU_Mbstatet@@@std@@MBEHAAU_Mbstatet@@PBD1AAPBDPA_S3AAPA_S@Z");
+
+        SET(p_basic_streambuf_char_ctor, "??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IAE@XZ");
+        SET(p_basic_streambuf_char_dtor, "??1?$basic_streambuf@DU?$char_traits@D@std@@@std@@UAE@XZ");
+        SET(p_basic_streambuf_char_setg, "?setg@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IAEXPAD00@Z");
+        SET(p_basic_ios_char_rdbuf_get, "?rdbuf@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEPAV?$basic_streambuf@DU?$char_traits@D@std@@@2@XZ");
+        SET(p_basic_ios_char_fill_get, "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEDXZ");
+        SET(p_basic_ios_char_fill_set, "?fill@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEDD@Z");
+        SET(p_basic_ios_char_tie_get, "?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEPAV?$basic_ostream@DU?$char_traits@D@std@@@2@XZ");
+        SET(p_basic_ios_char_tie_set, "?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEPAV?$basic_ostream@DU?$char_traits@D@std@@@2@PAV32@@Z");
+        SET(p_ios_base_rdstate, "?rdstate@ios_base@std@@QBEHXZ");
+        SET(p_basic_istream_char_ctor, "??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z");
+        SET(p_basic_istream_char_move_ctor, "??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z");
+        SET(p_basic_istream_char_op_assign, "??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z");
+        SET(p_basic_istream_char_vbase_dtor, "??_D?$basic_istream@DU?$char_traits@D@std@@@std@@QAEXXZ");
+        SET(p_basic_istream_char_get, "?get@?$basic_istream@DU?$char_traits@D@std@@@std@@QAEHXZ");
+        SET(p_basic_istream_char_gcount, "?gcount@?$basic_istream@DU?$char_traits@D@std@@@std@@QBE_JXZ");
+        SET(p_basic_ostream_char_ctor, "??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z");
+        SET(p_basic_ostream_char_move_ctor, "??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z");
+        SET(p_basic_ostream_char_op_assign, "??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z");
+        SET(p_basic_ostream_char_vbase_dtor, "??_D?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEXXZ");
+        SET(p_basic_iostream_char_ctor, "??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z");
+        SET(p_basic_iostream_char_move_ctor, "??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z");
+        SET(p_basic_iostream_char_op_assign, "??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z");
+        SET(p_basic_iostream_char_vbase_dtor, "??_D?$basic_iostream@DU?$char_traits@D@std@@@std@@QAEXXZ");
 #endif
         SET(p___ExceptionPtrSwap, "?__ExceptionPtrSwap@@YAXPAX0@Z");
         SET(p__Schedule_chore, "?_Schedule_chore@details@Concurrency@@YAHPAU_Threadpool_chore@12@@Z");
@@ -2482,6 +2594,116 @@ static void test_exception_pointer(void)
     ok(ptr2.ref == (void *)2, "ptr2.ref = %p\n", ptr2.ref);
 }
 
+/* basic_istream & co. inherit basic_ios virtually: the vbtable pointer is the
+ * first member, vbtable[1] the displacement of the basic_ios subobject. */
+#define GET_BASIC_IOS(obj) ((void*)((char*)(obj) + (*(const int**)(obj))[1]))
+
+static void check_ios(unsigned line, void *stream, void *rdbuf, int state, char fill, void *tie)
+{
+    void *ios = GET_BASIC_IOS(stream);
+    void *p;
+    int i;
+
+    p = call_func1(p_basic_ios_char_rdbuf_get, ios);
+    ok_(__FILE__, line)(p == rdbuf, "rdbuf() = %p, expected %p\n", p, rdbuf);
+    i = (int)(INT_PTR)call_func1(p_ios_base_rdstate, ios);
+    ok_(__FILE__, line)(i == state, "rdstate() = %#x, expected %#x\n", i, state);
+    i = (char)(INT_PTR)call_func1(p_basic_ios_char_fill_get, ios);
+    ok_(__FILE__, line)(i == fill, "fill() = %#x, expected %#x\n", i, fill);
+    p = call_func1(p_basic_ios_char_tie_get, ios);
+    ok_(__FILE__, line)(p == tie, "tie() = %p, expected %p\n", p, tie);
+}
+#define CHECK_IOS(s, rdbuf, state, fill, tie) check_ios(__LINE__, s, rdbuf, state, fill, tie)
+
+static void check_gcount(unsigned line, void *istream, int expect)
+{
+    int n = (int)(INT_PTR)call_func1(p_basic_istream_char_gcount, istream);
+    ok_(__FILE__, line)(n == expect, "gcount() = %d, expected %d\n", n, expect);
+}
+#define CHECK_GCOUNT(s, n) check_gcount(__LINE__, s, n)
+
+static void test_stream_move(void)
+{
+    /* large enough for any basic_*stream<char> on either architecture */
+    union { char buf[256]; void *align; } sb, is1, is2, os1, os2, ios1, ios2;
+    char data[] = "abc";
+    void *ret;
+    int c;
+
+    call_func1(p_basic_streambuf_char_ctor, &sb);
+    call_func4(p_basic_streambuf_char_setg, &sb, data, data, data + 3);
+    call_func4(p_basic_ostream_char_ctor, &os1, &sb, FALSE, TRUE);
+
+    /* basic_istream: the move constructor takes over everything but rdbuf() */
+    call_func4(p_basic_istream_char_ctor, &is1, &sb, FALSE, TRUE);
+    c = (int)(INT_PTR)call_func1(p_basic_istream_char_get, &is1);
+    ok(c == 'a', "get() = %d\n", c);
+    call_func2(p_basic_ios_char_fill_set, GET_BASIC_IOS(&is1), 'x');
+    call_func2(p_basic_ios_char_tie_set, GET_BASIC_IOS(&is1), &os1);
+    CHECK_IOS(&is1, &sb, IOSTATE_goodbit, 'x', &os1);
+    CHECK_GCOUNT(&is1, 1);
+
+    ret = call_func3(p_basic_istream_char_move_ctor, &is2, &is1, TRUE);
+    ok(ret == &is2, "ret = %p, expected %p\n", ret, &is2);
+    CHECK_IOS(&is2, NULL, IOSTATE_goodbit, 'x', &os1);
+    CHECK_GCOUNT(&is2, 1);
+    CHECK_IOS(&is1, &sb, IOSTATE_badbit, ' ', NULL);
+    CHECK_GCOUNT(&is1, 0);
+
+    /* the move assignment swaps everything but rdbuf() */
+    ret = call_func2(p_basic_istream_char_op_assign, &is1, &is2);
+    ok(ret == &is1, "ret = %p, expected %p\n", ret, &is1);
+    CHECK_IOS(&is1, &sb, IOSTATE_goodbit, 'x', &os1);
+    CHECK_GCOUNT(&is1, 1);
+    CHECK_IOS(&is2, NULL, IOSTATE_badbit, ' ', NULL);
+    CHECK_GCOUNT(&is2, 0);
+    c = (int)(INT_PTR)call_func1(p_basic_istream_char_get, &is1);
+    ok(c == 'b', "get() = %d\n", c);
+
+    call_func1(p_basic_istream_char_vbase_dtor, &is2);
+    call_func1(p_basic_istream_char_vbase_dtor, &is1);
+
+    /* basic_ostream */
+    call_func2(p_basic_ios_char_fill_set, GET_BASIC_IOS(&os1), 'y');
+    ret = call_func3(p_basic_ostream_char_move_ctor, &os2, &os1, TRUE);
+    ok(ret == &os2, "ret = %p, expected %p\n", ret, &os2);
+    CHECK_IOS(&os2, NULL, IOSTATE_goodbit, 'y', NULL);
+    CHECK_IOS(&os1, &sb, IOSTATE_badbit, ' ', NULL);
+
+    ret = call_func2(p_basic_ostream_char_op_assign, &os1, &os2);
+    ok(ret == &os1, "ret = %p, expected %p\n", ret, &os1);
+    CHECK_IOS(&os1, &sb, IOSTATE_goodbit, 'y', NULL);
+    CHECK_IOS(&os2, NULL, IOSTATE_badbit, ' ', NULL);
+
+    call_func1(p_basic_ostream_char_vbase_dtor, &os2);
+    call_func1(p_basic_ostream_char_vbase_dtor, &os1);
+
+    /* basic_iostream: gcount() is neither moved nor swapped */
+    call_func3(p_basic_iostream_char_ctor, &ios1, &sb, TRUE);
+    c = (int)(INT_PTR)call_func1(p_basic_istream_char_get, &ios1);
+    ok(c == 'c', "get() = %d\n", c);
+    CHECK_GCOUNT(&ios1, 1);
+    call_func2(p_basic_ios_char_fill_set, GET_BASIC_IOS(&ios1), 'z');
+
+    ret = call_func3(p_basic_iostream_char_move_ctor, &ios2, &ios1, TRUE);
+    ok(ret == &ios2, "ret = %p, expected %p\n", ret, &ios2);
+    CHECK_IOS(&ios2, NULL, IOSTATE_goodbit, 'z', NULL);
+    CHECK_GCOUNT(&ios2, 0);
+    CHECK_IOS(&ios1, &sb, IOSTATE_badbit, ' ', NULL);
+    CHECK_GCOUNT(&ios1, 1);
+
+    ret = call_func2(p_basic_iostream_char_op_assign, &ios1, &ios2);
+    ok(ret == &ios1, "ret = %p, expected %p\n", ret, &ios1);
+    CHECK_IOS(&ios1, &sb, IOSTATE_goodbit, 'z', NULL);
+    CHECK_GCOUNT(&ios1, 1);
+    CHECK_IOS(&ios2, NULL, IOSTATE_badbit, ' ', NULL);
+    CHECK_GCOUNT(&ios2, 0);
+
+    call_func1(p_basic_iostream_char_vbase_dtor, &ios2);
+    call_func1(p_basic_iostream_char_vbase_dtor, &ios1);
+    call_func1(p_basic_streambuf_char_dtor, &sb);
+}
+
 START_TEST(msvcp140)
 {
     if(!init()) return;
@@ -2514,5 +2736,6 @@ START_TEST(msvcp140)
     test_codecvt_char16();
     test_thread_library_reference();
     test_exception_pointer();
+    test_stream_move();
     FreeLibrary(msvcp);
 }

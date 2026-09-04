@@ -1153,10 +1153,513 @@ static HRESULT library_create( IUnknown *outer, REFIID iid, void **obj )
     return hr;
 }
 
+/***********************************************************************
+ *          IUIAnimationManager2
+ */
+struct manager2
+{
+    IUIAnimationManager2 IUIAnimationManager2_iface;
+    LONG ref;
+};
+
+static struct manager2 *impl_from_IUIAnimationManager2( IUIAnimationManager2 *iface )
+{
+    return CONTAINING_RECORD( iface, struct manager2, IUIAnimationManager2_iface );
+}
+
+static HRESULT WINAPI manager2_QueryInterface( IUIAnimationManager2 *iface, REFIID iid, void **obj )
+{
+    struct manager2 *This = impl_from_IUIAnimationManager2( iface );
+
+    TRACE( "(%p)->(%s %p)\n", This, debugstr_guid( iid ), obj );
+
+    if (IsEqualIID( iid, &IID_IUnknown ) ||
+        IsEqualIID( iid, &IID_IUIAnimationManager2 ))
+    {
+        IUIAnimationManager2_AddRef( iface );
+        *obj = iface;
+        return S_OK;
+    }
+
+    FIXME( "interface %s not implemented\n", debugstr_guid( iid ) );
+    *obj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI manager2_AddRef( IUIAnimationManager2 *iface )
+{
+    struct manager2 *This = impl_from_IUIAnimationManager2( iface );
+    ULONG ref = InterlockedIncrement( &This->ref );
+
+    TRACE( "(%p) ref = %lu\n", This, ref );
+    return ref;
+}
+
+static ULONG WINAPI manager2_Release( IUIAnimationManager2 *iface )
+{
+    struct manager2 *This = impl_from_IUIAnimationManager2( iface );
+    ULONG ref = InterlockedDecrement( &This->ref );
+
+    TRACE( "(%p) ref = %lu\n", This, ref );
+
+    if (!ref)
+        free( This );
+
+    return ref;
+}
+
+static HRESULT WINAPI manager2_CreateAnimationVectorVariable( IUIAnimationManager2 *iface,
+        double *initial_value, UINT32 dimension, IUIAnimationVariable2 **variable )
+{
+    FIXME( "stub (%p)->(%p %u %p)\n", iface, initial_value, dimension, variable );
+    if (variable) *variable = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI manager2_CreateAnimationVariable( IUIAnimationManager2 *iface,
+        double initial_value, IUIAnimationVariable2 **variable )
+{
+    FIXME( "stub (%p)->(%f %p)\n", iface, initial_value, variable );
+    if (variable) *variable = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI manager2_ScheduleTransition( IUIAnimationManager2 *iface,
+        IUIAnimationVariable2 *variable, IUIAnimationTransition2 *transition, DOUBLE time_now )
+{
+    FIXME( "stub (%p)->(%p %p %f)\n", iface, variable, transition, time_now );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI manager2_CreateStoryboard( IUIAnimationManager2 *iface,
+        IUIAnimationStoryboard2 **storyboard )
+{
+    FIXME( "stub (%p)->(%p)\n", iface, storyboard );
+    if (storyboard) *storyboard = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI manager2_FinishAllStoryboards( IUIAnimationManager2 *iface, DOUBLE deadline )
+{
+    FIXME( "stub (%p)->(%f)\n", iface, deadline );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI manager2_AbandonAllStoryboards( IUIAnimationManager2 *iface )
+{
+    FIXME( "stub (%p)\n", iface );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI manager2_Update( IUIAnimationManager2 *iface, DOUBLE time_now,
+        UI_ANIMATION_UPDATE_RESULT *result )
+{
+    FIXME( "stub (%p)->(%f %p)\n", iface, time_now, result );
+    if (result) *result = UI_ANIMATION_UPDATE_NO_CHANGE;
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_GetVariableFromTag( IUIAnimationManager2 *iface, IUnknown *object,
+        UINT32 id, IUIAnimationVariable2 **variable )
+{
+    FIXME( "stub (%p)->(%p %u %p)\n", iface, object, id, variable );
+    if (variable) *variable = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI manager2_GetStoryboardFromTag( IUIAnimationManager2 *iface, IUnknown *object,
+        UINT32 id, IUIAnimationStoryboard2 **storyboard )
+{
+    FIXME( "stub (%p)->(%p %u %p)\n", iface, object, id, storyboard );
+    if (storyboard) *storyboard = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI manager2_EstimateNextEventTime( IUIAnimationManager2 *iface, DOUBLE *seconds )
+{
+    FIXME( "stub (%p)->(%p)\n", iface, seconds );
+    if (seconds) *seconds = UI_ANIMATION_SECONDS_EVENTUALLY;
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_GetStatus( IUIAnimationManager2 *iface, UI_ANIMATION_MANAGER_STATUS *status )
+{
+    FIXME( "stub (%p)->(%p)\n", iface, status );
+    if (status) *status = UI_ANIMATION_MANAGER_IDLE;
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_SetAnimationMode( IUIAnimationManager2 *iface, UI_ANIMATION_MODE mode )
+{
+    FIXME( "stub (%p)->(%d)\n", iface, mode );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_Pause( IUIAnimationManager2 *iface )
+{
+    FIXME( "stub (%p)\n", iface );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_Resume( IUIAnimationManager2 *iface )
+{
+    FIXME( "stub (%p)\n", iface );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_SetManagerEventHandler( IUIAnimationManager2 *iface,
+        IUIAnimationManagerEventHandler2 *handler, LONG register_for_next_event )
+{
+    FIXME( "stub (%p)->(%p %ld)\n", iface, handler, register_for_next_event );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_SetCancelPriorityComparison( IUIAnimationManager2 *iface,
+        IUIAnimationPriorityComparison2 *comparison )
+{
+    FIXME( "stub (%p)->(%p)\n", iface, comparison );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_SetTrimPriorityComparison( IUIAnimationManager2 *iface,
+        IUIAnimationPriorityComparison2 *comparison )
+{
+    FIXME( "stub (%p)->(%p)\n", iface, comparison );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_SetCompressPriorityComparison( IUIAnimationManager2 *iface,
+        IUIAnimationPriorityComparison2 *comparison )
+{
+    FIXME( "stub (%p)->(%p)\n", iface, comparison );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_SetConcludePriorityComparison( IUIAnimationManager2 *iface,
+        IUIAnimationPriorityComparison2 *comparison )
+{
+    FIXME( "stub (%p)->(%p)\n", iface, comparison );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_SetDefaultLongestAcceptableDelay( IUIAnimationManager2 *iface, DOUBLE delay )
+{
+    FIXME( "stub (%p)->(%f)\n", iface, delay );
+    return S_OK;
+}
+
+static HRESULT WINAPI manager2_Shutdown( IUIAnimationManager2 *iface )
+{
+    FIXME( "stub (%p)\n", iface );
+    return S_OK;
+}
+
+static const struct IUIAnimationManager2Vtbl manager2_vtbl =
+{
+    manager2_QueryInterface,
+    manager2_AddRef,
+    manager2_Release,
+    manager2_CreateAnimationVectorVariable,
+    manager2_CreateAnimationVariable,
+    manager2_ScheduleTransition,
+    manager2_CreateStoryboard,
+    manager2_FinishAllStoryboards,
+    manager2_AbandonAllStoryboards,
+    manager2_Update,
+    manager2_GetVariableFromTag,
+    manager2_GetStoryboardFromTag,
+    manager2_EstimateNextEventTime,
+    manager2_GetStatus,
+    manager2_SetAnimationMode,
+    manager2_Pause,
+    manager2_Resume,
+    manager2_SetManagerEventHandler,
+    manager2_SetCancelPriorityComparison,
+    manager2_SetTrimPriorityComparison,
+    manager2_SetCompressPriorityComparison,
+    manager2_SetConcludePriorityComparison,
+    manager2_SetDefaultLongestAcceptableDelay,
+    manager2_Shutdown,
+};
+
+static HRESULT manager2_create( IUnknown *outer, REFIID iid, void **obj )
+{
+    struct manager2 *This = malloc( sizeof(*This) );
+    HRESULT hr;
+
+    if (!This) return E_OUTOFMEMORY;
+    This->IUIAnimationManager2_iface.lpVtbl = &manager2_vtbl;
+    This->ref = 1;
+
+    hr = IUIAnimationManager2_QueryInterface( &This->IUIAnimationManager2_iface, iid, obj );
+
+    IUIAnimationManager2_Release( &This->IUIAnimationManager2_iface );
+    return hr;
+}
+
+/***********************************************************************
+ *          IUIAnimationTransitionLibrary2
+ */
+struct tr_library2
+{
+    IUIAnimationTransitionLibrary2 IUIAnimationTransitionLibrary2_iface;
+    LONG ref;
+};
+
+static struct tr_library2 *impl_from_IUIAnimationTransitionLibrary2( IUIAnimationTransitionLibrary2 *iface )
+{
+    return CONTAINING_RECORD( iface, struct tr_library2, IUIAnimationTransitionLibrary2_iface );
+}
+
+static HRESULT WINAPI tr_library2_QueryInterface( IUIAnimationTransitionLibrary2 *iface, REFIID iid, void **obj )
+{
+    struct tr_library2 *This = impl_from_IUIAnimationTransitionLibrary2( iface );
+
+    TRACE( "(%p)->(%s %p)\n", This, debugstr_guid( iid ), obj );
+
+    if (IsEqualIID( iid, &IID_IUnknown ) ||
+        IsEqualIID( iid, &IID_IUIAnimationTransitionLibrary2 ))
+    {
+        IUIAnimationTransitionLibrary2_AddRef( iface );
+        *obj = iface;
+        return S_OK;
+    }
+
+    FIXME( "interface %s not implemented\n", debugstr_guid( iid ) );
+    *obj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI tr_library2_AddRef( IUIAnimationTransitionLibrary2 *iface )
+{
+    struct tr_library2 *This = impl_from_IUIAnimationTransitionLibrary2( iface );
+    ULONG ref = InterlockedIncrement( &This->ref );
+
+    TRACE( "(%p) ref = %lu\n", This, ref );
+    return ref;
+}
+
+static ULONG WINAPI tr_library2_Release( IUIAnimationTransitionLibrary2 *iface )
+{
+    struct tr_library2 *This = impl_from_IUIAnimationTransitionLibrary2( iface );
+    ULONG ref = InterlockedDecrement( &This->ref );
+
+    TRACE( "(%p) ref = %lu\n", This, ref );
+
+    if (!ref)
+        free( This );
+
+    return ref;
+}
+
+static HRESULT WINAPI tr_library2_CreateInstantaneousTransition( IUIAnimationTransitionLibrary2 *iface,
+        double final_value, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %p)\n", iface, final_value, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateInstantaneousVectorTransition( IUIAnimationTransitionLibrary2 *iface,
+        double *final_value, UINT32 dimension, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%p %u %p)\n", iface, final_value, dimension, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateConstantTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %p)\n", iface, duration, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateDiscreteTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE delay, double final_value, DOUBLE hold, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %f %p)\n", iface, delay, final_value, hold, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateDiscreteVectorTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE delay, double *final_value, UINT32 dimension, DOUBLE hold, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %p %u %f %p)\n", iface, delay, final_value, dimension, hold, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateLinearTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, double final_value, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %p)\n", iface, duration, final_value, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateLinearVectorTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, double *final_value, UINT32 dimension, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %p %u %p)\n", iface, duration, final_value, dimension, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateLinearTransitionFromSpeed( IUIAnimationTransitionLibrary2 *iface,
+        double speed, double final_value, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %p)\n", iface, speed, final_value, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateLinearVectorTransitionFromSpeed( IUIAnimationTransitionLibrary2 *iface,
+        double speed, double *final_value, UINT32 dimension, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %p %u %p)\n", iface, speed, final_value, dimension, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateSinusoidalTransitionFromVelocity( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, DOUBLE period, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %p)\n", iface, duration, period, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateSinusoidalTransitionFromRange( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, double minimum_value, double maximum_value, DOUBLE period,
+        UI_ANIMATION_SLOPE slope, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %f %f %d %p)\n", iface, duration, minimum_value, maximum_value,
+           period, slope, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateAccelerateDecelerateTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, double final_value, double acceleration_ratio, double deceleration_ratio,
+        IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %f %f %p)\n", iface, duration, final_value, acceleration_ratio,
+           deceleration_ratio, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateReversalTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %p)\n", iface, duration, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateCubicTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, double final_value, double final_velocity, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %f %p)\n", iface, duration, final_value, final_velocity, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateCubicVectorTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, double *final_value, double *final_velocity, UINT32 dimension,
+        IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %p %p %u %p)\n", iface, duration, final_value, final_velocity,
+           dimension, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateSmoothStopTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE maximum_duration, double final_value, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %p)\n", iface, maximum_duration, final_value, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateParabolicTransitionFromAcceleration( IUIAnimationTransitionLibrary2 *iface,
+        double final_value, double final_velocity, double acceleration, IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %f %p)\n", iface, final_value, final_velocity, acceleration, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateCubicBezierLinearTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, double final_value, double x1, double y1, double x2, double y2,
+        IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %f %f %f %f %f %p)\n", iface, duration, final_value, x1, y1, x2, y2, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI tr_library2_CreateCubicBezierLinearVectorTransition( IUIAnimationTransitionLibrary2 *iface,
+        DOUBLE duration, double *final_value, UINT32 dimension, double x1, double y1, double x2, double y2,
+        IUIAnimationTransition2 **transition )
+{
+    FIXME( "stub (%p)->(%f %p %u %f %f %f %f %p)\n", iface, duration, final_value, dimension,
+           x1, y1, x2, y2, transition );
+    if (transition) *transition = NULL;
+    return E_NOTIMPL;
+}
+
+static const struct IUIAnimationTransitionLibrary2Vtbl tr_library2_vtbl =
+{
+    tr_library2_QueryInterface,
+    tr_library2_AddRef,
+    tr_library2_Release,
+    tr_library2_CreateInstantaneousTransition,
+    tr_library2_CreateInstantaneousVectorTransition,
+    tr_library2_CreateConstantTransition,
+    tr_library2_CreateDiscreteTransition,
+    tr_library2_CreateDiscreteVectorTransition,
+    tr_library2_CreateLinearTransition,
+    tr_library2_CreateLinearVectorTransition,
+    tr_library2_CreateLinearTransitionFromSpeed,
+    tr_library2_CreateLinearVectorTransitionFromSpeed,
+    tr_library2_CreateSinusoidalTransitionFromVelocity,
+    tr_library2_CreateSinusoidalTransitionFromRange,
+    tr_library2_CreateAccelerateDecelerateTransition,
+    tr_library2_CreateReversalTransition,
+    tr_library2_CreateCubicTransition,
+    tr_library2_CreateCubicVectorTransition,
+    tr_library2_CreateSmoothStopTransition,
+    tr_library2_CreateParabolicTransitionFromAcceleration,
+    tr_library2_CreateCubicBezierLinearTransition,
+    tr_library2_CreateCubicBezierLinearVectorTransition,
+};
+
+static HRESULT library2_create( IUnknown *outer, REFIID iid, void **obj )
+{
+    struct tr_library2 *This = malloc( sizeof(*This) );
+    HRESULT hr;
+
+    if (!This) return E_OUTOFMEMORY;
+    This->IUIAnimationTransitionLibrary2_iface.lpVtbl = &tr_library2_vtbl;
+    This->ref = 1;
+
+    hr = IUIAnimationTransitionLibrary2_QueryInterface( &This->IUIAnimationTransitionLibrary2_iface, iid, obj );
+
+    IUIAnimationTransitionLibrary2_Release( &This->IUIAnimationTransitionLibrary2_iface );
+    return hr;
+}
+
 static struct class_factory manager_cf = { { &class_factory_vtbl }, manager_create };
 static struct class_factory timer_cf   = { { &class_factory_vtbl }, timer_create };
 static struct class_factory transition_cf = { { &class_factory_vtbl }, transition_create };
 static struct class_factory library_cf = { { &class_factory_vtbl }, library_create };
+static struct class_factory manager2_cf = { { &class_factory_vtbl }, manager2_create };
+static struct class_factory library2_cf = { { &class_factory_vtbl }, library2_create };
 
 /******************************************************************
  *             DllGetClassObject
@@ -1175,6 +1678,10 @@ HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID iid, void **obj )
         cf = &transition_cf.IClassFactory_iface;
     else if (IsEqualCLSID( clsid, &CLSID_UIAnimationTransitionLibrary ))
         cf = &library_cf.IClassFactory_iface;
+    else if (IsEqualCLSID( clsid, &CLSID_UIAnimationManager2 ))
+        cf = &manager2_cf.IClassFactory_iface;
+    else if (IsEqualCLSID( clsid, &CLSID_UIAnimationTransitionLibrary2 ))
+        cf = &library2_cf.IClassFactory_iface;
 
     if (!cf)
         return CLASS_E_CLASSNOTAVAILABLE;

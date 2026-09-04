@@ -5228,7 +5228,11 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (type & MEM_RESET)
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
+#ifdef MADV_FREE
+        else madvise( base, size, MADV_FREE );
+#else
         else madvise( base, size, MADV_DONTNEED );
+#endif
     }
     else  /* commit the pages */
     {

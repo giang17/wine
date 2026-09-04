@@ -2782,12 +2782,12 @@ static void STDMETHODCALLTYPE d3d11_device_context_UpdateSubresource1(ID3D11Devi
 static void STDMETHODCALLTYPE d3d11_device_context_DiscardResource(ID3D11DeviceContext4 *iface,
         ID3D11Resource *resource)
 {
-    FIXME("iface %p, resource %p stub!\n", iface, resource);
+    TRACE("iface %p, resource %p.\n", iface, resource);
 }
 
 static void STDMETHODCALLTYPE d3d11_device_context_DiscardView(ID3D11DeviceContext4 *iface, ID3D11View *view)
 {
-    FIXME("iface %p, view %p stub!\n", iface, view);
+    TRACE("iface %p, view %p.\n", iface, view);
 }
 
 static void STDMETHODCALLTYPE d3d11_device_context_VSSetConstantBuffers1(ID3D11DeviceContext4 *iface,
@@ -2968,7 +2968,7 @@ static void STDMETHODCALLTYPE d3d11_device_context_ClearView(ID3D11DeviceContext
 static void STDMETHODCALLTYPE d3d11_device_context_DiscardView1(ID3D11DeviceContext4 *iface, ID3D11View *view,
         const D3D11_RECT *rects, UINT num_rects)
 {
-    FIXME("iface %p, view %p, rects %p, num_rects %u stub!\n", iface, view, rects, num_rects);
+    TRACE("iface %p, view %p, rects %p, num_rects %u.\n", iface, view, rects, num_rects);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_device_context_UpdateTileMappings(ID3D11DeviceContext4 *iface,
@@ -3077,17 +3077,43 @@ static void STDMETHODCALLTYPE d3d11_device_context_GetHardwareProtectionState(ID
 static HRESULT STDMETHODCALLTYPE d3d11_device_context_Signal(ID3D11DeviceContext4 *iface,
         ID3D11Fence *fence, UINT64 value)
 {
-    FIXME("iface %p, fence %p, value %I64x stub!\n", iface, fence, value);
+    struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, fence %p, value %I64x.\n", iface, fence, value);
+
+    if (!fence)
+        return E_INVALIDARG;
+
+    if (context->type != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+    {
+        FIXME("Signal is not implemented for deferred contexts.\n");
+        return E_NOTIMPL;
+    }
+
+    /* The fence timeline is CPU-side: flush pending GPU work first, then
+     * advance the completed value directly. */
+    wined3d_device_context_flush(context->wined3d_context);
+
+    return d3d11_fence_signal(fence, value);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_device_context_Wait(ID3D11DeviceContext4 *iface,
         ID3D11Fence *fence, UINT64 value)
 {
-    FIXME("iface %p, fence %p, value %I64x stub!\n", iface, fence, value);
+    struct d3d11_device_context *context = impl_from_ID3D11DeviceContext4(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, fence %p, value %I64x.\n", iface, fence, value);
+
+    if (!fence)
+        return E_INVALIDARG;
+
+    if (context->type != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+    {
+        FIXME("Wait is not implemented for deferred contexts.\n");
+        return E_NOTIMPL;
+    }
+
+    return d3d11_fence_wait(fence, value);
 }
 
 static const struct ID3D11DeviceContext4Vtbl d3d11_device_context_vtbl =
@@ -5410,18 +5436,26 @@ static void STDMETHODCALLTYPE d3d11_device_UnregisterDeviceRemoved(ID3D11Device5
 static HRESULT STDMETHODCALLTYPE d3d11_device_OpenSharedFence(ID3D11Device5 *iface, HANDLE handle,
         REFIID iid, void **fence)
 {
-    FIXME("iface %p, handle %p, iid %s, fence %p stub!\n", iface, handle, debugstr_guid(iid), fence);
+    TRACE("iface %p, handle %p, iid %s, fence %p.\n", iface, handle, debugstr_guid(iid), fence);
 
-    return E_NOTIMPL;
+    if (!fence)
+        return E_INVALIDARG;
+
+    /* The opened fence keeps its creating device; sharing state is what
+     * matters for our in-process consumers. */
+    return d3d11_fence_open_shared(handle, iid, fence);
 }
 
 static HRESULT STDMETHODCALLTYPE d3d11_device_CreateFence(ID3D11Device5 *iface, UINT64 initial_value,
         D3D11_FENCE_FLAG flags, REFIID iid, void **fence)
 {
-    FIXME("iface %p, initial_value %I64x, flags %d, iid %s, fence %p stub!\n", iface, initial_value,
+    TRACE("iface %p, initial_value %I64x, flags %#x, iid %s, fence %p.\n", iface, initial_value,
             flags, debugstr_guid(iid), fence);
 
-    return E_NOTIMPL;
+    if (!fence)
+        return E_INVALIDARG;
+
+    return d3d11_fence_create(iface, initial_value, flags, iid, fence);
 }
 
 static const struct ID3D11Device5Vtbl d3d11_device_vtbl =

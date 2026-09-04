@@ -1686,6 +1686,12 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
     if (ret == -1) return ret;
     *attr |= get_file_attributes( st );
     if (reparse_tag) *reparse_tag = 0;
+    /* a bound AF_UNIX socket is a reparse point on Windows */
+    if (S_ISSOCK( st->st_mode ))
+    {
+        *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+        if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
+    }
     /* consider mount points to be reparse points (IO_REPARSE_TAG_MOUNT_POINT) */
     if (options & FILE_OPEN_REPARSE_POINT)
     {
@@ -1794,6 +1800,12 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
         }
+    }
+    /* a bound AF_UNIX socket is a reparse point on Windows */
+    else if (S_ISSOCK( st->st_mode ))
+    {
+        *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+        if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
     }
     else if (S_ISDIR( st->st_mode ) && (parent_path = malloc( len + 4 )))
     {
@@ -4911,7 +4923,7 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
 
         if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
             status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
             fill_file_info( &st, attributes, info, FileNetworkOpenInformation );
@@ -4940,7 +4952,7 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
 
         if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
             status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
             status = fill_file_info( &st, attributes, info, FileBasicInformation );
@@ -5070,7 +5082,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     case FileBasicInformation:
         if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
             status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
             fill_file_info( &st, attr, ptr, class );
@@ -5177,7 +5189,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     case FileStatInformation:
         if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag ) == -1)
             status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
         {

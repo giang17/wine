@@ -17,6 +17,9 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
+#include <stdlib.h>
+#include <string.h>
+
 #include "winsock2.h"
 #include "winternl.h"
 #include "ws2ipdef.h"
@@ -25,6 +28,7 @@
 #include "iptypes.h"
 #include "netiodef.h"
 #include "wine/nsi.h"
+#include "wine/list.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(nsi);
@@ -61,6 +65,127 @@ static inline HANDLE get_nsi_device( BOOL async )
             CloseHandle( device );
     }
     return *cached_device;
+}
+
+/* Short-lived memo cache for the static-ish tables.
+ *
+ * Every NSI request is a round trip into nsiproxy.sys, which lives in a
+ * winedevice.exe process, so even a trivial lookup like luid -> index costs
+ * ~30 us here (a syscall on Windows). Applications that poll interface data
+ * in tight loops pay seconds for that: JUCE's MACAddress::findAllAddresses()
+ * issues ~40 requests per call, and the KORG Collection engines call it
+ * hundreds of times while they start up. Interface, address and route
+ * tables change rarely, so answering an identical request again within a
+ * few milliseconds from the last reply is invisible to the application.
+ *
+ * WINE_NSI_CACHE_MS sets the lifetime in ms (default 20, 0 disables). */
+
+enum cache_kind { CACHE_ENUMERATE, CACHE_GET_ALL, CACHE_GET_PARAMETER };
+
+struct cache_entry
+{
+    struct list entry;
+    ULONGLONG stamp;
+    enum cache_kind kind;
+    DWORD err;
+    DWORD req_size;
+    DWORD out_size;
+    BYTE data[1]; /* req_size request bytes followed by out_size reply bytes */
+};
+
+#define CACHE_MAX_ENTRIES 64
+
+static struct list cache_list = LIST_INIT( cache_list );
+static unsigned int cache_count;
+static DWORD cache_ttl = ~0u;
+
+static CRITICAL_SECTION cache_cs;
+static CRITICAL_SECTION_DEBUG cache_cs_debug =
+{
+    0, 0, &cache_cs,
+    { &cache_cs_debug.ProcessLocksList, &cache_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": cache_cs") }
+};
+static CRITICAL_SECTION cache_cs = { &cache_cs_debug, -1, 0, 0, 0, 0 };
+
+static DWORD get_cache_ttl( void )
+{
+    if (cache_ttl == ~0u)
+    {
+        char buf[16];
+        DWORD ttl = 20;
+        if (GetEnvironmentVariableA( "WINE_NSI_CACHE_MS", buf, sizeof(buf) )) ttl = atoi( buf );
+        cache_ttl = ttl;
+    }
+    return cache_ttl;
+}
+
+static BOOL cacheable_table( const NPI_MODULEID *module, DWORD table )
+{
+    if (!get_cache_ttl()) return FALSE;
+    if (!memcmp( module, &NPI_MS_NDIS_MODULEID, sizeof(*module) ))
+        return table == NSI_NDIS_IFINFO_TABLE || table == NSI_NDIS_INDEX_LUID_TABLE;
+    if (!memcmp( module, &NPI_MS_IPV4_MODULEID, sizeof(*module) ) ||
+        !memcmp( module, &NPI_MS_IPV6_MODULEID, sizeof(*module) ))
+        return table == NSI_IP_UNICAST_TABLE || table == NSI_IP_FORWARD_TABLE;
+    return FALSE;
+}
+
+/* Returns TRUE and copies the reply into out on a fresh hit. Expired entries are dropped on the way. */
+static BOOL cache_lookup( enum cache_kind kind, const void *req, DWORD req_size, void *out, DWORD out_size, DWORD *err )
+{
+    struct cache_entry *e, *next;
+    ULONGLONG now = GetTickCount64();
+    DWORD ttl = get_cache_ttl();
+    BOOL found = FALSE;
+
+    EnterCriticalSection( &cache_cs );
+    LIST_FOR_EACH_ENTRY_SAFE( e, next, &cache_list, struct cache_entry, entry )
+    {
+        if (now - e->stamp > ttl)
+        {
+            list_remove( &e->entry );
+            cache_count--;
+            free( e );
+            continue;
+        }
+        if (e->kind == kind && e->req_size == req_size && e->out_size == out_size && !memcmp( e->data, req, req_size ))
+        {
+            memcpy( out, e->data + req_size, out_size );
+            *err = e->err;
+            found = TRUE;
+            break;
+        }
+    }
+    LeaveCriticalSection( &cache_cs );
+    if (found) TRACE( "cache hit kind %u size %lu\n", kind, out_size );
+    return found;
+}
+
+static void cache_store( enum cache_kind kind, const void *req, DWORD req_size, const void *out, DWORD out_size, DWORD err )
+{
+    struct cache_entry *e = malloc( FIELD_OFFSET( struct cache_entry, data[req_size + out_size] ) );
+
+    if (!e) return;
+    e->stamp = GetTickCount64();
+    e->kind = kind;
+    e->err = err;
+    e->req_size = req_size;
+    e->out_size = out_size;
+    memcpy( e->data, req, req_size );
+    memcpy( e->data + req_size, out, out_size );
+
+    EnterCriticalSection( &cache_cs );
+    if (cache_count >= CACHE_MAX_ENTRIES)
+    {
+        struct cache_entry *old = LIST_ENTRY( list_tail( &cache_list ), struct cache_entry, entry );
+        list_remove( &old->entry );
+        cache_count--;
+        free( old );
+    }
+    list_add_head( &cache_list, &e->entry );
+    cache_count++;
+    LeaveCriticalSection( &cache_cs );
 }
 
 DWORD WINAPI NsiAllocateAndGetTable( DWORD unk, const NPI_MODULEID *module, DWORD table, void **key_data, DWORD key_size,
@@ -167,6 +292,7 @@ DWORD WINAPI NsiEnumerateObjectsAllParametersEx( struct nsi_enumerate_all_ex *pa
     HANDLE device = get_nsi_device( FALSE );
     struct nsiproxy_enumerate_all in;
     BYTE *out, *ptr;
+    BOOL use_cache = cacheable_table( params->module, params->table );
 
     if (device == INVALID_HANDLE_VALUE) return GetLastError();
 
@@ -176,6 +302,7 @@ DWORD WINAPI NsiEnumerateObjectsAllParametersEx( struct nsi_enumerate_all_ex *pa
     out = malloc( out_size );
     if (!out) return ERROR_OUTOFMEMORY;
 
+    memset( &in, 0, sizeof(in) );
     in.module = *params->module;
     in.first_arg = params->first_arg;
     in.second_arg = params->second_arg;
@@ -186,8 +313,13 @@ DWORD WINAPI NsiEnumerateObjectsAllParametersEx( struct nsi_enumerate_all_ex *pa
     in.static_size = params->static_size;
     in.count = params->count;
 
-    if (!DeviceIoControl( device, IOCTL_NSIPROXY_WINE_ENUMERATE_ALL, &in, sizeof(in), out, out_size, &received, NULL ))
-        err = GetLastError();
+    if (!use_cache || !cache_lookup( CACHE_ENUMERATE, &in, sizeof(in), out, out_size, &err ))
+    {
+        if (!DeviceIoControl( device, IOCTL_NSIPROXY_WINE_ENUMERATE_ALL, &in, sizeof(in), out, out_size, &received, NULL ))
+            err = GetLastError();
+        if (use_cache && (err == ERROR_SUCCESS || err == ERROR_MORE_DATA))
+            cache_store( CACHE_ENUMERATE, &in, sizeof(in), out, out_size, err );
+    }
     if (err == ERROR_SUCCESS || err == ERROR_MORE_DATA)
     {
         params->count = *(DWORD *)out;
@@ -250,10 +382,11 @@ DWORD WINAPI NsiGetAllParametersEx( struct nsi_get_all_parameters_ex *params )
     ULONG out_size = params->rw_size + params->dynamic_size + params->static_size;
     DWORD err = ERROR_SUCCESS;
     BYTE *out, *ptr;
+    BOOL use_cache = cacheable_table( params->module, params->table );
 
     if (device == INVALID_HANDLE_VALUE) return GetLastError();
 
-    in = malloc( in_size );
+    in = calloc( 1, in_size );
     out = malloc( out_size );
     if (!in || !out)
     {
@@ -270,8 +403,12 @@ DWORD WINAPI NsiGetAllParametersEx( struct nsi_get_all_parameters_ex *params )
     in->static_size = params->static_size;
     memcpy( in->key, params->key, params->key_size );
 
-    if (!DeviceIoControl( device, IOCTL_NSIPROXY_WINE_GET_ALL_PARAMETERS, in, in_size, out, out_size, &received, NULL ))
-        err = GetLastError();
+    if (!use_cache || !cache_lookup( CACHE_GET_ALL, in, in_size, out, out_size, &err ))
+    {
+        if (!DeviceIoControl( device, IOCTL_NSIPROXY_WINE_GET_ALL_PARAMETERS, in, in_size, out, out_size, &received, NULL ))
+            err = GetLastError();
+        if (use_cache && err == ERROR_SUCCESS) cache_store( CACHE_GET_ALL, in, in_size, out, out_size, err );
+    }
     if (err == ERROR_SUCCESS)
     {
         ptr = out;
@@ -317,10 +454,11 @@ DWORD WINAPI NsiGetParameterEx( struct nsi_get_parameter_ex *params )
     struct nsiproxy_get_parameter *in;
     ULONG in_size = FIELD_OFFSET( struct nsiproxy_get_parameter, key[params->key_size] ), received;
     DWORD err = ERROR_SUCCESS;
+    BOOL use_cache = cacheable_table( params->module, params->table );
 
     if (device == INVALID_HANDLE_VALUE) return GetLastError();
 
-    in = malloc( in_size );
+    in = calloc( 1, in_size );
     if (!in) return ERROR_OUTOFMEMORY;
     in->module = *params->module;
     in->first_arg = params->first_arg;
@@ -330,8 +468,13 @@ DWORD WINAPI NsiGetParameterEx( struct nsi_get_parameter_ex *params )
     in->data_offset = params->data_offset;
     memcpy( in->key, params->key, params->key_size );
 
-    if (!DeviceIoControl( device, IOCTL_NSIPROXY_WINE_GET_PARAMETER, in, in_size, params->data, params->data_size, &received, NULL ))
-        err = GetLastError();
+    if (!use_cache || !cache_lookup( CACHE_GET_PARAMETER, in, in_size, params->data, params->data_size, &err ))
+    {
+        if (!DeviceIoControl( device, IOCTL_NSIPROXY_WINE_GET_PARAMETER, in, in_size, params->data, params->data_size, &received, NULL ))
+            err = GetLastError();
+        if (use_cache && err == ERROR_SUCCESS)
+            cache_store( CACHE_GET_PARAMETER, in, in_size, params->data, params->data_size, err );
+    }
 
     free( in );
     return err;

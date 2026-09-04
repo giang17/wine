@@ -170,6 +170,17 @@ HRESULT dxgi_adapter_create(struct dxgi_factory *factory, UINT ordinal,
         struct dxgi_adapter **adapter);
 struct dxgi_adapter *unsafe_impl_from_IDXGIAdapter(IDXGIAdapter *iface);
 
+/* DComp composition reblit timer IDs, shared between factory.c (set/handle)
+ * and swapchain.c (kill on teardown). */
+#define DCOMP_REBLIT_TIMER_ID 0xDC01
+#define DCOMP_POPUP_REBLIT_TIMER_ID 0xDC02
+
+/* Count of currently subclassed DComp target windows (defined in factory.c).
+ * Controls full-vs-popup mode; d3d11_swapchain_Release() decrements it when it
+ * un-subclasses a target on its own UI thread. */
+extern LONG dcomp_subclassed_target_count;
+extern void dcomp_swapchain_subclass_teardown(HWND hwnd);
+
 /* IDXGISwapChain */
 struct d3d11_swapchain
 {
@@ -185,6 +196,13 @@ struct d3d11_swapchain
     IDXGIOutput *target;
     LONG present_count;
     LONG in_set_fullscreen_state;
+    DXGI_ALPHA_MODE alpha_mode;
+
+    /* DComp composition-swapchain teardown bookkeeping (see d3d11_swapchain_Release).
+     * Each composition swapchain owns one comp_wnd and subclasses at most one
+     * target window (verified 1:1 — every popup gets its own swapchain). */
+    HWND comp_wnd;
+    HWND target_hwnd;
 };
 
 HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_device *device,

@@ -203,6 +203,32 @@ static Cursor get_empty_cursor(void)
 }
 
 /***********************************************************************
+ *		get_default_cursor
+ *
+ * Return a shared visible arrow cursor used as the initial cursor for newly
+ * created windows.  Without it a window keeps the X11 default of inheriting
+ * its parent's cursor; this breaks for cross-process embedded surfaces (e.g.
+ * WebView2/Chromium content windows) which never call SetCursor and whose
+ * inheritance chain to the owner window is severed once the window manager
+ * reparents the toplevel into a frame, leaving the cursor blank.
+ */
+Cursor get_default_cursor(void)
+{
+    static Cursor cursor;
+
+    if (!cursor)
+    {
+        Cursor new = XCreateFontCursor( gdi_display, XC_left_ptr );
+        /* flush so the cursor is known to the server before another display
+           connection (create_whole_window uses data->display) references it */
+        XFlush( gdi_display );
+        if (InterlockedCompareExchangePointer( (void **)&cursor, (void *)new, 0 ))
+            XFreeCursor( gdi_display, new );
+    }
+    return cursor;
+}
+
+/***********************************************************************
  *		set_window_cursor
  */
 static void set_window_cursor( Window window, HCURSOR handle )
@@ -439,6 +465,11 @@ void x11drv_xinput2_init( struct x11drv_thread_data *data )
  *
  * Start a pointer grab on the clip window.
  */
+static int clip_window_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->error_code == BadWindow);
+}
+
 static BOOL grab_clipping_window( const RECT *clip )
 {
 #ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
@@ -469,11 +500,20 @@ static BOOL grab_clipping_window( const RECT *clip )
 
     TRACE( "clipping to %s win %lx\n", wine_dbgstr_rect(clip), clip_window );
 
+    /* as in ungrab_clipping_window: the clip window can be destroyed under us
+     * when its desktop goes away, and an unhandled BadWindow would be fatal */
+    X11DRV_expect_error( data->display, clip_window_error, NULL );
     if (!data->clipping_cursor) XUnmapWindow( data->display, clip_window );
     pos = virtual_screen_to_root( clip->left, clip->top );
     XMoveResizeWindow( data->display, clip_window, pos.x, pos.y,
                        max( 1, clip->right - clip->left ), max( 1, clip->bottom - clip->top ) );
     XMapWindow( data->display, clip_window );
+    XSync( data->display, False );
+    if (X11DRV_check_error())
+    {
+        WARN( "clipping window %lx already destroyed\n", clip_window );
+        return FALSE;
+    }
 
     /* if the rectangle is shrinking we may get a pointer warp */
     if (!data->clipping_cursor || clip->left > clip_rect.left || clip->top > clip_rect.top ||
@@ -519,7 +559,13 @@ void ungrab_clipping_window(void)
     if (!clip_window) return;
 
     TRACE( "no longer clipping\n" );
+    /* the clip window belongs to the desktop window and can already be gone
+     * when a desktop is torn down (virtual desktop switch), and an unhandled
+     * BadWindow here would be fatal */
+    X11DRV_expect_error( data->display, clip_window_error, NULL );
     XUnmapWindow( data->display, clip_window );
+    XSync( data->display, False );
+    if (X11DRV_check_error()) WARN( "clipping window %lx already destroyed\n", clip_window );
     if (clipping_cursor) XUngrabPointer( data->display, CurrentTime );
     clipping_cursor = FALSE;
     data->clipping_cursor = FALSE;

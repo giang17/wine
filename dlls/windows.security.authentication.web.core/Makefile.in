@@ -1,0 +1,9 @@
+MODULE  = windows.security.authentication.web.core.dll
+IMPORTS = combase
+
+SOURCES = \
+	async.c \
+	async_private.idl \
+	classes.idl \
+	main.c \
+	manager.c

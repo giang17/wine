@@ -91,6 +91,8 @@ static ULONG STDMETHODCALLTYPE d2d_bitmap_Release(ID2D1Bitmap1 *iface)
             ID3D11RenderTargetView_Release(bitmap->rtv);
         if (bitmap->surface)
             IDXGISurface_Release(bitmap->surface);
+        if (bitmap->color_context)
+            ID2D1ColorContext_Release(bitmap->color_context);
         ID3D11Resource_Release(bitmap->resource);
         ID2D1Factory_Release(bitmap->factory);
         free(bitmap);
@@ -249,7 +251,12 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromMemory(ID2D1Bitmap1 *iface,
 
 static void STDMETHODCALLTYPE d2d_bitmap_GetColorContext(ID2D1Bitmap1 *iface, ID2D1ColorContext **context)
 {
-    FIXME("iface %p, context %p stub!\n", iface, context);
+    struct d2d_bitmap *bitmap = impl_from_ID2D1Bitmap1(iface);
+
+    TRACE("iface %p, context %p.\n", iface, context);
+
+    if ((*context = bitmap->color_context))
+        ID2D1ColorContext_AddRef(*context);
 }
 
 static D2D1_BITMAP_OPTIONS STDMETHODCALLTYPE d2d_bitmap_GetOptions(ID2D1Bitmap1 *iface)
@@ -407,6 +414,8 @@ static void d2d_bitmap_init(struct d2d_bitmap *bitmap, struct d2d_device_context
     bitmap->dpi_x = desc->dpiX;
     bitmap->dpi_y = desc->dpiY;
     bitmap->options = desc->bitmapOptions;
+    if (desc->colorContext)
+        ID2D1ColorContext_AddRef(bitmap->color_context = desc->colorContext);
 
     if (d2d_device_context_is_dxgi_target(context))
         ID3D11Resource_QueryInterface(resource, &IID_IDXGISurface, (void **)&bitmap->surface);
@@ -761,7 +770,9 @@ HRESULT d2d_bitmap_create_from_wic_bitmap(struct d2d_device_context *context, IW
     switch (bitmap_desc.pixelFormat.format)
     {
         case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
         case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
             bpp = 4;
             break;
 

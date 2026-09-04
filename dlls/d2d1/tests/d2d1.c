@@ -9869,6 +9869,69 @@ static void test_bezier_intersect(BOOL d3d11)
     release_test_context(&ctx);
 }
 
+static void test_bezier_non_finite(BOOL d3d11)
+{
+    D2D1_QUADRATIC_BEZIER_SEGMENT quadratic;
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    ID2D1Factory *factory;
+    D2D1_POINT_2F point;
+    unsigned int i;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* Closing these figures used to hang: resolving overlapping Bézier control
+     * triangles subdivides the curves involved until they no longer overlap,
+     * but the area of these control triangles is not a finite number, so the
+     * overlap test never stopped reporting an overlap. */
+    static const struct
+    {
+        const char *name;
+        float x1, y1, x2, y2;
+        float x3, y3, x4, y4;
+    }
+    tests[] =
+    {
+        {"NaN endpoint", 10.0f, 20.0f, NAN, NAN, -20.0f, 5.0f, 0.0f, 0.0f},
+        {"NaN control point", NAN, 0.0f, 100.0f, 0.0f, -200.0f, 50.0f, 0.0f, 0.0f},
+        {"infinite control point", INFINITY, 0.0f, 100.0f, 0.0f, -200.0f, 50.0f, 0.0f, 0.0f},
+        /* The area overflows to infinity even though every coordinate is finite. */
+        {"area overflow", 3.0e30f, 1.0e30f, 1.0e30f, 0.0f, -2.0e30f, 1.0e30f, 0.0f, 0.0f},
+    };
+
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("%s", tests[i].name);
+
+        hr = ID2D1Factory_CreatePathGeometry(factory, &geometry);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        hr = ID2D1PathGeometry_Open(geometry, &sink);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        set_point(&point, 0.0f, 0.0f);
+        ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+        set_quadratic(&quadratic, tests[i].x1, tests[i].y1, tests[i].x2, tests[i].y2);
+        ID2D1GeometrySink_AddQuadraticBezier(sink, &quadratic);
+        set_quadratic(&quadratic, tests[i].x3, tests[i].y3, tests[i].x4, tests[i].y4);
+        ID2D1GeometrySink_AddQuadraticBezier(sink, &quadratic);
+        ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+        hr = ID2D1GeometrySink_Close(sink);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        ID2D1GeometrySink_Release(sink);
+        ID2D1PathGeometry_Release(geometry);
+
+        winetest_pop_context();
+    }
+
+    refcount = ID2D1Factory_Release(factory);
+    ok(!refcount, "Factory has %lu references left.\n", refcount);
+}
+
 static void test_create_device(BOOL d3d11)
 {
     D2D1_CREATION_PROPERTIES properties = {0};
@@ -13720,6 +13783,124 @@ static void test_effect_grayscale(BOOL d3d11)
     release_test_context(&ctx);
 }
 
+static void test_effect_color_management(BOOL d3d11)
+{
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    DWORD colour, expected_colour;
+    struct d2d1_test_context ctx;
+    struct resource_readback rb;
+    ID2D1DeviceContext *context;
+    D2D1_SIZE_U input_size;
+    ID2D1Bitmap1 *bitmap;
+    ID2D1Effect *effect;
+    ID2D1Image *output;
+    DWORD srgb_pixel;
+    unsigned int i;
+    WORD pixel[4];
+    HRESULT hr;
+
+    /* Half precision floating point encodings of linear (scRGB) grey levels,
+     * with the corresponding sRGB encoded value:
+     * srgb(c) = c <= 0.0031308 ? 12.92 * c : 1.055 * c^(1/2.4) - 0.055 */
+    static const struct
+    {
+        WORD linear;
+        BYTE srgb;
+    }
+    tests[] =
+    {
+        {0x0000,   0}, /* 0.0  -> 0.0    */
+        {0x3400, 137}, /* 0.25 -> 0.5372 */
+        {0x3800, 188}, /* 0.5  -> 0.7354 */
+        {0x3a00, 225}, /* 0.75 -> 0.8808 */
+        {0x3c00, 255}, /* 1.0  -> 1.0    */
+    };
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    context = ctx.context;
+
+    hr = ID2D1DeviceContext_CreateEffect(context, &CLSID_D2D1ColorManagement, &effect);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* A floating point source is scRGB, i.e. linear. Drawing it to the 8 bits
+     * per channel unsigned normalised target encodes it as sRGB. */
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("Test %u", i);
+
+        pixel[0] = pixel[1] = pixel[2] = tests[i].linear;
+        pixel[3] = 0x3c00;
+
+        set_size_u(&input_size, 1, 1);
+        bitmap_desc.pixelFormat.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+        bitmap_desc.dpiX = 96.0f;
+        bitmap_desc.dpiY = 96.0f;
+        bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+        bitmap_desc.colorContext = NULL;
+        hr = ID2D1DeviceContext_CreateBitmap(context, input_size, pixel, sizeof(pixel), &bitmap_desc, &bitmap);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        ID2D1Effect_SetInput(effect, 0, (ID2D1Image *)bitmap, FALSE);
+        ID2D1Effect_GetOutput(effect, &output);
+
+        ID2D1DeviceContext_BeginDraw(context);
+        ID2D1DeviceContext_Clear(context, 0);
+        ID2D1DeviceContext_DrawImage(context, output, NULL, NULL, 0, 0);
+        hr = ID2D1DeviceContext_EndDraw(context, NULL, NULL);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        get_surface_readback(&ctx, &rb);
+        colour = get_readback_colour(&rb, 0, 0);
+        expected_colour = 0xff000000 | (tests[i].srgb << 16) | (tests[i].srgb << 8) | tests[i].srgb;
+        ok(compare_colour(colour, expected_colour, 1),
+                "Got unexpected colour %#lx, expected %#lx.\n", colour, expected_colour);
+        release_resource_readback(&rb);
+
+        ID2D1Image_Release(output);
+        ID2D1Bitmap1_Release(bitmap);
+        winetest_pop_context();
+    }
+
+    /* An 8 bits per channel unsigned normalised source is already sRGB encoded
+     * and has to be passed through unchanged. */
+    srgb_pixel = 0xff804020;
+
+    set_size_u(&input_size, 1, 1);
+    bitmap_desc.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bitmap_desc.dpiX = 96.0f;
+    bitmap_desc.dpiY = 96.0f;
+    bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
+    bitmap_desc.colorContext = NULL;
+    hr = ID2D1DeviceContext_CreateBitmap(context, input_size, &srgb_pixel,
+            sizeof(srgb_pixel), &bitmap_desc, &bitmap);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    ID2D1Effect_SetInput(effect, 0, (ID2D1Image *)bitmap, FALSE);
+    ID2D1Effect_GetOutput(effect, &output);
+
+    ID2D1DeviceContext_BeginDraw(context);
+    ID2D1DeviceContext_Clear(context, 0);
+    ID2D1DeviceContext_DrawImage(context, output, NULL, NULL, 0, 0);
+    hr = ID2D1DeviceContext_EndDraw(context, NULL, NULL);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    get_surface_readback(&ctx, &rb);
+    colour = get_readback_colour(&rb, 0, 0);
+    ok(compare_colour(colour, srgb_pixel, 1),
+            "Got unexpected colour %#lx, expected %#lx.\n", colour, srgb_pixel);
+    release_resource_readback(&rb);
+
+    ID2D1Image_Release(output);
+    ID2D1Bitmap1_Release(bitmap);
+
+    ID2D1Effect_Release(effect);
+    release_test_context(&ctx);
+}
+
 static void test_effect_gaussian_blur(BOOL d3d11)
 {
     static const struct effect_property properties[] =
@@ -15471,6 +15652,247 @@ static void test_image_bounds(BOOL d3d11)
     release_test_context(&ctx);
 }
 
+static void test_stroke_contains_point_dashed(BOOL d3d11)
+{
+    /* Stroke width 10 with a 2/2 dash pattern paints [0,20), skips [20,40),
+     * paints [40,60) and so on — dash lengths are multiples of the width. */
+    static const struct
+    {
+        float x;
+        BOOL solid;
+        BOOL dashed;
+        BOOL offset;
+        const char *where;
+    }
+    tests[] =
+    {
+        { 10.0f, TRUE,  TRUE,  FALSE, "erster Strich" },
+        { 30.0f, TRUE,  FALSE, TRUE,  "erste Luecke" },
+        { 50.0f, TRUE,  TRUE,  FALSE, "zweiter Strich" },
+        { 70.0f, TRUE,  FALSE, TRUE,  "zweite Luecke" },
+        { 90.0f, TRUE,  TRUE,  FALSE, "dritter Strich" },
+    };
+    D2D1_STROKE_STYLE_PROPERTIES stroke_desc;
+    ID2D1StrokeStyle *dashed = NULL, *shifted = NULL;
+    struct d2d1_test_context ctx;
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    unsigned int i;
+    D2D1_POINT_2F p;
+    BOOL contains;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(geometry, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* A straight horizontal line from (0,0) to (100,0). */
+    set_point(&p, 0.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, p, D2D1_FIGURE_BEGIN_HOLLOW);
+    set_point(&p, 100.0f, 0.0f);
+    ID2D1GeometrySink_AddLine(sink, p);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    stroke_desc.startCap = D2D1_CAP_STYLE_FLAT;
+    stroke_desc.endCap = D2D1_CAP_STYLE_FLAT;
+    stroke_desc.dashCap = D2D1_CAP_STYLE_FLAT;
+    stroke_desc.lineJoin = D2D1_LINE_JOIN_MITER;
+    stroke_desc.miterLimit = 10.0f;
+    stroke_desc.dashStyle = D2D1_DASH_STYLE_DASH;
+    stroke_desc.dashOffset = 0.0f;
+    hr = ID2D1Factory_CreateStrokeStyle(ctx.factory, &stroke_desc, NULL, 0, &dashed);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* Shifting by one dash length swaps dashes and gaps. */
+    stroke_desc.dashOffset = 2.0f;
+    hr = ID2D1Factory_CreateStrokeStyle(ctx.factory, &stroke_desc, NULL, 0, &shifted);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("%s (x %.0f)", tests[i].where, tests[i].x);
+
+        set_point(&p, tests[i].x, 0.0f);
+
+        /* Without a stroke style the whole line is covered — this is the
+         * control: it must keep behaving exactly as before. */
+        contains = !tests[i].solid;
+        hr = ID2D1PathGeometry_StrokeContainsPoint(geometry, p, 10.0f, NULL, NULL, 0.0f, &contains);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(contains == tests[i].solid, "Solid: got %#x, expected %#x.\n", contains, tests[i].solid);
+
+        contains = !tests[i].dashed;
+        hr = ID2D1PathGeometry_StrokeContainsPoint(geometry, p, 10.0f, dashed, NULL, 0.0f, &contains);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(contains == tests[i].dashed, "Dashed: got %#x, expected %#x.\n", contains, tests[i].dashed);
+
+        contains = !tests[i].offset;
+        hr = ID2D1PathGeometry_StrokeContainsPoint(geometry, p, 10.0f, shifted, NULL, 0.0f, &contains);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(contains == tests[i].offset, "Offset: got %#x, expected %#x.\n", contains, tests[i].offset);
+
+        winetest_pop_context();
+    }
+
+    /* Off the line entirely: never contained, dashed or not. */
+    set_point(&p, 10.0f, 50.0f);
+    contains = TRUE;
+    hr = ID2D1PathGeometry_StrokeContainsPoint(geometry, p, 10.0f, dashed, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "Got unexpected contains %#x for a point away from the line.\n", contains);
+
+    ID2D1StrokeStyle_Release(shifted);
+    ID2D1StrokeStyle_Release(dashed);
+    ID2D1PathGeometry_Release(geometry);
+    release_test_context(&ctx);
+}
+
+static void test_color_context(BOOL d3d11)
+{
+    static const D2D1_SIMPLE_COLOR_PROFILE simple_desc =
+    {
+        {0.640f, 0.330f}, {0.300f, 0.600f}, {0.150f, 0.060f},
+        {0.9505f, 1.0891f}, D2D1_GAMMA1_G22,
+    };
+    D2D1_SIMPLE_COLOR_PROFILE simple_profile;
+    ID2D1ColorContext *color_context, *context2;
+    ID2D1DeviceContext *device_context;
+    ID2D1ColorContext1 *color_context1;
+    ID2D1DeviceContext5 *context5;
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    struct d2d1_test_context ctx;
+    DXGI_COLOR_SPACE_TYPE space;
+    BYTE *profile, *profile2;
+    ID2D1Bitmap1 *bitmap;
+    UINT32 size, size2;
+    D2D1_SIZE_U pixel_size;
+    ULONG refcount;
+    HRESULT hr;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    device_context = ctx.context;
+
+    /* The well known colour spaces do not take a profile; it is generated from
+     * the space instead. */
+    hr = ID2D1DeviceContext_CreateColorContext(device_context, D2D1_COLOR_SPACE_SRGB, NULL, 0, &color_context);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(ID2D1ColorContext_GetColorSpace(color_context) == D2D1_COLOR_SPACE_SRGB,
+            "Got unexpected colour space %#x.\n", ID2D1ColorContext_GetColorSpace(color_context));
+
+    size = ID2D1ColorContext_GetProfileSize(color_context);
+    ok(size > 128, "Got unexpected profile size %u.\n", size);
+    profile = calloc(1, size);
+    hr = ID2D1ColorContext_GetProfile(color_context, profile, size);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    /* Every ICC profile carries the 'acsp' signature at offset 36. */
+    ok(!memcmp(profile + 36, "acsp", 4), "Got unexpected profile signature %#x.\n", *(unsigned int *)(profile + 36));
+    hr = ID2D1ColorContext_GetProfile(color_context, profile, size - 1);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    /* A colour context created from raw profile bytes hands them back. */
+    hr = ID2D1DeviceContext_CreateColorContext(device_context, D2D1_COLOR_SPACE_CUSTOM, profile, size, &context2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    size2 = ID2D1ColorContext_GetProfileSize(context2);
+    ok(size2 == size, "Got unexpected profile size %u, expected %u.\n", size2, size);
+    profile2 = calloc(1, size2);
+    hr = ID2D1ColorContext_GetProfile(context2, profile2, size2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!memcmp(profile, profile2, size), "Profile data does not round trip.\n");
+    ok(ID2D1ColorContext_GetColorSpace(context2) == D2D1_COLOR_SPACE_CUSTOM,
+            "Got unexpected colour space %#x.\n", ID2D1ColorContext_GetColorSpace(context2));
+    free(profile2);
+    ID2D1ColorContext_Release(context2);
+
+    /* A custom space without a profile has nothing to describe it. */
+    hr = ID2D1DeviceContext_CreateColorContext(device_context, D2D1_COLOR_SPACE_CUSTOM, NULL, 0, &context2);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    hr = ID2D1ColorContext_QueryInterface(color_context, &IID_ID2D1ColorContext1, (void **)&color_context1);
+    ok(hr == S_OK || broken(hr == E_NOINTERFACE) /* d2d1 < 1.3 */, "Got unexpected hr %#lx.\n", hr);
+    if (SUCCEEDED(hr))
+    {
+        ok(ID2D1ColorContext1_GetColorContextType(color_context1) == D2D1_COLOR_CONTEXT_TYPE_ICC,
+                "Got unexpected context type %#x.\n", ID2D1ColorContext1_GetColorContextType(color_context1));
+        ID2D1ColorContext1_Release(color_context1);
+    }
+    free(profile);
+
+    hr = ID2D1DeviceContext_CreateColorContext(device_context, D2D1_COLOR_SPACE_SCRGB, NULL, 0, &context2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(ID2D1ColorContext_GetColorSpace(context2) == D2D1_COLOR_SPACE_SCRGB,
+            "Got unexpected colour space %#x.\n", ID2D1ColorContext_GetColorSpace(context2));
+    ID2D1ColorContext_Release(context2);
+
+    /* A bitmap hands back the colour context it was created with. */
+    pixel_size.width = 4;
+    pixel_size.height = 4;
+    memset(&bitmap_desc, 0, sizeof(bitmap_desc));
+    bitmap_desc.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bitmap_desc.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    bitmap_desc.colorContext = color_context;
+    hr = ID2D1DeviceContext_CreateBitmap(device_context, pixel_size, NULL, 0, &bitmap_desc, &bitmap);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    context2 = (void *)0xdeadbeef;
+    ID2D1Bitmap1_GetColorContext(bitmap, &context2);
+    ok(context2 == color_context, "Got unexpected colour context %p, expected %p.\n", context2, color_context);
+    if (context2 && context2 != (void *)0xdeadbeef)
+        ID2D1ColorContext_Release(context2);
+    ID2D1Bitmap1_Release(bitmap);
+
+    /* A bitmap without one hands back NULL. */
+    bitmap_desc.colorContext = NULL;
+    hr = ID2D1DeviceContext_CreateBitmap(device_context, pixel_size, NULL, 0, &bitmap_desc, &bitmap);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    context2 = (void *)0xdeadbeef;
+    ID2D1Bitmap1_GetColorContext(bitmap, &context2);
+    ok(!context2, "Got unexpected colour context %p.\n", context2);
+    ID2D1Bitmap1_Release(bitmap);
+
+    refcount = ID2D1ColorContext_Release(color_context);
+    ok(!refcount, "Got unexpected refcount %lu.\n", refcount);
+
+    hr = ID2D1DeviceContext_QueryInterface(device_context, &IID_ID2D1DeviceContext5, (void **)&context5);
+    if (FAILED(hr))
+    {
+        win_skip("ID2D1DeviceContext5 is not supported.\n");
+        release_test_context(&ctx);
+        return;
+    }
+
+    hr = ID2D1DeviceContext5_CreateColorContextFromDxgiColorSpace(context5,
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, &color_context1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(ID2D1ColorContext1_GetColorContextType(color_context1) == D2D1_COLOR_CONTEXT_TYPE_DXGI,
+            "Got unexpected context type %#x.\n", ID2D1ColorContext1_GetColorContextType(color_context1));
+    space = ID2D1ColorContext1_GetDXGIColorSpace(color_context1);
+    ok(space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, "Got unexpected DXGI colour space %u.\n", space);
+    ok(ID2D1ColorContext1_GetColorSpace(color_context1) == D2D1_COLOR_SPACE_SRGB,
+            "Got unexpected colour space %#x.\n", ID2D1ColorContext1_GetColorSpace(color_context1));
+    ID2D1ColorContext1_Release(color_context1);
+
+    hr = ID2D1DeviceContext5_CreateColorContextFromSimpleColorProfile(context5, &simple_desc, &color_context1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(ID2D1ColorContext1_GetColorContextType(color_context1) == D2D1_COLOR_CONTEXT_TYPE_SIMPLE,
+            "Got unexpected context type %#x.\n", ID2D1ColorContext1_GetColorContextType(color_context1));
+    memset(&simple_profile, 0, sizeof(simple_profile));
+    hr = ID2D1ColorContext1_GetSimpleColorProfile(color_context1, &simple_profile);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!memcmp(&simple_profile, &simple_desc, sizeof(simple_profile)), "Simple profile does not round trip.\n");
+    ID2D1ColorContext1_Release(color_context1);
+
+    ID2D1DeviceContext5_Release(context5);
+    release_test_context(&ctx);
+}
+
 static void test_bitmap_map(BOOL d3d11)
 {
     static const struct
@@ -16995,6 +17417,616 @@ static void test_compute_geometry_area(BOOL d3d11)
 
     release_test_context(&ctx);
 }
+/* Combine two geometries and return the result as a path geometry. The caller
+ * owns the returned geometry, which is valid even when the combination itself
+ * failed - it is then simply empty. */
+#define combine_geometry(a, b, c, d, e, f) combine_geometry_(__LINE__, a, b, c, d, e, f)
+static HRESULT combine_geometry_(unsigned int line, ID2D1Factory *factory, ID2D1Geometry *geometry1,
+        ID2D1Geometry *geometry2, D2D1_COMBINE_MODE mode, const D2D1_MATRIX_3X2_F *transform,
+        ID2D1PathGeometry **result)
+{
+    ID2D1GeometrySink *sink;
+    HRESULT hr, hr2;
+
+    hr = ID2D1Factory_CreatePathGeometry(factory, result);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(*result, &sink);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = ID2D1Geometry_CombineWithGeometry(geometry1, geometry2, mode, transform,
+            D2D1_DEFAULT_FLATTENING_TOLERANCE, (ID2D1SimplifiedGeometrySink *)sink);
+
+    hr2 = ID2D1GeometrySink_Close(sink);
+    ok_(__FILE__, line)(hr2 == S_OK, "Got unexpected hr %#lx.\n", hr2);
+    ID2D1GeometrySink_Release(sink);
+
+    return hr;
+}
+
+/* The exact set of figures a combination decomposes into is not specified, so
+ * check the filled area and the bounds instead. Both are well defined. */
+#define check_combined_geometry(a, b, c, d, e, f) check_combined_geometry_(__LINE__, a, b, c, d, e, f)
+static void check_combined_geometry_(unsigned int line, ID2D1PathGeometry *geometry, float area,
+        float left, float top, float right, float bottom)
+{
+    D2D1_RECT_F rect;
+    float value;
+    HRESULT hr;
+
+    hr = ID2D1PathGeometry_ComputeArea(geometry, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, &value);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok_(__FILE__, line)(compare_float(value, area, 64), "Got unexpected area %.8e, expected %.8e.\n", value, area);
+
+    hr = ID2D1PathGeometry_GetBounds(geometry, NULL, &rect);
+    ok_(__FILE__, line)(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok_(__FILE__, line)(compare_rect(&rect, left, top, right, bottom, 64),
+            "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n", rect.left, rect.top, rect.right, rect.bottom);
+}
+
+/* Add an axis-aligned rectangle as one closed figure. */
+static void append_rect_figure(ID2D1GeometrySink *sink, float left, float top, float right, float bottom)
+{
+    D2D1_POINT_2F point;
+
+    set_point(&point, left, top);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, right, top);
+    line_to(sink, right, bottom);
+    line_to(sink, left, bottom);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+}
+
+static void test_combine_geometry(BOOL d3d11)
+{
+    ID2D1TransformedGeometry *transformed_geometry;
+    ID2D1RectangleGeometry *rect1, *rect2;
+    ID2D1EllipseGeometry *ellipse_geometry;
+    ID2D1PathGeometry *path, *path2, *result;
+    struct d2d1_test_context ctx;
+    D2D1_MATRIX_3X2_F matrix;
+    ID2D1GeometrySink *sink;
+    D2D1_ELLIPSE ellipse;
+    D2D1_POINT_2F point;
+    D2D1_RECT_F rect;
+    UINT32 count;
+    BOOL contains;
+    HRESULT hr;
+    float area;
+
+    if (!init_test_context(&ctx, d3d11))
+        return;
+
+    /* Two overlapping axis-aligned rectangles: 400 + 400, overlapping in 100. */
+    set_rect(&rect, 0.0f, 0.0f, 20.0f, 20.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_rect(&rect, 10.0f, 10.0f, 30.0f, 30.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 100.0f, 10.0f, 10.0f, 20.0f, 20.0f);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_UNION, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 700.0f, 0.0f, 0.0f, 30.0f, 30.0f);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_XOR, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 600.0f, 0.0f, 0.0f, 30.0f, 30.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* Exclude removes the input geometry from the calling one, so the operands
+     * are not interchangeable here. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 300.0f, 0.0f, 0.0f, 20.0f, 20.0f);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect2, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 300.0f, 10.0f, 10.0f, 30.0f, 30.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* The transform applies to the input geometry only. */
+    set_matrix_identity(&matrix);
+    translate_matrix(&matrix, 10.0f, 10.0f);
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_INTERSECT, &matrix, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 100.0f, 10.0f, 10.0f, 20.0f, 20.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* A NULL transform is the identity. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 400.0f, 0.0f, 0.0f, 20.0f, 20.0f);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1RectangleGeometry_Release(rect2);
+
+    /* Disjoint geometries intersect to nothing. That is not an error, and the
+     * resulting geometry is empty. */
+    set_rect(&rect, 100.0f, 100.0f, 120.0f, 120.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 0.0f, INFINITY, INFINITY, FLT_MAX, FLT_MAX);
+    point.x = 110.0f;
+    point.y = 110.0f;
+    hr = ID2D1PathGeometry_FillContainsPoint(result, point, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "Point is inside the empty geometry.\n");
+    ID2D1PathGeometry_Release(result);
+    ID2D1RectangleGeometry_Release(rect2);
+
+    /* A rectangle intersected with a path holding several disjoint rectangles.
+     * This is the shape JUCE builds for a partial repaint clip. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 2.0f, 2.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 8.0f, 2.0f);
+    line_to(sink, 8.0f, 8.0f);
+    line_to(sink, 2.0f, 8.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    set_point(&point, 12.0f, 2.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 18.0f, 2.0f);
+    line_to(sink, 18.0f, 8.0f);
+    line_to(sink, 12.0f, 8.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    /* Reaches past the clipping rectangle. */
+    set_point(&point, 12.0f, 12.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 40.0f, 12.0f);
+    line_to(sink, 40.0f, 18.0f);
+    line_to(sink, 12.0f, 18.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    /* 36 + 36 + 8 * 6. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 120.0f, 2.0f, 2.0f, 20.0f, 18.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* The same combination the other way round - intersection is commutative. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 120.0f, 2.0f, 2.0f, 20.0f, 18.0f);
+    ID2D1PathGeometry_Release(result);
+
+    /* A transformed rectangle is a parallelogram, and stays convex under any
+     * affine transform. Rotating by 45 degrees keeps the area at 400, and the
+     * bounds grow to the diagonal. */
+    set_rect(&rect, -10.0f, -10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_matrix_identity(&matrix);
+    rotate_matrix(&matrix, M_PI / 4.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)rect2,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    set_rect(&rect, -100.0f, -100.0f, 100.0f, 100.0f);
+    ID2D1RectangleGeometry_Release(rect1);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 400.0f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1RectangleGeometry_Release(rect1);
+    ID2D1RectangleGeometry_Release(rect2);
+
+    /* An ellipse clipped to half of its bounding box. The result is half a
+     * circle of radius 10, so 157.08 - but the exact figure depends on whether
+     * the curve survives into the output or is flattened at the requested
+     * tolerance, so allow for both. */
+    set_ellipse(&ellipse, 0.0f, 0.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateEllipseGeometry(ctx.factory, &ellipse, &ellipse_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_rect(&rect, 0.0f, -10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)ellipse_geometry,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_ComputeArea(result, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, &area);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(area > 150.0f && area < 158.0f, "Got unexpected area %.8e.\n", area);
+    hr = ID2D1PathGeometry_GetBounds(result, NULL, &rect);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(compare_rect(&rect, 0.0f, -10.0f, 10.0f, 10.0f, 64),
+            "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n", rect.left, rect.top, rect.right, rect.bottom);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1EllipseGeometry_Release(ellipse_geometry);
+    ID2D1RectangleGeometry_Release(rect1);
+    ID2D1PathGeometry_Release(path);
+
+    /* A shape with a hole, intersected with an operand that contains it. The
+     * result is the shape itself, hole included, whichever way the combination
+     * arrives at it. A 100x100 square with a 50x50 hole, so 7500. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 0.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 100.0f, 0.0f);
+    line_to(sink, 100.0f, 100.0f);
+    line_to(sink, 0.0f, 100.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    /* Wound the other way, so it is a hole under the winding fill rule. */
+    set_point(&point, 25.0f, 25.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 25.0f, 75.0f);
+    line_to(sink, 75.0f, 75.0f);
+    line_to(sink, 75.0f, 25.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    /* Both operands are rectangular here, so this goes through the scanline
+     * pass over the rectangles. */
+    set_rect(&rect, -50.0f, -50.0f, 150.0f, 150.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)rect1,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 7500.0f, 0.0f, 0.0f, 100.0f, 100.0f);
+    point.x = 50.0f;
+    point.y = 50.0f;
+    hr = ID2D1PathGeometry_FillContainsPoint(result, point, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "The hole is filled.\n");
+    ID2D1PathGeometry_Release(result);
+
+    /* The ellipse is not rectangular, so this goes through the convex clip
+     * instead, and has to arrive at the same shape. */
+    set_ellipse(&ellipse, 50.0f, 50.0f, 200.0f, 200.0f);
+    hr = ID2D1Factory_CreateEllipseGeometry(ctx.factory, &ellipse, &ellipse_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)ellipse_geometry,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 7500.0f, 0.0f, 0.0f, 100.0f, 100.0f);
+    point.x = 50.0f;
+    point.y = 50.0f;
+    hr = ID2D1PathGeometry_FillContainsPoint(result, point, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "The hole is filled.\n");
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1EllipseGeometry_Release(ellipse_geometry);
+    ID2D1RectangleGeometry_Release(rect1);
+    ID2D1PathGeometry_Release(path);
+
+    /* A square and the same square rotated by 45 degrees meet in a regular
+     * octagon of 2 * a^2 * (sqrt(2) - 1), which is 331.370850 for a side of
+     * 20 and is what INTERSECT returns above. The union is therefore
+     * 800 - 331.370850, the exclusive or 800 - 2 * 331.370850, and the
+     * difference 400 - 331.370850. */
+    set_rect(&rect, -10.0f, -10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_matrix_identity(&matrix);
+    rotate_matrix(&matrix, M_PI / 4.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)rect1,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_UNION, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 468.629150f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_XOR, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 137.258300f, -14.142136f, -14.142136f, 14.142136f, 14.142136f);
+    ID2D1PathGeometry_Release(result);
+
+    /* The difference stays inside the calling geometry, so the bounds do not
+     * grow to the diagonal here. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 68.629150f, -10.0f, -10.0f, 10.0f, 10.0f);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1RectangleGeometry_Release(rect1);
+
+    /* The same boundary with two curved operands. Two circles of radius 10
+     * whose centres are 10 * sqrt(2) apart overlap in 57.08, so the union is
+     * 2 * 314.16 - 57.08 = 571.24 when the curves survive into the output, and
+     * a few units less when they are flattened at the requested tolerance -
+     * allow for both. */
+    set_ellipse(&ellipse, 10.0f, 10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateEllipseGeometry(ctx.factory, &ellipse, &ellipse_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_matrix_identity(&matrix);
+    translate_matrix(&matrix, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)ellipse_geometry,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)ellipse_geometry,
+            (ID2D1Geometry *)transformed_geometry, D2D1_COMBINE_MODE_UNION, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_ComputeArea(result, NULL, D2D1_DEFAULT_FLATTENING_TOLERANCE, &area);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(area > 565.0f && area < 575.0f, "Got unexpected area %.8e.\n", area);
+    hr = ID2D1PathGeometry_GetBounds(result, NULL, &rect);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(compare_rect(&rect, 0.0f, 0.0f, 30.0f, 30.0f, 64),
+            "Got unexpected bounds {%.8e, %.8e, %.8e, %.8e}.\n",
+            rect.left, rect.top, rect.right, rect.bottom);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1EllipseGeometry_Release(ellipse_geometry);
+
+    /* Two non-convex polygons: an L shape and the same shape mirrored through
+     * the centre of its bounding box. Each arm of one crosses an arm of the
+     * other, so the intersection is two disconnected 10x10 squares. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 0.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 10.0f, 0.0f);
+    line_to(sink, 10.0f, 40.0f);
+    line_to(sink, 30.0f, 40.0f);
+    line_to(sink, 30.0f, 50.0f);
+    line_to(sink, 0.0f, 50.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    set_matrix_identity(&matrix);
+    rotate_matrix(&matrix, M_PI);
+    translate_matrix(&matrix, -30.0f, -50.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)path,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 200.0f, 0.0f, 0.0f, 30.0f, 50.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1PathGeometry_Release(path);
+
+    /* The result of a combination is the outline of the union, not the pieces
+     * an implementation happened to compute it from. A region that a scanline
+     * algorithm decomposes into several bands is still a single connected
+     * shape, and has to come back as a single figure - interior edges between
+     * the bands are an implementation artefact. */
+    set_rect(&rect, 0.0f, 0.0f, 60.0f, 40.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    /* Three rectangles of differing heights, meeting along shared vertical
+     * edges: one cross-shaped figure, 400 + 800 + 400. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    append_rect_figure(sink, 0.0f, 10.0f, 20.0f, 30.0f);
+    append_rect_figure(sink, 20.0f, 0.0f, 40.0f, 40.0f);
+    append_rect_figure(sink, 40.0f, 10.0f, 60.0f, 30.0f);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 1600.0f, 0.0f, 0.0f, 60.0f, 40.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path);
+
+    /* Three rectangles of equal height in a row: also a single figure. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    append_rect_figure(sink, 0.0f, 0.0f, 20.0f, 20.0f);
+    append_rect_figure(sink, 20.0f, 0.0f, 40.0f, 20.0f);
+    append_rect_figure(sink, 40.0f, 0.0f, 60.0f, 20.0f);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 1200.0f, 0.0f, 0.0f, 60.0f, 20.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path);
+
+    /* Disconnected components stay separate figures. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    append_rect_figure(sink, 0.0f, 0.0f, 10.0f, 10.0f);
+    append_rect_figure(sink, 20.0f, 0.0f, 30.0f, 10.0f);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_INTERSECT, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 200.0f, 0.0f, 0.0f, 30.0f, 10.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path);
+    ID2D1RectangleGeometry_Release(rect1);
+
+    /* A rectangle with a rectangular bite taken out of its middle: an outer
+     * contour plus the hole, so two figures. */
+    set_rect(&rect, 0.0f, 0.0f, 40.0f, 40.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_rect(&rect, 10.0f, 10.0f, 30.0f, 30.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)rect2,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 1200.0f, 0.0f, 0.0f, 40.0f, 40.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1RectangleGeometry_Release(rect2);
+    ID2D1RectangleGeometry_Release(rect1);
+
+    /* Excluding an oblique operand cuts a hole with oblique edges. */
+    set_rect(&rect, -100.0f, -100.0f, 100.0f, 100.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect1);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_rect(&rect, -10.0f, -10.0f, 10.0f, 10.0f);
+    hr = ID2D1Factory_CreateRectangleGeometry(ctx.factory, &rect, &rect2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    set_matrix_identity(&matrix);
+    rotate_matrix(&matrix, M_PI / 4.0f);
+    hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)rect2,
+            &matrix, &transformed_geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)rect1, (ID2D1Geometry *)transformed_geometry,
+            D2D1_COMBINE_MODE_EXCLUDE, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 39600.0f, -100.0f, -100.0f, 100.0f, 100.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 2, "Got unexpected figure count %u.\n", count);
+    point.x = 0.0f;
+    point.y = 0.0f;
+    hr = ID2D1PathGeometry_FillContainsPoint(result, point, NULL, 0.0f, &contains);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(!contains, "The hole is filled.\n");
+    ID2D1PathGeometry_Release(result);
+
+    ID2D1TransformedGeometry_Release(transformed_geometry);
+    ID2D1RectangleGeometry_Release(rect2);
+    ID2D1RectangleGeometry_Release(rect1);
+
+    /* Two triangles sharing their oblique hypotenuse make a square. The
+     * shared edge is coincident but wound in opposite directions, and has to
+     * cancel out instead of surviving as an interior edge. */
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 0.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 10.0f, 0.0f);
+    line_to(sink, 0.0f, 10.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path2);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(path2, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+    set_point(&point, 10.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 10.0f, 10.0f);
+    line_to(sink, 0.0f, 10.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ID2D1GeometrySink_Release(sink);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)path2,
+            D2D1_COMBINE_MODE_UNION, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 100.0f, 0.0f, 0.0f, 10.0f, 10.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path2);
+
+    /* A geometry XORed with itself is empty, one united with itself is the
+     * geometry - every edge here is coincident with its counterpart. */
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_XOR, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 0.0f, INFINITY, INFINITY, FLT_MAX, FLT_MAX);
+    ID2D1PathGeometry_Release(result);
+
+    hr = combine_geometry(ctx.factory, (ID2D1Geometry *)path, (ID2D1Geometry *)path,
+            D2D1_COMBINE_MODE_UNION, NULL, &result);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    check_combined_geometry(result, 50.0f, 0.0f, 0.0f, 10.0f, 10.0f);
+    hr = ID2D1PathGeometry_GetFigureCount(result, &count);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    ok(count == 1, "Got unexpected figure count %u.\n", count);
+    ID2D1PathGeometry_Release(result);
+    ID2D1PathGeometry_Release(path);
+
+    release_test_context(&ctx);
+}
 
 static D2D1_PIXEL_FORMAT get_wic_target_format(const D2D1_PIXEL_FORMAT *target_format,
         const GUID *bitmap_format)
@@ -18212,6 +19244,7 @@ START_TEST(d2d1)
     queue_test(test_wic_gdi_interop);
     queue_test(test_layer);
     queue_test(test_bezier_intersect);
+    queue_d3d10_test(test_bezier_non_finite);
     queue_test(test_create_device);
     queue_test(test_create_device_context);
     queue_test(test_bitmap_surface);
@@ -18219,6 +19252,8 @@ START_TEST(d2d1)
     queue_d3d10_test(test_invert_matrix);
     queue_d3d10_test(test_skew_matrix);
     queue_test(test_command_list);
+    queue_test(test_color_context);
+    queue_test(test_stroke_contains_point_dashed);
     queue_d3d10_test(test_max_bitmap_size);
     queue_test(test_dpi);
     queue_test(test_unit_mode);
@@ -18234,6 +19269,7 @@ START_TEST(d2d1)
     queue_test(test_effect_2d_affine);
     queue_test(test_effect_crop);
     queue_test(test_effect_grayscale);
+    queue_test(test_effect_color_management);
     queue_d3d10_test(test_registered_effects);
     queue_d3d10_test(test_effect_gaussian_blur);
     queue_d3d10_test(test_effect_point_specular);
@@ -18262,6 +19298,7 @@ START_TEST(d2d1)
     queue_d3d10_test(test_get_effect_properties);
     queue_test(test_effect_vertex_buffer);
     queue_d3d10_test(test_compute_geometry_area);
+    queue_d3d10_test(test_combine_geometry);
     queue_test(test_wic_target_format);
     queue_d3d10_test(test_effect_blob_property);
     queue_test(test_get_dxgi_device);

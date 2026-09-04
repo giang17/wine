@@ -795,7 +795,20 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockSetRate(IMFClockStateSink
 
     if (rate == 0.0 || rate == 1.0)
     {
+        BOOL resumed = renderer->rate == 0.0f && rate != 0.0f;
+
         renderer->rate = rate;
+
+        /* Nothing was requested while the rate was zero, so the render loop has no
+         * outstanding request to piggyback on.  Ask for one sample here. */
+        if (resumed && renderer->clock_state == MFCLOCK_STATE_RUNNING
+                && !(renderer->flags & SAR_SAMPLE_REQUESTED)
+                && renderer->queued_frames < renderer->max_frames)
+        {
+            IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkRequestSample,
+                    &GUID_NULL, S_OK, NULL);
+            renderer->flags |= SAR_SAMPLE_REQUESTED;
+        }
     }
     else
     {
@@ -1587,7 +1600,8 @@ static HRESULT WINAPI audio_renderer_stream_ProcessSample(IMFStreamSink *iface, 
             hr = stream_queue_sample(renderer, sample);
         renderer->flags &= ~SAR_SAMPLE_REQUESTED;
 
-        if (renderer->queued_frames < renderer->max_frames && renderer->clock_state == MFCLOCK_STATE_RUNNING)
+        if (renderer->queued_frames < renderer->max_frames && renderer->clock_state == MFCLOCK_STATE_RUNNING
+                && renderer->rate != 0.0f)
         {
             IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkRequestSample,
                     &GUID_NULL, S_OK, NULL);
@@ -2145,7 +2159,16 @@ static void audio_renderer_render(struct audio_renderer *renderer, IMFAsyncResul
 
     if (list_empty(&renderer->queue))
     {
-        if (!(renderer->flags & SAR_SAMPLE_REQUESTED))
+        /* While the clock rate is zero the presentation is scrubbing and no audio is
+         * rendered.  A renderer that keeps pulling regardless drains the read-ahead
+         * of the demultiplexer until the video stream, which stops being consumed
+         * for the still frame, starves it.  The source request handler then blocks
+         * in wait_on_sample() and, because it shares one serial work queue with the
+         * source's control commands, the Pause and Stop that follow are never run:
+         * the session stays in the pause transition and no further session events
+         * are delivered.  The preroll path is left alone so that a Start at rate
+         * zero still delivers the frame for the new position. */
+        if (!(renderer->flags & SAR_SAMPLE_REQUESTED) && renderer->rate != 0.0f)
         {
             IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkRequestSample, &GUID_NULL, S_OK, NULL);
             renderer->flags |= SAR_SAMPLE_REQUESTED;

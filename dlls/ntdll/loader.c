@@ -2060,6 +2060,118 @@ NTSTATUS WINAPI LdrUnlockLoaderLock( ULONG flags, ULONG_PTR magic )
 }
 
 
+/* Whether to hide the wine_get_version export from GetProcAddress.
+ *
+ * JUCE 8.0.13 and later pick their renderer with
+ *
+ *     GetProcAddress( GetModuleHandleA("ntdll"), "wine_get_version" ) != nullptr
+ *
+ * and fall back to GDI whenever that succeeds, which bypasses the Direct2D and
+ * DirectComposition stack completely.  On a Wine build that implements that
+ * stack the fallback is not wanted.  Hiding this one export makes those builds
+ * take the Direct2D path again.
+ *
+ * Off unless asked for, because the switch applies to the whole process: other
+ * components that probe for Wine stop finding it too, and some depend on the
+ * answer.  PACE/iLok protected software fails to start without it ("Error 2000,
+ * iLok background component not running"), and Ableton Live's embedded Splice
+ * view stops loading.  Enable it for the hosts that run JUCE plug-ins instead:
+ *
+ *     WINE_HIDE_WINE_VERSION=1                                  (single run)
+ *     HKCU\Software\Wine\AppDefaults\<app.exe>\HideWineVersion = "Y"
+ *     HKCU\Software\Wine\HideWineVersion = "Y"                  (global)
+ *
+ * The per-application value wins over the global one, so "N" can carve out an
+ * exception if the global switch is enabled.
+ */
+/* Reads the HideWineVersion value from an open key; -1 if absent. */
+static int query_hide_wine_version_value( HANDLE key )
+{
+    char buffer[offsetof(KEY_VALUE_PARTIAL_INFORMATION, Data) + 16 * sizeof(WCHAR)];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
+    UNICODE_STRING nameW;
+    const WCHAR *value;
+    ULONG count;
+
+    RtlInitUnicodeString( &nameW, L"HideWineVersion" );
+    if (NtQueryValueKey( key, &nameW, KeyValuePartialInformation, buffer, sizeof(buffer), &count ))
+        return -1;
+    if (info->Type != REG_SZ) return -1;
+
+    value = (const WCHAR *)info->Data;
+    return (value[0] == 'Y' || value[0] == 'y' || value[0] == '1');
+}
+
+/* HKCU\Software\Wine\AppDefaults\<app.exe>\HideWineVersion, falling back to
+ * HKCU\Software\Wine\HideWineVersion.  -1 if neither is set. */
+static int query_hide_wine_version_registry(void)
+{
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING nameW;
+    HANDLE root, config_key, hkey;
+    WCHAR appkey[MAX_PATH + 20];
+    const WCHAR *p, *appname = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+    int ret = -1;
+
+    if (RtlOpenCurrentUser( KEY_READ, &root )) return -1;
+    InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, root, NULL );
+    RtlInitUnicodeString( &nameW, L"Software\\Wine" );
+
+    /* @@ Wine registry key: HKCU\Software\Wine */
+    if (NtOpenKey( &config_key, KEY_READ, &attr )) config_key = 0;
+    NtClose( root );
+    if (!config_key) return -1;
+
+    if (appname)
+    {
+        if ((p = wcsrchr( appname, '/' ))) appname = p + 1;
+        if ((p = wcsrchr( appname, '\\' ))) appname = p + 1;
+
+        if (wcslen( appname ) < ARRAY_SIZE(appkey) - 20)
+        {
+            wcscpy( appkey, L"AppDefaults\\" );
+            wcscat( appkey, appname );
+            RtlInitUnicodeString( &nameW, appkey );
+            attr.RootDirectory = config_key;
+
+            /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe */
+            if (!NtOpenKey( &hkey, KEY_READ, &attr ))
+            {
+                ret = query_hide_wine_version_value( hkey );
+                NtClose( hkey );
+            }
+        }
+    }
+
+    if (ret == -1) ret = query_hide_wine_version_value( config_key );
+    NtClose( config_key );
+    return ret;
+}
+
+static BOOL hide_wine_version_export(void)
+{
+    static int cached = -1;
+
+    if (cached == -1)
+    {
+        WCHAR buf[8];
+        SIZE_T len = 0;
+        int reg;
+
+        /* The environment variable wins, so a single run can override the
+         * registry without touching it. */
+        buf[0] = 0;
+        if (!RtlQueryEnvironmentVariable( NULL, L"WINE_HIDE_WINE_VERSION", 22,
+                                          buf, ARRAY_SIZE(buf) - 1, &len ) && buf[0])
+            cached = (buf[0] != '0');
+        else if ((reg = query_hide_wine_version_registry()) != -1)
+            cached = reg;
+        else
+            cached = 0;  /* off unless asked for, see comment above */
+    }
+    return cached;
+}
+
 /******************************************************************
  *		LdrGetProcedureAddress  (NTDLL.@)
  */
@@ -2070,6 +2182,14 @@ NTSTATUS WINAPI LdrGetProcedureAddress(HMODULE module, const ANSI_STRING *name,
     WINE_MODREF *wm;
     DWORD exp_size;
     NTSTATUS ret = STATUS_PROCEDURE_NOT_FOUND;
+
+    if (name && name->Buffer && name->Length == 16
+        && !memcmp( name->Buffer, "wine_get_version", 16 )
+        && hide_wine_version_export())
+    {
+        WARN( "hiding wine_get_version (WINE_HIDE_WINE_VERSION)\n" );
+        return STATUS_PROCEDURE_NOT_FOUND;
+    }
 
     RtlEnterCriticalSection( &loader_section );
 

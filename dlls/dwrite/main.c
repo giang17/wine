@@ -36,6 +36,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(dwrite);
 
 HMODULE dwrite_module = 0;
+HANDLE dwrite_heap;
 static IDWriteFactory7 *shared_factory;
 static void release_shared_factory(IDWriteFactory7 *factory);
 
@@ -44,6 +45,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
+        dwrite_heap = HeapCreate(0, 0, 0);
+        if (!dwrite_heap) return FALSE;
         dwrite_module = hinstDLL;
         DisableThreadLibraryCalls( hinstDLL );
         if (!__wine_init_unix_call())
@@ -55,6 +58,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
         release_shared_factory(shared_factory);
         release_system_fallback_data();
         UNIX_CALL(process_detach, NULL);
+        if (dwrite_heap)
+        {
+            HeapDestroy(dwrite_heap);
+            dwrite_heap = NULL;
+        }
     }
     return TRUE;
 }
@@ -613,6 +621,13 @@ struct dwritefactory
     IDWriteFontFileLoader *localfontfileloader;
     struct list localfontfaces;
 
+    /* Glyph caches of fontfaces that have already been destroyed. Text layout
+     * creates and drops a fontface per run, so without this the rasteriser
+     * redoes the same glyphs on every frame. Data only - no reference is held
+     * on a fontface, so this cannot make the factory outlive itself. */
+    struct list parked_caches;
+    unsigned int parked_cache_count;
+
     struct list collection_loaders;
     struct list file_loaders;
 
@@ -622,6 +637,172 @@ struct dwritefactory
 static inline struct dwritefactory *impl_from_IDWriteFactory7(IDWriteFactory7 *iface)
 {
     return CONTAINING_RECORD(iface, struct dwritefactory, IDWriteFactory7_iface);
+}
+
+/* Number of (font file, face index, simulations) combinations whose glyph
+ * cache is kept after the last fontface using it went away. A UI draws from a
+ * handful of faces, so this only has to cover that working set. */
+#define MAX_PARKED_CACHES 8
+
+struct parked_cache
+{
+    struct list entry;
+    /* Identity of the font file the cache was built for, kept as plain values.
+     * The loader pointer is never dereferenced and no reference is held, so a
+     * parked entry cannot reach into a loader whose DLL has been unloaded. */
+    IDWriteFontFileLoader *loader;
+    void *key;
+    UINT32 key_size;
+    UINT32 index;
+    USHORT simulations;
+    struct fontface_glyph_cache cache;
+};
+
+static void release_parked_cache(struct parked_cache *parked)
+{
+    list_remove(&parked->entry);
+    fontface_glyph_cache_release(&parked->cache);
+    free(parked->key);
+    free(parked);
+}
+
+/* Same identity test the fontface cache uses: loader plus reference key. For a
+ * local file the key carries the write time, so a file that changed on disk
+ * does not match an older cache. Only ever called on a live font file: the
+ * loader reference GetLoader() takes is dropped right away, and the pointer is
+ * only compared as a value afterwards, never dereferenced. */
+static BOOL fontfile_get_identity(IDWriteFontFile *file, IDWriteFontFileLoader **loader,
+        const void **key, UINT32 *key_size)
+{
+    if (FAILED(IDWriteFontFile_GetLoader(file, loader)))
+        return FALSE;
+    IDWriteFontFileLoader_Release(*loader);
+    return SUCCEEDED(IDWriteFontFile_GetReferenceKey(file, key, key_size));
+}
+
+static struct parked_cache *find_parked_cache(struct dwritefactory *factory, IDWriteFontFileLoader *loader,
+        const void *key, UINT32 key_size, UINT32 index, USHORT simulations)
+{
+    struct parked_cache *parked;
+
+    LIST_FOR_EACH_ENTRY(parked, &factory->parked_caches, struct parked_cache, entry)
+    {
+        if (parked->index == index && parked->simulations == simulations
+                && parked->loader == loader && parked->key_size == key_size
+                && (!key_size || !memcmp(parked->key, key, key_size)))
+            return parked;
+    }
+    return NULL;
+}
+
+/* Drop every parked cache that was built for a font file of the given loader.
+ * Called on loader registration and unregistration: after an unregister the
+ * loader's DLL may be unloaded at any time, and a fresh registration may reuse
+ * the address of an earlier loader. */
+static void factory_purge_parked_caches_for_loader(struct dwritefactory *factory, IDWriteFontFileLoader *loader)
+{
+    struct parked_cache *parked, *next;
+
+    EnterCriticalSection(&factory->cs);
+    LIST_FOR_EACH_ENTRY_SAFE(parked, next, &factory->parked_caches, struct parked_cache, entry)
+    {
+        if (parked->loader == loader)
+        {
+            release_parked_cache(parked);
+            factory->parked_cache_count--;
+        }
+    }
+    LeaveCriticalSection(&factory->cs);
+}
+
+/* Hand a dying fontface's glyph cache over to the factory. The cache is left
+ * empty but valid, so the caller's own teardown has nothing left to free. */
+void factory_park_glyph_cache(IDWriteFactory7 *iface, IDWriteFontFile *file, UINT32 index,
+        USHORT simulations, struct fontface_glyph_cache *cache)
+{
+    struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+    struct parked_cache *parked, *old;
+    IDWriteFontFileLoader *loader;
+    const void *key;
+    UINT32 key_size;
+
+    if (!file || !cache->entries) return;
+    if (!fontfile_get_identity(file, &loader, &key, &key_size)) return;
+
+    EnterCriticalSection(&factory->cs);
+
+    if ((old = find_parked_cache(factory, loader, key, key_size, index, simulations)))
+    {
+        /* Two fontfaces for the same face were alive at once. Keep whichever
+         * cache holds more, so that parking never loses ground. */
+        if (old->cache.entries >= cache->entries)
+        {
+            LeaveCriticalSection(&factory->cs);
+            return;
+        }
+        release_parked_cache(old);
+        factory->parked_cache_count--;
+    }
+
+    if (!(parked = calloc(1, sizeof(*parked))))
+    {
+        LeaveCriticalSection(&factory->cs);
+        return;
+    }
+
+    if (key_size && !(parked->key = malloc(key_size)))
+    {
+        free(parked);
+        LeaveCriticalSection(&factory->cs);
+        return;
+    }
+    if (key_size) memcpy(parked->key, key, key_size);
+    parked->key_size = key_size;
+    parked->loader = loader;
+
+    while (factory->parked_cache_count >= MAX_PARKED_CACHES && !list_empty(&factory->parked_caches))
+    {
+        release_parked_cache(LIST_ENTRY(list_tail(&factory->parked_caches), struct parked_cache, entry));
+        factory->parked_cache_count--;
+    }
+
+    parked->index = index;
+    parked->simulations = simulations;
+    parked->cache = *cache;
+    list_init(&parked->cache.mru);
+    list_move_head(&parked->cache.mru, &cache->mru);
+    list_add_head(&factory->parked_caches, &parked->entry);
+    factory->parked_cache_count++;
+
+    fontface_glyph_cache_reset(cache);
+    LeaveCriticalSection(&factory->cs);
+}
+
+/* Take a parked cache back for a freshly created fontface. */
+void factory_adopt_glyph_cache(IDWriteFactory7 *iface, IDWriteFontFile *file, UINT32 index,
+        USHORT simulations, struct fontface_glyph_cache *cache)
+{
+    struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+    struct parked_cache *parked;
+    IDWriteFontFileLoader *loader;
+    const void *key;
+    UINT32 key_size;
+
+    if (!file) return;
+    if (!fontfile_get_identity(file, &loader, &key, &key_size)) return;
+
+    EnterCriticalSection(&factory->cs);
+    if ((parked = find_parked_cache(factory, loader, key, key_size, index, simulations)))
+    {
+        *cache = parked->cache;
+        list_init(&cache->mru);
+        list_move_head(&cache->mru, &parked->cache.mru);
+
+        fontface_glyph_cache_reset(&parked->cache);
+        release_parked_cache(parked);
+        factory->parked_cache_count--;
+    }
+    LeaveCriticalSection(&factory->cs);
 }
 
 static void release_fontface_cache(struct list *fontfaces)
@@ -660,6 +841,9 @@ static void release_dwritefactory(struct dwritefactory *factory)
 
     EnterCriticalSection(&factory->cs);
     release_fontface_cache(&factory->localfontfaces);
+    while (!list_empty(&factory->parked_caches))
+        release_parked_cache(LIST_ENTRY(list_head(&factory->parked_caches), struct parked_cache, entry));
+    factory->parked_cache_count = 0;
     LeaveCriticalSection(&factory->cs);
 
     LIST_FOR_EACH_ENTRY_SAFE(loader, loader2, &factory->collection_loaders, struct collectionloader, entry) {
@@ -1116,8 +1300,12 @@ static HRESULT WINAPI dwritefactory_CreateRenderingParams(IDWriteFactory7 *iface
 static HRESULT WINAPI dwritefactory_CreateMonitorRenderingParams(IDWriteFactory7 *iface, HMONITOR monitor,
     IDWriteRenderingParams **params)
 {
+    DWRITE_PIXEL_GEOMETRY geometry = DWRITE_PIXEL_GEOMETRY_FLAT;
+    UINT smoothing_type, orientation;
     IDWriteRenderingParams3 *params3;
+    float cleartype_level = 0.0f;
     static int fixme_once = 0;
+    BOOL smoothing;
     HRESULT hr;
 
     TRACE("%p, %p, %p.\n", iface, monitor, params);
@@ -1125,8 +1313,30 @@ static HRESULT WINAPI dwritefactory_CreateMonitorRenderingParams(IDWriteFactory7
     if (!fixme_once++)
         FIXME("(%p): monitor setting ignored\n", monitor);
 
+    /* The ClearType level and the pixel geometry decide whether a caller that
+     * asks for DWRITE_TEXT_ANTIALIAS_MODE_DEFAULT gets subpixel text: d2d1
+     * only promotes the default to ClearType when the level is above zero.
+     * Reporting zero and a flat geometry meant every application taking the
+     * default drew greyscale no matter what the user had configured, so take
+     * both from the system font-smoothing settings, the same ones GDI reads. */
+    if (!SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0))
+        smoothing = FALSE;
+    if (smoothing)
+    {
+        if (!SystemParametersInfoW(SPI_GETFONTSMOOTHINGTYPE, 0, &smoothing_type, 0))
+            smoothing_type = FE_FONTSMOOTHINGSTANDARD;
+        if (smoothing_type == FE_FONTSMOOTHINGCLEARTYPE)
+        {
+            if (!SystemParametersInfoW(SPI_GETFONTSMOOTHINGORIENTATION, 0, &orientation, 0))
+                orientation = FE_FONTSMOOTHINGORIENTATIONRGB;
+            geometry = orientation == FE_FONTSMOOTHINGORIENTATIONBGR
+                    ? DWRITE_PIXEL_GEOMETRY_BGR : DWRITE_PIXEL_GEOMETRY_RGB;
+            cleartype_level = 1.0f;
+        }
+    }
+
     /* FIXME: use actual per-monitor gamma factor */
-    hr = IDWriteFactory7_CreateCustomRenderingParams(iface, 2.0f, 0.0f, 1.0f, 0.0f, DWRITE_PIXEL_GEOMETRY_FLAT,
+    hr = IDWriteFactory7_CreateCustomRenderingParams(iface, 2.0f, 0.0f, 1.0f, cleartype_level, geometry,
         DWRITE_RENDERING_MODE1_DEFAULT, DWRITE_GRID_FIT_MODE_DEFAULT, &params3);
     *params = (IDWriteRenderingParams*)params3;
     return hr;
@@ -1165,6 +1375,10 @@ static HRESULT WINAPI dwritefactory_RegisterFontFileLoader(IDWriteFactory7 *ifac
     if (factory_get_file_loader(factory, loader))
         return DWRITE_E_ALREADYREGISTERED;
 
+    /* A new loader may reuse the address of an earlier, unregistered one -
+     * caches parked under that address belong to the old loader. */
+    factory_purge_parked_caches_for_loader(factory, loader);
+
     if (!(entry = malloc(sizeof(*entry))))
         return E_OUTOFMEMORY;
 
@@ -1190,6 +1404,9 @@ static HRESULT WINAPI dwritefactory_UnregisterFontFileLoader(IDWriteFactory7 *if
     if (!found)
         return E_INVALIDARG;
 
+    /* The loader's DLL may be unloaded right after this call - drop the parked
+     * caches that identify their font files by this loader. */
+    factory_purge_parked_caches_for_loader(factory, loader);
     release_fileloader(found);
     return S_OK;
 }
@@ -2241,6 +2458,7 @@ static void init_dwritefactory(struct dwritefactory *factory, DWRITE_FACTORY_TYP
     list_init(&factory->collection_loaders);
     list_init(&factory->file_loaders);
     list_init(&factory->localfontfaces);
+    list_init(&factory->parked_caches);
 
     InitializeCriticalSectionEx(&factory->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
     factory->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": dwritefactory.lock");

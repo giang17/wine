@@ -948,6 +948,10 @@ static NTSTATUS heap_free_block( struct heap *heap, ULONG flags, struct block *b
     /* keep room for a full committed block as hysteresis */
     if (!next) subheap_decommit( heap, subheap, (char *)((struct entry *)block + 1) + REGION_ALIGN );
 
+    /* Note: interior free block MEM_RESET (MADV_FREE) was tested here but has no effect.
+     * Free blocks are reused within milliseconds — the kernel never gets a chance to
+     * reclaim the pages. See docs/wine-wined3d-buffer-leak.md Option D for details. */
+
     return STATUS_SUCCESS;
 }
 

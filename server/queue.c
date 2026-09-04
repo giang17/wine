@@ -4035,7 +4035,17 @@ DECL_HANDLER(set_cursor)
     if (req->flags & SET_CURSOR_NOCLIP) set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 0 );
 
     new_cursor = input_shm->cursor_count < 0 ? 0 : input_shm->cursor;
-    if (prev_cursor != new_cursor) update_desktop_cursor_handle( desktop, input, new_cursor );
+    /* A hide/show transition must reach the driver even when the effective
+     * cursor stays zero.  An application that hides the pointer with
+     * ShowCursor(FALSE) and also sets a null cursor while it is hidden leaves
+     * both prev_cursor and new_cursor at zero on ShowCursor(TRUE), so the
+     * handle comparison alone sends nothing and the pointer stays invisible
+     * until an unrelated event sets a cursor again.  WebView2 content does
+     * exactly this while dragging a slider.  A null handle resolves to the
+     * window class cursor, then IDC_ARROW, on the client side. */
+    if (prev_cursor != new_cursor
+            || (reply->prev_count < 0) != (input_shm->cursor_count < 0))
+        update_desktop_cursor_handle( desktop, input, new_cursor );
 
     reply->new_x       = desktop_shm->cursor.x;
     reply->new_y       = desktop_shm->cursor.y;

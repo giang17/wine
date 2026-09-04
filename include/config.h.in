@@ -813,6 +813,9 @@
 /* Define to the soname of the libXcursor library. */
 #undef SONAME_LIBXCURSOR
 
+/* Define to the soname of the libXdamage library. */
+#undef SONAME_LIBXDAMAGE
+
 /* Define to the soname of the libXext library. */
 #undef SONAME_LIBXEXT
 

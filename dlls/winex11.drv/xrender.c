@@ -824,7 +824,11 @@ static HFONT xrenderdrv_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
     HFONT ret;
 
     NtGdiExtGetObjectW( hfont, sizeof(lfsz.lf), &lfsz.lf );
-    if (!*aa_flags) *aa_flags = get_xft_aa_flags( &lfsz.lf );
+    if (!*aa_flags)
+    {
+        *aa_flags = get_xft_aa_flags( &lfsz.lf );
+        if (*aa_flags) *aa_flags |= WINE_GGO_AA_FROM_HOST;
+    }
 
     ret = next->funcs->pSelectFont( next, hfont, aa_flags );
     if (!ret) return 0;
@@ -1855,6 +1859,15 @@ static DWORD xrenderdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
 
         pXRenderFreePicture( gdi_display, src_pict );
         XFreePixmap( gdi_display, src_pixmap );
+
+        /* Push the request out.  The other two paths that put pixels on a window from
+         * this driver - x11drv_surface_flush() and X11DRV_client_surface_present() -
+         * both end in an explicit XFlush(); this one did not, so its output sat in the
+         * Xlib buffer until unrelated traffic happened to flush it.  An application
+         * that finishes painting and then blocks in GetMessage() produces no such
+         * traffic, and the pixels stay invisible until the next input event moves them
+         * out (issue 258: SynthEdit's MDI canvas after enlarging it by hand). */
+        XFlush( gdi_display );
     }
     return ret;
 

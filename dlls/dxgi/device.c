@@ -469,6 +469,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_swapchain_factory_create_swapchain(IWineDX
         return hr;
     }
 
+    object->alpha_mode = desc->AlphaMode;
+
     TRACE("Created swapchain %p.\n", object);
 
     *swapchain = (IDXGISwapChain1 *)&object->IDXGISwapChain4_iface;

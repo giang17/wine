@@ -8262,6 +8262,14 @@ static GLuint shader_glsl_generate_vertex_shader(const struct wined3d_context_gl
         }
     }
 
+    /* setup_vs_output() takes the whole output array by value, so the elements
+     * the shader never writes are copied along with the rest. Initialise them,
+     * otherwise drivers warn about reading uninitialised values for every
+     * program linking this shader (NVIDIA: C7050 "vs_out[N] might be used
+     * before being initialized"). The stores are dead after inlining. */
+    for (i = 0; i < shader->limits->packed_output; ++i)
+        shader_addline(buffer, "vs_out[%u] = vec4(0.0);\n", i);
+
     if (FAILED(shader_generate_code(shader, buffer, reg_maps, &priv_ctx, NULL, NULL)))
         return 0;
 

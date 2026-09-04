@@ -116,8 +116,36 @@ static void activate_ime_hkl( HWND hwnd )
 
 static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR *result_str )
 {
+    HWND target = get_focus();  /* route to the actual focus window (e.g. an embedded client
+                                 * in another process), not the X event recipient window */
+    if (!target) target = get_active_window();
+    if (!target) target = hwnd;
+
     activate_ime_hkl( hwnd );
-    NtUserMessageCall( hwnd, WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str,
+
+    /* Embedded clients in another process (e.g. Chromium/WebView2) ignore the WM_IME
+     * composition result and only consume WM_CHAR, so characters routed solely through
+     * the IME update never appear. Post the finished result string as WM_CHAR as well
+     * so it reaches the focus window directly. Composition strings (comp_str) stay
+     * IME-only, which CJK input methods rely on.
+     * Scope this to cross-process windows: a local window that consumes the IME
+     * composition result (CJK/Vietnamese input methods in process) would otherwise
+     * receive each committed character twice. A foreign top-level has no win_data
+     * in this process, which is how we tell the cases apart. */
+    {
+        struct x11drv_win_data *root_data = get_win_data( NtUserGetAncestor( target, GA_ROOT ) );
+        BOOL cross_process = !root_data;
+        release_win_data( root_data );
+
+        if (result_str && cross_process)
+        {
+            UINT i;
+            for (i = 0; result_str[i]; i++)
+                NtUserPostMessage( target, WM_CHAR, (WPARAM)result_str[i], 0 );
+        }
+    }
+
+    NtUserMessageCall( target, WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str,
                        result_str, NtUserImeDriverCall, FALSE );
 }
 

@@ -1078,6 +1078,7 @@ SOURCES = \
 	windows.perception.spatial.idl \
 	windows.perception.spatial.surfaces.idl \
 	windows.security.authentication.onlineid.idl \
+	windows.security.authentication.web.core.idl \
 	windows.security.authorization.appcapabilityaccess.idl \
 	windows.security.credentials.idl \
 	windows.security.credentials.ui.idl \
@@ -1117,6 +1118,7 @@ SOURCES = \
 	wine/atsvc.idl \
 	wine/condrv.h \
 	wine/dcetypes.idl \
+	wine/dcomp_layer.h \
 	wine/debug.h \
 	wine/dplaysp.h \
 	wine/epm.idl \

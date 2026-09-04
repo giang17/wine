@@ -1481,6 +1481,14 @@ TOOLTIPS_Pop (TOOLTIPS_INFO *infoPtr)
 {
     TOOLTIPS_Hide (infoPtr);
 
+    /* If the tooltip is in tracking mode, TTM_POP should also hide it. */
+    if (infoPtr->bTrackActive)
+    {
+        TOOLTIPS_TrackHide (infoPtr);
+        infoPtr->bTrackActive = FALSE;
+        infoPtr->nTrackTool = -1;
+    }
+
     return 0;
 }
 

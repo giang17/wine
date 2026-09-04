@@ -23,9 +23,34 @@
 #include "wined3d_private.h"
 #include "wined3d_gl.h"
 #include "wined3d_vk.h"
+#include "wine/dcomp_layer.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
+
+static void wined3d_swapchain_set_layer_sink(struct wined3d_swapchain *swapchain, BOOL add);
 WINE_DECLARE_DEBUG_CHANNEL(d3d_perf);
+
+/* Route top-level window presents through glXSwapBuffers instead of the GDI
+ * blit: the GDI path reads the whole backbuffer off the GPU into system
+ * memory every present (~650 MB/s of display-server traffic and more than a
+ * core during continuous UI activity in Ableton Live), and as a 60 Hz GDI
+ * painter it fights every other painter sharing the top level's drawable —
+ * the dcomp tree timer's WebView2 composite in particular (issue 121).
+ * WINE_DISABLE_GL_PRESENT=1 restores the GDI path for every window; the
+ * value is read, not just the presence, so =0 keeps the GL path.
+ * Adopted from shibco/ableton-linux patch 0055 (diagnosis and measurements:
+ * Lucas Gillingham/ClickSentinel, their issue 91). */
+static BOOL wined3d_gl_present_disabled(void)
+{
+    static int disabled = -1;
+
+    if (disabled < 0)
+    {
+        const char *e = getenv("WINE_DISABLE_GL_PRESENT");
+        disabled = (e && e[0] != '0') ? 1 : 0;
+    }
+    return disabled > 0;
+}
 
 static BOOL set_window_present_rect(HWND hwnd, UINT x, UINT y, UINT width, UINT height)
 {
@@ -46,6 +71,50 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
     UINT i;
 
     TRACE("Destroying swapchain %p.\n", swapchain);
+
+    if (swapchain->comp_dc)
+    {
+        SelectObject(swapchain->comp_dc, swapchain->comp_old_bitmap);
+        DeleteObject(swapchain->comp_bitmap);
+        DeleteDC(swapchain->comp_dc);
+        swapchain->comp_dc = NULL;
+        swapchain->comp_bits = NULL;
+    }
+
+    /* Remove the composition props this swapchain set on its window during
+     * Present (see SetPropW of __wine_dcomp_comp_dc/_size/_bits). The comp_dc
+     * and bits they reference are freed above; leaving the props behind lets
+     * the child-compositing path read a stale HDC/bits pointer after the
+     * swapchain is gone. Only our own props are touched — __wine_dcomp_child_*
+     * and __wine_dcomp_is_child are owned by dcomp/dxgi and removed there. */
+    if (swapchain->win_handle)
+    {
+        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_dc");
+        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_size");
+        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_bits");
+    }
+
+    /* The dcomp leaf layer (issue 206): count out of the sink so dcomp stops
+     * publishing for a window nobody composites for any more, and drop the
+     * texture.  The layer itself belongs to dcomp and is not ours to touch. */
+    if (swapchain->layer_sink)
+        wined3d_swapchain_set_layer_sink(swapchain, FALSE);
+    if (swapchain->layer_texture)
+    {
+        wined3d_texture_decref(swapchain->layer_texture);
+        swapchain->layer_texture = NULL;
+        swapchain->layer_tex_width = swapchain->layer_tex_height = 0;
+    }
+    swapchain->layer = NULL;
+
+    if (swapchain->surface_bits)
+    {
+        HeapFree(GetProcessHeap(), 0, swapchain->surface_bits);
+        swapchain->surface_bits = NULL;
+        swapchain->surface_width = 0;
+        swapchain->surface_height = 0;
+        swapchain->surface_valid = FALSE;
+    }
 
     wined3d_swapchain_state_cleanup(&swapchain->state);
     wined3d_swapchain_set_gamma_ramp(swapchain, 0, &swapchain->orig_gamma);
@@ -163,6 +232,7 @@ ULONG CDECL wined3d_swapchain_decref(struct wined3d_swapchain *swapchain)
     if (!refcount)
     {
         struct wined3d_device *device;
+        unsigned int i;
 
         wined3d_mutex_lock();
 
@@ -170,6 +240,39 @@ ULONG CDECL wined3d_swapchain_decref(struct wined3d_swapchain *swapchain)
         if (device->swapchain_count && device->swapchains[0] == swapchain)
             wined3d_device_uninit_3d(device);
         wined3d_cs_finish(device->cs, WINED3D_CS_QUEUE_DEFAULT);
+
+        /* Contexts hold a bare pointer to the swapchain they last drew to, set
+         * in wined3d_context_gl_activate() whenever a texture belongs to a
+         * different one.  Nothing used to clear it when the swapchain went
+         * away first, and the context is not destroyed with it: only
+         * wined3d_context_gl_destroy() ever resets the field, which is exactly
+         * where the long-standing FIXME asking for this pointer to disappear
+         * sits.  A context that outlives its swapchain then keeps reading
+         * win_handle and dc out of freed memory on every acquire.
+         *
+         * The reads are not harmless in practice.  What comes back decides the
+         * code path: with a recycled NULL in win_handle the pixel format call
+         * goes through and prints an error per acquire, with garbage in it the
+         * window comparison fails one line earlier and the same defect passes
+         * silently.  A measurement on the same binary produced 6525, 4 and 0
+         * occurrences in three runs for that reason alone.
+         *
+         * Clearing the field here is safe: every reader either tests it first
+         * (wined3d_context_gl_update_window(), wined3d_context_gl_activate())
+         * or runs while the context is being created and the swapchain is
+         * known good (wined3d_context_gl_init()).  A context whose swapchain
+         * is NULL simply keeps the device context it currently holds until it
+         * is activated for a live swapchain again.
+         *
+         * The command stream has been drained above and the wined3d mutex is
+         * held, so no CS work can touch device->contexts while this runs. */
+        for (i = 0; i < device->context_count; ++i)
+        {
+            if (device->contexts[i]->swapchain != swapchain)
+                continue;
+            TRACE("Clearing swapchain %p from context %p.\n", swapchain, device->contexts[i]);
+            device->contexts[i]->swapchain = NULL;
+        }
 
         if (swapchain->dc)
             wined3d_release_dc(swapchain->win_handle, swapchain->dc);
@@ -211,6 +314,74 @@ void CDECL wined3d_swapchain_set_window(struct wined3d_swapchain *swapchain, HWN
 
     if (!(swapchain->dc = GetDCEx(swapchain->win_handle, 0, DCX_USESTYLE | DCX_CACHE)))
         WARN("Failed to retrieve device context, trying swapchain backup.\n");
+}
+
+void CDECL wined3d_swapchain_set_device_window(struct wined3d_swapchain *swapchain, HWND window)
+{
+    TRACE("Setting swapchain %p device window from %p to %p.\n",
+            swapchain, swapchain->state.device_window, window);
+
+    swapchain->state.device_window = window;
+    swapchain->state.desc.device_window = window;
+    wined3d_swapchain_set_window(swapchain, window);
+}
+
+/* Composition present-state setters, called from the DXGI/client thread.
+ *
+ * set_dirty_rects() writes the per-frame dirty-rect buffer that the present
+ * path consumes on the CS thread.  To avoid the client/CS data race on that
+ * buffer (a pipelined next-frame set_dirty_rects() overwriting rects while a
+ * CS-thread present of the previous frame is still reading them), the rects are
+ * handed off through the present CS op: emit snapshots present_dirty_rects[]
+ * into the op (app thread, after this setter), and wined3d_cs_exec_present
+ * copies the op snapshot into cs_present_dirty_rects[], which is the only buffer
+ * the present path (swapchain_blit_gdi) reads.  present_dirty_rects[] is thus
+ * touched only on the app thread, cs_present_dirty_rects[] only on the CS thread.
+ *
+ * set_force_gdi_present() / set_premultiplied_alpha() write state.desc.flags
+ * bits that are also read on the CS-thread present path, but these are
+ * configured once at swapchain/target creation (see dlls/dxgi/factory.c) before
+ * any Present, never per frame, so they are not raced in practice and do not
+ * need the per-frame handoff. */
+void CDECL wined3d_swapchain_set_force_gdi_present(struct wined3d_swapchain *swapchain, BOOL force)
+{
+    TRACE("swapchain %p, force %d.\n", swapchain, force);
+
+    if (force)
+        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT;
+    else
+        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT;
+}
+
+void CDECL wined3d_swapchain_set_prefer_gl_present(struct wined3d_swapchain *swapchain, BOOL prefer)
+{
+    TRACE("swapchain %p, prefer %d.\n", swapchain, prefer);
+
+    if (prefer)
+        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
+    else
+        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
+}
+
+void CDECL wined3d_swapchain_set_premultiplied_alpha(struct wined3d_swapchain *swapchain, BOOL premultiplied)
+{
+    TRACE("swapchain %p, premultiplied %d.\n", swapchain, premultiplied);
+
+    if (premultiplied)
+        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA;
+    else
+        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA;
+}
+
+void CDECL wined3d_swapchain_set_dirty_rects(struct wined3d_swapchain *swapchain,
+        const RECT *rects, unsigned int count)
+{
+    if (count > ARRAY_SIZE(swapchain->present_dirty_rects))
+        count = ARRAY_SIZE(swapchain->present_dirty_rects);
+
+    if (rects && count)
+        memcpy(swapchain->present_dirty_rects, rects, count * sizeof(*rects));
+    swapchain->present_dirty_rect_count = count;
 }
 
 HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
@@ -431,6 +602,420 @@ HRESULT CDECL wined3d_swapchain_get_gamma_ramp(const struct wined3d_swapchain *s
 
 /* The is a fallback for cases where we e.g. can't create a GL context or
  * Vulkan swapchain for the swapchain window. */
+
+/* Merge pixels from src into dst, copying only where source alpha is non-zero.
+ * This preserves existing composition buffer content under transparent areas
+ * left by Clear(transparent) + partial redraw (JUCE/Serum2 pattern).
+ * Used in the "no-dirty full blit" path for SEQUENTIAL swapchains where the
+ * app calls Present() without Present1() dirty rects. */
+static void comp_buffer_alpha_merge(DWORD *dst_bits, unsigned int dst_pitch,
+        const DWORD *src_bits, unsigned int src_pitch,
+        int width, int height)
+{
+    int x, y;
+
+    for (y = 0; y < height; ++y)
+    {
+        const DWORD *src_row = (const DWORD *)((const char *)src_bits
+                + (unsigned int)y * src_pitch);
+        DWORD *dst_row = (DWORD *)((char *)dst_bits
+                + (unsigned int)y * dst_pitch);
+
+        for (x = 0; x < width; ++x)
+        {
+            if (src_row[x] & 0xff000000)
+                dst_row[x] = src_row[x];
+        }
+    }
+}
+
+/* Copy pixels from src to dst, but only where source alpha is non-zero.
+ * This preserves existing composition buffer content under transparent
+ * areas of the back buffer (after Clear(transparent) + partial redraw).
+ * DComp plugins rely on the compositor preserving unmodified regions. */
+static void comp_buffer_alpha_copy(DWORD *dst_bits, unsigned int dst_pitch,
+        const DWORD *src_bits, unsigned int src_pitch,
+        int dst_x, int dst_y, int src_x, int src_y,
+        int width, int height)
+{
+    /* Copy all pixels from backbuffer to comp buffer, including transparent
+     * ones. The old code skipped alpha==0 pixels to preserve comp buffer
+     * content, but this caused stale content because Clear(transparent) +
+     * partial redraw left transparent pixels that never overwrote the old
+     * comp buffer. */
+    int y;
+
+    for (y = 0; y < height; ++y)
+    {
+        const DWORD *src_row = (const DWORD *)((const char *)src_bits
+                + (unsigned int)(src_y + y) * src_pitch) + src_x;
+        DWORD *dst_row = (DWORD *)((char *)dst_bits
+                + (unsigned int)(dst_y + y) * dst_pitch) + dst_x;
+
+        memcpy(dst_row, src_row, width * sizeof(DWORD));
+    }
+}
+
+/* Porter-Duff Over: C_out = C_src + C_dst * (1 - alpha_src)
+ * Both src and dst are premultiplied alpha BGRA. */
+static void composite_over_premul(DWORD *dst, const DWORD *src,
+        unsigned int dst_stride, unsigned int src_stride,
+        int dst_x, int dst_y, int src_w, int src_h,
+        int dst_total_w, int dst_total_h)
+{
+    int y, x;
+    int x_end = dst_x + src_w;
+    int y_end = dst_y + src_h;
+
+    /* Clip to destination bounds */
+    int sx_start = 0, sy_start = 0;
+    if (dst_x < 0) { sx_start = -dst_x; dst_x = 0; }
+    if (dst_y < 0) { sy_start = -dst_y; dst_y = 0; }
+    if (x_end > dst_total_w) x_end = dst_total_w;
+    if (y_end > dst_total_h) y_end = dst_total_h;
+
+    for (y = dst_y; y < y_end; ++y)
+    {
+        DWORD *dp = dst + y * dst_stride + dst_x;
+        const DWORD *sp = src + (sy_start + y - dst_y) * src_stride + sx_start;
+        int width = x_end - dst_x;
+
+        for (x = 0; x < width; ++x)
+        {
+            DWORD s = sp[x];
+            unsigned int sa = (s >> 24) & 0xff;
+
+            if (sa == 0)
+                continue;  /* Fully transparent — skip */
+
+            if (sa == 255)
+            {
+                dp[x] = s;  /* Fully opaque — overwrite */
+                continue;
+            }
+
+            /* Blend: premultiplied over */
+            {
+                DWORD d = dp[x];
+                unsigned int inv_sa = 255 - sa;
+                unsigned int rb = ((d & 0x00ff00ff) * inv_sa + 128);
+                unsigned int g  = ((d & 0x0000ff00) * inv_sa + 128);
+                unsigned int da = ((d >> 24) * inv_sa + 128);
+
+                rb = (rb + ((rb >> 8) & 0x00ff00ff)) >> 8;
+                g  = (g  + ((g  >> 8) & 0x0000ff00)) >> 8;
+                da = (da + (da >> 8)) >> 8;
+
+                dp[x] = (s & 0x00ff00ff) + (rb & 0x00ff00ff)
+                      + ((s & 0x0000ff00) + (g & 0x0000ff00))
+                      + (((sa + da) > 255 ? 255 : (sa + da)) << 24);
+            }
+        }
+    }
+}
+
+/* Must match DCOMP_MAX_SERIALIZED_LEAVES in dlls/dcomp/device.c -- the two are
+ * separate copies of the same contract, and nothing checks that they agree. */
+#define WINED3D_DCOMP_MAX_LEAVES 16
+
+/* Composite child visuals onto root's comp buffer.
+ * Reads child info from window properties set by dcomp Commit().
+ *
+ * One kind of leaf arrives here: a composition swapchain, addressed through its
+ * hidden composition window.  DComp surfaces and composition textures are
+ * composited by dcomp itself (dcomp_target_composite_leaves), which walks the
+ * visual tree rather than these properties. */
+static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
+        unsigned int dst_w, unsigned int dst_h)
+{
+    ULONG_PTR child_count_val, gen_before, gen_after;
+    unsigned int child_count, i;
+    WCHAR prop_name[64];
+
+    if (!swapchain->comp_bits)
+        return;
+
+    /* Read the commit generation around the whole set (see dcomp_layer.h): it
+     * tells a settled set from one dcomp is rewriting right now, and its
+     * absence tells this reader it is talking to a dcomp from before the
+     * generation existed. */
+    gen_before = (ULONG_PTR)GetPropW(swapchain->win_handle, WINE_DCOMP_CHILD_GEN_PROP);
+
+    child_count_val = (ULONG_PTR)GetPropW(swapchain->win_handle,
+            L"__wine_dcomp_child_count");
+    child_count = (unsigned int)child_count_val;
+    if (!child_count)
+        return;
+
+    if (child_count > WINED3D_DCOMP_MAX_LEAVES)
+    {
+        /* dcomp caps at the same number, so this means the two halves disagree
+         * -- a half-deployed build.  The leaves past the limit are dropped. */
+        static unsigned int over_count;
+
+        if (++over_count <= 5 || !(over_count % 200))
+            FIXME("Leaf count %u exceeds the reader limit of %u on %p #%u: dropping %u leaves.\n",
+                    child_count, WINED3D_DCOMP_MAX_LEAVES, swapchain->win_handle,
+                    over_count, child_count - WINED3D_DCOMP_MAX_LEAVES);
+    }
+
+    for (i = 0; i < child_count && i < WINED3D_DCOMP_MAX_LEAVES; ++i)
+    {
+        HWND child_wnd;
+        DWORD *child_bits;
+        LPARAM child_dims, child_offset;
+        unsigned int cw, ch;
+        int ox, oy;
+
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_child_%u_wnd", i);
+        child_wnd = (HWND)GetPropW(swapchain->win_handle, prop_name);
+        if (!child_wnd)
+        {
+            /* Every serialized leaf carries a composition window since dcomp
+             * stopped writing surface and texture leaves, so a null handle means
+             * the two halves disagree -- a half-deployed build.  Until then the
+             * null handle was how dcomp announced a DComp surface or composition
+             * texture, and this continue dropped it before the direct-bits branch
+             * that would have read it; that branch never ran once between
+             * e99905af0dd (31.03.2026) and its removal, and has been deleted. */
+            static unsigned int no_wnd_count;
+
+            if (++no_wnd_count <= 5 || !(no_wnd_count % 200))
+                FIXME("Leaf #%u dropped on %p (report #%u): no composition window on the "
+                        "leaf, which no current dcomp writes -- the two halves disagree.\n",
+                        i, swapchain->win_handle, no_wnd_count);
+            continue;
+        }
+
+        child_bits = (DWORD *)GetPropW(child_wnd, L"__wine_dcomp_comp_bits");
+        child_dims = (LPARAM)GetPropW(child_wnd, L"__wine_dcomp_comp_size");
+        if (!child_bits || !child_dims)
+        {
+            /* The window is there but carries no composite buffer yet -- the
+             * child swapchain has not presented once.  Persisting past the first
+             * frames means the leaf never arrives. */
+            static unsigned int no_bits_count;
+
+            if (++no_bits_count <= 5 || !(no_bits_count % 200))
+                FIXME("Leaf #%u dropped on %p (report #%u): child window %p has bits=%p "
+                        "dims=%#Ix.\n", i, swapchain->win_handle, no_bits_count,
+                        child_wnd, child_bits, (ULONG_PTR)child_dims);
+            continue;
+        }
+
+        cw = LOWORD(child_dims);
+        ch = HIWORD(child_dims);
+
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_child_%u_offset", i);
+        child_offset = (LPARAM)GetPropW(swapchain->win_handle, prop_name);
+        ox = (short)LOWORD(child_offset);
+        oy = (short)HIWORD(child_offset);
+
+        {
+            static unsigned int comp_log_count;
+            ++comp_log_count;
+            if (comp_log_count <= 10 || !(comp_log_count % 500))
+                TRACE("Composite child #%u: wnd=%p bits=%p %ux%u at (%d,%d) onto %ux%u.\n",
+                        i, child_wnd, child_bits, cw, ch, ox, oy, dst_w, dst_h);
+        }
+
+        /* Flush GDI operations on child's comp_dc before reading bits */
+        {
+            HDC child_dc = (HDC)GetPropW(child_wnd, L"__wine_dcomp_comp_dc");
+            if (child_dc)
+                GdiFlush();
+        }
+
+        composite_over_premul(swapchain->comp_bits, child_bits,
+                dst_w, cw,
+                ox, oy, cw, ch,
+                dst_w, dst_h);
+    }
+
+    gen_after = (ULONG_PTR)GetPropW(swapchain->win_handle, WINE_DCOMP_CHILD_GEN_PROP);
+    if (!gen_before && !gen_after)
+    {
+        /* Leaves without a generation: the dcomp half predates the protocol.
+         * Detection only -- the set was composited above as it always was. */
+        static unsigned int no_gen_count;
+
+        if (++no_gen_count <= 5 || !(no_gen_count % 200))
+            FIXME("Composited %u leaves on %p without a commit generation (report #%u): "
+                    "the dcomp half predates the bus check -- a half-deployed build.\n",
+                    child_count, swapchain->win_handle, no_gen_count);
+    }
+    else if ((gen_before & 1) || gen_before != gen_after)
+    {
+        /* dcomp rewrote the set while it was read: parts of two commits may
+         * have been mixed.  The next present reads a settled set; today's
+         * behavior (use what was read) is unchanged, but no longer silent. */
+        static unsigned int torn_count;
+
+        if (++torn_count <= 5 || !(torn_count % 200))
+            FIXME("The leaf set on %p was rewritten while it was composited "
+                    "(report #%u): generation %Iu -> %Iu.\n",
+                    swapchain->win_handle, torn_count, gen_before, gen_after);
+    }
+}
+
+/* --- The published dcomp leaf layer, drawn into the frame (issue 206) -------
+ *
+ * A DirectComposition tree covering only a sliver of its window delivers just
+ * the rectangles it covers and leaves the window to the application.  Those
+ * pixels used to be blitted onto the window after the present that produced the
+ * frame -- two writers, no ordering, and every swap landing between two
+ * deliveries showed a window without them (48.2% of frames on Fender Studio
+ * Pro 8; 0.2% with this).
+ *
+ * dcomp publishes them as a layer with alpha instead and we draw them into the
+ * frame we are about to present.  See include/wine/dcomp_layer.h for the
+ * contract, the locking and the lifetime rules.
+ *
+ * We tell dcomp that we are here by counting ourselves into the sink property:
+ * without a sink dcomp keeps blitting, which is what has to happen for a window
+ * this swapchain does not composite for -- a Vulkan swapchain, say, whose
+ * present path has no composite step at all. */
+static void wined3d_swapchain_set_layer_sink(struct wined3d_swapchain *swapchain, BOOL add)
+{
+    ULONG_PTR count;
+
+    if (!swapchain->win_handle)
+        return;
+
+    /* Counted, because more than one swapchain may present to the same window
+     * and the last one out has to be the one that clears it. */
+    count = (ULONG_PTR)GetPropW(swapchain->win_handle, WINE_DCOMP_LAYER_SINK_PROP);
+    if (add)
+        ++count;
+    else if (count)
+        --count;
+
+    if (count)
+        SetPropW(swapchain->win_handle, WINE_DCOMP_LAYER_SINK_PROP, (HANDLE)count);
+    else
+        RemovePropW(swapchain->win_handle, WINE_DCOMP_LAYER_SINK_PROP);
+    swapchain->layer_sink = add;
+
+    TRACE("swapchain %p, hwnd %p: layer sink %s, count %Iu.\n",
+            swapchain, swapchain->win_handle, add ? "added" : "removed", count);
+}
+
+/* Presents between two lookups while none has succeeded.  GetPropW is a
+ * wineserver round trip -- NtUserGetProp is a server request, not a read of
+ * anything local -- and the GL present path makes none at all otherwise.  One
+ * per present would be a thousand round trips a second in an application
+ * presenting at a thousand frames, for a window that will never have a
+ * composition target.  Every eighth present is an eighth of that, and delays
+ * picking up a target that appears later by at most eight frames. */
+#define WINED3D_LAYER_LOOKUP_INTERVAL 8
+
+/* The layer of this swapchain's window, or NULL.  Looked up at most once:
+ * dcomp never frees the structure and never removes the property, so a
+ * successful lookup holds for the life of the swapchain. */
+static struct wine_dcomp_layer *swapchain_poll_layer(struct wined3d_swapchain *swapchain)
+{
+    if (!swapchain->layer_sink)
+        return NULL;
+    if (!swapchain->layer)
+    {
+        struct wine_dcomp_layer *l;
+
+        if (swapchain->layer_lookup)
+        {
+            --swapchain->layer_lookup;
+            return NULL;
+        }
+        swapchain->layer_lookup = WINED3D_LAYER_LOOKUP_INTERVAL - 1;
+        if ((l = (struct wine_dcomp_layer *)GetPropW(swapchain->win_handle,
+                WINE_DCOMP_LAYER_PROP))
+                && (l->magic != WINE_DCOMP_LAYER_MAGIC || l->size != sizeof(*l)))
+        {
+            /* Published by a dcomp built against another layout of the layer.
+             * Taking it would mean reading pixel pointers through the wrong
+             * fields; not taking it means the blit route, which dcomp falls
+             * back to on its own when the drawn count never moves.  Not cached,
+             * so the next lookup picks up the replacement dcomp publishes. */
+            static unsigned int bad_count;
+
+            if (++bad_count <= 5 || !(bad_count % 200))
+                ERR("Rejecting the layer on hwnd %p (report #%u): magic %#lx, size %lu, "
+                        "expected %#x, %Iu -- the dcomp half was built against another layout.\n",
+                        swapchain->win_handle, bad_count, l->magic, l->size,
+                        WINE_DCOMP_LAYER_MAGIC, sizeof(*l));
+            l = NULL;
+        }
+        swapchain->layer = l;
+    }
+    return swapchain->layer;
+}
+
+/* Take the shared lock and clip the published rectangles to everything they
+ * have to fit into.  Returns 0 with the lock released when there is nothing to
+ * draw; otherwise the caller owns the shared lock and must release it.
+ *
+ * The clip is what this present actually writes: a swapchain presenting to a
+ * part of its window must not put leaves outside it, and two swapchains on one
+ * window then each draw the layer into their own frame -- which is what they
+ * should do, since either frame is a whole frame. */
+static unsigned int swapchain_layer_lock_rects(struct wined3d_swapchain *swapchain,
+        struct wine_dcomp_layer **layer, RECT *rects, const RECT *clip)
+{
+    struct wine_dcomp_layer *l;
+    unsigned int i, n = 0;
+    RECT extent, c;
+
+    /* Resolved by swapchain_poll_layer() earlier in this present. */
+    if (!(l = swapchain->layer))
+        return 0;
+
+    AcquireSRWLockShared(&l->lock);
+    if (l->bits && l->rect_count)
+    {
+        SetRect(&extent, 0, 0, l->width, l->height);
+        IntersectRect(&extent, &extent, clip);
+        for (i = 0; i < l->rect_count && i < WINE_DCOMP_LAYER_MAX_RECTS; ++i)
+            if (IntersectRect(&c, &l->rects[i], &extent))
+                rects[n++] = c;
+    }
+    if (!n)
+    {
+        ReleaseSRWLockShared(&l->lock);
+        return 0;
+    }
+    *layer = l;
+    return n;
+}
+
+/* CPU side, for the GDI present branch: composite the layer into the buffer
+ * that is about to go to the window. */
+static BOOL swapchain_composite_layer(struct wined3d_swapchain *swapchain, DWORD *dst,
+        unsigned int dst_stride_dwords, unsigned int dst_w, unsigned int dst_h)
+{
+    RECT rects[WINE_DCOMP_LAYER_MAX_RECTS], clip;
+    struct wine_dcomp_layer *layer;
+    unsigned int i, n;
+
+    if (!dst || !swapchain_poll_layer(swapchain))
+        return FALSE;
+
+    SetRect(&clip, 0, 0, dst_w, dst_h);
+    if (!(n = swapchain_layer_lock_rects(swapchain, &layer, rects, &clip)))
+        return FALSE;
+
+    for (i = 0; i < n; ++i)
+        composite_over_premul(dst, layer->bits + (SIZE_T)rects[i].top * layer->width + rects[i].left,
+                dst_stride_dwords, layer->width, rects[i].left, rects[i].top,
+                rects[i].right - rects[i].left, rects[i].bottom - rects[i].top, dst_w, dst_h);
+    ReleaseSRWLockShared(&layer->lock);
+    InterlockedIncrement(&layer->drawn);
+
+    TRACE("Composited %u layer rect(s) into a %ux%u buffer for hwnd %p.\n",
+            n, dst_w, dst_h, swapchain->win_handle);
+    return TRUE;
+}
+
 static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         struct wined3d_context *context, const RECT *src_rect, const RECT *dst_rect)
 {
@@ -439,6 +1024,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
     D3DKMT_CREATEDCFROMMEMORY create_desc;
     const struct wined3d_format *format;
     unsigned int row_pitch, slice_pitch;
+    BOOL composited_layer = FALSE;
     NTSTATUS status;
     HBITMAP bitmap;
     HDC src_dc;
@@ -450,6 +1036,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
     if (!once++)
         FIXME("Using GDI present.\n");
+
 
     format = back_buffer->resource.format;
     if (!format->ddi_format)
@@ -482,11 +1069,339 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
     TRACE("Created source DC %p, bitmap %p for backbuffer %p.\n", src_dc, bitmap, back_buffer);
 
-    if (!StretchBlt(swapchain->dc, dst_rect->left, dst_rect->top, dst_rect->right - dst_rect->left,
-            dst_rect->bottom - dst_rect->top, src_dc, src_rect->left, src_rect->top,
-            src_rect->right - src_rect->left, src_rect->bottom - src_rect->top, SRCCOPY))
-        ERR("Failed to blit.\n");
+    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA)
+            || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
+            || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_SEQUENTIAL)
+    {
+        unsigned int dst_w = dst_rect->right - dst_rect->left;
+        unsigned int dst_h = dst_rect->bottom - dst_rect->top;
+        unsigned int src_w = src_rect->right - src_rect->left;
+        unsigned int src_h = src_rect->bottom - src_rect->top;
 
+        /* Ensure persistent composition buffer exists and is the right size. */
+        if (!swapchain->comp_dc || swapchain->comp_width != dst_w
+                || swapchain->comp_height != dst_h
+                || swapchain->last_blit_window != swapchain->win_handle)
+        {
+            BITMAPINFO bmi;
+
+            if (swapchain->comp_dc)
+            {
+                SelectObject(swapchain->comp_dc, swapchain->comp_old_bitmap);
+                DeleteObject(swapchain->comp_bitmap);
+                DeleteDC(swapchain->comp_dc);
+            }
+
+            memset(&bmi, 0, sizeof(bmi));
+            bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+            bmi.bmiHeader.biWidth = dst_w;
+            bmi.bmiHeader.biHeight = -(int)dst_h; /* top-down */
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            if (!(swapchain->comp_dc = CreateCompatibleDC(swapchain->dc)))
+            {
+                WARN("Failed to create composition DC.\n");
+                swapchain->comp_bits = NULL;
+                goto done;
+            }
+            if (!(swapchain->comp_bitmap = CreateDIBSection(swapchain->comp_dc, &bmi,
+                    DIB_RGB_COLORS, (void **)&swapchain->comp_bits, NULL, 0)))
+            {
+                WARN("Failed to create composition DIB section.\n");
+                DeleteDC(swapchain->comp_dc);
+                swapchain->comp_dc = NULL;
+                swapchain->comp_bits = NULL;
+                goto done;
+            }
+            if (!(swapchain->comp_old_bitmap = SelectObject(swapchain->comp_dc, swapchain->comp_bitmap)))
+            {
+                WARN("Failed to select composition bitmap into DC.\n");
+                DeleteObject(swapchain->comp_bitmap);
+                swapchain->comp_bitmap = NULL;
+                DeleteDC(swapchain->comp_dc);
+                swapchain->comp_dc = NULL;
+                swapchain->comp_bits = NULL;
+                goto done;
+            }
+            swapchain->comp_width = dst_w;
+            swapchain->comp_height = dst_h;
+            swapchain->last_blit_window = swapchain->win_handle;
+
+            /* Allocate/resize per-visual surface buffer BEFORE copying into it.
+             * Must happen before the memcpy below to avoid buffer overflow when
+             * the new comp buffer is larger than the old surface_bits allocation. */
+            if (!swapchain->surface_bits || swapchain->surface_width != dst_w
+                    || swapchain->surface_height != dst_h)
+            {
+                HeapFree(GetProcessHeap(), 0, swapchain->surface_bits);
+                swapchain->surface_bits = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                        dst_w * dst_h * sizeof(DWORD));
+                swapchain->surface_width = dst_w;
+                swapchain->surface_height = dst_h;
+                swapchain->surface_valid = FALSE;
+            }
+
+            /* No content guess on recreate: copying the full backbuffer pulls
+             * stale frames after a resize or window switch (flip buffers still
+             * hold the previous window's frame — FL Studio tab-stale), and
+             * stretching the present's src_rect over the whole buffer distorts
+             * dirty-rect presents (issue 88 resize).  The DIB is
+             * zero-initialized; the regular dirty-/full-present paths below
+             * fill it from this present's actual content. */
+        }
+        if (swapchain->cs_present_dirty_rect_count > 0)
+        {
+            /* Dirty rects: accumulate only changed regions into comp buffer.
+             * Use alpha-aware copy to preserve existing content under transparent
+             * areas — DComp plugins Clear(transparent) every frame and only redraw
+             * changed elements, relying on the compositor to preserve the rest. */
+            unsigned int i;
+            BOOL is_full_frame = FALSE;
+            BOOL use_alpha_copy = swapchain->comp_bits && src_w == dst_w
+                    && src_h == dst_h && format->byte_count == 4;
+
+            if (use_alpha_copy)
+                GdiFlush();
+
+            for (i = 0; i < swapchain->cs_present_dirty_rect_count; ++i)
+            {
+                const RECT *dr = &swapchain->cs_present_dirty_rects[i];
+                int sx = dr->left;
+                int sy = dr->top;
+                int sw = dr->right - dr->left;
+                int sh = dr->bottom - dr->top;
+                int dx = src_w ? sx * (int)dst_w / (int)src_w : sx;
+                int dy = src_h ? sy * (int)dst_h / (int)src_h : sy;
+                int dw = src_w ? sw * (int)dst_w / (int)src_w : sw;
+                int dh = src_h ? sh * (int)dst_h / (int)src_h : sh;
+
+                if (sx == 0 && sy == 0 && (unsigned int)sw >= src_w && (unsigned int)sh >= src_h)
+                    is_full_frame = TRUE;
+
+                if (use_alpha_copy)
+                {
+                    /* Write to per-visual surface_bits if available. Clamp the
+                     * dirty rect to both the source (backbuffer) and the target
+                     * buffer bounds before comp_buffer_alpha_copy's raw memcpy:
+                     * present_dirty_rects come from the app via Present1 and are
+                     * only count-clamped upstream (wined3d_swapchain_set_dirty_rects),
+                     * never coordinate-clamped, so a rect larger than the surface
+                     * or with a negative origin would read past the backbuffer and
+                     * write past the comp/surface buffer. */
+                    DWORD *target = swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits;
+                    unsigned int stride = swapchain->surface_bits ? swapchain->surface_width * 4 : swapchain->comp_width * 4;
+                    int tgt_w = swapchain->surface_bits ? (int)swapchain->surface_width : (int)swapchain->comp_width;
+                    int tgt_h = swapchain->surface_bits ? (int)swapchain->surface_height : (int)swapchain->comp_height;
+                    int csx = sx, csy = sy, cdx = dx, cdy = dy, cw = dw, ch = dh;
+
+                    /* Trim negative origins, advancing the paired origin by the
+                     * overshoot so src/dst columns stay aligned. */
+                    if (csx < 0) { cw += csx; cdx -= csx; csx = 0; }
+                    if (cdx < 0) { cw += cdx; csx -= cdx; cdx = 0; }
+                    if (csy < 0) { ch += csy; cdy -= csy; csy = 0; }
+                    if (cdy < 0) { ch += cdy; csy -= cdy; cdy = 0; }
+
+                    /* Trim extent against source (src_w/src_h) and target bounds. */
+                    if (csx + cw > (int)src_w) cw = (int)src_w - csx;
+                    if (cdx + cw > tgt_w)      cw = tgt_w - cdx;
+                    if (csy + ch > (int)src_h) ch = (int)src_h - csy;
+                    if (cdy + ch > tgt_h)      ch = tgt_h - cdy;
+
+                    /* Skip degenerate rects (fully clipped or inverted). */
+                    if (cw > 0 && ch > 0)
+                        comp_buffer_alpha_copy(target, stride,
+                                back_buffer->resource.heap_memory, row_pitch,
+                                cdx, cdy, csx, csy, cw, ch);
+                }
+                else
+                {
+                    StretchBlt(swapchain->comp_dc, dx, dy, dw, dh,
+                            src_dc, sx, sy, sw, sh, SRCCOPY);
+                }
+            }
+            {
+                static unsigned int dirty_blit_count;
+                ++dirty_blit_count;
+                if (dirty_blit_count <= 10 || !(dirty_blit_count % 500))
+                {
+                    const RECT *dr0 = &swapchain->cs_present_dirty_rects[0];
+                    TRACE("Dirty blit #%u: win %p, %u rects, r0=(%ld,%ld)-(%ld,%ld) %s, buf=%ux%u.\n",
+                            dirty_blit_count, swapchain->win_handle,
+                            swapchain->cs_present_dirty_rect_count,
+                            dr0->left, dr0->top, dr0->right, dr0->bottom,
+                            is_full_frame ? "FULL-FRAME" : "partial",
+                            src_w, src_h);
+                }
+                /* Log all rects for multi-rect blits (> 2 rects = likely UI change, not cursor blink). */
+                if (swapchain->cs_present_dirty_rect_count > 2
+                        && (dirty_blit_count <= 50 || !(dirty_blit_count % 100)))
+                {
+                    unsigned int j;
+                    LONG union_l = LONG_MAX, union_t = LONG_MAX, union_r = 0, union_b = 0;
+                    unsigned long total_area = 0;
+                    for (j = 0; j < swapchain->cs_present_dirty_rect_count; ++j)
+                    {
+                        const RECT *r = &swapchain->cs_present_dirty_rects[j];
+                        if (r->left < union_l) union_l = r->left;
+                        if (r->top < union_t) union_t = r->top;
+                        if (r->right > union_r) union_r = r->right;
+                        if (r->bottom > union_b) union_b = r->bottom;
+                        total_area += (unsigned long)(r->right - r->left) * (r->bottom - r->top);
+                        TRACE("  r[%u]=(%ld,%ld)-(%ld,%ld) %ldx%ld\n",
+                                j, r->left, r->top, r->right, r->bottom,
+                                r->right - r->left, r->bottom - r->top);
+                    }
+                    TRACE("  union=(%ld,%ld)-(%ld,%ld) area=%lu/%lu (%.0f%%)\n",
+                            union_l, union_t, union_r, union_b,
+                            total_area, (unsigned long)src_w * src_h,
+                            100.0 * total_area / ((unsigned long)src_w * src_h));
+                }
+            }
+            /* Ensure surface_bits has latest root visual data after dirty-rect update. */
+            if (swapchain->surface_bits && swapchain->comp_bits)
+            {
+                if (!use_alpha_copy)
+                {
+                    /* StretchBlt wrote to comp_dc — sync back to surface_bits. */
+                    GdiFlush();
+                    memcpy(swapchain->surface_bits, swapchain->comp_bits,
+                            swapchain->surface_width * swapchain->surface_height * sizeof(DWORD));
+                }
+                swapchain->surface_valid = TRUE;
+            }
+        }
+        else
+        {
+            /* No dirty rects (Present without Present1, or timer-triggered).
+             * Do a full blit from backbuffer to comp buffer so that any
+             * D3D11/D2D1 rendering since the last Present becomes visible.
+             * This is the composition-swapchain equivalent of a
+             * full-window present. */
+            BOOL use_alpha_merge = (swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_SEQUENTIAL)
+                    && !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA)
+                    && swapchain->comp_bits && swapchain->surface_bits
+                    && src_w == dst_w && src_h == dst_h
+                    && format->byte_count == 4;
+
+            if (use_alpha_merge)
+            {
+                /* SEQUENTIAL swapchain without dirty rects: the app (JUCE/Serum2)
+                 * calls Clear(transparent) every frame and only redraws dirty
+                 * elements. Merge only non-transparent pixels into surface_bits
+                 * so that the previous frame content is preserved where the app
+                 * cleared to transparent. Phase 3 will copy surface_bits to
+                 * comp_bits for the final BitBlt to the window. */
+                GdiFlush();
+                comp_buffer_alpha_merge(swapchain->surface_bits, swapchain->surface_width * 4,
+                        back_buffer->resource.heap_memory, row_pitch,
+                        dst_w, dst_h);
+                swapchain->surface_valid = TRUE;
+            }
+            else
+            {
+                StretchBlt(swapchain->comp_dc, 0, 0, dst_w, dst_h,
+                        src_dc, src_rect->left, src_rect->top, src_w, src_h, SRCCOPY);
+                if (swapchain->surface_bits && swapchain->comp_bits)
+                {
+                    GdiFlush();
+                    memcpy(swapchain->surface_bits, swapchain->comp_bits,
+                            dst_w * dst_h * sizeof(DWORD));
+                    swapchain->surface_valid = TRUE;
+                }
+            }
+        }
+
+        /* Phase 3 Compositor: rebuild comp_bits from clean root surface_bits,
+         * then composite child visuals on top. */
+        if (!GetPropW(swapchain->win_handle, L"__wine_dcomp_is_child"))
+        {
+            if (swapchain->surface_valid && swapchain->surface_bits && swapchain->comp_bits)
+            {
+                GdiFlush();
+                memcpy(swapchain->comp_bits, swapchain->surface_bits,
+                        swapchain->surface_width * swapchain->surface_height * sizeof(DWORD));
+            }
+            swapchain_composite_children(swapchain, dst_w, dst_h);
+            /* The dcomp leaf layer, see above. */
+            swapchain_composite_layer(swapchain, swapchain->comp_bits,
+                    swapchain->comp_width, dst_w, dst_h);
+        }
+
+        /* Child visuals: only update comp buffer, skip window blit.
+         * The root visual reads our comp_bits directly. */
+        if (GetPropW(swapchain->win_handle, L"__wine_dcomp_is_child"))
+        {
+            /* Child visuals: only update comp buffer, skip window blit. */
+        }
+        else
+        {
+            /* No area is kept out of this blit on account of another DComp
+             * target sharing the top level.  That exclusion used to live here
+             * (for issue 121) and was measured to subtract nothing: it keys off
+             * the foreign target's window rect, and Chromium parks that window
+             * exactly one client width to the side, so the rect it excludes and
+             * the area we paint never meet.  Both the flicker it was written
+             * for and the black block a later refinement addressed are handled
+             * elsewhere now — top levels take the GL present path and never
+             * reach this function, and targets of other top levels were already
+             * filtered out by their differing GA_ROOT.  What remained was a
+             * walk of the 16-slot desktop registry on every present, each slot
+             * a wineserver round trip, that declined to act every time.  If a
+             * present ever does need to spare a target's area, the source for
+             * it cannot be the window rect; it has to be the geometry the
+             * target is actually composed at, which nothing publishes today. */
+            /* Always BitBlt full comp buffer to window — survives any surface reset. */
+            if (!BitBlt(swapchain->dc, dst_rect->left, dst_rect->top, dst_w, dst_h,
+                    swapchain->comp_dc, 0, 0, SRCCOPY))
+                WARN("Failed to blit composition buffer to window.\n");
+        }
+
+        /* Store comp_dc as window property so WM_PAINT can re-blit. Don't
+         * publish a partially-initialized composition state via props. */
+        if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_dc", (HANDLE)swapchain->comp_dc))
+            WARN("Failed to set __wine_dcomp_comp_dc property.\n");
+        {
+            /* Store dimensions as a single LPARAM-sized value. */
+            LPARAM dims = MAKELPARAM(dst_w, dst_h);
+            if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_size", (HANDLE)dims))
+                WARN("Failed to set __wine_dcomp_comp_size property.\n");
+        }
+        /* Expose surface_bits so root can composite per-visual layers. */
+        if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_bits",
+                (HANDLE)(swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits)))
+            WARN("Failed to set __wine_dcomp_comp_bits property.\n");
+
+        swapchain->cs_present_dirty_rect_count = 0;
+    }
+    else
+    {
+        /* The dcomp leaf layer goes into the source memory BEFORE the blit --
+         * that is the back buffer copy this branch is about to write to the
+         * window (issue 206). */
+        composited_layer = format->byte_count == 4 && swapchain_composite_layer(swapchain,
+                (DWORD *)back_buffer->resource.heap_memory, row_pitch / 4,
+                create_desc.Width, create_desc.Height);
+        if (composited_layer)
+            GdiFlush();
+
+        if (!StretchBlt(swapchain->dc, dst_rect->left, dst_rect->top,
+                dst_rect->right - dst_rect->left, dst_rect->bottom - dst_rect->top,
+                src_dc, src_rect->left, src_rect->top,
+                src_rect->right - src_rect->left, src_rect->bottom - src_rect->top, SRCCOPY))
+            ERR("Failed to blit.\n");
+
+        /* Do not leave the leaves in that copy: a later present skipping the
+         * download would blit them a second time and the leaf would trail. */
+        if (composited_layer)
+            wined3d_texture_invalidate_location(back_buffer, 0, WINED3D_LOCATION_SYSMEM);
+    }
+
+    /* Suppress spurious WM_PAINT after writing to the window surface. */
+    ValidateRect(swapchain->win_handle, NULL);
+
+done:
     destroy_desc.hDc = src_dc;
     destroy_desc.hBitmap = bitmap;
     if ((status = D3DKMTDestroyDCFromMemory(&destroy_desc)))
@@ -522,6 +1437,229 @@ static void swapchain_blit(const struct wined3d_swapchain *swapchain,
     wined3d_texture_invalidate_location(texture, 0, WINED3D_LOCATION_DRAWABLE);
 }
 
+/* --- The leaf layer in the GL present frame (issue 206) ---------------------
+ *
+ * swapchain_composite_layer() above composites on the CPU, into the buffer the
+ * GDI branch writes to the window.  A FLIP_DISCARD swapchain on a top-level
+ * window does not take that branch: it presents through swapchain_blit() plus
+ * wglSwapBuffers().  For the layer to be part of that frame it has to be drawn
+ * into the drawable between those two calls -- after which it leaves with the
+ * swap and there is no queue left to lose a race against.
+ *
+ * The layer lives in a persistent texture of ours (only the published box is
+ * uploaded per present, not the whole layer) and is drawn through wined3d's own
+ * blitter chain.  Three places this could have gone wrong:
+ *
+ * 1. THE STATE CACHE.  Foreign GL leaves wined3d's cache inconsistent and the
+ *    damage shows up somewhere else entirely.  So nothing but the blend is set
+ *    by hand: wined3d_context_gl_apply_blit_state() establishes the known blit
+ *    state AND marks the affected STATE_* invalid (STATE_BLEND among them), and
+ *    the rest is the blitter chain's own business.  The blend is switched off
+ *    again afterwards so the blit state keeps the invariant apply_blit_state()
+ *    relies on the next time round -- it returns early when last_was_blit is
+ *    already set, and would then not switch it off.
+ *
+ * 2. WHICH BLITTER.  device->blitter is a chain, raw -> fbo -> glsl -> ffp ->
+ *    cpu.  A WINED3D_BLIT_OP_COLOR_BLIT is taken by the fbo blitter, which
+ *    serves it with glBlitFramebuffer -- and that ignores GL_BLEND entirely, so
+ *    the layer would overwrite the frame in its box instead of lying over it.
+ *    With WINED3D_BLIT_OP_COLOR_BLIT_ALPHATEST the fbo blitter does not take it
+ *    (fbo_blitter_supported() knows COLOR_BLIT and DEPTH_BLIT and nothing else)
+ *    and the request falls through to the glsl blitter, which draws a shader
+ *    quad -- and a quad respects blending.  The alpha test itself is a side
+ *    effect, discarding the fully transparent pixels blending would have passed
+ *    through anyway.
+ *
+ *    That is a quiet coupling to somebody else's code and the one place a
+ *    reviewer should look.  A blit op that asks for blending outright would be
+ *    the honest form of it.
+ *
+ * 3. THE Y DIRECTION.  Not computed here: glsl_blitter_blit() calls
+ *    wined3d_texture_translate_drawable_coords() itself for
+ *    WINED3D_LOCATION_DRAWABLE, so the destination rectangle goes in as client
+ *    coordinates.  And because the box is uploaded to the same place in the
+ *    texture that it occupies in the window, source and destination are the
+ *    same rectangle.
+ *
+ * Alpha is PREMULTIPLIED (dcomp lays the layer down that way), hence GL_ONE /
+ * GL_ONE_MINUS_SRC_ALPHA and not GL_SRC_ALPHA. */
+
+/* Create or resize the texture.  Deliberately NOT part of drawing: creating it
+ * inside the present path made wined3d activate a context with a NULL DC, which
+ * cost five wglSetPixelFormatWINE errors per session and a context switch in a
+ * path that is supposed to be quick.  Called before the present acquires its
+ * context, so this is an ordinary texture creation like any other.
+ *
+ * It is not done at swapchain creation either, which would look tidier: the
+ * layer is as large as the window, and a texture that size for every top-level
+ * swapchain would cost tens of megabytes in every 3D application, the vast
+ * majority of which never see a composition target.  Here it costs nothing
+ * until a layer is actually published. */
+static void swapchain_gl_prepare_layer_texture(struct wined3d_swapchain *swapchain)
+{
+    struct wined3d_resource_desc desc;
+    struct wine_dcomp_layer *layer;
+    struct wined3d_sub_resource_data data;
+    unsigned int w = 0, h = 0;
+    DWORD *zero;
+    HRESULT hr;
+
+    if (!(layer = swapchain_poll_layer(swapchain)))
+        return;
+
+    AcquireSRWLockShared(&layer->lock);
+    if (layer->bits)
+    {
+        w = layer->width;
+        h = layer->height;
+    }
+    ReleaseSRWLockShared(&layer->lock);
+
+    if (!w || !h)
+        return;
+    if (swapchain->layer_texture && swapchain->layer_tex_width == w
+            && swapchain->layer_tex_height == h)
+        return;
+
+    if (swapchain->layer_texture)
+    {
+        wined3d_texture_decref(swapchain->layer_texture);
+        swapchain->layer_texture = NULL;
+        swapchain->layer_tex_width = swapchain->layer_tex_height = 0;
+    }
+
+    /* Zero-initialised, not merely allocated.  Only the published box is ever
+     * uploaded, so everything outside it is whatever the texture happened to
+     * come with -- transparent is the only value that draws nothing.  Today
+     * only the box is drawn as well, so it would not show; the moment a real
+     * region is drawn instead of a box, it would. */
+    if (!(zero = calloc((size_t)w * h, sizeof(DWORD))))
+    {
+        ERR("Failed to allocate the layer texture initialiser.\n");
+        return;
+    }
+
+    desc.resource_type = WINED3D_RTYPE_TEXTURE_2D;
+    desc.format = WINED3DFMT_B8G8R8A8_UNORM;
+    desc.multisample_type = WINED3D_MULTISAMPLE_NONE;
+    desc.multisample_quality = 0;
+    desc.usage = WINED3DUSAGE_CS;
+    desc.bind_flags = WINED3D_BIND_SHADER_RESOURCE;
+    desc.access = WINED3D_RESOURCE_ACCESS_GPU;
+    desc.width = w;
+    desc.height = h;
+    desc.depth = 1;
+    desc.size = 0;
+
+    data.data = zero;
+    data.row_pitch = w * sizeof(DWORD);
+    data.slice_pitch = (unsigned int)((size_t)w * h * sizeof(DWORD));
+
+    if (FAILED(hr = wined3d_texture_create(swapchain->device, &desc, 1, 1, 0,
+            &data, NULL, &wined3d_null_parent_ops, &swapchain->layer_texture)))
+    {
+        ERR("Failed to create the %ux%u layer texture, hr %#lx.\n", w, h, hr);
+        swapchain->layer_texture = NULL;
+    }
+    else
+    {
+        swapchain->layer_tex_width = w;
+        swapchain->layer_tex_height = h;
+        TRACE("Created a %ux%u layer texture for hwnd %p.\n", w, h, swapchain->win_handle);
+    }
+    free(zero);
+}
+
+static BOOL swapchain_gl_draw_layer(struct wined3d_swapchain *swapchain,
+        struct wined3d_context *context, const RECT *dst_rect)
+{
+    struct wined3d_context_gl *context_gl = wined3d_context_gl(context);
+    struct wined3d_texture *back_buffer = swapchain->back_buffers[0];
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    struct wined3d_device *device = swapchain->device;
+    const struct wined3d_format_gl *format_gl;
+    struct wined3d_texture_gl *texture_gl;
+    RECT rects[WINE_DCOMP_LAYER_MAX_RECTS];
+    struct wine_dcomp_layer *layer;
+    unsigned int i, n;
+
+    if (!swapchain->layer_texture)
+        return FALSE;
+    if (!(n = swapchain_layer_lock_rects(swapchain, &layer, rects, dst_rect)))
+        return FALSE;
+
+    /* The texture is prepared before the context is acquired, so a layer that
+     * has just changed size has to wait one present for its texture.  Drawing
+     * against the old one would put the rectangles in the wrong place. */
+    if (layer->width != swapchain->layer_tex_width || layer->height != swapchain->layer_tex_height)
+    {
+        ReleaseSRWLockShared(&layer->lock);
+        return FALSE;
+    }
+
+    texture_gl = wined3d_texture_gl(swapchain->layer_texture);
+    format_gl = wined3d_format_gl(swapchain->layer_texture->resource.format);
+
+    if (!wined3d_texture_prepare_location(swapchain->layer_texture, 0, context, WINED3D_LOCATION_TEXTURE_RGB))
+    {
+        ERR("Failed to prepare the layer texture.\n");
+        ReleaseSRWLockShared(&layer->lock);
+        return FALSE;
+    }
+
+    /* Only the published rectangles go up.  What sits outside them in the
+     * texture is older, and outside them nothing is drawn. */
+    wined3d_texture_gl_bind_and_dirtify(texture_gl, context_gl, FALSE);
+    GL_EXTCALL(glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0));
+    gl_info->gl_ops.gl.p_glPixelStorei(GL_UNPACK_ROW_LENGTH, layer->width);
+    for (i = 0; i < n; ++i)
+        gl_info->gl_ops.gl.p_glTexSubImage2D(texture_gl->target, 0, rects[i].left, rects[i].top,
+                rects[i].right - rects[i].left, rects[i].bottom - rects[i].top,
+                format_gl->format, format_gl->type,
+                layer->bits + (SIZE_T)rects[i].top * layer->width + rects[i].left);
+    gl_info->gl_ops.gl.p_glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    checkGLcall("dcomp layer upload");
+    wined3d_texture_validate_location(swapchain->layer_texture, 0, WINED3D_LOCATION_TEXTURE_RGB);
+
+    /* Everything below reads the texture, not the layer. */
+    ReleaseSRWLockShared(&layer->lock);
+
+    /* swapchain_blit() has just written the drawable and then marked it invalid
+     * (the swap discards it).  For the duration of these blits it is valid --
+     * without that the blitter would load the whole back buffer into the
+     * drawable a second time for the sake of a partial rectangle. */
+    wined3d_texture_validate_location(back_buffer, 0, WINED3D_LOCATION_DRAWABLE);
+
+    wined3d_context_gl_apply_blit_state(context_gl, device);
+    gl_info->gl_ops.gl.p_glEnable(GL_BLEND);
+    if (gl_info->supported[EXT_BLEND_FUNC_SEPARATE])
+        GL_EXTCALL(glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
+    else
+        gl_info->gl_ops.gl.p_glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    if (gl_info->supported[EXT_BLEND_EQUATION_SEPARATE])
+        GL_EXTCALL(glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD));
+    checkGLcall("dcomp layer blend state");
+
+    for (i = 0; i < n; ++i)
+        device->blitter->ops->blitter_blit(device->blitter, WINED3D_BLIT_OP_COLOR_BLIT_ALPHATEST,
+                context, swapchain->layer_texture, 0, WINED3D_LOCATION_TEXTURE_RGB, &rects[i],
+                back_buffer, 0, WINED3D_LOCATION_DRAWABLE, &rects[i], NULL, WINED3D_TEXF_NONE, NULL);
+
+    gl_info->gl_ops.gl.p_glDisable(GL_BLEND);
+    checkGLcall("dcomp layer blend reset");
+    /* apply_blit_state() marked STATE_BLEND invalid; the application's next
+     * real draw restores its own function and equation. */
+    context_invalidate_state(context, STATE_BLEND);
+
+    wined3d_texture_invalidate_location(back_buffer, 0, WINED3D_LOCATION_DRAWABLE);
+
+    /* dcomp watches this to tell a sink that draws from one that does not. */
+    InterlockedIncrement(&layer->drawn);
+
+    TRACE("Drew %u layer rect(s) into the frame for hwnd %p.\n", n, swapchain->win_handle);
+    return TRUE;
+}
+
 static void swapchain_gl_set_swap_interval(struct wined3d_swapchain *swapchain,
         struct wined3d_context_gl *context_gl, unsigned int swap_interval)
 {
@@ -543,6 +1681,47 @@ static void swapchain_gl_set_swap_interval(struct wined3d_swapchain *swapchain,
     }
 }
 
+/* Whether this swapchain's back buffers may be left alone on a present.
+ *
+ * A present rotates the back buffer textures, and for the flip model it copies
+ * the presented frame back into back buffer 0 so an application can keep
+ * rendering incrementally (dirty rects).  The two halves are only correct
+ * together: rotating without copying hands the application a buffer holding an
+ * older frame, copying without rotating overwrites what it just drew.
+ *
+ * Doing neither is equivalent for the application and cheaper than both -- back
+ * buffer 0 simply keeps the frame that was just presented.  That equivalence
+ * holds wherever the application cannot address the other buffers as distinct
+ * surfaces:
+ *
+ *   DISCARD                        the content of a back buffer after a present
+ *                                  is undefined by specification, so nothing may
+ *                                  rely on which buffer it is handed
+ *   FLIP_DISCARD, FLIP_SEQUENTIAL  the DXGI flip model allows only back buffer 0
+ *                                  as a render target
+ *
+ * SEQUENTIAL is deliberately not included: that is D3D9's D3DSWAPEFFECT_FLIP,
+ * where rotating through the buffer chain is the documented behaviour and an
+ * application may render into the other buffers.
+ *
+ * Fender Studio Pro 8 renders incrementally into a DISCARD swapchain with more
+ * than one back buffer.  It therefore drew onto a buffer two frames old every
+ * other frame, which showed as the window's tool and transport bars alternating
+ * between two states while the arrangement area stood still (issue 185). */
+bool wined3d_swapchain_keeps_back_buffers(const struct wined3d_swapchain *swapchain)
+{
+    switch (swapchain->state.desc.swap_effect)
+    {
+        case WINED3D_SWAP_EFFECT_DISCARD:
+        case WINED3D_SWAP_EFFECT_FLIP_DISCARD:
+        case WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
 /* Context activation is done by the caller. */
 static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, struct wined3d_context *context)
 {
@@ -554,7 +1733,8 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
     unsigned int i;
     static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
 
-    if (swapchain->state.desc.backbuffer_count < 2)
+    if (swapchain->state.desc.backbuffer_count < 2
+            || wined3d_swapchain_keeps_back_buffers(swapchain))
         return;
 
     texture_prev = wined3d_texture_gl(swapchain->back_buffers[0]);
@@ -629,6 +1809,9 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     struct wined3d_context_gl *context_gl;
     struct wined3d_context *context;
 
+    /* Before the context is acquired, see the comment on the function. */
+    swapchain_gl_prepare_layer_texture(swapchain);
+
     context = context_acquire(swapchain->device, swapchain->front_buffer, 0);
     context_gl = wined3d_context_gl(context);
     if (!context_gl->valid)
@@ -641,9 +1824,36 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     TRACE("Presenting DC %p.\n", context_gl->dc);
 
     pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format - 1];
-    if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
+
+    /* PREFER_GL_PRESENT overrides FLIP_SEQUENTIAL/SEQUENTIAL/partial checks
+     * for top-level popup windows with a GL-capable X11 drawable.  The GL
+     * context must have successfully bound (not backup_dc) and FORCE_GDI
+     * must not be set.  This eliminates the GPU readback + CPU copies that
+     * the GDI present path requires (~5-10ms per frame). */
+    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
+            && !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+            && context_gl->dc != wined3d_device_gl(swapchain->device)->backup_dc)
+    {
+        static unsigned int gl_present_count;
+        gl_info = context_gl->gl_info;
+
+        if (!(gl_present_count++ % 60))
+            TRACE("GL popup present #%u: dc %p, win %p.\n",
+                    gl_present_count, context_gl->dc, swapchain->win_handle);
+
+        swapchain_gl_set_swap_interval(swapchain, context_gl, swap_interval);
+        wined3d_texture_load_location(back_buffer, 0, context, back_buffer->resource.draw_binding);
+        swapchain_blit(swapchain, context, src_rect, dst_rect);
+        /* The dcomp leaf layer into the frame, before the swap (issue 206). */
+        swapchain_gl_draw_layer(swapchain, context, dst_rect);
+        gl_info->gl_ops.wgl.p_wglSwapBuffers(context_gl->dc);
+    }
+    else if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
+            || (swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
             || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
-            && swapchain_present_is_partial_copy(swapchain, dst_rect)))
+            && swapchain_present_is_partial_copy(swapchain, dst_rect))
+            || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
+            || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_SEQUENTIAL)
     {
         swapchain_blit_gdi(swapchain, context, src_rect, dst_rect);
     }
@@ -657,6 +1867,9 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
         swapchain_blit(swapchain, context, src_rect, dst_rect);
 
+        /* The dcomp leaf layer into the frame, before the swap (issue 206). */
+        swapchain_gl_draw_layer(swapchain, context, dst_rect);
+
         if (swapchain->device->context_count > 1)
         {
             WARN_(d3d_perf)("Multiple contexts, calling glFinish() to enforce ordering.\n");
@@ -666,6 +1879,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
         /* call wglSwapBuffers through the gl table to avoid confusing the Steam overlay */
         gl_info->gl_ops.wgl.p_wglSwapBuffers(context_gl->dc);
     }
+
 
     if (context->d3d_info->fences)
         wined3d_context_gl_submit_command_fence(context_gl);
@@ -1218,7 +2432,8 @@ static void wined3d_swapchain_vk_rotate(struct wined3d_swapchain *swapchain, str
 
     static const DWORD supported_locations = WINED3D_LOCATION_TEXTURE_RGB | WINED3D_LOCATION_RB_MULTISAMPLE;
 
-    if (swapchain->state.desc.backbuffer_count < 2)
+    if (swapchain->state.desc.backbuffer_count < 2
+            || wined3d_swapchain_keeps_back_buffers(swapchain))
         return;
 
     texture_prev = wined3d_texture_vk(swapchain->back_buffers[0]);
@@ -1651,6 +2866,33 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
+    /* WS_CHILD and WS_POPUP swapchains keep the GDI path: dcomp composition
+     * windows depend on it, and WS_POPUP windows (settings dialogs, context
+     * menus) paint black on the GL path until first interaction (empirical,
+     * shibco patch 0055). A swapchain that dxgi later marks FORCE_GDI_PRESENT
+     * still takes the GDI branch at present time — swapchain_gl_present()
+     * checks that flag first. Swapchains are routinely created before the
+     * first ShowWindow(), so visibility is not part of the test.
+     *
+     * ID2D1HwndRenderTarget top-level windows stay on the GDI path too: on
+     * the GL path their first present never becomes visible (the window
+     * stays black until an expose forces a second present — resize, minimize
+     * and restore both fix it, a plain move does not; issue 208).  d2d1 sets
+     * __wine_d3d_hwnd_target on the window before creating the swapchain,
+     * so the marker is already there when we decide.  The GDI path renders
+     * these windows correctly from the first present on. */
+    if (!wined3d_gl_present_disabled() && window)
+    {
+        LONG style = GetWindowLongW(window, GWL_STYLE);
+
+        if (!(style & (WS_CHILD | WS_POPUP))
+                && !GetPropW(window, L"__wine_d3d_hwnd_target"))
+        {
+            swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
+            TRACE("Preferring GL present for top-level window %p (style %#lx).\n", window, style);
+        }
+    }
+
     if (!(swapchain->dc = GetDCEx(swapchain->win_handle, 0, DCX_USESTYLE | DCX_CACHE)))
         WARN("Failed to retrieve device context, trying swapchain backup.\n");
 
@@ -1810,11 +3052,20 @@ HRESULT wined3d_swapchain_gl_init(struct wined3d_swapchain_gl *swapchain_gl, str
         const struct wined3d_swapchain_desc *desc, struct wined3d_swapchain_state_parent *state_parent,
         void *parent, const struct wined3d_parent_ops *parent_ops)
 {
+    HRESULT hr;
+
     TRACE("swapchain_gl %p, device %p, desc %p, state_parent %p, parent %p, parent_ops %p.\n",
             swapchain_gl, device, desc, state_parent, parent, parent_ops);
 
-    return wined3d_swapchain_init(&swapchain_gl->s, device, desc, state_parent, parent,
-            parent_ops, &swapchain_gl_ops);
+    if (FAILED(hr = wined3d_swapchain_init(&swapchain_gl->s, device, desc, state_parent, parent,
+            parent_ops, &swapchain_gl_ops)))
+        return hr;
+
+    /* This swapchain composites in both its present branches, so tell dcomp it
+     * may publish a layer for this window (issue 206).  A Vulkan swapchain does
+     * not, and deliberately does not say so. */
+    wined3d_swapchain_set_layer_sink(&swapchain_gl->s, TRUE);
+    return hr;
 }
 
 HRESULT wined3d_swapchain_vk_init(struct wined3d_swapchain_vk *swapchain_vk, struct wined3d_device *device,

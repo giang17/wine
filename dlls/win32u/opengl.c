@@ -1993,6 +1993,53 @@ static struct opengl_drawable *get_window_current_drawable( HWND hwnd )
     return drawable;
 }
 
+/* issue-250: park a drawable the DC is
+ * letting go of, so the next DC for the same window can reuse it.
+ *
+ * An application that drags redraws through a fresh DC per frame.  A fresh DC has
+ * no drawable, so get_window_unused_drawable() finds an empty cache and calls
+ * p_surface_create(), which builds a NEW X client window every time -- measured
+ * 58 of them during a 20 s drag, and the child being swapped underneath is what
+ * makes the dragged bitmap drop out.
+ *
+ * Only parked when the cache is empty, and get_window_unused_drawable() takes it
+ * back OUT when handing it over, so it can never be given to two consumers at
+ * once -- which is the concern the comment in that function raises.  Without the
+ * variable, behaviour is exactly as before. */
+static BOOL argb_drawable_cache_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "WINE_ARGB_PIXFMT" );
+        /* on by default; WINE_ARGB_PIXFMT=0 turns it off without a rebuild */
+        enabled = (e && !atoi( e )) ? 0 : 1;
+    }
+    return enabled;
+}
+
+void release_dc_opengl_drawable( struct opengl_drawable *drawable )
+{
+    WND *win;
+
+    if (argb_drawable_cache_enabled() && drawable->client && drawable->client->hwnd
+            && (win = get_win_ptr( drawable->client->hwnd ))
+            && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    {
+        if (!win->unused_drawable)
+        {
+            TRACE( "parking %s for hwnd %p\n", debugstr_opengl_drawable( drawable ),
+                   drawable->client->hwnd );
+            win->unused_drawable = drawable;
+            opengl_drawable_add_ref( drawable );
+        }
+        release_win_ptr( win );
+    }
+
+    opengl_drawable_release( drawable );
+}
+
 static struct opengl_drawable *get_window_unused_drawable( HWND hwnd, int format )
 {
     struct opengl_drawable *drawable = NULL;

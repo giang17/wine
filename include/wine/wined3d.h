@@ -923,6 +923,9 @@ enum wined3d_memory_segment_group
 /* Allow the swapchain flag, but not actual locking */
 #define WINED3D_SWAPCHAIN_ALLOW_MS_LOCKABLE_BACKBUFFER          0x00200000u
 #define WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT         0x00400000u
+#define WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT                     0x01000000u
+#define WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA                   0x02000000u
+#define WINED3D_SWAPCHAIN_PREFER_GL_PRESENT                     0x04000000u
 
 #define WINED3DDP_MAXTEXCOORD                                   8
 
@@ -2934,6 +2937,12 @@ HRESULT __cdecl wined3d_swapchain_set_gamma_ramp(const struct wined3d_swapchain 
 HRESULT __cdecl wined3d_swapchain_set_max_frame_latency(struct wined3d_swapchain *swapchain, unsigned int latency);
 void __cdecl wined3d_swapchain_set_palette(struct wined3d_swapchain *swapchain, struct wined3d_palette *palette);
 void __cdecl wined3d_swapchain_set_window(struct wined3d_swapchain *swapchain, HWND window);
+void __cdecl wined3d_swapchain_set_device_window(struct wined3d_swapchain *swapchain, HWND window);
+void __cdecl wined3d_swapchain_set_force_gdi_present(struct wined3d_swapchain *swapchain, BOOL force);
+void __cdecl wined3d_swapchain_set_prefer_gl_present(struct wined3d_swapchain *swapchain, BOOL prefer);
+void __cdecl wined3d_swapchain_set_dirty_rects(struct wined3d_swapchain *swapchain,
+        const RECT *rects, unsigned int count);
+void __cdecl wined3d_swapchain_set_premultiplied_alpha(struct wined3d_swapchain *swapchain, BOOL premultiplied);
 
 HRESULT __cdecl wined3d_swapchain_state_create(const struct wined3d_swapchain_desc *desc,
         HWND window, struct wined3d *wined3d, struct wined3d_swapchain_state_parent *state_parent,

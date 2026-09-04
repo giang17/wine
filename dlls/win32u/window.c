@@ -56,6 +56,9 @@ static void *client_objects[MAX_USER_HANDLES];
 
 static volatile unsigned int startup_info_flags;
 static unsigned int startup_show_window;
+static DWORD reentrant_wpchanged_thread;
+static HWND reentrant_wpchanged_hwnd;
+static UINT reentrant_wpchanged_depth;
 
 static unsigned int set_startup_info_flags( unsigned int mask, unsigned int flags )
 {
@@ -2311,6 +2314,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     struct window_rects old_rects;
     RECT extra_rects[3];
     struct window_surface *old_surface;
+    RECT surface_rects[2], *surface_copy = NULL;
     HICON icon, icon_small;
     ICONINFO ii, ii_small;
 
@@ -2323,6 +2327,29 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     get_window_rects( hwnd, COORDS_PARENT, &old_rects, dpi );
     if (IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
+
+    /* A window class that asks for a full redraw on resize (CS_HREDRAW/CS_VREDRAW)
+     * makes WM_NCCALCSIZE return WVR_REDRAW, which clears the valid rects.  That is
+     * the right answer for the application - it will repaint everything - but it
+     * also stops the pixels of the old window surface from being carried over when
+     * the surface object itself is replaced.  The successor then starts out as the
+     * plain fill colour, and the expose events the resize generates flush it before
+     * the repaint arrives: one frame of the whole window in that colour.  Keep a
+     * copy rectangle of our own for that case - stale pixels for one frame are
+     * better than none, and the pending repaint overwrites them anyway. */
+    if (!is_layered)
+    {
+        int cx, cy;
+        surface_rects[0] = new_rects->client;
+        surface_rects[1] = old_rects.client;
+        cx = min( surface_rects[0].right - surface_rects[0].left, surface_rects[1].right - surface_rects[1].left );
+        cy = min( surface_rects[0].bottom - surface_rects[0].top, surface_rects[1].bottom - surface_rects[1].top );
+        surface_rects[0].right = surface_rects[0].left + cx;
+        surface_rects[0].bottom = surface_rects[0].top + cy;
+        surface_rects[1].right = surface_rects[1].left + cx;
+        surface_rects[1].bottom = surface_rects[1].top + cy;
+        if (cx > 0 && cy > 0) surface_copy = surface_rects;
+    }
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
     old_surface = win->surface;
@@ -2435,6 +2462,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
                     move_window_bits( hwnd, new_rects, valid_rects );
                 }
             }
+            else if (surface_copy && old_surface != new_surface && old_surface != &dummy_surface &&
+                     new_surface && new_surface != &dummy_surface)
+                inherit_window_surface_bits( hwnd, &new_rects->window, old_surface, &old_rects.visible, surface_copy );
             window_surface_release( old_surface );
         }
         else if (valid_rects)
@@ -2467,6 +2497,17 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
                 move_window_bits( hwnd, new_rects, valid_rects );
             }
         }
+
+        /* A window that was drawing straight to the driver window and now gets a
+         * window surface again starts out with a blank surface: the pixels it is
+         * supposed to own live on the driver window, and nothing copies them back
+         * (X11DRV_MoveWindowBits copies within the same window, source == target).
+         * The valid rects still claim the client area is intact, so no repaint is
+         * asked for either, and everything that does not redraw itself of its own
+         * accord stays at the surface fill colour.  Ask for one. */
+        if (!old_surface && new_surface && new_surface != &dummy_surface &&
+            (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
+            NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
 
         if (need_icons && (icon = get_window_icon_info( hwnd, ICON_BIG, icon, &ii )))
         {
@@ -4157,6 +4198,53 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     }
     if (surface) window_surface_release( surface );
 
+    /* After apply_window_pos, the window's content may have been BitBlt'd from the
+     * old position. During batch processing (EndDeferWindowPos), sibling expose_window
+     * calls can set update regions that cause DCX_EXCLUDERGN to skip parts of the
+     * BitBlt, leaving stale content. Force a full invalidation so WM_PAINT repaints
+     * everything correctly on top of the BitBlt'd content.
+     *
+     * Nothing was BitBlt'd when nothing moved, though, and SWP_AGG_NOGEOMETRYCHANGE
+     * does not cover the move bits: masking with SWP_AGG_STATUSFLAGS keeps
+     * SWP_NOMOVE|SWP_NOCLIENTMOVE in the result, so a SetWindowPos that changes
+     * nothing at all (flags 0x5917 -> masked 0x1807) never compares equal to
+     * SWP_AGG_NOGEOMETRYCHANGE (0x805) and invalidates the whole window with
+     * RDW_ERASE.  Applications that re-assert their layout on every mouse move get
+     * a full erase per motion event, and the erase reaches the screen on its own
+     * because window surfaces are flushed when the message loop goes idle - one
+     * flush shows the erased window, the next one the repainted one (issue 253:
+     * SynthEdit's canvas frames flickering while the mouse is over the menu bar).
+     *
+     * Skip that case, but compare against the *full* status mask rather than just
+     * the position bits: SWP_FRAMECHANGED asks for a non-client repaint and is a
+     * reason to invalidate even when nothing moved.  Dropping it as well leaves
+     * SynthEdit's canvas background unpainted at startup (blackcheck 18.6 %). */
+    /* SWP_AGG_NOGEOMETRYCHANGE must not be a second exemption here.  It covers size
+     * and z-order but not the move bits, so a window that moves without resizing
+     * masks to exactly SWP_AGG_NOGEOMETRYCHANGE (0x805) and gets skipped - which is
+     * precisely the case move_window_bits BitBlts, and therefore the one this
+     * invalidation was written for (issue 260: dragging SynthEdit's MDI canvas by
+     * its title bar leaves the MDI client stale until something else repaints it).
+     * Only "nothing changed at all" stays exempt.
+     *
+     * That plain-move case is a child's, though: only a child window has its bits
+     * inside an ancestor's surface for move_window_bits to BitBlt.  A top-level
+     * window that moves without resizing has its own X window, which carries its
+     * pixels along - there is nothing to repaint, but the erase this invalidation
+     * queues paints the MDI client over its children once per motion event, and a
+     * window-manager drag delivers one such SetWindowPos per motion event (issue
+     * 281: SynthEdit's canvas captions flicker while the main window is dragged;
+     * 40 moves -> 40 invalidations -> 8 frames showing the 0x404040 erase).  So a
+     * plain move invalidates child windows only. */
+    if (!(winpos->flags & (SWP_NOREDRAW | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) &&
+        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE &&
+        ((winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOGEOMETRYCHANGE ||
+         (get_window_long( winpos->hwnd, GWL_STYLE ) & WS_CHILD)))
+    {
+        TRACE( "hwnd %p: post-move invalidation (flags %08x)\n", winpos->hwnd, (int)winpos->flags );
+        NtUserRedrawWindow( winpos->hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
+    }
+
     if (winpos->flags & SWP_HIDEWINDOW)
     {
         NtUserNotifyWinEvent( EVENT_OBJECT_HIDE, winpos->hwnd, 0, 0 );
@@ -4207,6 +4295,17 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     if (((winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE)
             && !((orig_flags & SWP_AGG_NOCLIENTCHANGE) && (orig_flags & SWP_SHOWWINDOW)))
     {
+        static const UINT reentrant_resize_flags =
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        DWORD style = get_window_long( winpos->hwnd, GWL_STYLE );
+        DWORD tid = GetCurrentThreadId();
+        BOOL suppress_reentrant_wpch =
+            !(style & WS_CHILD) &&
+            reentrant_wpchanged_depth &&
+            reentrant_wpchanged_thread == tid &&
+            reentrant_wpchanged_hwnd == winpos->hwnd &&
+            (orig_flags & reentrant_resize_flags) == reentrant_resize_flags &&
+            !(orig_flags & (SWP_NOSIZE | SWP_SHOWWINDOW | SWP_HIDEWINDOW));
         /* WM_WINDOWPOSCHANGED is sent even if SWP_NOSENDCHANGING is set
            and always contains final window position.
          */
@@ -4214,7 +4313,24 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         winpos->y  = new_rects.window.top;
         winpos->cx = new_rects.window.right - new_rects.window.left;
         winpos->cy = new_rects.window.bottom - new_rects.window.top;
-        send_message( winpos->hwnd, WM_WINDOWPOSCHANGED, 0, (LPARAM)winpos );
+        /* Avoid re-entering the same top-level window with a nested
+         * size-only WM_WINDOWPOSCHANGED update.  This breaks the
+         * configure feedback loop that drives per-frame geometry
+         * oscillation for custom-NC windows (e.g. Ableton Live). */
+        if (!suppress_reentrant_wpch)
+        {
+            DWORD prev_thread = reentrant_wpchanged_thread;
+            HWND prev_hwnd = reentrant_wpchanged_hwnd;
+            UINT prev_depth = reentrant_wpchanged_depth;
+
+            reentrant_wpchanged_thread = tid;
+            reentrant_wpchanged_hwnd = winpos->hwnd;
+            reentrant_wpchanged_depth = prev_depth + 1;
+            send_message( winpos->hwnd, WM_WINDOWPOSCHANGED, 0, (LPARAM)winpos );
+            reentrant_wpchanged_thread = prev_thread;
+            reentrant_wpchanged_hwnd = prev_hwnd;
+            reentrant_wpchanged_depth = prev_depth;
+        }
     }
 
     if ((winpos->flags & (SWP_NOSIZE|SWP_NOMOVE|SWP_FRAMECHANGED)) != (SWP_NOSIZE|SWP_NOMOVE))

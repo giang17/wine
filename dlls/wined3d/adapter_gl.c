@@ -3952,8 +3952,8 @@ static void wined3d_adapter_init_fb_cfgs(struct wined3d_adapter_gl *adapter_gl, 
     {
         UINT attrib_count = 0;
         GLint cfg_count;
-        int attribs[12];
-        int values[12];
+        int attribs[13];
+        int values[13];
         int attribute;
 
         attribute = WGL_NUMBER_PIXEL_FORMATS_ARB;
@@ -3972,6 +3972,8 @@ static void wined3d_adapter_init_fb_cfgs(struct wined3d_adapter_gl *adapter_gl, 
         attribs[attrib_count++] = WGL_DOUBLE_BUFFER_ARB;
         attribs[attrib_count++] = WGL_AUX_BUFFERS_ARB;
         attribs[attrib_count++] = WGL_SWAP_METHOD_ARB;
+        /* issue-250: winex11 sets this on ARGB-visual formats (WINE_ARGB_PIXFMT=1). */
+        attribs[attrib_count++] = WGL_TRANSPARENT_ARB;
 
         for (i = 0, adapter_gl->pixel_format_count = 0; i < cfg_count; ++i)
         {
@@ -3993,6 +3995,7 @@ static void wined3d_adapter_init_fb_cfgs(struct wined3d_adapter_gl *adapter_gl, 
             cfg->doubleBuffer = values[9];
             cfg->auxBuffers = values[10];
             cfg->swap_method = values[11];
+            cfg->transparent = values[12];
 
             cfg->numSamples = 0;
             /* Check multisample support. */
@@ -4388,8 +4391,22 @@ static bool adapter_gl_alloc_bo(struct wined3d_device *device, struct wined3d_re
         flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_CLIENT_STORAGE_BIT;
     }
 
-    if (!(bo_gl = malloc(sizeof(*bo_gl))))
-        return false;
+    /* Try to recycle a bo_gl struct from the free pool. */
+    wined3d_device_bo_map_lock(device);
+    if (device->bo_gl_free_pool)
+    {
+        bo_gl = CONTAINING_RECORD(device->bo_gl_free_pool, struct wined3d_bo_gl, b);
+        device->bo_gl_free_pool = (struct wined3d_bo *)bo_gl->b.map_ptr;
+        --device->bo_gl_free_pool_count;
+        wined3d_device_bo_map_unlock(device);
+        memset(bo_gl, 0, sizeof(*bo_gl));
+    }
+    else
+    {
+        wined3d_device_bo_map_unlock(device);
+        if (!(bo_gl = malloc(sizeof(*bo_gl))))
+            return false;
+    }
 
     if (!(wined3d_device_gl_create_bo(device_gl, NULL, size, binding, usage, coherent, flags, bo_gl)))
     {

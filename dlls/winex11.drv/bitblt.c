@@ -1589,6 +1589,7 @@ struct x11drv_window_surface
     GC                    gc;
     struct x11drv_image  *image;
     BOOL                  byteswap;
+    BOOL                  glass_alpha; /* per-pixel alpha from a DWM-glass window */
 };
 
 static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
@@ -1809,6 +1810,12 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
         }
     }
 
+    /* A DWM-glass window takes its alpha from the pixels.  win32u derives
+     * alpha_bits from the LWA_ALPHA constant opacity, which would force every
+     * pixel opaque here; that constant is already applied by the window
+     * manager through _NET_WM_WINDOW_OPACITY (sync_window_opacity). */
+    if (surface->glass_alpha) alpha_bits = 0;
+
     if (src != dst)
     {
         int map[256], *mapping = get_window_surface_mapping( ximage->bits_per_pixel, map );
@@ -1853,7 +1860,12 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
                    dirty->right - dirty->left, dirty->bottom - dirty->top );
 
-    XFlush( gdi_display );
+    /* The surface bitmap lives in the shared memory segment XShmPutImage reads
+     * from, and the server only reads it when it gets to the request.  Anything
+     * painted into the surface before then - typically a background erase that
+     * follows a resize - is what the server puts on screen, not what was there
+     * when the flush was issued.  Wait for the request to complete. */
+    XSync( gdi_display, False );
 
     return TRUE;
 }
@@ -1881,7 +1893,7 @@ static const struct window_surface_funcs x11drv_surface_funcs =
  *           create_surface
  */
 static struct window_surface *create_surface( HWND hwnd, Window window, const XVisualInfo *vis, const RECT *rect,
-                                              BOOL use_alpha )
+                                              BOOL use_alpha, BOOL glass_alpha )
 {
     const XPixmapFormatValues *format = pixmap_formats[vis->depth];
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -1940,6 +1952,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
     else
     {
         surface = get_x11_surface( window_surface );
+        surface->glass_alpha = glass_alpha;
         surface->image = image;
         surface->byteswap = byteswap;
         surface->window = window;
@@ -1984,16 +1997,28 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
     if (layered)
     {
         data->layered = TRUE;
+        data->wants_argb = 1; /* UpdateLayeredWindow always needs per-pixel alpha */
         if (!data->embedded && argb_visual.visualid) set_window_visual( data, &argb_visual, TRUE );
     }
-    else if (enable_direct_drawing( data, layered ))
+    else
     {
-        *surface = NULL;  /* indicate that we want to draw directly to the window */
-        goto done; /* draw directly to the window */
+        /* a DWM-glass window is per-pixel alpha capable even without ULW */
+        update_window_argb_visual( data );
+        /* Keep direct drawing for a glass window and only change the visual.
+         * Forcing the win32u surface instead (as the ULW path does) was measured
+         * and rejected: it produced black frames because the content keeps
+         * arriving through the GL child window while the surface is flushed
+         * empty. */
+        if (enable_direct_drawing( data, layered ))
+        {
+            *surface = NULL;  /* indicate that we want to draw directly to the window */
+            goto done; /* draw directly to the window */
+        }
     }
 
     *surface = create_surface( data->hwnd, data->whole_window, &data->vis, surface_rect,
-                               layered ? data->use_alpha : FALSE );
+                               (layered || data->wants_argb) ? data->use_alpha : FALSE,
+                               !layered && data->wants_argb );
 
 done:
     release_win_data( data );

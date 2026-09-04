@@ -119,6 +119,76 @@ static BOOL can_enable_desktop(void)
     return ret;
 }
 
+/* ClearType enhanced contrast, in hundredths of the DirectWrite value. Only the
+ * three settings the documentation covers are offered; a value put there by hand
+ * is kept and offered back rather than snapped to one of them. */
+static const struct
+{
+    int id;
+    UINT value;
+}
+text_contrast_options[] =
+{
+    { IDC_TEXT_CONTRAST_OFF,     0 },
+    { IDC_TEXT_CONTRAST_MEDIUM, 50 },
+    { IDC_TEXT_CONTRAST_STRONG, 70 },
+};
+
+static UINT read_text_contrast(void)
+{
+    WCHAR *buf = get_reg_key(config_key, keypath(L"Direct2D"), L"text_enhanced_contrast", NULL);
+    UINT value = buf ? *buf : 0;
+    free(buf);
+    return value;
+}
+
+static void init_text_contrast(HWND dialog)
+{
+    HWND combo = GetDlgItem(dialog, IDC_TEXT_CONTRAST);
+    UINT value = read_text_contrast();
+    WCHAR str[256];
+    unsigned int i;
+    LRESULT index;
+
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+
+    for (i = 0; i < ARRAY_SIZE(text_contrast_options); i++)
+    {
+        LoadStringW(GetModuleHandleW(NULL), text_contrast_options[i].id, str, ARRAY_SIZE(str));
+        index = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)str);
+        SendMessageW(combo, CB_SETITEMDATA, index, text_contrast_options[i].value);
+        if (text_contrast_options[i].value == value)
+            SendMessageW(combo, CB_SETCURSEL, index, 0);
+    }
+
+    if (SendMessageW(combo, CB_GETCURSEL, 0, 0) == CB_ERR)
+    {
+        WCHAR format[64];
+
+        LoadStringW(GetModuleHandleW(NULL), IDC_TEXT_CONTRAST_CUSTOM, format, ARRAY_SIZE(format));
+        swprintf(str, ARRAY_SIZE(str), format, value);
+        index = SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)str);
+        SendMessageW(combo, CB_SETITEMDATA, index, value);
+        SendMessageW(combo, CB_SETCURSEL, index, 0);
+    }
+}
+
+static void on_text_contrast_changed(HWND dialog)
+{
+    LRESULT index = SendDlgItemMessageW(dialog, IDC_TEXT_CONTRAST, CB_GETCURSEL, 0, 0);
+    UINT value;
+
+    if (index == CB_ERR) return;
+    value = SendDlgItemMessageW(dialog, IDC_TEXT_CONTRAST, CB_GETITEMDATA, index, 0);
+
+    /* The default is the absence of the value, not an explicit zero: writing one
+     * would turn "untouched" into "deliberately off" in every prefix. */
+    if (!value)
+        set_reg_key(config_key, keypath(L"Direct2D"), L"text_enhanced_contrast", NULL);
+    else
+        set_reg_key_dword(config_key, keypath(L"Direct2D"), L"text_enhanced_contrast", value);
+}
+
 static void init_dialog(HWND dialog)
 {
     WCHAR *buf;
@@ -158,6 +228,8 @@ static void init_dialog(HWND dialog)
     else
 	CheckDlgButton(dialog, IDC_ENABLE_DECORATED, BST_UNCHECKED);
     free(buf);
+
+    init_text_contrast(dialog);
 
     updating_ui = FALSE;
 }
@@ -386,7 +458,20 @@ GraphDlgProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		    break;
 		}
 		case CBN_SELCHANGE: {
+		    if (updating_ui) break;
 		    SendMessageW(GetParent(hDlg), PSM_CHANGED, 0, 0);
+		    if (LOWORD(wParam) == IDC_TEXT_CONTRAST)
+			on_text_contrast_changed(hDlg);
+		    break;
+		}
+		/* Walking the open list sends CBN_SELCHANGE for every entry
+		 * passed, but abandoning it restores the old selection without
+		 * one. Read the selection back once the list is closed so that
+		 * what was written is always what is on display. */
+		case CBN_CLOSEUP: {
+		    if (updating_ui) break;
+		    if (LOWORD(wParam) == IDC_TEXT_CONTRAST)
+			on_text_contrast_changed(hDlg);
 		    break;
 		}
 		    

@@ -29,6 +29,8 @@
 #endif
 
 #include <assert.h>
+#include <stdio.h>
+#include <string.h>
 #include "ntgdi_private.h"
 #include "ntuser_private.h"
 #include "wine/server.h"
@@ -45,6 +47,7 @@ struct cursoricon_object
     UNICODE_STRING          module;     /* module for icons loaded from resources */
     WCHAR                  *resname;    /* resource name for icons loaded from resources */
     HRSRC                   rsrc;       /* resource for shared icons */
+    HANDLE                  section;    /* section publishing the first frame to other processes */
     BOOL                    is_shared;  /* whether this object is shared */
     BOOL                    is_icon;    /* whether icon or cursor */
     BOOL                    is_ani;     /* whether this object is a static cursor or an animated cursor */
@@ -74,9 +77,42 @@ static struct cursoricon_object *get_icon_ptr( HICON handle )
     return obj;
 }
 
+static void publish_cursor( HCURSOR handle );
+static HCURSOR get_foreign_cursor( HCURSOR foreign );
+
 BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle )
 {
     TRACE( "hwnd %p, window %p, hcursor %p\n", hwnd, window, handle );
+    if (!handle)
+    {
+        /* Native Windows shows the class cursor, then the system arrow, for a
+         * window whose cursor is not set — never the empty/transparent cursor
+         * that hides the pointer. Only ShowCursor(FALSE) (count < 0) should
+         * hide it; CURSOR_SHOWING is clear in that case. */
+        CURSORINFO info;
+        info.cbSize = sizeof(info);
+        if (NtUserGetCursorInfo( &info ) && (info.flags & CURSOR_SHOWING))
+        {
+            handle = (HCURSOR)get_class_long_ptr( window, GCLP_HCURSOR, FALSE );
+            if (!handle) handle = LoadImageW( 0, MAKEINTRESOURCEW(IDC_ARROW),
+                                              IMAGE_CURSOR, 0, 0,
+                                              LR_SHARED | LR_DEFAULTSIZE );
+        }
+    }
+    if (handle)
+    {
+        /* The server routes this message to the thread owning the window under
+         * the pointer; the cursor may have been created by another process
+         * (out-of-process child windows). Use a local proxy for it then. */
+        struct cursoricon_object *obj = get_user_handle_ptr( handle, NTUSER_OBJ_ICON );
+        if (obj == OBJ_OTHER_PROCESS)
+        {
+            HCURSOR proxy = get_foreign_cursor( handle );
+            TRACE( "cursor %p from other process -> proxy %p\n", handle, proxy );
+            if (proxy) handle = proxy;
+        }
+        else if (obj) release_user_handle_ptr( obj );
+    }
     user_driver->pSetCursor( window, handle );
     return TRUE;
 }
@@ -112,6 +148,11 @@ HCURSOR WINAPI NtUserSetCursor( HCURSOR cursor )
     BOOL ret;
 
     TRACE( "%p\n", cursor );
+
+    /* cursors are published on creation; this covers icons used as cursors and
+     * must happen before the server request, as the receiving thread may process
+     * the resulting WM_WINE_SETCURSOR before this call returns */
+    if (cursor) publish_cursor( cursor );
 
     SERVER_START_REQ( set_cursor )
     {
@@ -216,12 +257,340 @@ static BOOL free_icon_handle( HICON handle )
         }
         if (!IS_INTRESOURCE( obj->resname )) free( obj->resname );
         if (obj->module.Length) free(obj->module.Buffer);
+        if (obj->section) NtClose( obj->section );
         free( obj );
         KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len );
         user_driver->pDestroyCursorIcon( handle );
         return TRUE;
     }
     return FALSE;
+}
+
+/***********************************************************************
+ * Cross-process cursors
+ *
+ * Cursors are process-local objects in Wine, while on Windows they are
+ * session-wide USER objects. The server routes WM_WINE_SETCURSOR to the
+ * thread that owns the window under the pointer, and with out-of-process
+ * child windows (WebView2 inside a host, plugins under a bridge) that is
+ * not the process that created the cursor: get_icon_ptr() rejects the
+ * handle and the driver keeps showing whatever it showed before.
+ *
+ * Instead of moving the bits into the server, the owning process publishes
+ * the first frame in a named section when the cursor is first set
+ * (publish_cursor), and a receiving process builds a process-local proxy
+ * cursor from it (get_foreign_cursor) that the driver handles like any
+ * other cursor. Proxies live in a small cache so the driver resources are
+ * released again once a cursor falls out of use.
+ */
+
+#define SHARED_CURSOR_MAGIC       0x52554357  /* 'WCUR' */
+#define FOREIGN_CURSOR_CACHE_SIZE 8
+#define MAX_SHARED_CURSOR_SIZE    1024
+
+struct shared_cursor_header
+{
+    UINT magic;
+    UINT width;
+    UINT height;        /* height of one frame */
+    INT  xhot;
+    INT  yhot;
+    UINT color_size;    /* 32 bpp top-down bits following the header, 0 for monochrome */
+    UINT mask_height;   /* rows in the mask bitmap, 2 * height for monochrome */
+    UINT mask_size;     /* 1 bpp top-down bits following the color bits, DWORD-aligned rows */
+};
+
+static struct
+{
+    HCURSOR foreign;    /* handle owned by another process */
+    HCURSOR local;      /* process-local proxy built from the published bits */
+    UINT    last_use;
+} foreign_cursors[FOREIGN_CURSOR_CACHE_SIZE];
+static UINT foreign_cursor_clock;
+/* > 0 while creating objects that must not be published: the frames of an animated
+ * cursor (published through the outer object) and proxies (process-local by nature).
+ * Always changed and read with user_lock held, so a plain counter is enough. */
+static UINT publish_suppressed;
+
+static void init_shared_cursor_name( HCURSOR handle, WCHAR *bufferW, UNICODE_STRING *name )
+{
+    char buffer[128];
+
+    snprintf( buffer, sizeof(buffer), "\\Sessions\\%u\\BaseNamedObjects\\__wine_cursor_%08x",
+              (unsigned int)NtCurrentTeb()->Peb->SessionId, wine_server_user_handle( handle ) );
+    name->Buffer = bufferW;
+    name->MaximumLength = asciiz_to_unicode( bufferW, buffer );
+    name->Length = name->MaximumLength - sizeof(WCHAR);
+}
+
+static void init_dib_info( BITMAPINFO *info, UINT width, UINT height, UINT bpp )
+{
+    memset( &info->bmiHeader, 0, sizeof(info->bmiHeader) );
+    info->bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    info->bmiHeader.biWidth       = width;
+    info->bmiHeader.biHeight      = -(LONG)height;  /* top-down */
+    info->bmiHeader.biPlanes      = 1;
+    info->bmiHeader.biBitCount    = bpp;
+    info->bmiHeader.biCompression = BI_RGB;
+    info->bmiHeader.biSizeImage   = ((width * bpp + 31) / 32 * 4) * height;
+    if (bpp == 1)
+    {
+        info->bmiHeader.biClrUsed = 2;
+        memset( info->bmiColors, 0, 2 * sizeof(RGBQUAD) );
+        info->bmiColors[1].rgbRed = info->bmiColors[1].rgbGreen = info->bmiColors[1].rgbBlue = 0xff;
+    }
+}
+
+/* publish the first frame of a cursor owned by this process, so that a process
+ * receiving WM_WINE_SETCURSOR for it can build a proxy */
+static void publish_cursor( HCURSOR handle )
+{
+    char info_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)info_buf;
+    struct cursoricon_object *obj, *frame;
+    struct shared_cursor_header hdr;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    WCHAR bufferW[128];
+    LARGE_INTEGER size;
+    SIZE_T view_size = 0;
+    HANDLE section;
+    void *view = NULL;
+    char *bits;
+    BOOL ok;
+    BITMAP bm;
+    HDC hdc;
+    unsigned int status;
+
+    obj = get_user_handle_ptr( handle, NTUSER_OBJ_ICON );
+    if (!obj || obj == OBJ_OTHER_PROCESS) return;
+    if (obj->section) goto done;  /* already published */
+    if (!(frame = get_icon_frame_ptr( handle, 0 ))) goto done;
+    if (!frame->frame.mask || !NtGdiExtGetObjectW( frame->frame.mask, sizeof(bm), &bm )) goto done_frame;
+
+    hdr.magic       = SHARED_CURSOR_MAGIC;
+    hdr.width       = frame->frame.width;
+    hdr.height      = frame->frame.height;
+    hdr.xhot        = frame->frame.hotspot.x;
+    hdr.yhot        = frame->frame.hotspot.y;
+    hdr.color_size  = frame->frame.color ? hdr.width * hdr.height * 4 : 0;
+    hdr.mask_height = bm.bmHeight;
+    hdr.mask_size   = ((hdr.width + 31) / 32 * 4) * hdr.mask_height;
+    if (!hdr.width || !hdr.height || !hdr.mask_height ||
+        hdr.width > MAX_SHARED_CURSOR_SIZE || hdr.height > MAX_SHARED_CURSOR_SIZE) goto done_frame;
+
+    init_shared_cursor_name( handle, bufferW, &name );
+    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
+    size.QuadPart = sizeof(hdr) + hdr.color_size + hdr.mask_size;
+    if ((status = NtCreateSection( &section, SECTION_MAP_READ | SECTION_MAP_WRITE, &attr,
+                                   &size, PAGE_READWRITE, SEC_COMMIT, 0 )))
+    {
+        WARN( "failed to create section for cursor %p, status %#x\n", handle, status );
+        goto done_frame;
+    }
+    if ((status = NtMapViewOfSection( section, NtCurrentProcess(), &view, 0, 0, NULL, &view_size,
+                                      ViewUnmap, 0, PAGE_READWRITE )))
+    {
+        WARN( "failed to map section for cursor %p, status %#x\n", handle, status );
+        NtClose( section );
+        goto done_frame;
+    }
+
+    hdc = NtGdiCreateCompatibleDC( 0 );
+    memcpy( view, &hdr, sizeof(hdr) );
+    bits = (char *)view + sizeof(hdr);
+    ok = TRUE;
+    if (hdr.color_size)
+    {
+        init_dib_info( info, hdr.width, hdr.height, 32 );
+        ok = NtGdiGetDIBitsInternal( hdc, frame->frame.color, 0, hdr.height, bits, info,
+                                     DIB_RGB_COLORS, hdr.color_size, sizeof(info_buf) ) == hdr.height;
+        bits += hdr.color_size;
+    }
+    if (ok)
+    {
+        init_dib_info( info, hdr.width, hdr.mask_height, 1 );
+        ok = NtGdiGetDIBitsInternal( hdc, frame->frame.mask, 0, hdr.mask_height, bits, info,
+                                     DIB_RGB_COLORS, hdr.mask_size, sizeof(info_buf) ) == hdr.mask_height;
+    }
+    NtGdiDeleteObjectApp( hdc );
+    NtUnmapViewOfSection( NtCurrentProcess(), view );
+    if (!ok)
+    {
+        WARN( "failed to read bits of cursor %p\n", handle );
+        NtClose( section );
+        goto done_frame;
+    }
+    obj->section = section;
+    TRACE( "cursor %p (%ux%u) published as %s\n", handle, hdr.width, hdr.height, debugstr_us(&name) );
+
+done_frame:
+    release_user_handle_ptr( frame );
+done:
+    release_user_handle_ptr( obj );
+}
+
+static HBITMAP create_dib_from_bits( HDC hdc, BITMAPINFO *info, const void *src, UINT size, void **bits_ret )
+{
+    void *bits = NULL;
+    HBITMAP bitmap = NtGdiCreateDIBSection( hdc, NULL, 0, info, DIB_RGB_COLORS, 0, 0, 0, &bits );
+
+    if (!bitmap) return 0;
+    memcpy( bits, src, size );
+    if (bits_ret) *bits_ret = bits;
+    return bitmap;
+}
+
+/* build a process-local cursor from the bits published by the owning process */
+static HCURSOR create_proxy_cursor( HCURSOR foreign )
+{
+    char info_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)info_buf;
+    struct cursoricon_frame frame = {0};
+    struct cursoricon_desc desc = { .frames = &frame };
+    const struct shared_cursor_header *hdr;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING name;
+    WCHAR bufferW[128];
+    SIZE_T view_size = 0;
+    HANDLE section;
+    void *view = NULL;
+    HCURSOR local = 0;
+    HDC hdc = 0;
+    unsigned int status;
+    BOOL ok;
+
+    init_shared_cursor_name( foreign, bufferW, &name );
+    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
+    if ((status = NtOpenSection( &section, SECTION_MAP_READ, &attr )))
+    {
+        WARN( "cursor %p from other process has no published bits, status %#x\n", foreign, status );
+        return 0;
+    }
+    if ((status = NtMapViewOfSection( section, NtCurrentProcess(), &view, 0, 0, NULL, &view_size,
+                                      ViewUnmap, 0, PAGE_READONLY )))
+    {
+        WARN( "failed to map published bits of cursor %p, status %#x\n", foreign, status );
+        NtClose( section );
+        return 0;
+    }
+
+    hdr = view;
+    if (view_size < sizeof(*hdr) || hdr->magic != SHARED_CURSOR_MAGIC ||
+        !hdr->width || !hdr->height ||
+        hdr->width > MAX_SHARED_CURSOR_SIZE || hdr->height > MAX_SHARED_CURSOR_SIZE ||
+        (hdr->color_size && hdr->color_size != hdr->width * hdr->height * 4) ||
+        (hdr->mask_height != hdr->height && hdr->mask_height != 2 * hdr->height) ||
+        hdr->mask_size != ((hdr->width + 31) / 32 * 4) * hdr->mask_height ||
+        (ULONGLONG)sizeof(*hdr) + hdr->color_size + hdr->mask_size > view_size)
+    {
+        WARN( "invalid published bits for cursor %p\n", foreign );
+        goto done;
+    }
+
+    hdc = NtGdiCreateCompatibleDC( 0 );
+    frame.width     = hdr->width;
+    frame.height    = hdr->height;
+    frame.hotspot.x = hdr->xhot;
+    frame.hotspot.y = hdr->yhot;
+    if (hdr->color_size)
+    {
+        const DWORD *src = (const DWORD *)(hdr + 1);
+        UINT i, count = hdr->width * hdr->height;
+        unsigned char *ptr;
+
+        init_dib_info( info, hdr->width, hdr->height, 32 );
+        if (!(frame.color = create_dib_from_bits( hdc, info, src, hdr->color_size, NULL ))) goto done;
+        for (i = 0; i < count; i++) if (src[i] & 0xff000000) break;
+        if (i < count)  /* has an alpha channel: build the pre-multiplied copy that DrawIconEx uses */
+        {
+            if (!(frame.alpha = create_dib_from_bits( hdc, info, src, hdr->color_size, (void **)&ptr ))) goto done;
+            for (i = 0; i < count; i++, ptr += 4)
+            {
+                unsigned int alpha = ptr[3];
+                ptr[0] = (ptr[0] * alpha + 127) / 255;
+                ptr[1] = (ptr[1] * alpha + 127) / 255;
+                ptr[2] = (ptr[2] * alpha + 127) / 255;
+            }
+        }
+    }
+    init_dib_info( info, hdr->width, hdr->mask_height, 1 );
+    if (!(frame.mask = create_dib_from_bits( hdc, info, (const char *)(hdr + 1) + hdr->color_size,
+                                             hdr->mask_size, NULL ))) goto done;
+
+    if (!(local = alloc_cursoricon_handle( FALSE ))) goto done;
+    user_lock();
+    publish_suppressed++;
+    ok = NtUserSetCursorIconData( local, NULL, NULL, &desc );
+    publish_suppressed--;
+    user_unlock();
+    if (!ok)
+    {
+        free_icon_handle( local );
+        local = 0;
+        goto done;
+    }
+    frame.color = frame.alpha = frame.mask = 0;  /* owned by the proxy object now */
+    TRACE( "cursor %p from other process -> proxy %p (%ux%u)\n", foreign, local, hdr->width, hdr->height );
+
+done:
+    if (frame.color) NtGdiDeleteObjectApp( frame.color );
+    if (frame.alpha) NtGdiDeleteObjectApp( frame.alpha );
+    if (frame.mask)  NtGdiDeleteObjectApp( frame.mask );
+    if (hdc) NtGdiDeleteObjectApp( hdc );
+    NtUnmapViewOfSection( NtCurrentProcess(), view );
+    NtClose( section );
+    return local;
+}
+
+/* user_lock must be held by caller */
+static HCURSOR find_foreign_cursor( HCURSOR foreign )
+{
+    unsigned int i;
+
+    for (i = 0; i < FOREIGN_CURSOR_CACHE_SIZE; i++)
+    {
+        if (foreign_cursors[i].local && foreign_cursors[i].foreign == foreign)
+        {
+            foreign_cursors[i].last_use = ++foreign_cursor_clock;
+            return foreign_cursors[i].local;
+        }
+    }
+    return 0;
+}
+
+/* map a cursor handle owned by another process to a local proxy the driver can use */
+static HCURSOR get_foreign_cursor( HCURSOR foreign )
+{
+    HCURSOR local, proxy, evicted = 0;
+    unsigned int i, slot = 0;
+
+    user_lock();
+    local = find_foreign_cursor( foreign );
+    user_unlock();
+    if (local) return local;
+
+    if (!(proxy = create_proxy_cursor( foreign ))) return 0;
+
+    user_lock();
+    if ((local = find_foreign_cursor( foreign ))) evicted = proxy;  /* another thread was faster */
+    else
+    {
+        for (i = 0; i < FOREIGN_CURSOR_CACHE_SIZE; i++)
+        {
+            if (!foreign_cursors[i].local) { slot = i; break; }
+            if (foreign_cursors[i].last_use < foreign_cursors[slot].last_use) slot = i;
+        }
+        evicted = foreign_cursors[slot].local;
+        foreign_cursors[slot].foreign  = foreign;
+        foreign_cursors[slot].local    = proxy;
+        foreign_cursors[slot].last_use = ++foreign_cursor_clock;
+        local = proxy;
+    }
+    user_unlock();
+
+    if (evicted) free_icon_handle( evicted );
+    return local;
 }
 
 /***********************************************************************
@@ -303,6 +672,7 @@ BOOL WINAPI NtUserSetCursorIconData( HCURSOR cursor, UNICODE_STRING *module, UNI
         {
             struct cursoricon_desc frame_desc;
             DWORD frame_id;
+            BOOL ok;
 
             if (obj->ani.frames[i]) continue; /* already set */
 
@@ -315,8 +685,15 @@ BOOL WINAPI NtUserSetCursorIconData( HCURSOR cursor, UNICODE_STRING *module, UNI
             memset( &frame_desc, 0, sizeof(frame_desc) );
             frame_desc.delay  = desc->frame_rates ? desc->frame_rates[i] : desc->delay;
             frame_desc.frames = &desc->frames[frame_id];
-            if (!(obj->ani.frames[i] = alloc_cursoricon_handle( obj->is_icon )) ||
-                !NtUserSetCursorIconData( obj->ani.frames[i], NULL, NULL, &frame_desc ))
+            if (!(obj->ani.frames[i] = alloc_cursoricon_handle( obj->is_icon )))
+            {
+                release_user_handle_ptr( obj );
+                return 0;
+            }
+            publish_suppressed++;  /* frames are published through the outer object only */
+            ok = NtUserSetCursorIconData( obj->ani.frames[i], NULL, NULL, &frame_desc );
+            publish_suppressed--;
+            if (!ok)
             {
                 release_user_handle_ptr( obj );
                 return 0;
@@ -341,6 +718,10 @@ BOOL WINAPI NtUserSetCursorIconData( HCURSOR cursor, UNICODE_STRING *module, UNI
             list_add_head( &icon_cache, &obj->entry );
         }
     }
+
+    /* make cursors reachable from other processes right away: any process may
+     * pass this handle to SetCursor(), not only the one that created it */
+    if (!obj->is_icon && !publish_suppressed) publish_cursor( cursor );
 
     release_user_handle_ptr( obj );
     return TRUE;

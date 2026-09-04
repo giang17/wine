@@ -50,6 +50,16 @@ WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
 DriverFuncs drvs;
 static DriverFuncs midi_driver;
 
+/* Every driver entry point is expected to return STATUS_SUCCESS.  Keep the
+ * assert, but log the call code and status first, so that a rare non-zero
+ * status can be attributed when it happens. */
+void wine_unix_call(unsigned int code, void *args)
+{
+    const NTSTATUS status = __wine_unix_call(drvs.module_unixlib, code, args);
+    if (status) ERR("unix call %u returned status %lx\n", code, status);
+    assert(!status);
+}
+
 #define MIDI_CALL(code,args)  __wine_unix_call( midi_driver.module_unixlib, code, args )
 
 const WCHAR drv_keyW[] = L"Software\\Wine\\Drivers";

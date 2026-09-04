@@ -38,6 +38,7 @@
 #include "windows.system.userprofile.h"
 
 extern IActivationFactory *geographic_region_factory;
+extern IActivationFactory *calendar_factory;
 
 #include "wine/debug.h"
 #include "wine/list.h"
