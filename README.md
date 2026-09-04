@@ -7,7 +7,7 @@
 
 <p align="center">
   <img alt="Base" src="https://img.shields.io/badge/base-Wine%2011.0%20stable-blue">
-  <img alt="Rolling devel" src="https://img.shields.io/badge/rolling%20devel-11.16-blue">
+  <img alt="Rolling devel" src="https://img.shields.io/badge/rolling%20devel-newest%2011.x%20tag-blue">
   <img alt="Commits" src="https://img.shields.io/badge/commits-487-informational">
   <img alt="Subsystems" src="https://img.shields.io/badge/subsystems-46-informational">
   <img alt="License" src="https://img.shields.io/badge/license-LGPL--2.1-green">
@@ -104,7 +104,7 @@ Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**.
 | Branch | Base | For whom |
 |---|---|---|
 | **`d2d1-dcomp-11.0`** | `wine-11.0` stable | **Most users.** The full stack on the stable release, actively maintained. This is the default branch. |
-| **`d2d1-dcomp-11.<N>`** | newest WineHQ devel tag | **Rolling-release users** (`wine-tkg-dev` and similar). The same stack rebased onto the newest devel tag roughly every two weeks — currently `d2d1-dcomp-11.16`. Always take the **highest-numbered** one; lower numbers are superseded snapshots. Plugin-tested before each push. |
+| **`d2d1-dcomp-11.<N>`** | newest WineHQ devel tag | **Rolling-release users** (`wine-tkg-dev` and similar). The same stack rebased onto the newest devel tag roughly every two weeks. Always take the **highest-numbered** `d2d1-dcomp-11.*` branch; lower numbers are superseded snapshots. Plugin-tested before each push. |
 | `d2d1-v6` | `wine-11.0` | **Deprecated** since 2026-05-03. The original upstream-targeted D2D1-only series, kept for reference. |
 
 ## Tested applications
