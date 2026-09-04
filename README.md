@@ -61,9 +61,12 @@ pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty 
 </td>
 </tr>
 <tr>
-<td colspan="2" align="center">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/eprom-webview2-login.png" width="62%" alt="EPROM Memory Rites login through WebView2">
-  <br>
+<td width="50%" valign="top">
+  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/fl-cloud-plugins.png" alt="FL Cloud plugin store in FL Studio">
+  <sub><b>FL Cloud</b> in FL Studio — the plugin store browses with its artwork, products show as installed, and a download runs in place. Installing from it needs the AF_UNIX patches from this fork.</sub>
+</td>
+<td width="50%" valign="top">
+  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/eprom-webview2-login.png" alt="EPROM Memory Rites login through WebView2">
   <sub><b>EPROM — Memory Rites</b> (JUCE 8.0.13) inside Reaper: the splash and login screen render through WebView2, the rest of the GUI through JUCE.</sub>
 </td>
 </tr>
