@@ -8,8 +8,7 @@
 <p align="center">
   <img alt="Base" src="https://img.shields.io/badge/base-Wine%2011.0%20stable-blue">
   <img alt="Rolling devel" src="https://img.shields.io/badge/rolling%20devel-newest%2011.x%20tag-blue">
-  <img alt="Commits" src="https://img.shields.io/badge/commits-487-informational">
-  <img alt="Subsystems" src="https://img.shields.io/badge/subsystems-46-informational">
+  <img alt="Subsystems" src="https://img.shields.io/badge/patched%20subsystems-40%2B-informational">
   <img alt="License" src="https://img.shields.io/badge/license-LGPL--2.1-green">
 </p>
 
@@ -38,14 +37,14 @@ difference: plugin windows come up black, artwork and icons are missing, GUIs fl
 and some applications refuse to start at all because the graphics engine they build on
 never comes up.
 
-This fork implements the missing pieces. It is **487 commits on top of `wine-11.0`**,
-reaching into 42 DLLs and 4 programs, and it is used daily for music production rather
-than kept as a proof of concept.
+This fork implements the missing pieces. It adds **over 30 000 lines to stock Wine**,
+reaching into more than 40 DLLs and programs, and it is used daily for music production
+rather than kept as a proof of concept.
 
 ```
 d2d1 · dcomp · dwrite · dxgi · d3d11 · wined3d · winex11.drv · win32u · uianimation
-dwmapi · ntdll · ole32 · msi · secur32 · comdlg32 · shell32 · advapi32 · wintrust
-pwrshsip (new) · powershell.exe · winemenubuilder.exe · and 25 more
+dwmapi · ntdll · ole32 · msi · crypt32 · comdlg32 · shell32 · advapi32 · wintrust
+pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty others
 ```
 
 ## What it looks like
@@ -75,7 +74,7 @@ pwrshsip (new) · powershell.exe · winemenubuilder.exe · and 25 more
 ```bash
 git clone https://github.com/giang17/wine.git
 cd wine
-git checkout d2d1-dcomp-11.0
+git checkout d2d1-dcomp-11.0     # or the highest-numbered d2d1-dcomp-11.* for rolling release
 ./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64
 make -j$(nproc)
 sudo make install
@@ -126,7 +125,7 @@ exactly each one needs, and what breaks without it — is in
 | **Native Access 3.25.2**, **Kontakt 8 Player** | Electron/Chromium, InstallAware/MSI | Install, sign in and run — need the `powershell` and `msi` patches from this fork |
 | **VProm3** (VST3) | SynthEdit/GMPI + D2D1 | Fully functional, correct colours (needs the Color Management effect) |
 | **SynthEdit 1.5** | Custom engine (D2D1 + winex11 client surfaces) | Fully functional — the MDI canvas draws completely and stays stable through menus, resizes and moves |
-| **UVI Portal**, **Minimal Hub** | WebView2, Tauri v2 | Install, sign in and update products; Minimal Hub needs the `secur32` schannel fix from this fork |
+| **UVI Portal**, **Minimal Hub** | WebView2, Tauri v2 | Install, sign in and update products; Minimal Hub needs the schannel `DecryptMessage` fix for incomplete messages, which this branch carries — without it its `oauth/token` request stops after a partial response and the app waits forever |
 
 ## What the fork changes
 
@@ -155,8 +154,8 @@ switches for each.
   decorated plugin menus on KDE), no black expose flash while a client window renders
   offscreen
 - **Everything an installer needs** — `msi` string pool and feature cost, Script SIP for
-  signed PowerShell (`pwrshsip`, `wintrust`, `msisip`), a usable `powershell.exe`, schannel
-  `DecryptMessage`, `IShellLink::GetPath` short paths, `MiniDumpWriteDump` module lists.
+  signed PowerShell (`pwrshsip`, `wintrust`, `msisip`), a usable `powershell.exe`,
+  `IShellLink::GetPath` short paths, `MiniDumpWriteDump` module lists.
   Unglamorous, but it is the difference between an application that installs and one that
   does not
 
