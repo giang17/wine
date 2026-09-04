@@ -74,6 +74,8 @@ static BOOL fetch_process_info(struct dump_context* dc)
                     dc->threads[dc->num_threads].tid        = HandleToULong(spi->ti[i].ClientId.UniqueThread);
                     dc->threads[dc->num_threads].prio_class = spi->ti[i].dwBasePriority; /* FIXME */
                     dc->threads[dc->num_threads].curr_prio  = spi->ti[i].dwCurrentPriority;
+                    dc->threads[dc->num_threads].stack_start = 0;
+                    dc->threads[dc->num_threads].stack_size = 0;
                     dc->num_threads++;
                 }
                 HeapFree(GetProcessHeap(), 0, pcs_buffer);
@@ -198,6 +200,7 @@ static BOOL add_module(struct dump_context* dc, const WCHAR* name,
     dc->modules[dc->num_modules].timestamp = timestamp;
     dc->modules[dc->num_modules].checksum = checksum;
     dc->modules[dc->num_modules].is_elf = is_elf;
+    dc->modules[dc->num_modules].referenced_by_memory = FALSE;
     dc->num_modules++;
 
     return TRUE;
@@ -422,6 +425,55 @@ static  unsigned        dump_exception_info(struct dump_context* dc)
 }
 
 /******************************************************************
+ *		scan_memory_for_modules
+ *
+ * MiniDumpScanMemory: look through the thread stacks written to the dump for
+ * pointer-sized values inside a module, and flag those modules.  The module
+ * callback is then told about them with ModuleReferencedByMemory, which is
+ * what callbacks keeping "only the modules referenced by memory" rely on.
+ */
+static void scan_memory_for_modules(struct dump_context* dc)
+{
+    const unsigned      word_size = dbghelp_current_cpu->word_size;
+    ULONG64             lo = ~(ULONG64)0, hi = 0, addr;
+    unsigned            i, j, pos, len, off;
+    char                tmp[1024];
+
+    for (i = 0; i < dc->num_modules; i++)
+    {
+        lo = min(lo, dc->modules[i].base);
+        hi = max(hi, dc->modules[i].base + dc->modules[i].size);
+    }
+    if (lo >= hi) return;
+
+    for (i = 0; i < dc->num_threads; i++)
+    {
+        for (pos = 0; pos < dc->threads[i].stack_size; pos += sizeof(tmp))
+        {
+            len = min(dc->threads[i].stack_size - pos, sizeof(tmp));
+            if (!read_process_memory(dc->process, dc->threads[i].stack_start + pos, tmp, len)) break;
+            for (off = 0; off + word_size <= len; off += word_size)
+            {
+                if (word_size == sizeof(ULONG64)) memcpy(&addr, tmp + off, sizeof(ULONG64));
+                else
+                {
+                    ULONG addr32;
+                    memcpy(&addr32, tmp + off, sizeof(addr32));
+                    addr = addr32;
+                }
+                if (addr < lo || addr >= hi) continue;
+                for (j = 0; j < dc->num_modules; j++)
+                {
+                    if (!dc->modules[j].referenced_by_memory &&
+                        addr - dc->modules[j].base < dc->modules[j].size)
+                        dc->modules[j].referenced_by_memory = TRUE;
+                }
+            }
+        }
+    }
+}
+
+/******************************************************************
  *		dump_modules
  *
  * Write in File the modules from pcs
@@ -464,6 +516,8 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
             continue;
 
         flags_out = ModuleWriteModule | ModuleWriteMiscRecord | ModuleWriteCvRecord;
+        if (dc->modules[i].referenced_by_memory)
+            flags_out |= ModuleReferencedByMemory;
         if (dc->type & MiniDumpWithDataSegs)
             flags_out |= ModuleWriteDataSeg;
         if (dc->type & MiniDumpWithProcessThreadData)
@@ -702,6 +756,8 @@ static  unsigned        dump_threads(struct dump_context* dc)
             }
             if (mdThd.Stack.Memory.DataSize && (flags_out & ThreadWriteStack))
             {
+                dc->threads[i].stack_start = mdThd.Stack.StartOfMemoryRange;
+                dc->threads[i].stack_size = mdThd.Stack.Memory.DataSize;
                 minidump_add_memory_block(dc, mdThd.Stack.StartOfMemoryRange,
                                           mdThd.Stack.Memory.DataSize,
                                           rva_base + sizeof(mdThdList.NumberOfThreads) +
@@ -942,6 +998,10 @@ static DWORD CALLBACK write_minidump(void *_args)
     if ((mdDir.Location.DataSize = dump_threads_names(dc)))
         writeat(dc, mdHead.StreamDirectoryRva + idx_stream++ * sizeof(mdDir),
                 &mdDir, sizeof(mdDir));
+
+    /* the thread stacks are known now: find the modules they point into */
+    if ((dc->type & MiniDumpScanMemory) && dc->cb)
+        scan_memory_for_modules(dc);
 
     mdDir.StreamType = ModuleListStream;
     mdDir.Location.Rva = dc->rva;

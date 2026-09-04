@@ -714,6 +714,97 @@ static void test_callback(void)
     }
 }
 
+struct scan_cb_info
+{
+    /* input */
+    BOOL drop_unreferenced; /* keep only the modules referenced by memory, as the common callbacks do */
+    /* output */
+    unsigned num_modules;
+    unsigned num_referenced;
+    ULONG exe_flags;
+    ULONG kernel32_flags;
+    ULONG ntdll_flags;
+};
+
+static BOOL CALLBACK test_scan_memory_cb(void *pmt, MINIDUMP_CALLBACK_INPUT *input, MINIDUMP_CALLBACK_OUTPUT *output)
+{
+    struct scan_cb_info *cb = pmt;
+
+    if (input->CallbackType != ModuleCallback) return TRUE;
+    cb->num_modules++;
+    ok((output->ModuleWriteFlags & ~ModuleReferencedByMemory) == (ModuleWriteModule | ModuleWriteMiscRecord | ModuleWriteCvRecord),
+       "Unexpected module flags %lx\n", output->ModuleWriteFlags);
+    if (input->Module.BaseOfImage == (DWORD_PTR)GetModuleHandleW(NULL))
+        cb->exe_flags = output->ModuleWriteFlags;
+    else if (input->Module.BaseOfImage == (DWORD_PTR)GetModuleHandleW(L"kernel32.dll"))
+        cb->kernel32_flags = output->ModuleWriteFlags;
+    else if (input->Module.BaseOfImage == (DWORD_PTR)GetModuleHandleW(L"ntdll.dll"))
+        cb->ntdll_flags = output->ModuleWriteFlags;
+    if (output->ModuleWriteFlags & ModuleReferencedByMemory)
+        cb->num_referenced++;
+    else if (cb->drop_unreferenced)
+        output->ModuleWriteFlags &= ~ModuleWriteModule;
+    return TRUE;
+}
+
+static BOOL minidump_has_module(void *data, DWORD64 base)
+{
+    MINIDUMP_MODULE_LIST *module_list;
+    BOOL ret;
+    int i;
+
+    ret = MiniDumpReadDumpStream(data, ModuleListStream, NULL, (void**)&module_list, NULL);
+    ok(ret && module_list, "Couldn't find module-list stream\n");
+    for (i = 0; i < module_list->NumberOfModules; i++)
+        if (module_list->Modules[i].BaseOfImage == base) return TRUE;
+    return FALSE;
+}
+
+static void test_scan_memory(void)
+{
+    struct scan_cb_info cb_info;
+    MINIDUMP_CALLBACK_INFORMATION cbi = {.CallbackRoutine = test_scan_memory_cb, .CallbackParam = &cb_info};
+    MINIDUMP_MODULE_LIST *module_list;
+    void *data;
+    BOOL ret;
+
+    /* without MiniDumpScanMemory, no module is reported as referenced by memory */
+    memset(&cb_info, 0, sizeof(cb_info));
+    minidump_write(GetCurrentProcess(), L"foo.mdmp", MiniDumpNormal, FALSE, NULL, &cbi);
+    ok(cb_info.num_modules > 3, "Unexpected number of modules %u\n", cb_info.num_modules);
+    ok(cb_info.num_referenced == 0, "Unexpected number of referenced modules %u\n", cb_info.num_referenced);
+    ret = DeleteFileA("foo.mdmp");
+    ok(ret, "Couldn't delete file\n");
+
+    /* with it, the modules the thread stacks point into are flagged: at least the ones on
+     * the calling thread's stack, from the main module down to the thread start in ntdll */
+    memset(&cb_info, 0, sizeof(cb_info));
+    minidump_write(GetCurrentProcess(), L"foo.mdmp", MiniDumpScanMemory, FALSE, NULL, &cbi);
+    ok(cb_info.num_modules > 3, "Unexpected number of modules %u\n", cb_info.num_modules);
+    ok(cb_info.num_referenced > 0 && cb_info.num_referenced <= cb_info.num_modules,
+       "Unexpected number of referenced modules %u (%u)\n", cb_info.num_referenced, cb_info.num_modules);
+    ok(cb_info.exe_flags & ModuleReferencedByMemory, "Main module not referenced by memory (%lx)\n", cb_info.exe_flags);
+    ok(cb_info.kernel32_flags & ModuleReferencedByMemory, "kernel32 not referenced by memory (%lx)\n", cb_info.kernel32_flags);
+    ok(cb_info.ntdll_flags & ModuleReferencedByMemory, "ntdll not referenced by memory (%lx)\n", cb_info.ntdll_flags);
+    ret = DeleteFileA("foo.mdmp");
+    ok(ret, "Couldn't delete file\n");
+
+    /* a callback keeping only the referenced modules must still leave them in the dump */
+    memset(&cb_info, 0, sizeof(cb_info));
+    cb_info.drop_unreferenced = TRUE;
+    minidump_write(GetCurrentProcess(), L"foo.mdmp", MiniDumpScanMemory, FALSE, NULL, &cbi);
+    data = minidump_open_for_read("foo.mdmp");
+    ret = MiniDumpReadDumpStream(data, ModuleListStream, NULL, (void**)&module_list, NULL);
+    ok(ret && module_list, "Couldn't find module-list stream\n");
+    ok(module_list->NumberOfModules == cb_info.num_referenced, "Unexpected number of modules %lu (%u)\n",
+       module_list->NumberOfModules, cb_info.num_referenced);
+    ok(minidump_has_module(data, (DWORD_PTR)GetModuleHandleW(NULL)), "Main module missing from the dump\n");
+    ok(minidump_has_module(data, (DWORD_PTR)GetModuleHandleW(L"ntdll.dll")), "ntdll missing from the dump\n");
+    minidump_close_for_read(data);
+    ret = DeleteFileA("foo.mdmp");
+    ok(ret, "Couldn't delete file\n");
+}
+
 static void test_exception(void)
 {
     static const struct
@@ -898,5 +989,6 @@ START_TEST(minidump)
     test_minidump_contents();
     test_current_process();
     test_callback();
+    test_scan_memory();
     test_exception();
 }
