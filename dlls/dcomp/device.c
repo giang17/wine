@@ -426,39 +426,45 @@ static HRESULT STDMETHODCALLTYPE dcomp_surface_BeginDraw(IDCompositionSurface *i
         surface->has_dirty_rect = FALSE;
     }
 
+    /* A Direct2D device context is only available for a surface whose device was
+     * created on a Direct2D rendering device -- BeginDraw() returns E_INVALIDARG
+     * otherwise, and the caller is expected to ask for IDXGISurface1 or
+     * ID3D11Texture2D instead.  Both are implemented below.
+     *
+     * This used to build a context out of D2D1CreateDeviceContext() for a surface
+     * on a D3D11 device, which is worse than refusing: that function takes the
+     * DXGI surface to reach the device and does not make it the context's target
+     * (documented behaviour -- "the DXGI device will be specified implicitly
+     * through dxgiSurface" is all it says about the surface).  The caller got
+     * S_OK and a context with no target, every draw into it set
+     * D2DERR_WRONG_STATE, and the surface stayed empty.  An application that had
+     * been told E_INVALIDARG would have taken one of the routes that work; one
+     * that is told S_OK has no reason to.  Same class as issue 183: a half
+     * implemented entry point defeats the fallback the application brought. */
     if (IsEqualGUID(iid, &IID_ID2D1DeviceContext))
     {
-        /* D2D1Device path: use VSTGUI's device so resources are compatible. */
-        if (surface->d2d1_device)
+        if (!surface->d2d1_device)
         {
-            hr = dcomp_surface_ensure_d2d1_resources(surface);
-            if (FAILED(hr))
-                return hr;
+            static unsigned int no_d2d1_count;
 
-            context = surface->persistent_context;
-            ID2D1DeviceContext_SetTarget(context, (ID2D1Image *)surface->target_bitmap);
-            ID2D1DeviceContext_BeginDraw(context);
+            if (++no_d2d1_count <= 5 || !(no_d2d1_count % 200))
+                WARN("Surface %p has no Direct2D device (report #%u): its device was created on "
+                        "a %s.  Ask for IID_IDXGISurface1 or IID_ID3D11Texture2D instead.\n",
+                        surface, no_d2d1_count, surface->dxgi_surface ? "D3D11 device" : "device of its own");
+            return E_INVALIDARG;
         }
-        else if (surface->dxgi_surface)
-        {
-            /* D3D11 path: create a standalone D2D1 context from the DXGI surface. */
-            D2D1_CREATION_PROPERTIES props;
-            memset(&props, 0, sizeof(props));
-            props.threadingMode = D2D1_THREADING_MODE_SINGLE_THREADED;
-            props.options = D2D1_DEVICE_CONTEXT_OPTIONS_NONE;
 
-            hr = D2D1CreateDeviceContext(surface->dxgi_surface, &props, &context);
-            if (FAILED(hr))
-            {
-                FIXME("D2D1CreateDeviceContext failed: %#lx.\n", hr);
-                return hr;
-            }
-        }
-        else
-        {
-            WARN("Surface has neither D2D1 device nor DXGI surface.\n");
-            return E_FAIL;
-        }
+        hr = dcomp_surface_ensure_d2d1_resources(surface);
+        if (FAILED(hr))
+            return hr;
+
+        /* The context is handed out ready to draw on: the surface is its target
+         * and the draw is open, so the application only renders and calls
+         * IDCompositionSurface::EndDraw -- it must not call BeginDraw or EndDraw
+         * on the context itself. */
+        context = surface->persistent_context;
+        ID2D1DeviceContext_SetTarget(context, (ID2D1Image *)surface->target_bitmap);
+        ID2D1DeviceContext_BeginDraw(context);
 
         /* Push a clip rect so that Clear() only affects the dirty area,
          * preserving the rest of the surface (VSTGUI partial redraw pattern). */
