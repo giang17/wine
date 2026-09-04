@@ -3388,9 +3388,9 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
                     uncomposited_count, target_hwnd, stats.surface, stats.texture);
     }
     /* A surface root presents through dcomp_target_present_region(), which
-     * composites its direct surface children itself (Cubase 15: 34 of them
-     * under the project window's root surface, all delivered).  What that
-     * path does not draw are texture leaves. */
+     * composites the surface leaves below the root itself, at any depth
+     * (Cubase 15: 34 of them under the project window's root surface, all
+     * delivered).  What that path does not draw are texture leaves. */
     else if (!rootless && root->surface_content && stats.texture)
     {
         static unsigned int uncomposited_count;
@@ -5376,10 +5376,34 @@ static LONGLONG dcomp_qpc_freq(void)
     return freq;
 }
 
+/* Fold one subtree's surface leaves into the fingerprint, depth first with
+ * accumulated offsets -- the placement is what a container visual above the
+ * leaf can change without the leaf itself moving. */
+static UINT64 dcomp_visual_surface_signature(const struct dcomp_visual *visual,
+        int base_x, int base_y, UINT64 sig)
+{
+    const struct dcomp_surface *surf = visual->surface_content;
+    const struct dcomp_visual *child;
+    int vx = base_x + (int)visual->offset_x;
+    int vy = base_y + (int)visual->offset_y;
+
+    if (surf)
+    {
+        sig = (sig ^ (UINT_PTR)surf) * 1099511628211ull;
+        sig = (sig ^ (UINT32)vx) * 1099511628211ull;
+        sig = (sig ^ (UINT32)vy) * 1099511628211ull;
+        sig = (sig ^ ((UINT64)surf->width << 32 | surf->height)) * 1099511628211ull;
+    }
+
+    for (child = visual->children; child; child = child->next_sibling)
+        sig = dcomp_visual_surface_signature(child, vx, vy, sig);
+    return sig;
+}
+
 /* What dcomp_target_present_region() puts on top of the root surface, as one
- * number: the direct children that carry a surface, which surface, its size and
- * where it sits.  A child that is added, removed, moved or given another
- * surface changes the frame without touching the root surface, and only this
+ * number: every surface leaf below the root, which surface, its size and where
+ * it sits.  A leaf that is added, removed, moved or given another surface
+ * changes the frame without touching the root surface, and only this
  * fingerprint tells the commit path so. */
 static UINT64 dcomp_target_children_signature(const struct dcomp_target *target)
 {
@@ -5387,17 +5411,24 @@ static UINT64 dcomp_target_children_signature(const struct dcomp_target *target)
     UINT64 sig = 0;
 
     for (child = target->root_visual->children; child; child = child->next_sibling)
-    {
-        const struct dcomp_surface *surf = child->surface_content;
-
-        if (!surf)
-            continue;
-        sig = (sig ^ (UINT_PTR)surf) * 1099511628211ull;
-        sig = (sig ^ (UINT32)(int)child->offset_x) * 1099511628211ull;
-        sig = (sig ^ (UINT32)(int)child->offset_y) * 1099511628211ull;
-        sig = (sig ^ ((UINT64)surf->width << 32 | surf->height)) * 1099511628211ull;
-    }
+        sig = dcomp_visual_surface_signature(child, 0, 0, sig);
     return sig;
+}
+
+static BOOL dcomp_visual_surface_has_pending(const struct dcomp_visual *visual)
+{
+    const struct dcomp_surface *surf = visual->surface_content;
+    const struct dcomp_visual *child;
+
+    /* Same gate as the composite: a leaf it would skip cannot be read back
+     * there, and counting it here would present on every commit for good. */
+    if (surf && surf->has_pending && surf->bits && surf->width && surf->height)
+        return TRUE;
+
+    for (child = visual->children; child; child = child->next_sibling)
+        if (dcomp_visual_surface_has_pending(child))
+            return TRUE;
+    return FALSE;
 }
 
 /* Does a surface root owe its window a present for its children alone?  The
@@ -5412,14 +5443,8 @@ static BOOL dcomp_target_children_need_present(const struct dcomp_target *target
     const struct dcomp_visual *child;
 
     for (child = target->root_visual->children; child; child = child->next_sibling)
-    {
-        const struct dcomp_surface *surf = child->surface_content;
-
-        /* Same gate as the composite: a child it would skip cannot be read back
-         * there, and counting it here would present on every commit for good. */
-        if (surf && surf->has_pending && surf->bits && surf->width && surf->height)
+        if (dcomp_visual_surface_has_pending(child))
             return TRUE;
-    }
     return dcomp_target_children_signature(target) != target->children_sig;
 }
 
@@ -5596,6 +5621,56 @@ static void dcomp_target_present_nested(struct dcomp_target *target,
     }
 }
 
+/* Composite the surface leaves of one subtree onto the frame this present is
+ * building, depth first with accumulated offsets -- the shape
+ * dcomp_target_composite_leaves() has for the rootless path.
+ *
+ * The walk used to be a single loop over the root's direct children that drew a
+ * child only if it carried a surface itself.  A leaf one level deeper -- root ->
+ * container visual -> surface leaf -- was therefore never drawn: its pixels
+ * stayed in its own surface, nothing reported it, and the frame simply lacked
+ * them (issue 330).  Cubase 15, the first application in the field with a
+ * surface root and surface leaves under it (34 of them -- scrollbars,
+ * splitters, meters, issue 329), builds a flat tree and never showed the limit;
+ * the next tree to group its leaves would have lost them in silence.
+ *
+ * Container visuals carry no content and only pass their offset down, which is
+ * why the offset accumulates here rather than being read off the leaf.
+ *
+ * Texture leaves are still not drawn here -- dcomp_commit_visual_tree() reports
+ * those ("Leaves not composited"). */
+static void dcomp_target_composite_surface_leaves(struct dcomp_target *target,
+        struct dcomp_visual *visual, int base_x, int base_y, UINT dst_w, UINT dst_h)
+{
+    struct dcomp_surface *surf = visual->surface_content;
+    struct dcomp_visual *child;
+    int vx = base_x + (int)visual->offset_x;
+    int vy = base_y + (int)visual->offset_y;
+
+    if (surf && surf->bits && surf->width && surf->height)
+    {
+        static unsigned int child_comp_log;
+
+        /* EndDraw leaves the GPU->CPU readback to the present (issue 56), and
+         * this present read back the root surface only: a leaf was composited
+         * out of bits nothing had ever filled -- alpha 0, skipped, whatever the
+         * root painted underneath stayed (issues 333/334).  The rootless path
+         * got this call on 13.08.2026 for Studio Pro 8; this is the same leaf
+         * under a surface root. */
+        dcomp_surface_ensure_bits(surf);
+
+        if (++child_comp_log <= 5)
+            FIXME("Compositing child visual %ux%u at (%d,%d) onto %ux%u root.\n",
+                    surf->width, surf->height, vx, vy, dst_w, dst_h);
+
+        dcomp_composite_premul_over(target->comp_bits, dst_w, dst_h,
+                surf->bits, surf->width, surf->height, vx, vy);
+    }
+
+    for (child = visual->children; child; child = child->next_sibling)
+        dcomp_target_composite_surface_leaves(target, child, vx, vy, dst_w, dst_h);
+}
+
 /* Present region [left,right)x[top,bottom) of the target's root surface to its HWND.
  * Caller holds device->cs and has validated root_visual/surface->bits/comp_bits. */
 static void dcomp_target_present_region(struct dcomp_target *target,
@@ -5622,71 +5697,14 @@ static void dcomp_target_present_region(struct dcomp_target *target,
                 surface->width * surface->height * sizeof(DWORD));
     }
 
-    /* Composite child visual surfaces on top (premultiplied alpha over) */
+    /* Composite the surface leaves below the root on top (premultiplied alpha
+     * over), depth first with accumulated offsets. */
     {
         struct dcomp_visual *child;
-        static unsigned int child_comp_log;
 
         for (child = target->root_visual->children; child; child = child->next_sibling)
-        {
-            struct dcomp_surface *child_surf = child->surface_content;
-            int ox, oy, src_x, src_y, dst_x, dst_y, copy_w, copy_h, y, x;
-            DWORD *dst_row, *src_row;
-
-            if (!child_surf || !child_surf->bits || !child_surf->width || !child_surf->height)
-                continue;
-
-            /* EndDraw leaves the GPU->CPU readback to the present (issue 56),
-             * and this present read back the root surface only: a child was
-             * composited out of bits nothing had ever filled -- alpha 0, skipped,
-             * whatever the root painted underneath stayed (issues 333/334).  The
-             * rootless path got this call on 13.08.2026 for Studio Pro 8; this
-             * is the same leaf under a surface root. */
-            dcomp_surface_ensure_bits(child_surf);
-
-            ox = (int)child->offset_x;
-            oy = (int)child->offset_y;
-
-            src_x = (ox < 0) ? -ox : 0;
-            src_y = (oy < 0) ? -oy : 0;
-            dst_x = (ox < 0) ? 0 : ox;
-            dst_y = (oy < 0) ? 0 : oy;
-            copy_w = min((int)child_surf->width - src_x, (int)surface->width - dst_x);
-            copy_h = min((int)child_surf->height - src_y, (int)surface->height - dst_y);
-
-            if (copy_w <= 0 || copy_h <= 0)
-                continue;
-
-            if (++child_comp_log <= 5)
-                FIXME("Compositing child visual %ux%u at (%d,%d) onto %ux%u root.\n",
-                        child_surf->width, child_surf->height, ox, oy,
-                        surface->width, surface->height);
-
-            for (y = 0; y < copy_h; y++)
-            {
-                dst_row = (DWORD *)target->comp_bits + (dst_y + y) * surface->width + dst_x;
-                src_row = (DWORD *)child_surf->bits + (src_y + y) * child_surf->width + src_x;
-                for (x = 0; x < copy_w; x++)
-                {
-                    DWORD s = src_row[x];
-                    BYTE sa = (s >> 24);
-                    if (sa == 0xff)
-                    {
-                        dst_row[x] = s;
-                    }
-                    else if (sa > 0)
-                    {
-                        /* Premultiplied alpha: out = src + dst * (1 - sa/255) */
-                        DWORD d = dst_row[x];
-                        BYTE ia = 255 - sa;
-                        dst_row[x] = ((min(sa + (((d >> 24) * ia + 127) / 255), 255u)) << 24)
-                                   | ((((s >> 16) & 0xff) + ((((d >> 16) & 0xff) * ia + 127) / 255)) << 16)
-                                   | ((((s >> 8) & 0xff) + ((((d >> 8) & 0xff) * ia + 127) / 255)) << 8)
-                                   | (((s & 0xff) + (((d & 0xff) * ia + 127) / 255)));
-                    }
-                }
-            }
-        }
+            dcomp_target_composite_surface_leaves(target, child, 0, 0,
+                    surface->width, surface->height);
     }
 
     target->children_sig = dcomp_target_children_signature(target);
