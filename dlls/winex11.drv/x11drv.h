@@ -385,6 +385,7 @@ struct x11drv_client_surface
     LONG listed;
     LONG blit_pending;   /* an offscreen present blit went to the top-level since the last VisibilityNotify */
     LONG reblitting;     /* x11drv_client_surface_reblit() is presenting this surface */
+    LONG offscreen_hidden; /* the surface renders offscreen only because its window is not visible */
 };
 
 extern struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client );
