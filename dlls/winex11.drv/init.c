@@ -264,6 +264,18 @@ BOOL needs_offscreen_rendering( HWND hwnd )
         return TRUE; /* child window, needs compositing */
     }
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
+    /* A top-level that is not visible has no mapped X window, and an unmapped window
+     * has no backing store: what GL renders into it is undefined, and reading it back
+     * picks up the clear colour or a stale frame of another window - the same undefined
+     * pixmap content the comment in client_surface_update_offscreen() describes for a
+     * re-parent.  HALion Sonic renders the Anima 3D wavetable view into a hidden 260x151
+     * top-level ("OGLWnd") and reads it back with glReadPixels to paint it into the
+     * editor through Direct2D; on Windows a hidden window still has a valid backbuffer,
+     * under X11 it does not, so the view showed a stale desktop frame upside down (GL
+     * rows run bottom-up) or a flat clear colour, and never updated (issue 341).
+     * Render offscreen instead: get_dummy_parent() maps its dummy window, so a client
+     * window redirected there has a valid pixmap. */
+    if (!NtUserIsWindowVisible( hwnd )) return TRUE;
     return FALSE;
 }
 
@@ -339,6 +351,7 @@ struct x11drv_client_surface
     LONG listed;
     LONG blit_pending;   /* an offscreen present blit went to the top-level since the last VisibilityNotify */
     LONG reblitting;     /* x11drv_client_surface_reblit() is presenting this surface */
+    LONG offscreen_hidden; /* the surface renders offscreen only because its window is not visible */
 };
 
 /* every x11drv client surface, so that a top-level's VisibilityNotify can find
@@ -488,7 +501,7 @@ static Pixmap client_surface_save_content( struct x11drv_client_surface *surface
 
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
-    BOOL offscreen = needs_offscreen_rendering( hwnd );
+    BOOL offscreen = needs_offscreen_rendering( hwnd ), was_hidden;
     struct x11drv_win_data *data;
     Pixmap saved = 0;
     GC saved_gc = NULL;
@@ -502,9 +515,17 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
      * stale frame of another window - and nothing presents again until the
      * application draws (issue 291).  Once a top-level has gone offscreen,
      * keep it there for the lifetime of the client surface: the blit it pays
-     * per present is what it paid while it had the focus anyway. */
+     * per present is what it paid while it had the focus anyway.
+     *
+     * A window that renders offscreen only because it is not visible is not that
+     * case: it makes the transition back exactly once, when it is shown, instead
+     * of flipping with the focus.  Latching it would put every GL top-level whose
+     * client surface exists before its ShowWindow on the blit path for good, so
+     * remember why the surface went offscreen and let this one return (issue 341). */
+    was_hidden = InterlockedExchange( &surface->offscreen_hidden,
+                                      offscreen && !NtUserIsWindowVisible( hwnd ) );
     if (!offscreen && InterlockedCompareExchange( &surface->client.offscreen, 0, 0 )
-        && NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow())
+        && NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow() && !was_hidden)
     {
         TRACE( "%s stays offscreen\n", debugstr_client_surface( &surface->client ) );
         offscreen = TRUE;
@@ -582,8 +603,11 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
      * move on its own: Studio Pro's main window, whose Assistant panel makes it
      * render offscreen, stayed black until the pointer hovered a control.  Ask
      * for a repaint, as a change of client window does (see
-     * X11DRV_client_surface_present()). */
-    if (offscreen) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN );
+     * X11DRV_client_surface_present()).  The move back leaves the client window's
+     * content just as undefined, and since issue 341 a hidden window actually
+     * makes that transition, so ask in both directions - control only reaches
+     * here when the offscreen state really changed. */
+    NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN );
 }
 
 static void x11drv_client_surface_update( struct client_surface *client )
