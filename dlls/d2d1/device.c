@@ -4021,7 +4021,11 @@ static void STDMETHODCALLTYPE d2d_device_context_PushAxisAlignedClip(ID2D1Device
         d2d_command_list_push_clip(context->target.command_list, clip_rect, antialias_mode);
 
     if (antialias_mode != D2D1_ANTIALIAS_MODE_ALIASED)
-        FIXME("Ignoring antialias_mode %#x.\n", antialias_mode);
+    {
+        static int once;
+        if (!once++)
+            FIXME("Ignoring antialias_mode %#x.\n", antialias_mode);
+    }
 
     x_scale = context->desc.dpiX / 96.0f;
     y_scale = context->desc.dpiY / 96.0f;
