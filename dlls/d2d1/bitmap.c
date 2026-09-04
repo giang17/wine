@@ -792,19 +792,11 @@ HRESULT d2d_bitmap_create_from_wic_bitmap(struct d2d_device_context *context, IW
     rect.Y = 0;
     rect.Width = size.width;
     rect.Height = size.height;
-    /* Skip CopyPixels for TARGET bitmaps — they should start transparent (zeroed).
-     * On Windows, CreateBitmapFromWicBitmap with D2D1_BITMAP_OPTIONS_TARGET ignores
-     * the WIC source data. Without this skip, the WIC bitmap retains GPU readback
-     * content from previous frames, causing alpha accumulation on semi-transparent
-     * regions (e.g. tooltip rounded-rect corners rendered via SOURCE_OVER). */
-    if (!(bitmap_desc.bitmapOptions & D2D1_BITMAP_OPTIONS_TARGET))
+    if (FAILED(hr = IWICBitmapSource_CopyPixels(bitmap_source, &rect, pitch, data_size, data)))
     {
-        if (FAILED(hr = IWICBitmapSource_CopyPixels(bitmap_source, &rect, pitch, data_size, data)))
-        {
-            WARN("Failed to copy bitmap pixels, hr %#lx.\n", hr);
-            free(data);
-            return hr;
-        }
+        WARN("Failed to copy bitmap pixels, hr %#lx.\n", hr);
+        free(data);
+        return hr;
     }
 
     hr = d2d_bitmap_create(context, size, data, pitch, &bitmap_desc, bitmap);
