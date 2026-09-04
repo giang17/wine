@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img alt="Base" src="https://img.shields.io/badge/base-Wine%2011.0%20stable-blue">
+  <img alt="Base" src="https://img.shields.io/badge/base-Wine%2011.16%20devel-blue">
   <img alt="Rolling devel" src="https://img.shields.io/badge/rolling%20devel-newest%2011.x%20tag-blue">
   <img alt="Subsystems" src="https://img.shields.io/badge/patched%20subsystems-40%2B-informational">
   <img alt="License" src="https://img.shields.io/badge/license-LGPL--2.1-green">
@@ -74,7 +74,7 @@ pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty 
 ```bash
 git clone https://github.com/giang17/wine.git
 cd wine
-git checkout d2d1-dcomp-11.0     # or the highest-numbered d2d1-dcomp-11.* for rolling release
+git checkout d2d1-dcomp-11.16    # this branch; d2d1-dcomp-11.0 is the stable one
 ./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64
 make -j$(nproc)
 sudo make install
