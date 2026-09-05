@@ -7,7 +7,7 @@
 # (substring match).  Exit 0 only when every case passes.
 #
 # Usage:
-#   documentation/mono-sma-shim/test/run-tests.sh [--prefix DIR] [--script FILE.ps1]
+#   scripts/mono-sma-shim/test/run-tests.sh [--prefix DIR] [--script FILE.ps1]
 #
 #   --prefix DIR    Wine prefix to run in (default: $WINEPREFIX, else ~/.wine)
 #   --script FILE   additionally run a real prerun script (Windows or Unix path)

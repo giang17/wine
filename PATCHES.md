@@ -362,12 +362,12 @@ these were developed against, but they are not specific to it.
 The DWrite patches fix font rendering in VSTGUI-based plugins, but some applications
 also require system fonts to be configured correctly (Unicode symbols, GDI menus).
 
-**[documentation/wine-font-setup.sh](documentation/wine-font-setup.sh)** does the
+**[scripts/wine-font-setup.sh](scripts/wine-font-setup.sh)** does the
 host part for you:
 
 ```bash
-documentation/wine-font-setup.sh --prefix ~/.wine
-documentation/wine-font-setup.sh --prefix ~/.wine --check   # report only
+scripts/wine-font-setup.sh --prefix ~/.wine
+scripts/wine-font-setup.sh --prefix ~/.wine --check   # report only
 ```
 
 It locates the fonts through fontconfig (so distribution paths do not matter),
@@ -398,7 +398,7 @@ Three of those steps matter more than they look:
   before suspecting the build:
 
   ```bash
-  documentation/wine-font-setup.sh --prefix ~/.wine --check
+  scripts/wine-font-setup.sh --prefix ~/.wine --check
   ```
 
   The values themselves are `text_enhanced_contrast` and `text_linear_blend`
@@ -542,7 +542,7 @@ without installing a single MSI. Nothing in the setup log says so. The Script SI
 this branch (`pwrshsip`/`wintrust`) gets such scripts past the "not trusted" check;
 this is the step after it.
 
-**[documentation/mono-sma-shim](documentation/mono-sma-shim/README.md)** is a
+**[scripts/mono-sma-shim](scripts/mono-sma-shim/README.md)** is a
 `System.Management.Automation.dll` with the identity Setup.exe asks for (version
 3.0.0.0, delay-signed with Microsoft's public key; Mono does not verify strong-name
 signatures) that implements the hosting API the installer uses and runs the script
@@ -553,9 +553,9 @@ the Wine build: Wine-Mono ships the C# compiler it needs, and it goes into the
 prefix' Wine-Mono GAC.
 
 ```bash
-documentation/mono-sma-shim/build.sh
-documentation/mono-sma-shim/install.sh --prefix ~/.wine          # then a probe through the GAC
-documentation/mono-sma-shim/install.sh --prefix ~/.wine --status # after a Wine-Mono update
+scripts/mono-sma-shim/build.sh
+scripts/mono-sma-shim/install.sh --prefix ~/.wine          # then a probe through the GAC
+scripts/mono-sma-shim/install.sh --prefix ~/.wine --status # after a Wine-Mono update
 ```
 
 A `wineboot -u` with a newer Wine replaces Wine-Mono and the shim with it; `--status`

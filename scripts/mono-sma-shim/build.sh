@@ -11,7 +11,7 @@
 # runs it through Wine when there is no `mcs` on the host.
 #
 # Usage:
-#   documentation/mono-sma-shim/build.sh [--prefix DIR] [--no-test]
+#   scripts/mono-sma-shim/build.sh [--prefix DIR] [--no-test]
 #
 #   --prefix DIR   Wine prefix whose Wine-Mono provides mcs.exe
 #                  (default: $WINEPREFIX, else ~/.wine)
