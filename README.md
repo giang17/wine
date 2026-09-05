@@ -56,8 +56,8 @@ pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty 
   <sub><b>Serum 2</b> (VSTGUI + DirectComposition) in FL Studio 2026 — three wavetable oscillators with their wavetable views, the filter response, the envelope, the Rössler chaos LFO and the arpeggiator all render.</sub>
 </td>
 <td width="50%" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/studio-pro-8.png" alt="Fender Studio Pro 8">
-  <sub><b>Fender Studio Pro 8</b> (CCL: DXGI + DirectWrite + DComp) — song view, plugin editors, the effect browser's thumbnails and the assistant panel. Without the <code>UIAnimationManager2</code> implementation from this fork it does not start at all.</sub>
+  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/studio-pro-8-video-splice.png" alt="Fender Studio Pro 8 with the video player and the Splice panel">
+  <sub><b>Fender Studio Pro 8</b> (CCL: DXGI + DirectWrite + DComp) — the demo song in playback: arranger sections and the video track in the song view, the floating video player, the console with live meters and the Splice panel docked on the right. Without the <code>UIAnimationManager2</code> implementation from this fork it does not start at all.</sub>
 </td>
 </tr>
 <tr>
