@@ -20,9 +20,9 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/cubase15-pro-arrangement.png" width="100%" alt="Cubase Pro 15 running on this fork">
+  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/cubase15-pro-mixconsole.png" width="100%" alt="Cubase Pro 15 running on this fork">
   <br>
-  <sub><i>Cubase Pro 15.0.30 under Wine — arrangement, MixConsole and live meters, on this fork.</i></sub>
+  <sub><i>Cubase Pro 15.0.30 under Wine — the Cubase 14 demo project in playback: arrangement, MixConsole in the lower zone with live meters, MediaBay on the right, on this fork.</i></sub>
 </p>
 
 ## Why this fork exists
@@ -52,8 +52,8 @@ pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty 
 <table>
 <tr>
 <td width="50%" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/serum2-reaper.png" alt="Serum 2 in Reaper">
-  <sub><b>Serum 2</b> (VSTGUI + DirectComposition) as a VST3 in Reaper — the 3D wavetable surface, the noise oscillator, the filter response, the envelope and the Lorenz-attractor LFO shape all render.</sub>
+  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/serum2-fl-studio.png" alt="Serum 2 in FL Studio">
+  <sub><b>Serum 2</b> (VSTGUI + DirectComposition) in FL Studio 2026 — three wavetable oscillators with their wavetable views, the filter response, the envelope, the Rössler chaos LFO and the arpeggiator all render.</sub>
 </td>
 <td width="50%" valign="top">
   <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/studio-pro-8.png" alt="Fender Studio Pro 8">
@@ -66,8 +66,8 @@ pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty 
   <sub><b>FL Cloud</b> in FL Studio — the plugin store browses with its artwork, products show as installed, and a download runs in place. Installing from it needs the AF_UNIX patches from this fork.</sub>
 </td>
 <td width="50%" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/eprom-webview2-login.png" alt="EPROM Memory Rites login through WebView2">
-  <sub><b>EPROM — Memory Rites</b> (JUCE 8.0.13) inside Reaper: the splash and login screen render through WebView2, the rest of the GUI through JUCE.</sub>
+  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/eprom-fl-studio.png" alt="EPROM Memory Rites in FL Studio">
+  <sub><b>EPROM — Memory Rites</b> (JUCE 8.0.13) in FL Studio 2026 — the preset header, the macro knobs, the artwork panel and the pad row render through JUCE; the splash and login screen before them go through WebView2.</sub>
 </td>
 </tr>
 </table>
