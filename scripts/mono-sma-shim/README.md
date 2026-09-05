@@ -67,11 +67,11 @@ No host Mono is needed; Wine-Mono ships `mcs.exe`, and the scripts run it throug
 Wine. A host `mcs` (`apt install mono-devel`) is used when present.
 
 ```bash
-documentation/mono-sma-shim/build.sh                      # -> System.Management.Automation.dll + test/smahost.exe
-documentation/mono-sma-shim/install.sh --prefix ~/.wine   # into the prefix' Wine-Mono GAC, then a probe
-documentation/mono-sma-shim/install.sh --prefix ~/.wine --status
-documentation/mono-sma-shim/test/run-tests.sh             # 17 regression cases
-documentation/mono-sma-shim/test/run-tests.sh --script "…/Additional Content/Installer Data/preinstall.ps1"
+scripts/mono-sma-shim/build.sh                      # -> System.Management.Automation.dll + test/smahost.exe
+scripts/mono-sma-shim/install.sh --prefix ~/.wine   # into the prefix' Wine-Mono GAC, then a probe
+scripts/mono-sma-shim/install.sh --prefix ~/.wine --status
+scripts/mono-sma-shim/test/run-tests.sh             # 17 regression cases
+scripts/mono-sma-shim/test/run-tests.sh --script "…/Additional Content/Installer Data/preinstall.ps1"
 ```
 
 Set `WINE` to the Wine binary that owns the prefix when it is not the one on `PATH`.

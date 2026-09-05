@@ -9,8 +9,8 @@ the symbol fallback fonts with their FontLink entries, and this branch's text
 rendering switches — and `--check` reports without changing anything:
 
 ```bash
-documentation/wine-font-setup.sh --prefix ~/.wine
-documentation/wine-font-setup.sh --prefix ~/.wine --check
+scripts/wine-font-setup.sh --prefix ~/.wine
+scripts/wine-font-setup.sh --prefix ~/.wine --check
 ```
 
 This guide explains what the script sets and why, shows the manual commands, and
@@ -211,7 +211,7 @@ measurements, is in `PATCHES.md` under *Font Setup*.
 ## 3. Verification
 
 ```bash
-documentation/wine-font-setup.sh --prefix ~/.wine --check
+scripts/wine-font-setup.sh --prefix ~/.wine --check
 
 # or by hand:
 wine reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "Tahoma"

@@ -14,7 +14,7 @@
 # holds no copy of its own, that Mono resolves the assembly from there.
 #
 # Usage:
-#   documentation/mono-sma-shim/install.sh [--prefix DIR] [--build] [--status] [--remove]
+#   scripts/mono-sma-shim/install.sh [--prefix DIR] [--build] [--status] [--remove]
 #
 #   --prefix DIR   target prefix (default: $WINEPREFIX, else ~/.wine)
 #   --build        run ./build.sh first
