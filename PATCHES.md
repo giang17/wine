@@ -532,6 +532,37 @@ flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
 fallback through `GetGlyphIndices`. That one has its own project:
 [giang17/flstudio-wine-font-fix](https://github.com/giang17/flstudio-wine-font-fix).
 
+## Steinberg installers: PowerShell hosting in Wine-Mono
+
+Steinberg's `Setup.exe` (the bootstrapper behind every Download Assistant package) runs
+the `preinstall.ps1` scripts from `setup.xml` by hosting PowerShell in-process through
+`System.Management.Automation`, an assembly Wine-Mono does not ship. The load fails,
+Setup.exe swallows the exception, logs "Finished Installation" and exits with 0 —
+without installing a single MSI. Nothing in the setup log says so. The Script SIP from
+this branch (`pwrshsip`/`wintrust`) gets such scripts past the "not trusted" check;
+this is the step after it.
+
+**[documentation/mono-sma-shim](documentation/mono-sma-shim/README.md)** is a
+`System.Management.Automation.dll` with the identity Setup.exe asks for (version
+3.0.0.0, delay-signed with Microsoft's public key; Mono does not verify strong-name
+signatures) that implements the hosting API the installer uses and runs the script
+with a small interpreter for the PowerShell subset those preruns are written in.
+Constructs outside that subset raise an error, so a script the shim cannot run is
+reported as failed rather than as done. It is a prefix-side component, not part of
+the Wine build: Wine-Mono ships the C# compiler it needs, and it goes into the
+prefix' Wine-Mono GAC.
+
+```bash
+documentation/mono-sma-shim/build.sh
+documentation/mono-sma-shim/install.sh --prefix ~/.wine          # then a probe through the GAC
+documentation/mono-sma-shim/install.sh --prefix ~/.wine --status # after a Wine-Mono update
+```
+
+A `wineboot -u` with a newer Wine replaces Wine-Mono and the shim with it; `--status`
+reports that (exit 3). Verified with MediaBay 1.3.100: removed with `msiexec /x`, then
+installed again through `Setup.exe --silent`, the setup log showing the prerun's
+`Write-Host` output and `preinstall.ps1 executed successfully`.
+
 ## D2D1 Patches Only (Branch: `d2d1-v6`) — DEPRECATED
 
 Deprecated since 2026-05-03; last update 2026-02-14, 15 patches against vanilla Wine 11.0
