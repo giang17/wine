@@ -224,7 +224,7 @@ the plug-in hosts that have been checked here, so a prefix created or updated wi
 branch has it without further setup:
 
 ```
-reaper.exe · FL64.exe · Studio Pro.exe · Ableton Live 12 {Intro,Lite,Standard,Suite,Trial}.exe
+reaper.exe · FL64.exe · Studio Pro.exe · Studio One.exe · Ableton Live 12 {Intro,Lite,Standard,Suite,Trial}.exe
 yabridge-host.exe · yabridge-host-32.exe
 BitwigAudioEngine-X64-{AVX2,SSE41}.exe · BitwigPluginHost-{X64-AVX2,X64-SSE41,X86-SSE41}.exe
 Cubase{12,13,14,15}.exe
