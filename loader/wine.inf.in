@@ -431,6 +431,8 @@ HKCU,Software\Wine\Debug,"RelayFromExclude",2,"winex11.drv;winemac.drv;user32;gd
 HKCU,"Software\Wine\AppDefaults\reaper.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\FL64.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Studio Pro.exe","HideWineVersion",2,"Y"
+; Studio One, the predecessor of Studio Pro, keeps one executable name across its versions
+HKCU,"Software\Wine\AppDefaults\Studio One.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Intro.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Lite.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Standard.exe","HideWineVersion",2,"Y"
