@@ -436,6 +436,11 @@ HKCU,"Software\Wine\AppDefaults\BitwigAudioEngine-X64-SSE41.exe","HideWineVersio
 HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X64-AVX2.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X64-SSE41.exe","HideWineVersion",2,"Y"
 HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X86-SSE41.exe","HideWineVersion",2,"Y"
+; Cubase is named per major version and loads its VST3 plug-ins in-process
+HKCU,"Software\Wine\AppDefaults\Cubase12.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Cubase13.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Cubase14.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Cubase15.exe","HideWineVersion",2,"Y"
 
 [DirectX]
 HKLM,Software\Microsoft\DirectX,"Version",,"4.09.00.0904"
