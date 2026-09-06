@@ -935,7 +935,18 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
         IDWriteFontCollection_Release(collection);
 
     hr = IDWriteFontCollection_QueryInterface(factory->system_collections[family_model], riid, out);
-    IDWriteFontCollection_Release(factory->system_collections[family_model]);
+
+    /* The cache slot is only a weak reference: the collection detaches itself
+     * from the factory when its last reference goes away, and the next request
+     * rebuilds it from scratch, which means parsing every installed font file.
+     * Callers that fetch the collection, use it briefly and release it again
+     * (JUCE's DirectWrite wrapper does this on every typeface change) therefore
+     * paid for a full font scan each time. The shared factory lives until the
+     * process exits, so it can hold on to a strong reference without creating
+     * a reference cycle; release_dwritefactory() drops it at unload. Isolated
+     * factories keep the weak semantics. */
+    if (&factory->IDWriteFactory7_iface != shared_factory)
+        IDWriteFontCollection_Release(factory->system_collections[family_model]);
     return hr;
 }
 
