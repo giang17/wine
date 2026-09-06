@@ -227,6 +227,7 @@ branch has it without further setup:
 reaper.exe · FL64.exe · Studio Pro.exe · Ableton Live 12 {Intro,Lite,Standard,Suite,Trial}.exe
 yabridge-host.exe · yabridge-host-32.exe
 BitwigAudioEngine-X64-{AVX2,SSE41}.exe · BitwigPluginHost-{X64-AVX2,X64-SSE41,X86-SSE41}.exe
+Cubase{12,13,14,15}.exe
 ```
 
 The entries use the INF "do not overwrite" flag, so a value you set yourself — including
