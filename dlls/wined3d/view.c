@@ -620,7 +620,14 @@ static void wined3d_render_target_view_gl_cs_init(void *object)
                         debug_d3dformat(resource->format->id), debug_d3dformat(view_gl->v.format->id));
                 return;
             }
-            if (texture_gl->t.swapchain && texture_gl->t.swapchain->state.desc.backbuffer_count > 1)
+            /* A present rotates the back buffer textures of a multi-buffer
+             * swapchain, so a texture view created on back buffer 0 would
+             * point at a different buffer after the next present.  Where the
+             * swapchain keeps its back buffers in place (see
+             * wined3d_swapchain_keeps_back_buffers()) the view stays valid,
+             * exactly as it does for a single back buffer. */
+            if (texture_gl->t.swapchain && texture_gl->t.swapchain->state.desc.backbuffer_count > 1
+                    && !wined3d_swapchain_keeps_back_buffers(texture_gl->t.swapchain))
             {
                 FIXME("Swapchain views not supported.\n");
                 return;
@@ -930,7 +937,10 @@ static void wined3d_render_target_view_vk_cs_init(void *object)
         return;
     }
 
-    if (texture_vk->t.swapchain && texture_vk->t.swapchain->state.desc.backbuffer_count > 1)
+    /* See wined3d_render_target_view_gl_cs_init(): only a rotating swapchain
+     * moves the image out from under the view. */
+    if (texture_vk->t.swapchain && texture_vk->t.swapchain->state.desc.backbuffer_count > 1
+            && !wined3d_swapchain_keeps_back_buffers(texture_vk->t.swapchain))
     {
         FIXME("Swapchain views not supported.\n");
         return;
