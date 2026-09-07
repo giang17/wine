@@ -4703,6 +4703,10 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFormatSupport(ID3D11Device5 *
         *format_support |= D3D11_FORMAT_SUPPORT_SHADER_LOAD;
         *format_support |= D3D11_FORMAT_SUPPORT_SHADER_SAMPLE;
         *format_support |= D3D11_FORMAT_SUPPORT_TEXTURECUBE;
+        /* Any texture format can back a staging or dynamic resource; Windows
+         * reports that for every texture format, and applications gate their
+         * CPU upload paths on it (Cubase's video player, issue 355). */
+        *format_support |= D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
 
         if (feature_level >= D3D_FEATURE_LEVEL_10_1)
             *format_support |= D3D11_FORMAT_SUPPORT_SHADER_GATHER;
