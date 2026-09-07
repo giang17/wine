@@ -3701,11 +3701,35 @@ static void dcomp_composite_premul_over(DWORD *dst_bits, UINT dst_w, UINT dst_h,
  * Studio Pro 8, whose entire tree is three such leaves: 1590 walks of them, not
  * one non-transparent pixel, while the application was drawing all along.
  * This is the surface counterpart of dcomp_texture_ensure_bits() below. */
+/* A readback must never see a surface between BeginDraw and EndDraw.  On
+ * Windows an update reaches the compositor only after EndDraw and Commit, never
+ * half drawn; here the pixels come from a copy of the GPU texture taken at
+ * present time, and the throttled present of a root surface runs from a timer on
+ * the window's thread -- not on the thread that draws (issue 56).  Cubase 15's
+ * video player draws its frame 120 times a second on a thread of its own and
+ * clears the rect first; the timer landed inside that draw in 577 of 584 cases,
+ * read back the cleared rect, and 18 % of the played frames came out black
+ * (issue 357).  Leave the pending region to the EndDraw's own commit or the
+ * next timer tick instead. */
+static BOOL dcomp_surface_draw_open(struct dcomp_surface *surface)
+{
+    static unsigned int skip_count;
+
+    if (!surface->drawing)
+        return FALSE;
+    if (++skip_count <= 5 || !(skip_count % 1000))
+        TRACE("Surface %p is between BeginDraw and EndDraw, leaving its readback pending (#%u).\n",
+                surface, skip_count);
+    return TRUE;
+}
+
 static void dcomp_surface_ensure_bits(struct dcomp_surface *surface)
 {
     LONG l, t, r, b;
 
     if (!surface->has_pending || !surface->bits || !surface->width || !surface->height)
+        return;
+    if (dcomp_surface_draw_open(surface))
         return;
 
     l = surface->pending_dirty.left;   t = surface->pending_dirty.top;
@@ -5780,7 +5804,18 @@ static void dcomp_target_flush_present(struct dcomp_target *target, struct dcomp
     /* Deferred GPU→CPU readback of the accumulated region — the expensive part (~1.3ms),
      * now run once per present instead of once per EndDraw. */
     if (surface->has_pending)
+    {
+        if (dcomp_surface_draw_open(surface))
+        {
+            /* The application is drawing this frame right now.  Its EndDraw commits
+             * and presents when the throttle allows; otherwise the timer comes back
+             * for the region, which stays pending (issue 357). */
+            if (target->hwnd)
+                SetTimer(target->hwnd, DCOMP_COALESCE_TIMER, DCOMP_FRAME_MS, NULL);
+            return;
+        }
         dcomp_surface_readback_region(surface, l, t, r, b);
+    }
     surface->has_pending = FALSE;
     SetRectEmpty(&surface->pending_dirty);
 
