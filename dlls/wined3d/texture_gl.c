@@ -1589,7 +1589,7 @@ static void wined3d_fixup_alpha(const struct wined3d_format *format, const uint8
 const struct wined3d_format *wined3d_texture_gl_get_plane_format(const struct wined3d_adapter *adapter,
         const struct wined3d_format *format, unsigned int plane_idx)
 {
-    enum wined3d_format_id plane_format_id = format->plane_formats[plane_idx];
+    enum wined3d_format_id plane_format_id = format->plane_formats[plane_idx]->id;
 
     switch (plane_format_id)
     {

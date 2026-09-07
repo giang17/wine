@@ -207,8 +207,7 @@ static void create_texture_view(struct wined3d_gl_view *view, GLenum view_target
     if (texture_gl->t.resource.format->attrs & WINED3D_FORMAT_ATTR_PLANAR)
     {
         /* Each plane is a separate GL texture; the view is a view of that plane. */
-        if (!find_format_plane_idx(texture_gl->t.resource.device->adapter,
-                texture_gl->t.resource.format, view_format, &plane_idx))
+        if (!find_format_plane_idx(texture_gl->t.resource.format, view_format, &plane_idx))
         {
             FIXME("Invalid view format %s for planar format %s.\n",
                     debug_d3dformat(view_format->id), debug_d3dformat(texture_gl->t.resource.format->id));
