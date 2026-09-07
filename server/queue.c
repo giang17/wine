@@ -196,6 +196,8 @@ static struct cursor_pos cursor_history[64];
 static unsigned int cursor_history_latest;
 
 static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
+static inline void set_queue_bits( struct msg_queue *queue, unsigned int bits );
+static inline int get_hardware_msg_bit( unsigned int message );
 static void free_message( struct message *msg );
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
@@ -381,24 +383,38 @@ static void unlock_input_keystate( struct thread_input *input )
 }
 
 /* change the thread input data of a given thread */
+/* does the window belong to the thread that owns this queue? */
+static int window_owned_by_queue( user_handle_t handle, struct msg_queue *queue )
+{
+    struct thread *owner;
+    int ret;
+
+    if (!handle || !(owner = get_window_thread( handle ))) return 0;
+    ret = owner->queue == queue;
+    release_object( owner );
+    return ret;
+}
+
+/* Windows keeps a thread's input state when its input queue gets attached
+ * elsewhere: a pressed button stays captured and the events that were already
+ * queued for it are still delivered.  Carry the capture and the pending
+ * hardware messages of this queue's thread over to the new input, otherwise a
+ * WM_LBUTTONUP queued before the attach is orphaned in the old input and never
+ * fetched.  JUCE calls AttachThreadInput( message thread, new thread ) at the
+ * start of every one of its threads, so an application that starts threads
+ * from a mouse-down handler loses the matching mouse-up (Minimal Audio Current
+ * only toggles a preset favourite on every second click). */
 static void assign_thread_input( struct msg_queue *queue, struct thread_input *new_input )
 {
     struct thread_input *old_input = queue->input;
-    user_handle_t new_focus = 0, new_active = 0;
-    struct thread *owner;
+    user_handle_t new_focus = 0, new_active = 0, new_capture = 0;
+    struct message *msg, *next;
 
     if (old_input == new_input) return;
 
-    if (old_input->shared->focus && (owner = get_window_thread( old_input->shared->focus )))
-    {
-        new_focus = owner->queue == queue ? old_input->shared->focus : 0;
-        release_object( owner );
-    }
-    if (old_input->shared->active && (owner = get_window_thread( old_input->shared->active )))
-    {
-        new_active = owner->queue == queue ? old_input->shared->active : 0;
-        release_object( owner );
-    }
+    if (window_owned_by_queue( old_input->shared->focus, queue )) new_focus = old_input->shared->focus;
+    if (window_owned_by_queue( old_input->shared->active, queue )) new_active = old_input->shared->active;
+    if (window_owned_by_queue( old_input->shared->capture, queue )) new_capture = old_input->shared->capture;
 
     SHARED_WRITE_BEGIN( old_input->shared, input_shm_t )
     {
@@ -412,6 +428,13 @@ static void assign_thread_input( struct msg_queue *queue, struct thread_input *n
             if (new_focus) old_shared->focus = 0;
             if (!new_shared->active) new_shared->active = new_active;
             if (new_active) old_shared->active = 0;
+            if (new_capture && !new_shared->capture)
+            {
+                new_shared->capture    = new_capture;
+                new_shared->menu_owner = old_shared->menu_owner;
+                new_shared->move_size  = old_shared->move_size;
+                old_shared->capture = old_shared->menu_owner = old_shared->move_size = 0;
+            }
 
             new_shared->cursor_count += queue->cursor_count;
             old_shared->cursor_count -= queue->cursor_count;
@@ -427,6 +450,16 @@ static void assign_thread_input( struct msg_queue *queue, struct thread_input *n
     {
         unlock_input_keystate( old_input );
         lock_input_keystate( new_input );
+    }
+
+    /* hardware messages queued for this thread's windows are still to be
+     * delivered to it; a keyboard message without a window follows the focus */
+    LIST_FOR_EACH_ENTRY_SAFE( msg, next, &old_input->msg_list, struct message, entry )
+    {
+        if (msg->win ? !window_owned_by_queue( msg->win, queue ) : !new_focus) continue;
+        list_remove( &msg->entry );
+        list_add_tail( &new_input->msg_list, &msg->entry );
+        set_queue_bits( queue, get_hardware_msg_bit( msg->msg ) );
     }
 
     /* invalidate the old object to force clients to refresh their cached thread input */
