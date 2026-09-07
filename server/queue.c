@@ -231,6 +231,8 @@ static struct cursor_pos cursor_history[64];
 static unsigned int cursor_history_latest;
 
 static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
+static inline void set_queue_bits( struct msg_queue *queue, unsigned int bits );
+static inline int get_hardware_msg_bit( unsigned int message );
 static void free_message( struct message *msg );
 
 /* set the caret window in a given thread input, requires write lock on the thread input shared member */
@@ -421,6 +423,62 @@ static void unlock_input_keystate( struct thread_input *input )
     if (!input_shm->keystate_lock) sync_input_keystate( input );
 }
 
+/* does the window belong to the thread that owns this queue? */
+static int window_owned_by_queue( user_handle_t handle, struct msg_queue *queue )
+{
+    struct thread *owner;
+    int ret;
+
+    if (!handle || !(owner = get_window_thread( handle ))) return 0;
+    ret = owner->queue == queue;
+    release_object( owner );
+    return ret;
+}
+
+/* Windows keeps a thread's input state when its input queue gets attached
+ * elsewhere: a pressed button stays captured and the events that were already
+ * queued for it are still delivered.  Carry the capture and the pending
+ * hardware messages of this queue's thread over to the new input, otherwise a
+ * WM_LBUTTONUP queued before the attach is orphaned in the old input and never
+ * fetched.  JUCE calls AttachThreadInput( message thread, new thread ) at the
+ * start of every one of its threads, so an application that starts threads
+ * from a mouse-down handler loses the matching mouse-up (Minimal Audio Current
+ * only toggles a preset favourite on every second click). */
+static void migrate_queue_input_state( struct msg_queue *queue, struct thread_input *old_input,
+                                       struct thread_input *new_input )
+{
+    input_shm_t *old_shm = old_input->shared, *new_shm = new_input->shared;
+    struct message *msg, *next;
+    int sole_user = list_empty( &old_input->queues );
+
+    if (old_shm->capture && !new_shm->capture &&
+        (sole_user || window_owned_by_queue( old_shm->capture, queue )))
+    {
+        SHARED_WRITE_BEGIN( old_shm, input_shm_t )
+        {
+            input_shm_t *old_shared = shared;
+
+            SHARED_WRITE_BEGIN( new_shm, input_shm_t )
+            {
+                shared->capture    = old_shared->capture;
+                shared->menu_owner = old_shared->menu_owner;
+                shared->move_size  = old_shared->move_size;
+                old_shared->capture = old_shared->menu_owner = old_shared->move_size = 0;
+            }
+            SHARED_WRITE_END;
+        }
+        SHARED_WRITE_END;
+    }
+
+    LIST_FOR_EACH_ENTRY_SAFE( msg, next, &old_input->msg_list, struct message, entry )
+    {
+        if (!sole_user && !window_owned_by_queue( msg->win, queue )) continue;
+        list_remove( &msg->entry );
+        list_add_tail( &new_input->msg_list, &msg->entry );
+        set_queue_bits( queue, get_hardware_msg_bit( msg->msg ) );
+    }
+}
+
 /* change the thread input data of a given message queue */
 static void assign_queue_input( struct msg_queue *queue, struct thread_input *new_input )
 {
@@ -441,6 +499,7 @@ static void assign_queue_input( struct msg_queue *queue, struct thread_input *ne
         /* invalidate the old object to force clients to refresh their cached thread input */
         invalidate_shared_object( queue->input->shared );
         list_remove( &queue->input_entry );
+        if (queue->input != new_input) migrate_queue_input_state( queue, queue->input, new_input );
         release_object( queue->input );
     }
     queue->input = (struct thread_input *)grab_object( new_input );
