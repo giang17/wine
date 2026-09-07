@@ -361,6 +361,9 @@ struct d2d_device_context
     ID3D11Buffer *vb;
     ID3D11RasterizerState *rs;
     ID3D11BlendState *bs;
+    /* Custom effect draws: the effect vertex shader and its constants. */
+    ID3D11VertexShader *effect_vs;
+    ID3D11Buffer *effect_vs_cb;
     /* Set for the duration of a single draw to make the shape pixel shader
      * apply the sRGB transfer function to the sampled colour. Used by the
      * ColorManagement effect to encode a linear (scRGB) source for an
@@ -907,6 +910,9 @@ struct d2d_device
 
     ID3D10Blob *precompiled_shape_vs[D2D_SHAPE_TYPE_COUNT];
     ID3D10Blob *precompiled_shape_ps;
+    /* Vertex shader feeding custom effect pixel shaders with the Direct2D
+     * effect semantics (SV_POSITION, SCENE_POSITION, TEXCOORDn). */
+    ID3D10Blob *precompiled_effect_vs;
 
     /* Shared shape input layouts / vertex + pixel shaders, created lazily once per
      * device (from the shared ID3D11Device) and referenced by every device context.
@@ -1053,6 +1059,14 @@ struct d2d_render_info
 
     unsigned int mask;
     GUID pixel_shader;
+
+    /* Pixel shader constants set through SetPixelShaderConstantBuffer(); the
+     * D3D buffer is created and refreshed by the device context that draws
+     * the effect. */
+    BYTE *ps_cb_data;
+    UINT32 ps_cb_size;
+    ID3D11Buffer *ps_cb;
+    BOOL ps_cb_dirty;
 };
 
 struct d2d_transform_node
@@ -1104,6 +1118,7 @@ struct d2d_effect
 
 HRESULT d2d_effect_create(struct d2d_device_context *context, const CLSID *effect_id,
         ID2D1Effect **effect);
+struct d2d_effect *unsafe_impl_from_ID2D1Effect(ID2D1Effect *iface);
 BOOL d2d_effect_get_color_management_spaces(ID2D1Effect *iface, D2D1_COLOR_SPACE *source,
         D2D1_COLOR_SPACE *destination);
 void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
