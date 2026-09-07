@@ -195,6 +195,21 @@ This is the recommended branch. What it changes, by subsystem:
   these fix seeking, looping, timeline jumps, playback stalling after 20-35 seconds,
   stuttering after a large seek, and a black picture after a window toggle in Fender
   Studio Pro 8
+- **Video players that drive the H.264 decoder themselves (wined3d, d3d11, d2d1,
+  winegstreamer)**: Cubase 15 does not render video through the EVR. It drives the H.264
+  decoder MFT directly: it enumerates it, hands it a DXGI device manager, receives NV12
+  Direct3D 11 textures, reads each frame back and draws it through a Direct2D effect of
+  its own with a YCbCr-to-RGB pixel shader. Four things were missing for that: wined3d
+  could allocate planar NV12 textures only in its Vulkan renderer (the OpenGL renderer now
+  keeps one texture per plane and creates plane views on them); `CheckFormatSupport`
+  never reported `D3D11_FORMAT_SUPPORT_CPU_LOCKABLE`, and the application polls that bit
+  and does not upload a frame without it; `ID2D1DeviceContext::DrawImage` dropped every
+  custom effect with "Unhandled effect" (effects with a single draw transform and bitmap
+  inputs are now drawn through the application's pixel shader); and the decoder's pool of
+  ten D3D samples ran empty, because the GStreamer pipeline returns a frame two to four
+  inputs late and the player holds every frame it has been handed until its next drain,
+  so more than ten at a time (the pool now grows to 32 on demand). The video window
+  shows the picture in stop and play
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
 - **Direct2D for JUCE 8.0.13+ (ntdll, wine.inf)**: JUCE 8.0.13 and later pick their
@@ -356,7 +371,7 @@ these were developed against, but they are not specific to it.
 | Minimal Audio Current / Evoke / Lucid (VST3 in Reaper) | JUCE 8.0.13 | Fully functional, same `HideWineVersion` requirement as above — without it the GDI fallback leaves the background black and parts of the interface missing |
 | Minimal Hub | Tauri v2 + SvelteKit + WebView2 | Starts, signs in and installs products (an 11.8 MB update completed). Needs the `secur32`/schannel `DecryptMessage` fix from this branch: without it the `oauth/token` request stops after a partial response and the app waits indefinitely, because reqwest has no response timeout. Its installer step also shells out to `powershell Start-Process`, but in a form the `powershell` patch does not recognise — it ran both with and without that patch |
 | Fender Studio Pro 8 | CCL (DXGI + DWrite + DComp) | Fully functional — the song view draws completely and stays stable, no stale tool bar or transport and no flicker; the transport playhead and the selection rectangle no longer flicker while the transport runs, and video on the timeline plays, seeks, loops and jumps without stalling or going black. Starting at all needs the `UIAnimationManager2` and `UIAnimationTransitionLibrary2` implementation from this branch; without it the CCL framework aborts with "requires Windows 10 or later" |
-| Steinberg Cubase Pro 15.0.30 | Custom (DComp + D2D1 + DirectWrite) + WebView2 | Installs through Steinberg's own bootstrapper and runs: project window, MixConsole with live meters, Hub. Installing needs the `msi` feature-cost fix (the setup crashed before its first dialog) and the Script SIP for signed PowerShell — without `pwrshsip`/`wintrust` the installer stops at "preinstall.ps1 … not trusted". Starting needs the `Windows.Globalization.Calendar` stub, without which `headtracking.dll` aborts behind the licence splash, and the `comdlg32` folder-dialog fix, without which the Hub reports the project folder as read-only. The window itself needs the dcomp virtual-surface resize and child-surface readback work — and the d2d1 WIC target fix, without which the MixConsole level meters stay empty |
+| Steinberg Cubase Pro 15.0.30 | Custom (DComp + D2D1 + DirectWrite) + WebView2 | Installs through Steinberg's own bootstrapper and runs: project window, MixConsole with live meters, Hub. Installing needs the `msi` feature-cost fix (the setup crashed before its first dialog) and the Script SIP for signed PowerShell — without `pwrshsip`/`wintrust` the installer stops at "preinstall.ps1 … not trusted". Starting needs the `Windows.Globalization.Calendar` stub, without which `headtracking.dll` aborts behind the licence splash, and the `comdlg32` folder-dialog fix, without which the Hub reports the project folder as read-only. The window itself needs the dcomp virtual-surface resize and child-surface readback work — and the d2d1 WIC target fix, without which the MixConsole level meters stay empty. The video player needs the planar NV12 textures in the OpenGL renderer, the `CPU_LOCKABLE` format bit, custom Direct2D effects and the larger decoder sample pool (see the video-player entry above) |
 
 ## Font Setup
 
