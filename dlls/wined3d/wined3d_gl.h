@@ -989,6 +989,10 @@ struct wined3d_texture_gl
     struct wined3d_texture t;
 
     struct gl_texture texture_rgb, texture_srgb;
+    /* The second plane of a planar format; the first plane lives in
+     * texture_rgb. OpenGL has no multi-planar image formats, so each plane
+     * is a separate texture object. */
+    struct gl_texture texture_uv;
 
     GLenum target;
 
@@ -1035,6 +1039,12 @@ static inline GLuint wined3d_texture_gl_get_texture_name(const struct wined3d_te
     return texture_gl->texture_rgb.name;
 }
 
+static inline GLuint wined3d_texture_gl_get_plane_name(const struct wined3d_texture_gl *texture_gl,
+        unsigned int plane_idx)
+{
+    return plane_idx ? texture_gl->texture_uv.name : texture_gl->texture_rgb.name;
+}
+
 static inline bool wined3d_texture_gl_is_multisample_location(const struct wined3d_texture_gl *texture_gl,
         uint32_t location)
 {
@@ -1062,6 +1072,10 @@ GLenum wined3d_texture_get_gl_buffer(const struct wined3d_texture *texture);
 void wined3d_texture_gl_apply_sampler_desc(struct wined3d_texture_gl *texture_gl,
         const struct wined3d_sampler_desc *sampler_desc, const struct wined3d_context_gl *context_gl);
 void wined3d_texture_gl_bind(struct wined3d_texture_gl *texture_gl, struct wined3d_context_gl *context_gl, BOOL srgb);
+void wined3d_texture_gl_bind_plane_and_dirtify(struct wined3d_texture_gl *texture_gl,
+        struct wined3d_context_gl *context_gl, unsigned int plane_idx);
+const struct wined3d_format *wined3d_texture_gl_get_plane_format(const struct wined3d_adapter *adapter,
+        const struct wined3d_format *format, unsigned int plane_idx);
 void wined3d_texture_gl_bind_and_dirtify(struct wined3d_texture_gl *texture_gl,
         struct wined3d_context_gl *context_gl, BOOL srgb);
 HRESULT wined3d_texture_gl_init(struct wined3d_texture_gl *texture_gl, struct wined3d_device *device,
