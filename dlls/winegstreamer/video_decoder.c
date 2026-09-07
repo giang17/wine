@@ -450,7 +450,13 @@ static HRESULT init_allocator(struct video_decoder *decoder)
     if (FAILED(hr = IMFTransform_SetOutputType(decoder->copier, 0, decoder->output_type, 0)))
         return hr;
 
-    if (FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(decoder->allocator, 10, 10,
+    /* Windows hands out ten D3D samples and then reports the allocator
+     * empty (mf/tests). A pipelined GStreamer decoder returns a frame two to
+     * four inputs late, so an application that decodes ahead and drains once
+     * per frame holds more than ten samples between presentations and stalls
+     * at ten (Cubase's video player, issue 355). Keep ten eager samples and
+     * let the pool grow to 32 on demand. */
+    if (FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(decoder->allocator, 10, 32,
             decoder->attributes, decoder->output_type)))
         return hr;
     decoder->allocator_initialized = TRUE;
