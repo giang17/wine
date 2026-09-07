@@ -529,6 +529,10 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
             IDWriteRenderingParams_Release(context->text_rendering_params);
         if (context->bs)
             ID3D11BlendState_Release(context->bs);
+        if (context->effect_vs)
+            ID3D11VertexShader_Release(context->effect_vs);
+        if (context->effect_vs_cb)
+            ID3D11Buffer_Release(context->effect_vs_cb);
         for (i = 0; i < ARRAY_SIZE(context->subpixel_bs); ++i)
             if (context->subpixel_bs[i])
                 ID3D11BlendState_Release(context->subpixel_bs[i]);
@@ -5348,6 +5352,358 @@ static void d2d_gaussian_blur_apply_pass(const BYTE *src, BYTE *dst, unsigned in
     }
 }
 
+
+struct d2d_effect_vs_cb
+{
+    struct d2d_vec4 corners[4];
+    struct d2d_vec4 uv_rects[4];
+};
+
+static HRESULT d2d_device_context_update_dynamic_buffer(struct d2d_device_context *context,
+        ID3D11Buffer **buffer, unsigned int size, const void *data)
+{
+    D3D11_MAPPED_SUBRESOURCE map_desc;
+    ID3D11DeviceContext *d3d_context;
+    D3D11_BUFFER_DESC buffer_desc;
+    HRESULT hr;
+
+    size = (size + 15) & ~15u;
+
+    if (*buffer)
+    {
+        ID3D11Buffer_GetDesc(*buffer, &buffer_desc);
+        if (buffer_desc.ByteWidth < size)
+        {
+            ID3D11Buffer_Release(*buffer);
+            *buffer = NULL;
+        }
+    }
+
+    if (!*buffer)
+    {
+        buffer_desc.ByteWidth = size;
+        buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+        buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        buffer_desc.MiscFlags = 0;
+        buffer_desc.StructureByteStride = 0;
+        if (FAILED(hr = ID3D11Device1_CreateBuffer(context->d3d_device, &buffer_desc, NULL, buffer)))
+        {
+            WARN("Failed to create constant buffer, hr %#lx.\n", hr);
+            return hr;
+        }
+        ID3D11Buffer_GetDesc(*buffer, &buffer_desc);
+    }
+
+    ID3D11Device1_GetImmediateContext(context->d3d_device, &d3d_context);
+    if (FAILED(hr = ID3D11DeviceContext_Map(d3d_context, (ID3D11Resource *)*buffer,
+            0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc)))
+    {
+        WARN("Failed to map constant buffer, hr %#lx.\n", hr);
+        ID3D11DeviceContext_Release(d3d_context);
+        return hr;
+    }
+    memset(map_desc.pData, 0, buffer_desc.ByteWidth);
+    memcpy(map_desc.pData, data, size);
+    ID3D11DeviceContext_Unmap(d3d_context, (ID3D11Resource *)*buffer, 0);
+    ID3D11DeviceContext_Release(d3d_context);
+
+    return S_OK;
+}
+
+/* Draw a custom effect whose transform graph is a single draw transform with
+ * a pixel shader, the shape every effect written against
+ * ID2D1EffectImpl/ID2D1DrawTransform with d2d1effecthelpers takes. The
+ * inputs have to be bitmaps; nested effects are not rendered. */
+static HRESULT d2d_device_context_draw_custom_effect(struct d2d_device_context *context,
+        struct d2d_effect *effect, const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
+        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
+{
+    ID3D11SamplerState *samplers[4] = {NULL}, **sampler_state;
+    ID3D11ShaderResourceView *srvs[4] = {NULL}, *null_srvs[4] = {NULL};
+    struct d2d_bitmap *bitmaps[4] = {NULL};
+    ID2D1DrawTransform *transform = NULL;
+    struct d2d_render_info *render_info;
+    struct d2d_transform_node *node;
+    ID3DDeviceContextState *prev_state;
+    ID3D11DeviceContext1 *d3d_context;
+    struct d2d_effect_vs_cb vs_cb;
+    ID3D11PixelShader *ps = NULL;
+    unsigned int i, input_count;
+    D2D1_RECT_L out_rect, in_rects[4];
+    D3D11_RECT scissor_rect;
+    D2D1_RECT_F rect;
+    D3D11_VIEWPORT vp;
+    IUnknown *unk;
+    HRESULT hr;
+
+    if (!effect->graph || !(node = effect->graph->output))
+        return E_NOTIMPL;
+
+    if (effect->graph->passthrough)
+    {
+        ID2D1Bitmap *bitmap;
+
+        if (effect->graph->passthrough_input >= effect->input_count
+                || !effect->inputs[effect->graph->passthrough_input]
+                || FAILED(ID2D1Image_QueryInterface(effect->inputs[effect->graph->passthrough_input],
+                &IID_ID2D1Bitmap, (void **)&bitmap)))
+            return E_NOTIMPL;
+        d2d_device_context_draw_effect_bitmap(context, bitmap, 1.0f, interpolation_mode,
+                image_rect, target_offset, composite_mode);
+        ID2D1Bitmap_Release(bitmap);
+        return S_OK;
+    }
+
+    if (!(render_info = node->render_info) || !(render_info->mask & D2D_RENDER_INFO_PIXEL_SHADER))
+    {
+        FIXME("Effect %p has no pixel shader draw transform.\n", effect);
+        return E_NOTIMPL;
+    }
+
+    if (!d2d_device_get_indexed_object(&context->device->shaders, &render_info->pixel_shader, &unk))
+    {
+        WARN("Pixel shader %s was not loaded.\n", debugstr_guid(&render_info->pixel_shader));
+        return E_NOTIMPL;
+    }
+    hr = IUnknown_QueryInterface(unk, &IID_ID3D11PixelShader, (void **)&ps);
+    IUnknown_Release(unk);
+    if (FAILED(hr))
+        return hr;
+
+    input_count = min(effect->input_count, ARRAY_SIZE(bitmaps));
+    if (effect->input_count > ARRAY_SIZE(bitmaps))
+        FIXME("Effect %p has %u inputs, using the first %u.\n", effect, (unsigned int)effect->input_count, input_count);
+
+    for (i = 0; i < input_count; ++i)
+    {
+        ID2D1Bitmap *bitmap;
+
+        if (!effect->inputs[i])
+            continue;
+        if (FAILED(ID2D1Image_QueryInterface(effect->inputs[i], &IID_ID2D1Bitmap, (void **)&bitmap)))
+        {
+            FIXME("Effect input %u is not a bitmap.\n", i);
+            hr = E_NOTIMPL;
+            goto done;
+        }
+        bitmaps[i] = unsafe_impl_from_ID2D1Bitmap(bitmap);
+        ID2D1Bitmap_Release(bitmap);
+        if (!bitmaps[i]->srv)
+        {
+            FIXME("Effect input %u has no shader resource view.\n", i);
+            hr = E_NOTIMPL;
+            goto done;
+        }
+        srvs[i] = bitmaps[i]->srv;
+    }
+
+    /* Direct2D lets the effect refresh its constants before every render. */
+    if (effect->impl && FAILED(hr = ID2D1EffectImpl_PrepareForRender(effect->impl, D2D1_CHANGE_TYPE_PROPERTIES)))
+    {
+        WARN("PrepareForRender() failed, hr %#lx.\n", hr);
+        goto done;
+    }
+
+    if (image_rect)
+    {
+        rect = *image_rect;
+    }
+    else if (bitmaps[0])
+    {
+        d2d_rect_set(&rect, 0.0f, 0.0f, bitmaps[0]->pixel_size.width, bitmaps[0]->pixel_size.height);
+    }
+    else
+    {
+        hr = E_INVALIDARG;
+        goto done;
+    }
+    out_rect.left = rect.left;
+    out_rect.top = rect.top;
+    out_rect.right = rect.right;
+    out_rect.bottom = rect.bottom;
+
+    /* The transform says which part of each input the output rectangle
+     * needs; that region maps onto the quad. */
+    for (i = 0; i < input_count; ++i)
+        in_rects[i] = out_rect;
+    if (SUCCEEDED(ID2D1TransformNode_QueryInterface(node->object, &IID_ID2D1DrawTransform, (void **)&transform)))
+    {
+        if (FAILED(hr = ID2D1DrawTransform_MapOutputRectToInputRects(transform, &out_rect, in_rects, input_count)))
+        {
+            WARN("MapOutputRectToInputRects() failed, hr %#lx.\n", hr);
+            for (i = 0; i < input_count; ++i)
+                in_rects[i] = out_rect;
+        }
+        ID2D1DrawTransform_Release(transform);
+    }
+
+    for (i = 0; i < 4; ++i)
+    {
+        D2D1_POINT_2F p;
+        float x, y;
+
+        x = (i & 1) ? rect.right : rect.left;
+        y = (i & 2) ? rect.bottom : rect.top;
+        vs_cb.corners[i].z = x;
+        vs_cb.corners[i].w = y;
+        if (target_offset)
+        {
+            x += target_offset->x;
+            y += target_offset->y;
+        }
+        d2d_point_transform(&p, &context->drawing_state.transform, x, y);
+        p.x *= context->desc.dpiX / 96.0f;
+        p.y *= context->desc.dpiY / 96.0f;
+        vs_cb.corners[i].x = p.x * 2.0f / context->pixel_size.width - 1.0f;
+        vs_cb.corners[i].y = 1.0f - p.y * 2.0f / context->pixel_size.height;
+    }
+    for (i = 0; i < ARRAY_SIZE(vs_cb.uv_rects); ++i)
+    {
+        if (i < input_count && bitmaps[i] && bitmaps[i]->pixel_size.width && bitmaps[i]->pixel_size.height)
+        {
+            vs_cb.uv_rects[i].x = (float)in_rects[i].left / bitmaps[i]->pixel_size.width;
+            vs_cb.uv_rects[i].y = (float)in_rects[i].top / bitmaps[i]->pixel_size.height;
+            vs_cb.uv_rects[i].z = (float)in_rects[i].right / bitmaps[i]->pixel_size.width;
+            vs_cb.uv_rects[i].w = (float)in_rects[i].bottom / bitmaps[i]->pixel_size.height;
+        }
+        else
+        {
+            vs_cb.uv_rects[i].x = vs_cb.uv_rects[i].y = 0.0f;
+            vs_cb.uv_rects[i].z = vs_cb.uv_rects[i].w = 1.0f;
+        }
+    }
+
+    if (!context->effect_vs)
+    {
+        ID3D10Blob *blob = context->device->precompiled_effect_vs;
+
+        if (!blob || FAILED(hr = ID3D11Device1_CreateVertexShader(context->d3d_device,
+                ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), NULL, &context->effect_vs)))
+        {
+            WARN("Failed to create the effect vertex shader.\n");
+            hr = E_FAIL;
+            goto done;
+        }
+    }
+    if (FAILED(hr = d2d_device_context_update_dynamic_buffer(context, &context->effect_vs_cb, sizeof(vs_cb), &vs_cb)))
+        goto done;
+    if (render_info->ps_cb_size && (render_info->ps_cb_dirty || !render_info->ps_cb))
+    {
+        if (FAILED(hr = d2d_device_context_update_dynamic_buffer(context, &render_info->ps_cb,
+                render_info->ps_cb_size, render_info->ps_cb_data)))
+            goto done;
+        render_info->ps_cb_dirty = FALSE;
+    }
+
+    for (i = 0; i < input_count; ++i)
+    {
+        sampler_state = &context->sampler_states
+                [interpolation_mode % D2D_SAMPLER_INTERPOLATION_MODE_COUNT]
+                [D2D1_EXTEND_MODE_CLAMP % D2D_SAMPLER_EXTEND_MODE_COUNT]
+                [D2D1_EXTEND_MODE_CLAMP % D2D_SAMPLER_EXTEND_MODE_COUNT];
+        if (!*sampler_state)
+        {
+            D3D11_SAMPLER_DESC sampler_desc;
+
+            sampler_desc.Filter = interpolation_mode == D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                    ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sampler_desc.MipLODBias = 0.0f;
+            sampler_desc.MaxAnisotropy = 0;
+            sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+            sampler_desc.BorderColor[0] = 0.0f;
+            sampler_desc.BorderColor[1] = 0.0f;
+            sampler_desc.BorderColor[2] = 0.0f;
+            sampler_desc.BorderColor[3] = 0.0f;
+            sampler_desc.MinLOD = 0.0f;
+            sampler_desc.MaxLOD = 0.0f;
+            if (FAILED(hr = ID3D11Device1_CreateSamplerState(context->d3d_device, &sampler_desc, sampler_state)))
+            {
+                WARN("Failed to create sampler state, hr %#lx.\n", hr);
+                goto done;
+            }
+        }
+        samplers[i] = *sampler_state;
+    }
+
+    vp.TopLeftX = 0;
+    vp.TopLeftY = 0;
+    vp.Width = context->pixel_size.width;
+    vp.Height = context->pixel_size.height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+
+    if (context->clip_stack.count)
+    {
+        const D2D1_RECT_F *clip_rect = &context->clip_stack.stack[context->clip_stack.count - 1];
+        float l = ceilf(clip_rect->left - 0.5f), t = ceilf(clip_rect->top - 0.5f);
+        float r = ceilf(clip_rect->right - 0.5f), b = ceilf(clip_rect->bottom - 0.5f);
+
+        scissor_rect.left = l < 0.0f ? 0 : l > 2.0e9f ? 2000000000 : (LONG)l;
+        scissor_rect.top = t < 0.0f ? 0 : t > 2.0e9f ? 2000000000 : (LONG)t;
+        scissor_rect.right = r < 0.0f ? 0 : r > 2.0e9f ? 2000000000 : (LONG)r;
+        scissor_rect.bottom = b < 0.0f ? 0 : b > 2.0e9f ? 2000000000 : (LONG)b;
+    }
+    else
+    {
+        scissor_rect.left = 0;
+        scissor_rect.top = 0;
+        scissor_rect.right = context->pixel_size.width;
+        scissor_rect.bottom = context->pixel_size.height;
+    }
+    if (scissor_rect.right > (LONG)context->pixel_size.width)
+        scissor_rect.right = context->pixel_size.width;
+    if (scissor_rect.bottom > (LONG)context->pixel_size.height)
+        scissor_rect.bottom = context->pixel_size.height;
+
+    if (context->cs)
+        EnterCriticalSection(context->cs);
+    ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
+    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &prev_state);
+
+    ID3D11DeviceContext1_IASetInputLayout(d3d_context, NULL);
+    ID3D11DeviceContext1_IASetPrimitiveTopology(d3d_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ID3D11DeviceContext1_VSSetConstantBuffers(d3d_context, 0, 1, &context->effect_vs_cb);
+    ID3D11DeviceContext1_VSSetShader(d3d_context, context->effect_vs, NULL, 0);
+    ID3D11DeviceContext1_PSSetConstantBuffers(d3d_context, 0, 1, &render_info->ps_cb);
+    ID3D11DeviceContext1_PSSetShader(d3d_context, ps, NULL, 0);
+    ID3D11DeviceContext1_PSSetShaderResources(d3d_context, 0, input_count, srvs);
+    ID3D11DeviceContext1_PSSetSamplers(d3d_context, 0, input_count, samplers);
+    ID3D11DeviceContext1_RSSetViewports(d3d_context, 1, &vp);
+    ID3D11DeviceContext1_RSSetScissorRects(d3d_context, 1, &scissor_rect);
+    ID3D11DeviceContext1_RSSetState(d3d_context, context->rs);
+    if (context->stencil_depth > 0)
+    {
+        ID3D11DeviceContext1_OMSetRenderTargets(d3d_context, 1, &context->target.bitmap->rtv, context->stencil_dsv);
+        ID3D11DeviceContext1_OMSetDepthStencilState(d3d_context, context->stencil_test_state, context->stencil_depth);
+    }
+    else
+    {
+        ID3D11DeviceContext1_OMSetRenderTargets(d3d_context, 1, &context->target.bitmap->rtv, NULL);
+    }
+    ID3D11DeviceContext1_OMSetBlendState(d3d_context,
+            composite_mode == D2D1_COMPOSITE_MODE_SOURCE_COPY ? NULL : context->bs, NULL, D3D11_DEFAULT_SAMPLE_MASK);
+
+    ID3D11DeviceContext1_Draw(d3d_context, 4, 0);
+
+    ID3D11DeviceContext1_PSSetShaderResources(d3d_context, 0, input_count, null_srvs);
+    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, prev_state, NULL);
+    ID3D11DeviceContext1_Release(d3d_context);
+    ID3DDeviceContextState_Release(prev_state);
+    if (context->cs)
+        LeaveCriticalSection(context->cs);
+
+    hr = S_OK;
+
+done:
+    if (ps)
+        ID3D11PixelShader_Release(ps);
+    return hr;
+}
+
 static HRESULT d2d_device_context_draw_gaussian_blur(struct d2d_device_context *context, ID2D1Effect *effect,
         const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
         D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
@@ -5707,7 +6063,14 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
                 }
                 else
                 {
-                    FIXME("Unhandled effect %s.\n", debugstr_guid(&clsid));
+                    struct d2d_effect *effect_impl = unsafe_impl_from_ID2D1Effect(effect);
+                    HRESULT hr = E_NOTIMPL;
+
+                    if (effect_impl && effect_impl->impl)
+                        hr = d2d_device_context_draw_custom_effect(context, effect_impl,
+                                target_offset, image_rect, interpolation_mode, composite_mode);
+                    if (FAILED(hr))
+                        FIXME("Unhandled effect %s, hr %#lx.\n", debugstr_guid(&clsid), hr);
                 }
             }
             ID2D1Effect_Release(effect);
@@ -8208,6 +8571,8 @@ static ULONG WINAPI d2d_device_Release(ID2D1Device6 *iface)
         }
         if (device->precompiled_shape_ps)
             ID3D10Blob_Release(device->precompiled_shape_ps);
+        if (device->precompiled_effect_vs)
+            ID3D10Blob_Release(device->precompiled_effect_vs);
         if (device->shape_resources_ready)
         {
             for (unsigned int i = 0; i < D2D_SHAPE_TYPE_COUNT; ++i)
@@ -8445,6 +8810,45 @@ struct d2d_device *unsafe_impl_from_ID2D1Device(ID2D1Device1 *iface)
     return CONTAINING_RECORD(iface, struct d2d_device, ID2D1Device6_iface);
 }
 
+/* Feeds a custom effect's pixel shader the way Direct2D does: one quad over
+ * the effect's output rectangle, SCENE_POSITION in output pixels and one
+ * TEXCOORD per input, normalised to that input's bitmap. */
+static const char effect_vs_code[] =
+    "cbuffer effect_cb : register(b0)\n"
+    "{\n"
+    "    float4 corners[4];   /* xy: clip space, zw: scene position */\n"
+    "    float4 uv_rects[4];  /* per input: left, top, right, bottom */\n"
+    "};\n"
+    "\n"
+    "struct vs_out\n"
+    "{\n"
+    "    float4 position : SV_POSITION;\n"
+    "    float4 scene : SCENE_POSITION;\n"
+    "    float4 uv0 : TEXCOORD0;\n"
+    "    float4 uv1 : TEXCOORD1;\n"
+    "    float4 uv2 : TEXCOORD2;\n"
+    "    float4 uv3 : TEXCOORD3;\n"
+    "};\n"
+    "\n"
+    "float4 input_uv(float4 rect, float2 t)\n"
+    "{\n"
+    "    return float4(lerp(rect.x, rect.z, t.x), lerp(rect.y, rect.w, t.y), 0.0f, 1.0f);\n"
+    "}\n"
+    "\n"
+    "vs_out main(uint id : SV_VertexID)\n"
+    "{\n"
+    "    float2 t = float2(id & 1, id >> 1);\n"
+    "    vs_out o;\n"
+    "\n"
+    "    o.position = float4(corners[id].xy, 0.0f, 1.0f);\n"
+    "    o.scene = float4(corners[id].zw, 0.0f, 1.0f);\n"
+    "    o.uv0 = input_uv(uv_rects[0], t);\n"
+    "    o.uv1 = input_uv(uv_rects[1], t);\n"
+    "    o.uv2 = input_uv(uv_rects[2], t);\n"
+    "    o.uv3 = input_uv(uv_rects[3], t);\n"
+    "    return o;\n"
+    "}\n";
+
 HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
     bool allow_get_dxgi_device)
 {
@@ -8482,6 +8886,14 @@ HRESULT d2d_device_init(struct d2d_device *device, ID2D1Factory1 *factory, IDXGI
         return hr;
     }
     device->precompiled_shape_ps = compiled;
+
+    if (FAILED(hr = D3DCompile(effect_vs_code, sizeof(effect_vs_code) - 1, "effect_vs", NULL, NULL,
+            "main", "vs_4_0", 0, 0, &compiled, NULL)))
+    {
+        WARN("Failed to compile the effect vertex shader, hr %#lx.\n", hr);
+        return hr;
+    }
+    device->precompiled_effect_vs = compiled;
 
     return S_OK;
 }

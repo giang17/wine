@@ -2857,6 +2857,16 @@ static inline struct d2d_effect *impl_from_ID2D1Effect(ID2D1Effect *iface)
     return CONTAINING_RECORD(iface, struct d2d_effect, ID2D1Effect_iface);
 }
 
+static const ID2D1EffectVtbl d2d_effect_vtbl;
+
+struct d2d_effect *unsafe_impl_from_ID2D1Effect(ID2D1Effect *iface)
+{
+    if (!iface)
+        return NULL;
+    assert(iface->lpVtbl == &d2d_effect_vtbl);
+    return impl_from_ID2D1Effect(iface);
+}
+
 /* Retrieve the colour spaces a ColorManagement effect was configured with. The
  * caller has already established that this is the builtin effect by its class
  * id; the vtable check guards against an application that registered its own
@@ -3522,7 +3532,12 @@ static ULONG STDMETHODCALLTYPE d2d_draw_info_Release(ID2D1DrawInfo *iface)
     TRACE("iface %p refcount %lu.\n", iface, refcount);
 
     if (!refcount)
+    {
+        if (render_info->ps_cb)
+            ID3D11Buffer_Release(render_info->ps_cb);
+        free(render_info->ps_cb_data);
         free(render_info);
+    }
 
     return refcount;
 }
@@ -3557,9 +3572,24 @@ static void STDMETHODCALLTYPE d2d_draw_info_SetInstructionCountHint(ID2D1DrawInf
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetPixelShaderConstantBuffer(ID2D1DrawInfo *iface,
         const BYTE *buffer, UINT32 size)
 {
-    FIXME("iface %p, buffer %p, size %u stub.\n", iface, buffer, size);
+    struct d2d_render_info *render_info = impl_from_ID2D1DrawInfo(iface);
+    BYTE *data;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, buffer %p, size %u.\n", iface, buffer, size);
+
+    if (!buffer && size)
+        return E_INVALIDARG;
+
+    if (!(data = calloc(1, max(size, 1))))
+        return E_OUTOFMEMORY;
+    memcpy(data, buffer, size);
+
+    free(render_info->ps_cb_data);
+    render_info->ps_cb_data = data;
+    render_info->ps_cb_size = size;
+    render_info->ps_cb_dirty = TRUE;
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_draw_info_SetResourceTexture(ID2D1DrawInfo *iface,
