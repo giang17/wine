@@ -577,6 +577,20 @@ static DWORD raw_blitter_blit(struct wined3d_blitter *blitter, enum wined3d_blit
             src_rect->bottom - src_rect->top, 1));
     checkGLcall("copy image data");
 
+    if (src_texture->resource.format->attrs & WINED3D_FORMAT_ATTR_PLANAR)
+    {
+        const struct wined3d_format *format = src_texture->resource.format;
+
+        /* The second plane is a separate texture object at reduced resolution. */
+        GL_EXTCALL(glCopyImageSubData(src_texture_gl->texture_uv.name, src_texture_gl->target, src_level,
+                src_rect->left / format->uv_width, src_rect->top / format->uv_height, src_layer,
+                dst_texture_gl->texture_uv.name, dst_texture_gl->target, dst_level,
+                dst_rect->left / format->uv_width, dst_rect->top / format->uv_height, dst_layer,
+                (src_rect->right - src_rect->left) / format->uv_width,
+                (src_rect->bottom - src_rect->top) / format->uv_height, 1));
+        checkGLcall("copy image data (second plane)");
+    }
+
     wined3d_texture_validate_location(dst_texture, dst_sub_resource_idx, location);
     wined3d_texture_invalidate_location(dst_texture, dst_sub_resource_idx, ~location);
     if (!wined3d_texture_load_location(dst_texture, dst_sub_resource_idx, context, dst_location))
@@ -1545,6 +1559,163 @@ static void wined3d_fixup_alpha(const struct wined3d_format *format, const uint8
     }
 }
 
+/* Planar formats are stored as one GL texture per plane. The plane formats
+ * in the format table are typed as UINT; the storage uses the UNORM sibling,
+ * so that the planes can be sampled directly as well as through views of any
+ * typed format of the same size. */
+const struct wined3d_format *wined3d_texture_gl_get_plane_format(const struct wined3d_adapter *adapter,
+        const struct wined3d_format *format, unsigned int plane_idx)
+{
+    enum wined3d_format_id plane_format_id = format->plane_formats[plane_idx];
+
+    switch (plane_format_id)
+    {
+        case WINED3DFMT_R8_UINT:
+            plane_format_id = WINED3DFMT_R8_UNORM;
+            break;
+        case WINED3DFMT_R8G8_UINT:
+            plane_format_id = WINED3DFMT_R8G8_UNORM;
+            break;
+        case WINED3DFMT_R16_UINT:
+            plane_format_id = WINED3DFMT_R16_UNORM;
+            break;
+        case WINED3DFMT_R16G16_UINT:
+            plane_format_id = WINED3DFMT_R16G16_UNORM;
+            break;
+        default:
+            break;
+    }
+
+    return wined3d_get_format(adapter, plane_format_id, 0);
+}
+
+/* Context activation is done by the caller. */
+static void wined3d_texture_gl_bind_plane(struct wined3d_texture_gl *texture_gl,
+        struct wined3d_context_gl *context_gl, unsigned int plane_idx)
+{
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    struct gl_texture *gl_tex = &texture_gl->texture_uv;
+    GLenum target = texture_gl->target;
+
+    if (!plane_idx)
+    {
+        wined3d_texture_gl_bind(texture_gl, context_gl, FALSE);
+        return;
+    }
+
+    if (gl_tex->name)
+    {
+        wined3d_context_gl_bind_texture(context_gl, target, gl_tex->name);
+        return;
+    }
+
+    gl_info->gl_ops.gl.p_glGenTextures(1, &gl_tex->name);
+    checkGLcall("glGenTextures");
+    TRACE("Generated texture %u for plane %u of texture %p.\n", gl_tex->name, plane_idx, texture_gl);
+
+    if (!gl_tex->name)
+    {
+        ERR("Failed to generate a texture name.\n");
+        return;
+    }
+
+    wined3d_context_gl_bind_texture(context_gl, target, gl_tex->name);
+    gl_info->gl_ops.gl.p_glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, texture_gl->t.level_count - 1);
+    checkGLcall("glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, texture->level_count)");
+}
+
+/* Context activation is done by the caller. */
+void wined3d_texture_gl_bind_plane_and_dirtify(struct wined3d_texture_gl *texture_gl,
+        struct wined3d_context_gl *context_gl, unsigned int plane_idx)
+{
+    context_invalidate_compute_state(&context_gl->c, STATE_COMPUTE_SHADER_RESOURCE_BINDING);
+    context_invalidate_state(&context_gl->c, STATE_GRAPHICS_SHADER_RESOURCE_BINDING);
+
+    wined3d_texture_gl_bind_plane(texture_gl, context_gl, plane_idx);
+}
+
+/* Upload a box of a planar sub-resource. In memory, the second plane
+ * follows the first one at src_slice_pitch, with uv_width times fewer
+ * columns and uv_height times fewer rows; its samples have twice the bytes
+ * of the first plane's. */
+static void wined3d_texture_gl_upload_planar_data(struct wined3d_context_gl *context_gl,
+        const struct wined3d_const_bo_address *src_bo_addr, const struct wined3d_format *src_format,
+        const struct wined3d_box *src_box, unsigned int src_row_pitch, unsigned int src_slice_pitch,
+        struct wined3d_texture_gl *dst_texture_gl, unsigned int dst_sub_resource_idx,
+        unsigned int dst_x, unsigned int dst_y, unsigned int dst_z)
+{
+    const struct wined3d_adapter *adapter = dst_texture_gl->t.resource.device->adapter;
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    struct wined3d_texture *dst_texture = &dst_texture_gl->t;
+    unsigned int level = dst_sub_resource_idx % dst_texture->level_count;
+    unsigned int update_w = src_box->right - src_box->left;
+    unsigned int update_h = src_box->bottom - src_box->top;
+    unsigned int uv_row_pitch, uv_slice_pitch;
+    const struct wined3d_format *plane_format;
+    struct wined3d_bo_address bo;
+    const uint8_t *offset;
+    GLenum target;
+
+    if (src_format->id != dst_texture->resource.format->id)
+    {
+        FIXME("Unhandled format conversion (%s -> %s).\n",
+                debug_d3dformat(src_format->id), debug_d3dformat(dst_texture->resource.format->id));
+        return;
+    }
+
+    target = wined3d_texture_gl_get_sub_resource_target(dst_texture_gl, dst_sub_resource_idx);
+    if (target == GL_TEXTURE_2D_ARRAY)
+        dst_z = dst_sub_resource_idx / dst_texture->level_count;
+    else if (target != GL_TEXTURE_2D)
+    {
+        FIXME("Unhandled target %#x for planar format %s.\n", target, debug_d3dformat(src_format->id));
+        return;
+    }
+
+    if (dst_texture->sub_resources[dst_sub_resource_idx].map_count)
+    {
+        WARN("Uploading a texture that is currently mapped, pinning sysmem.\n");
+        dst_texture->resource.pin_sysmem = 1;
+    }
+
+    bo.buffer_object = src_bo_addr->buffer_object;
+    bo.addr = (BYTE *)src_bo_addr->addr;
+    if (bo.buffer_object)
+    {
+        GL_EXTCALL(glBindBuffer(GL_PIXEL_UNPACK_BUFFER, wined3d_bo_gl(bo.buffer_object)->id));
+        checkGLcall("glBindBuffer");
+        bo.addr += bo.buffer_object->buffer_offset;
+    }
+    else
+    {
+        GL_EXTCALL(glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0));
+        checkGLcall("glBindBuffer");
+    }
+
+    plane_format = wined3d_texture_gl_get_plane_format(adapter, src_format, 0);
+    offset = bo.addr + src_box->top * src_row_pitch + src_box->left * plane_format->byte_count;
+    wined3d_texture_gl_bind_plane_and_dirtify(dst_texture_gl, context_gl, 0);
+    wined3d_texture_gl_upload_bo(plane_format, target, level, src_row_pitch, src_slice_pitch,
+            dst_x, dst_y, dst_z, update_w, update_h, 1, offset, false, dst_texture, gl_info);
+
+    uv_row_pitch = src_row_pitch * 2 / src_format->uv_width;
+    uv_slice_pitch = src_slice_pitch * 2 / src_format->uv_width / src_format->uv_height;
+    plane_format = wined3d_texture_gl_get_plane_format(adapter, src_format, 1);
+    offset = bo.addr + src_slice_pitch + (src_box->top / src_format->uv_height) * uv_row_pitch
+            + (src_box->left / src_format->uv_width) * plane_format->byte_count;
+    wined3d_texture_gl_bind_plane_and_dirtify(dst_texture_gl, context_gl, 1);
+    wined3d_texture_gl_upload_bo(plane_format, target, level, uv_row_pitch, uv_slice_pitch,
+            dst_x / src_format->uv_width, dst_y / src_format->uv_height, dst_z,
+            update_w / src_format->uv_width, update_h / src_format->uv_height, 1, offset, false, dst_texture, gl_info);
+
+    if (bo.buffer_object)
+    {
+        GL_EXTCALL(glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0));
+        wined3d_context_gl_reference_bo(context_gl, wined3d_bo_gl(bo.buffer_object));
+        checkGLcall("glBindBuffer");
+    }
+}
+
 static void wined3d_texture_gl_upload_data(struct wined3d_context *context,
         const struct wined3d_const_bo_address *src_bo_addr, const struct wined3d_format *src_format,
         const struct wined3d_box *src_box, unsigned int src_row_pitch, unsigned int src_slice_pitch,
@@ -1576,6 +1747,14 @@ static void wined3d_texture_gl_upload_data(struct wined3d_context *context,
     else if (dst_location != WINED3D_LOCATION_TEXTURE_RGB)
     {
         FIXME("Unhandled location %s.\n", wined3d_debug_location(dst_location));
+        return;
+    }
+
+    if (dst_texture->resource.format->attrs & WINED3D_FORMAT_ATTR_PLANAR)
+    {
+        wined3d_texture_gl_upload_planar_data(context_gl, src_bo_addr, src_format, src_box,
+                src_row_pitch, src_slice_pitch, wined3d_texture_gl(dst_texture), dst_sub_resource_idx,
+                dst_x, dst_y, dst_z);
         return;
     }
 
@@ -1866,6 +2045,64 @@ static void wined3d_texture_gl_download_data_slow_path(struct wined3d_texture_gl
     free(temporary_mem);
 }
 
+/* Download a whole planar sub-resource; the caller has checked the box,
+ * the format and the pitches. */
+static void wined3d_texture_gl_download_planar_data(struct wined3d_context_gl *context_gl,
+        struct wined3d_texture_gl *src_texture_gl, unsigned int src_sub_resource_idx,
+        const struct wined3d_bo_address *dst_bo_addr, unsigned int dst_slice_pitch)
+{
+    const struct wined3d_adapter *adapter = src_texture_gl->t.resource.device->adapter;
+    const struct wined3d_format *format = src_texture_gl->t.resource.format;
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    unsigned int level = src_sub_resource_idx % src_texture_gl->t.level_count;
+    const struct wined3d_format_gl *plane_format_gl;
+    uint8_t *offset = dst_bo_addr->addr;
+    struct wined3d_bo *dst_bo;
+    unsigned int plane_idx;
+    GLenum target;
+
+    target = wined3d_texture_gl_get_sub_resource_target(src_texture_gl, src_sub_resource_idx);
+    if (target != GL_TEXTURE_2D)
+    {
+        FIXME("Unhandled target %#x for planar format %s.\n", target, debug_d3dformat(format->id));
+        return;
+    }
+
+    if ((dst_bo = dst_bo_addr->buffer_object))
+    {
+        GL_EXTCALL(glBindBuffer(GL_PIXEL_PACK_BUFFER, wined3d_bo_gl(dst_bo)->id));
+        checkGLcall("glBindBuffer");
+        offset += dst_bo->buffer_offset;
+    }
+    else
+    {
+        GL_EXTCALL(glBindBuffer(GL_PIXEL_PACK_BUFFER, 0));
+        checkGLcall("glBindBuffer");
+    }
+
+    for (plane_idx = 0; plane_idx < 2; ++plane_idx)
+    {
+        plane_format_gl = wined3d_format_gl(wined3d_texture_gl_get_plane_format(adapter, format, plane_idx));
+
+        TRACE("Downloading plane %u of texture %p, %u, level %u, format %#x, type %#x, data %p.\n",
+                plane_idx, src_texture_gl, src_sub_resource_idx, level,
+                plane_format_gl->format, plane_format_gl->type, offset);
+
+        wined3d_texture_gl_bind_plane_and_dirtify(src_texture_gl, context_gl, plane_idx);
+        gl_info->gl_ops.gl.p_glGetTexImage(target, level, plane_format_gl->format, plane_format_gl->type, offset);
+        checkGLcall("glGetTexImage");
+
+        offset += dst_slice_pitch;
+    }
+
+    if (dst_bo)
+    {
+        GL_EXTCALL(glBindBuffer(GL_PIXEL_PACK_BUFFER, 0));
+        wined3d_context_gl_reference_bo(context_gl, wined3d_bo_gl(dst_bo));
+        checkGLcall("glBindBuffer");
+    }
+}
+
 static void wined3d_texture_gl_download_data(struct wined3d_context *context,
         struct wined3d_texture *src_texture, unsigned int src_sub_resource_idx, unsigned int src_location,
         const struct wined3d_box *src_box, const struct wined3d_bo_address *dst_bo_addr,
@@ -1929,6 +2166,13 @@ static void wined3d_texture_gl_download_data(struct wined3d_context *context,
     {
         FIXME("Unhandled destination pitches %u/%u (source pitches %u/%u).\n",
                 dst_row_pitch, dst_slice_pitch, src_row_pitch, src_slice_pitch);
+        return;
+    }
+
+    if (src_texture->resource.format->attrs & WINED3D_FORMAT_ATTR_PLANAR)
+    {
+        wined3d_texture_gl_download_planar_data(context_gl, src_texture_gl, src_sub_resource_idx,
+                dst_bo_addr, dst_slice_pitch);
         return;
     }
 
@@ -2250,6 +2494,54 @@ static bool wined3d_texture_use_immutable_storage(const struct wined3d_texture *
             && !(texture->resource.format_attrs & WINED3D_FORMAT_ATTR_HEIGHT_SCALE);
 }
 
+/* Allocate one immutable GL texture per plane of a planar format. */
+static void wined3d_texture_gl_prepare_planar_texture(struct wined3d_texture_gl *texture_gl,
+        struct wined3d_context_gl *context_gl)
+{
+    const struct wined3d_adapter *adapter = texture_gl->t.resource.device->adapter;
+    const struct wined3d_format *format = texture_gl->t.resource.format;
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+    const struct wined3d_format_gl *plane_format_gl;
+    unsigned int width, height, plane_idx;
+
+    if (!wined3d_texture_use_immutable_storage(&texture_gl->t, gl_info) || !gl_info->supported[ARB_TEXTURE_VIEW])
+    {
+        FIXME("Planar textures need ARB_texture_storage and ARB_texture_view.\n");
+        return;
+    }
+
+    if (texture_gl->target != GL_TEXTURE_2D && texture_gl->target != GL_TEXTURE_2D_ARRAY)
+    {
+        FIXME("Unhandled target %#x for planar format %s.\n", texture_gl->target, debug_d3dformat(format->id));
+        return;
+    }
+
+    for (plane_idx = 0; plane_idx < 2; ++plane_idx)
+    {
+        plane_format_gl = wined3d_format_gl(wined3d_texture_gl_get_plane_format(adapter, format, plane_idx));
+        width = wined3d_texture_get_level_width(&texture_gl->t, 0);
+        height = wined3d_texture_get_level_height(&texture_gl->t, 0);
+        if (plane_idx)
+        {
+            width /= format->uv_width;
+            height /= format->uv_height;
+        }
+
+        TRACE("Allocating plane %u of texture %p as %s (%ux%u, internal %#x).\n",
+                plane_idx, texture_gl, debug_d3dformat(plane_format_gl->f.id), width, height,
+                plane_format_gl->internal);
+
+        wined3d_texture_gl_bind_plane_and_dirtify(texture_gl, context_gl, plane_idx);
+        if (texture_gl->target == GL_TEXTURE_2D_ARRAY)
+            GL_EXTCALL(glTexStorage3D(texture_gl->target, texture_gl->t.level_count,
+                    plane_format_gl->internal, width, height, texture_gl->t.layer_count));
+        else
+            GL_EXTCALL(glTexStorage2D(texture_gl->target, texture_gl->t.level_count,
+                    plane_format_gl->internal, width, height));
+        checkGLcall("allocate planar storage");
+    }
+}
+
 void wined3d_texture_gl_prepare_texture(struct wined3d_texture_gl *texture_gl,
         struct wined3d_context_gl *context_gl, bool srgb)
 {
@@ -2265,6 +2557,15 @@ void wined3d_texture_gl_prepare_texture(struct wined3d_texture_gl *texture_gl,
 
     if (texture_gl->t.flags & alloc_flag)
         return;
+
+    if (format->attrs & WINED3D_FORMAT_ATTR_PLANAR)
+    {
+        if (srgb)
+            FIXME("sRGB is not supported for planar format %s.\n", debug_d3dformat(format->id));
+        wined3d_texture_gl_prepare_planar_texture(texture_gl, context_gl);
+        texture_gl->t.flags |= alloc_flag;
+        return;
+    }
 
     if (resource->format_caps & WINED3D_FORMAT_CAP_DECOMPRESS)
     {
@@ -2554,6 +2855,8 @@ static void wined3d_texture_gl_unload_location(struct wined3d_texture *texture,
         case WINED3D_LOCATION_TEXTURE_RGB:
             if (texture_gl->texture_rgb.name)
                 gltexture_delete(texture_gl->t.resource.device, context_gl->gl_info, &texture_gl->texture_rgb);
+            if (texture_gl->texture_uv.name)
+                gltexture_delete(texture_gl->t.resource.device, context_gl->gl_info, &texture_gl->texture_uv);
             break;
 
         case WINED3D_LOCATION_TEXTURE_SRGB:

@@ -4067,6 +4067,39 @@ BOOL wined3d_adapter_no3d_init_format_info(struct wined3d_adapter *adapter)
 }
 
 /* Context activation is done by the caller. */
+/* Planar formats have no GL internal format of their own; they are stored as
+ * one texture per plane (see wined3d_texture_gl_prepare_texture()), so they
+ * are supported as textures wherever both plane formats are. */
+static void init_format_planar_info_gl(struct wined3d_adapter *adapter, const struct wined3d_gl_info *gl_info)
+{
+    unsigned int i, plane_idx, caps;
+
+    if (!gl_info->supported[ARB_TEXTURE_STORAGE] || !gl_info->supported[ARB_TEXTURE_VIEW])
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(format_plane_info); ++i)
+    {
+        struct wined3d_format *format = get_format_internal(adapter, format_plane_info[i].id);
+
+        /* Views of the planes are ordinary R8/RG8 (or R16/RG16) textures, so
+         * they can be rendered to and used as UAVs wherever those formats can. */
+        caps = WINED3D_FORMAT_CAP_TEXTURE | WINED3D_FORMAT_CAP_FILTERING | WINED3D_FORMAT_CAP_BLIT
+                | WINED3D_FORMAT_CAP_RENDERTARGET | WINED3D_FORMAT_CAP_POSTPIXELSHADER_BLENDING
+                | WINED3D_FORMAT_CAP_UNORDERED_ACCESS;
+        for (plane_idx = 0; plane_idx < 2; ++plane_idx)
+        {
+            const struct wined3d_format *plane_format = wined3d_texture_gl_get_plane_format(adapter, format, plane_idx);
+
+            caps &= plane_format->caps[WINED3D_GL_RES_TYPE_TEX_2D];
+        }
+        if (!(caps & WINED3D_FORMAT_CAP_TEXTURE))
+            continue;
+
+        format->caps[WINED3D_GL_RES_TYPE_TEX_2D] |= caps;
+        TRACE("Planar format %s: caps %#x.\n", debug_d3dformat(format->id), caps);
+    }
+}
+
 BOOL wined3d_adapter_gl_init_format_info(struct wined3d_adapter *adapter, struct wined3d_caps_gl_ctx *ctx)
 {
     struct wined3d_gl_info *gl_info = &wined3d_adapter_gl(adapter)->gl_info;
@@ -4082,6 +4115,7 @@ BOOL wined3d_adapter_gl_init_format_info(struct wined3d_adapter *adapter, struct
     init_format_filter_info(adapter, gl_info);
     init_format_gen_mipmap_info(adapter, gl_info);
     init_format_depth_bias_scale(adapter, ctx);
+    init_format_planar_info_gl(adapter, gl_info);
 
     if (!init_typeless_formats(adapter)) goto fail;
 

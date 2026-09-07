@@ -202,6 +202,8 @@ static void create_texture_view(struct wined3d_gl_view *view, GLenum view_target
     const struct wined3d_gl_info *gl_info;
     struct wined3d_context_gl *context_gl;
     struct wined3d_context *context;
+    unsigned int plane_idx = 0;
+    bool planar = false;
     GLuint texture_name;
 
     view_format_gl = wined3d_format_gl(view_format);
@@ -209,8 +211,15 @@ static void create_texture_view(struct wined3d_gl_view *view, GLenum view_target
 
     if (texture_gl->t.resource.format->attrs & WINED3D_FORMAT_ATTR_PLANAR)
     {
-        FIXME("Planar views are not implemented for OpenGL.\n");
-        return;
+        /* Each plane is a separate GL texture; the view is a view of that plane. */
+        if (!find_format_plane_idx(texture_gl->t.resource.device->adapter,
+                texture_gl->t.resource.format, view_format, &plane_idx))
+        {
+            FIXME("Invalid view format %s for planar format %s.\n",
+                    debug_d3dformat(view_format->id), debug_d3dformat(texture_gl->t.resource.format->id));
+            return;
+        }
+        planar = true;
     }
 
     context = context_acquire(texture_gl->t.resource.device, NULL, 0);
@@ -225,7 +234,10 @@ static void create_texture_view(struct wined3d_gl_view *view, GLenum view_target
     }
 
     wined3d_texture_gl_prepare_texture(texture_gl, context_gl, false);
-    texture_name = wined3d_texture_gl_get_texture_name(texture_gl, context, FALSE);
+    if (planar)
+        texture_name = wined3d_texture_gl_get_plane_name(texture_gl, plane_idx);
+    else
+        texture_name = wined3d_texture_gl_get_texture_name(texture_gl, context, FALSE);
 
     level_idx = desc->u.texture.level_idx;
     layer_idx = desc->u.texture.layer_idx;
@@ -619,7 +631,7 @@ static void wined3d_render_target_view_gl_cs_init(void *object)
 
             resource_class = wined3d_format_gl(resource->format)->view_class;
             view_class = wined3d_format_gl(view_gl->v.format)->view_class;
-            if (resource_class != view_class)
+            if (resource_class != view_class && !(resource->format->attrs & WINED3D_FORMAT_ATTR_PLANAR))
             {
                 FIXME("Render target view not supported, resource format %s, view format %s.\n",
                         debug_d3dformat(resource->format->id), debug_d3dformat(view_gl->v.format->id));
@@ -1135,6 +1147,11 @@ static void wined3d_shader_resource_view_gl_cs_init(void *object)
         else if (resource->format->typeless_id == view_format->typeless_id
                 && resource_class == view_class)
         {
+            create_texture_view(&view_gl->gl_view, view_target, desc, texture_gl, view_format);
+        }
+        else if (resource->format->attrs & WINED3D_FORMAT_ATTR_PLANAR)
+        {
+            /* A view of one plane; create_texture_view() picks the plane. */
             create_texture_view(&view_gl->gl_view, view_target, desc, texture_gl, view_format);
         }
         else if (wined3d_format_is_depth_view(resource->format->id, view_format->id))
@@ -1857,7 +1874,8 @@ static void wined3d_unordered_access_view_gl_cs_init(void *object)
         else
             depth_or_layer_count = texture_gl->t.layer_count;
 
-        if (desc->u.texture.layer_idx || desc->u.texture.layer_count != depth_or_layer_count)
+        if (desc->u.texture.layer_idx || desc->u.texture.layer_count != depth_or_layer_count
+                || (resource->format->attrs & WINED3D_FORMAT_ATTR_PLANAR))
         {
             create_texture_view(&view_gl->gl_view, get_texture_view_target(gl_info, desc, texture_gl),
                     desc, texture_gl, view_gl->v.format);
