@@ -364,35 +364,50 @@ static const struct ID2D1Bitmap1Vtbl d2d_bitmap_vtbl =
     d2d_bitmap_Unmap,
 };
 
+/* The formats bitmaps and targets can be created in.  Also the answer
+ * ID2D1DeviceContext::IsDxgiFormatSupported() gives, there for the format alone. */
+static const D2D1_PIXEL_FORMAT supported_formats[] =
+{
+    {DXGI_FORMAT_R32G32B32A32_FLOAT,    D2D1_ALPHA_MODE_PREMULTIPLIED},
+    {DXGI_FORMAT_R32G32B32A32_FLOAT,    D2D1_ALPHA_MODE_IGNORE       },
+    {DXGI_FORMAT_R16G16B16A16_FLOAT,    D2D1_ALPHA_MODE_PREMULTIPLIED},
+    {DXGI_FORMAT_R16G16B16A16_FLOAT,    D2D1_ALPHA_MODE_IGNORE       },
+    {DXGI_FORMAT_R16G16B16A16_UNORM,    D2D1_ALPHA_MODE_PREMULTIPLIED},
+    {DXGI_FORMAT_R16G16B16A16_UNORM,    D2D1_ALPHA_MODE_IGNORE       },
+    {DXGI_FORMAT_R8G8B8A8_UNORM,        D2D1_ALPHA_MODE_PREMULTIPLIED},
+    {DXGI_FORMAT_R8G8B8A8_UNORM,        D2D1_ALPHA_MODE_IGNORE       },
+    {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,   D2D1_ALPHA_MODE_PREMULTIPLIED},
+    {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,   D2D1_ALPHA_MODE_IGNORE       },
+    {DXGI_FORMAT_A8_UNORM,              D2D1_ALPHA_MODE_PREMULTIPLIED},
+    {DXGI_FORMAT_A8_UNORM,              D2D1_ALPHA_MODE_STRAIGHT     },
+    {DXGI_FORMAT_B8G8R8A8_UNORM,        D2D1_ALPHA_MODE_PREMULTIPLIED},
+    {DXGI_FORMAT_B8G8R8A8_UNORM,        D2D1_ALPHA_MODE_IGNORE       },
+    {DXGI_FORMAT_B8G8R8X8_UNORM,        D2D1_ALPHA_MODE_IGNORE       },
+    {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,   D2D1_ALPHA_MODE_PREMULTIPLIED},
+    {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,   D2D1_ALPHA_MODE_IGNORE       },
+};
+
 static BOOL format_supported(const D2D1_PIXEL_FORMAT *format)
 {
     unsigned int i;
-
-    static const D2D1_PIXEL_FORMAT supported_formats[] =
-    {
-        {DXGI_FORMAT_R32G32B32A32_FLOAT,    D2D1_ALPHA_MODE_PREMULTIPLIED},
-        {DXGI_FORMAT_R32G32B32A32_FLOAT,    D2D1_ALPHA_MODE_IGNORE       },
-        {DXGI_FORMAT_R16G16B16A16_FLOAT,    D2D1_ALPHA_MODE_PREMULTIPLIED},
-        {DXGI_FORMAT_R16G16B16A16_FLOAT,    D2D1_ALPHA_MODE_IGNORE       },
-        {DXGI_FORMAT_R16G16B16A16_UNORM,    D2D1_ALPHA_MODE_PREMULTIPLIED},
-        {DXGI_FORMAT_R16G16B16A16_UNORM,    D2D1_ALPHA_MODE_IGNORE       },
-        {DXGI_FORMAT_R8G8B8A8_UNORM,        D2D1_ALPHA_MODE_PREMULTIPLIED},
-        {DXGI_FORMAT_R8G8B8A8_UNORM,        D2D1_ALPHA_MODE_IGNORE       },
-        {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,   D2D1_ALPHA_MODE_PREMULTIPLIED},
-        {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,   D2D1_ALPHA_MODE_IGNORE       },
-        {DXGI_FORMAT_A8_UNORM,              D2D1_ALPHA_MODE_PREMULTIPLIED},
-        {DXGI_FORMAT_A8_UNORM,              D2D1_ALPHA_MODE_STRAIGHT     },
-        {DXGI_FORMAT_B8G8R8A8_UNORM,        D2D1_ALPHA_MODE_PREMULTIPLIED},
-        {DXGI_FORMAT_B8G8R8A8_UNORM,        D2D1_ALPHA_MODE_IGNORE       },
-        {DXGI_FORMAT_B8G8R8X8_UNORM,        D2D1_ALPHA_MODE_IGNORE       },
-        {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,   D2D1_ALPHA_MODE_PREMULTIPLIED},
-        {DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,   D2D1_ALPHA_MODE_IGNORE       },
-    };
 
     for (i = 0; i < ARRAY_SIZE(supported_formats); ++i)
     {
         if (supported_formats[i].format == format->format
                 && supported_formats[i].alphaMode == format->alphaMode)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+BOOL d2d_dxgi_format_supported(DXGI_FORMAT format)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(supported_formats); ++i)
+    {
+        if (supported_formats[i].format == format)
             return TRUE;
     }
 
