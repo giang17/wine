@@ -4541,11 +4541,17 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateCommandList(ID2D1Devic
     return hr;
 }
 
+/* "Indicates whether the format is supported by the device context": the
+ * formats bitmaps and targets can be created in.  Cubase 15 asks for the whole
+ * DXGI range once at start-up and for B8G8R8A8_UNORM a few times more; the
+ * stub this replaces said no to all of them. */
 static BOOL STDMETHODCALLTYPE d2d_device_context_IsDxgiFormatSupported(ID2D1DeviceContext6 *iface, DXGI_FORMAT format)
 {
-    FIXME("iface %p, format %#x stub!\n", iface, format);
+    BOOL supported = d2d_dxgi_format_supported(format);
 
-    return FALSE;
+    TRACE("iface %p, format %#x, supported %d.\n", iface, format, supported);
+
+    return supported;
 }
 
 static BOOL STDMETHODCALLTYPE d2d_device_context_IsBufferPrecisionSupported(ID2D1DeviceContext6 *iface,

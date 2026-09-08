@@ -699,6 +699,7 @@ struct d2d_bitmap
     ID2D1ColorContext *color_context;
 };
 
+BOOL d2d_dxgi_format_supported(DXGI_FORMAT format);
 HRESULT d2d_bitmap_create(struct d2d_device_context *context, D2D1_SIZE_U size, const void *src_data,
         UINT32 pitch, const D2D1_BITMAP_PROPERTIES1 *desc, struct d2d_bitmap **bitmap);
 HRESULT d2d_bitmap_create_shared(struct d2d_device_context *context, REFIID iid, void *data,
