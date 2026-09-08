@@ -5,8 +5,9 @@ Fonts a Wine prefix needs for plugin GUIs: correct Unicode symbol rendering
 system font files to exist.
 
 **[wine-font-setup.sh](wine-font-setup.sh)** does the routine part — MS Core Fonts,
-the symbol fallback fonts with their FontLink entries, and this branch's text
-rendering switches — and `--check` reports without changing anything:
+the symbol fallback fonts with their FontLink entries, this branch's text
+rendering switches, and the system UI font once Segoe UI is in the prefix — and
+`--check` reports without changing anything:
 
 ```bash
 scripts/wine-font-setup.sh --prefix ~/.wine
@@ -208,6 +209,37 @@ registry values read once at startup and therefore live in the prefix; the scrip
 them, and `--contrast N` picks the enhanced-contrast value. What each does, with the
 measurements, is in `PATCHES.md` under *Font Setup*.
 
+## 2b. System UI font: Segoe UI 9pt instead of Wine's Tahoma
+
+Menus, dialogs, captions and status bars of every application in the prefix —
+plain Win32, Qt (Dorico 5, the Cubase dialogs), VSTGUI popups — draw with the six
+LOGFONTs under `HKCU\Control Panel\Desktop\WindowMetrics`. Wine's defaults name
+Tahoma 8pt, derived from `DEFAULT_GUI_FONT` (`MS Shell Dlg` → Tahoma), and in a
+prefix that never got the real Tahoma that is Wine's own clone,
+`share/wine/fonts/tahoma.ttf`. Its outlines were never drawn for 11–12 px; with the
+outline switch of section 2 the interface text therefore looks cramped (Dorico 5,
+2026-09-08: the letterforms of the menu text match the clone, not Segoe UI, and the
+process had `tahoma.ttf` mapped). Windows 10 reports Segoe UI 9pt for all six.
+
+`wine-font-setup.sh` switches the six values once the Segoe UI family is in the
+prefix (the check reports it); without the family it leaves them alone, since GDI
+would fall back to the clone anyway. `--no-uifont` skips the step. By hand:
+
+```bash
+# LOGFONTW, 92 bytes: height -12 (9pt at 96 dpi), weight 400, DEFAULT_CHARSET, face "Segoe UI"
+LF=f4ffffff0000000000000000000000009001000000000001000000005300650067006f006500200055004900000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+for v in CaptionFont SmCaptionFont MenuFont StatusFont MessageFont IconFont; do
+    wine reg add 'HKCU\Control Panel\Desktop\WindowMetrics' /v $v /t REG_BINARY /d $LF /f
+done
+```
+
+The height is stored at the prefix' system DPI (`LogPixels`): -12 at 96 dpi, -15 at
+120 dpi; a positive value means points (older prefixes carry `08000000` = 8pt).
+Applications read the metrics when they start — restart them, the wineserver can
+stay. Wine's own default is the same blob with `f5ffffff` (-11 = 8pt) and the face
+`Tahoma`; the registry backup the script writes (`user.reg.bak-<stamp>`) holds the
+previous values.
+
 ## 3. Verification
 
 ```bash
@@ -234,9 +266,15 @@ Start Serum 2 in Reaper and check:
 wine reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "Tahoma" /f
 wine reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "DejaVu Sans" /f
 rm -f ~/.wine/drive_c/windows/Fonts/DejaVuSans.ttf ~/.wine/drive_c/windows/Fonts/NotoSansSymbols2-Regular.ttf
+
+# system UI font back to Wine's default (Tahoma 8pt), or restore user.reg.bak-<stamp>
+LF=f5ffffff0000000000000000000000009001000000000001000000005400610068006f006d00610000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+for v in CaptionFont SmCaptionFont MenuFont StatusFont MessageFont IconFont; do
+    wine reg add 'HKCU\Control Panel\Desktop\WindowMetrics' /v $v /t REG_BINARY /d $LF /f
+done
 ```
 
-**Summary:** four rendering paths, four separate fixes:
+**Summary:** five rendering paths, five separate fixes:
 
 | Path | Font | Fix |
 |------|------|-----|
@@ -244,3 +282,4 @@ rm -f ~/.wine/drive_c/windows/Fonts/DejaVuSans.ttf ~/.wine/drive_c/windows/Fonts
 | DWrite/D2D1 (VSTGUI GUI) | BarlowSemiCondensed, symbols | `analyzer.c` fallback mapping U+2B00-2BFF (in the branch) |
 | GDI (native Win32 menus) | Tahoma → DejaVu Sans | FontLink registry → Noto Sans Symbols2 |
 | Serum 2 tooltips | BitPDisp-10 (proprietary) | DejaVu Sans Mono with a renamed family |
+| System UI font (menus, dialogs — Win32, Qt, VSTGUI) | Tahoma 8pt = Wine's clone | `WindowMetrics` → Segoe UI 9pt once the family is in the prefix (2b) |

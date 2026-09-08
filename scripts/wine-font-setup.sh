@@ -18,6 +18,13 @@
 #      therefore live in the PREFIX, not in the build: a fresh prefix does not
 #      have them, and the text then renders the way stock Wine renders it, with
 #      no hint that anything is switched off.
+#   4. The system UI font.  Wine's WindowMetrics defaults name Tahoma 8pt for
+#      menus, dialogs, captions and status bars, and "Tahoma" resolves to
+#      Wine's own clone unless the real one was installed; its outlines were
+#      never drawn for 11-12 px, so with step 3 the interface text of every
+#      application looks cramped.  Windows 10 reports Segoe UI 9pt there.  As
+#      soon as the Segoe UI family is in the prefix, the six LOGFONTs are
+#      switched to it; without the family the step is skipped.
 #
 # Fonts are located through fontconfig, so distribution paths do not matter.
 #
@@ -33,13 +40,14 @@
 #
 # Usage:
 #   wine-font-setup.sh [--prefix DIR] [--wine BINARY] [--check] [--no-mscore]
-#                      [--no-rendering] [--contrast N]
+#                      [--no-rendering] [--no-uifont] [--contrast N]
 #
 #   --prefix DIR    Wine prefix to operate on.  Default: $WINEPREFIX, else ~/.wine
 #   --wine BINARY   wine binary to use.  Default: wine
 #   --check         report only, change nothing
 #   --no-mscore     skip the MS Core Fonts part (step 1)
 #   --no-rendering  skip the text rendering switches (step 3)
+#   --no-uifont     keep the WindowMetrics fonts, the system UI font (step 4)
 #   --contrast N    enhanced contrast, 0-100.  Default: 50, what Windows uses.
 #                   70 suits dark interfaces; 0 turns the correction off.
 #
@@ -53,6 +61,7 @@ WINE="wine"
 CHECK_ONLY=0
 DO_MSCORE=1
 DO_RENDERING=1
+DO_UIFONT=1
 CONTRAST=50
 CONTRAST_EXPLICIT=0
 
@@ -73,8 +82,9 @@ while [ $# -gt 0 ]; do
         --check)     CHECK_ONLY=1 ;;
         --no-mscore) DO_MSCORE=0 ;;
         --no-rendering) DO_RENDERING=0 ;;
+        --no-uifont) DO_UIFONT=0 ;;
         --contrast)  shift; CONTRAST="${1:?--contrast needs a number 0-100}"; CONTRAST_EXPLICIT=1 ;;
-        -h|--help)   sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)   sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1  (try --help)" >&2; exit 1 ;;
     esac
     shift
@@ -190,6 +200,47 @@ have_segoe=0
 [ -f "$FONTDIR/segoeui.ttf" ] && grep -q '^"Segoe UI (TrueType)"=' "$SYSREG" 2>/dev/null \
     && have_segoe=1
 
+# The system UI font.  The six WindowMetrics values are LOGFONTW blobs of 92
+# bytes: the height at bytes 0-3 (negative = pixels at the prefix' system DPI,
+# positive = points), the face name at byte 28 as UTF-16LE.  Applications read
+# them once at start, so a change needs a restart, not a wineserver restart.
+UIFONT_VALUES=(CaptionFont SmCaptionFont MenuFont StatusFont MessageFont IconFont)
+windowmetrics_hex() {  # <value> — the hex of one WindowMetrics blob, comma-separated
+    RV_VAL="$1" awk '
+        index($0, "[Control Panel\\\\Desktop\\\\WindowMetrics]") == 1 {f=1; next}
+        f && /^\[/ {exit}
+        f && index($0, "\"" ENVIRON["RV_VAL"] "\"=hex:") == 1 {sub(/^[^:]*:/, ""); v=$0; c=1; next}
+        c && /^[ \t]*[0-9a-f][0-9a-f],/ {v = v $0; next}
+        c {exit}
+        END {gsub(/[\\ \t]/, "", v); print v}' "$USERREG" 2>/dev/null
+}
+uifont_face() {  # <value> — face name of one WindowMetrics blob, empty if unset
+    windowmetrics_hex "$1" | awk -F, '
+        BEGIN { for (i = 32; i < 127; i++) chr[sprintf("%02x", i)] = sprintf("%c", i) }
+        NF >= 30 { s = ""
+            for (i = 29; i + 1 <= NF; i += 2) {
+                if ($i == "00" && $(i+1) == "00") break
+                s = s (($(i+1) == "00" && ($i in chr)) ? chr[$i] : "?") }
+            print s }'
+}
+prefix_dpi() {  # the prefix' system DPI (LogPixels), 96 when unset
+    local v; v=$(reg_value "$USERREG" 'Control Panel\\Desktop' LogPixels)
+    case "$v" in *dword:*) echo $(( 16#${v##*:} )) ;; *) echo 96 ;; esac
+}
+uifont_points() {  # <value> — point size of one WindowMetrics blob, empty if unset
+    windowmetrics_hex "$1" | DPI="$(prefix_dpi)" awk -F, '
+        BEGIN { for (i = 0; i < 256; i++) val[sprintf("%02x", i)] = i }
+        NF >= 4 { h = val[$1] + val[$2] * 256 + val[$3] * 65536 + val[$4] * 16777216
+            if (h >= 2147483648) h -= 4294967296
+            if (h < 0) printf "%d\n", (-h * 72 + ENVIRON["DPI"] / 2) / ENVIRON["DPI"]
+            else printf "%d\n", h }'
+}
+menu_face=$(uifont_face MenuFont); menu_pt=$(uifont_points MenuFont)
+have_uifont=0
+[ "$menu_face" = "Segoe UI" ] && have_uifont=1
+# Not asked for, or not possible without the family: do not report it missing.
+{ [ "$DO_UIFONT" -eq 1 ] && [ "$have_segoe" -eq 1 ]; } || have_uifont=1
+
 echo "Current state of the prefix:"
 printf '  %-34s %s\n' "fonts in windows/Fonts" \
     "$( [ "$have_fonts" -eq 1 ] && echo present || echo missing )"
@@ -203,6 +254,10 @@ printf '  %-34s %s\n' "SystemLink values well-formed" \
 printf '  %-34s %s\n' "Segoe UI (Steinberg applications)" \
     "$( [ "$have_segoe" -eq 1 ] && echo present \
         || echo "absent — Cubase 15 Hub crashes without it; not installable by this script" )"
+printf '  %-34s %s\n' "system UI font (WindowMetrics)" \
+    "$( if [ "$menu_face" = "Segoe UI" ]; then echo "Segoe UI ${menu_pt}pt"; \
+        elif [ "$have_segoe" -eq 1 ]; then echo "${menu_face:-unset} ${menu_pt:+${menu_pt}pt }— Wine default; Segoe UI 9pt on apply"; \
+        else echo "${menu_face:-unset} ${menu_pt:+${menu_pt}pt }— Wine default; needs the Segoe UI family first"; fi )"
 if [ "$mangled_links" -gt 0 ]; then
     echo
     echo "  These SystemLink values hold one character per entry:"
@@ -216,7 +271,7 @@ fi
 if [ "$CHECK_ONLY" -eq 1 ]; then
     echo
     if [ "$have_fonts" -eq 1 ] && [ "$have_link" -eq 1 ] && [ "$have_rendering" -eq 1 ] &&
-       [ "$mangled_links" -eq 0 ]; then
+       [ "$mangled_links" -eq 0 ] && [ "$have_uifont" -eq 1 ]; then
         echo "Font setup is complete."
         exit 0
     fi
@@ -344,6 +399,32 @@ if [ "$DO_RENDERING" -eq 1 ]; then
         /v FontSmoothingType /t REG_DWORD /d 2 /f </dev/null >/dev/null 2>&1
 fi
 
+# --- 4c. system UI font --------------------------------------------------------
+# Wine's WindowMetrics defaults come from DEFAULT_GUI_FONT (MS Shell Dlg ->
+# Tahoma, 8pt), and "Tahoma" is Wine's own clone in every prefix that never got
+# the real one.  Plain Win32, Qt and VSTGUI menus and dialogs all draw with
+# these six LOGFONTs, so with step 3 the interface text of every application in
+# the prefix is the clone's outline at 11-12 px, which looks cramped (Dorico 5,
+# 2026-09-08).  Windows 10 reports Segoe UI 9pt for all six.  The height is
+# stored at the prefix' system DPI, so it is derived from LogPixels; the other
+# fields are what Wine writes itself (weight 400, DEFAULT_CHARSET).
+if [ "$DO_UIFONT" -eq 1 ] && [ "$have_segoe" -eq 1 ]; then
+    dpi=$(prefix_dpi)
+    h=$(( (9 * dpi + 36) / 72 ))                                   # 9pt in pixels
+    h_le=$(printf '%08x' $(( (-h) & 0xffffffff )) | sed -E 's/(..)(..)(..)(..)/\4\3\2\1/')
+    face_hex=5300650067006f006500200055004900                      # "Segoe UI", UTF-16LE
+    while [ ${#face_hex} -lt 128 ]; do face_hex="${face_hex}00"; done
+    #   height     width/escapement/orientation  weight  ital/ul/so/charset  prec/qual/pitch  face
+    lf="${h_le}000000000000000000000000900100000000000100000000${face_hex}"
+    echo "  setting the system UI font: Segoe UI 9pt (${h}px at ${dpi} dpi)..."
+    for v in "${UIFONT_VALUES[@]}"; do
+        WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Control Panel\Desktop\WindowMetrics' \
+            /v "$v" /t REG_BINARY /d "$lf" /f </dev/null >/dev/null 2>&1
+    done
+elif [ "$DO_UIFONT" -eq 1 ]; then
+    echo "  system UI font: left at Wine's default — the Segoe UI family is not in this prefix"
+fi
+
 # --- 5. verify ---------------------------------------------------------------
 # Wine keeps the registry in the wineserver and flushes system.reg to disk with
 # a delay — checking immediately reports a false failure. Poll with a cap.
@@ -373,6 +454,15 @@ if [ "$DO_RENDERING" -eq 1 ]; then
         [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {
             echo "ERROR: ${kv##*:} did not appear in $USERREG." >&2; ok=0; }
     done
+fi
+
+if [ "$DO_UIFONT" -eq 1 ] && [ "$have_segoe" -eq 1 ]; then
+    for _ in $(seq 1 15); do
+        [ "$(uifont_face MenuFont)" = "Segoe UI" ] && break
+        sleep 1
+    done
+    [ "$(uifont_face MenuFont)" = "Segoe UI" ] || {
+        echo "ERROR: the WindowMetrics fonts did not switch to Segoe UI in $USERREG." >&2; ok=0; }
 fi
 
 echo
