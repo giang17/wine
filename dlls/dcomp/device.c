@@ -1013,10 +1013,145 @@ static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Resize(IDCompositionVirtu
     return S_OK;
 }
 
+/* Zero one rectangle of the surface on every carrier it has -- the D2D1 target
+ * bitmap or the D3D11 texture, and the CPU mirror.  |zeros| holds at least as
+ * many transparent pixels as the rectangle covers.  A GPU carrier that does
+ * not exist yet (D2D1 path before the first BeginDraw) is created empty later
+ * and needs nothing. */
+static void dcomp_surface_clear_rect(struct dcomp_surface *surface, const RECT *rect, const DWORD *zeros)
+{
+    UINT w = (UINT)(rect->right - rect->left), y;
+    HRESULT hr;
+
+    if (surface->d2d1_device && surface->target_bitmap)
+    {
+        D2D1_RECT_U dst = {(UINT32)rect->left, (UINT32)rect->top, (UINT32)rect->right, (UINT32)rect->bottom};
+
+        if (FAILED(hr = ID2D1Bitmap1_CopyFromMemory(surface->target_bitmap, &dst, zeros, w * sizeof(DWORD))))
+            WARN("Could not clear %s on the target bitmap: %#lx.\n", wine_dbgstr_rect(rect), hr);
+    }
+    else if (surface->d3d11_device && surface->texture)
+    {
+        ID3D11DeviceContext *d3d_context;
+        D3D11_BOX box;
+
+        box.left = (UINT)rect->left; box.top = (UINT)rect->top; box.front = 0;
+        box.right = (UINT)rect->right; box.bottom = (UINT)rect->bottom; box.back = 1;
+        ID3D11Device_GetImmediateContext(surface->d3d11_device, &d3d_context);
+        ID3D11DeviceContext_UpdateSubresource(d3d_context, (ID3D11Resource *)surface->texture, 0, &box,
+                zeros, w * sizeof(DWORD), 0);
+        ID3D11DeviceContext_Release(d3d_context);
+    }
+
+    if (surface->bits)
+        for (y = (UINT)rect->top; y < (UINT)rect->bottom; ++y)
+            memset(surface->bits + y * surface->width + rect->left, 0, w * sizeof(DWORD));
+}
+
+/* "Discards pixels that fall outside of the specified trim rectangles."  The
+ * rectangles are what stays allocated; "any pixels that are outside the
+ * specified set of rectangles are no longer used for texturing", and with a
+ * count of zero "no pixels are kept".  On Windows that releases the tiles of a
+ * virtual surface the application no longer needs.  The surface here is
+ * allocated at its full logical size, so there is no memory to give back --
+ * but the visible half of the contract holds: what was trimmed no longer
+ * shows, and a later BeginDraw over it starts from transparent, as it does on
+ * Windows.  Until this was implemented the call was a no-op that kept
+ * everything the application had discarded. */
 static HRESULT STDMETHODCALLTYPE dcomp_virtual_surface_Trim(IDCompositionVirtualSurface *iface,
         const RECT *rectangles, UINT count)
 {
-    FIXME("iface %p, rectangles %p, count %u stub!\n", iface, rectangles, count);
+    struct dcomp_surface *surface = CONTAINING_RECORD(iface, struct dcomp_surface, IDCompositionSurface_iface);
+    DWORD size, i, max_pixels = 0;
+    HRGN discard, keep;
+    RGNDATA *data;
+    const RECT *rects;
+    DWORD *zeros;
+    RECT bounds;
+
+    TRACE("iface %p, rectangles %p, count %u.\n", iface, rectangles, count);
+
+    /* "The rectangles parameter can be NULL only if the count parameter is zero." */
+    if (count && !rectangles)
+        return E_INVALIDARG;
+
+    /* "This method fails if IDCompositionSurface::BeginDraw was called for this
+     * bitmap without a corresponding call to IDCompositionSurface::EndDraw." */
+    if (surface->drawing)
+    {
+        WARN("Trim during a draw session.\n");
+        return DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED;
+    }
+
+    /* What goes is the surface minus every rectangle to keep.  A GDI region
+     * takes the overlaps and the parts outside the surface off our hands and
+     * hands back the remainder as a set of disjoint rectangles. */
+    SetRect(&bounds, 0, 0, (LONG)surface->width, (LONG)surface->height);
+    if (!(discard = CreateRectRgnIndirect(&bounds)))
+        return E_OUTOFMEMORY;
+
+    for (i = 0; i < count; ++i)
+    {
+        RECT kept;
+
+        if (!IntersectRect(&kept, &rectangles[i], &bounds))
+            continue;
+        if (!(keep = CreateRectRgnIndirect(&kept)))
+        {
+            DeleteObject(discard);
+            return E_OUTOFMEMORY;
+        }
+        CombineRgn(discard, discard, keep, RGN_DIFF);
+        DeleteObject(keep);
+    }
+
+    if (!(size = GetRegionData(discard, 0, NULL)) || !(data = malloc(size)))
+    {
+        DeleteObject(discard);
+        return E_OUTOFMEMORY;
+    }
+    GetRegionData(discard, size, data);
+    DeleteObject(discard);
+
+    if (!data->rdh.nCount)
+    {
+        TRACE("Surface %p: the %u rectangle(s) cover the surface, nothing to discard.\n", surface, count);
+        free(data);
+        return S_OK;
+    }
+
+    rects = (const RECT *)data->Buffer;
+    for (i = 0; i < data->rdh.nCount; ++i)
+    {
+        DWORD pixels = (DWORD)(rects[i].right - rects[i].left) * (DWORD)(rects[i].bottom - rects[i].top);
+        if (pixels > max_pixels)
+            max_pixels = pixels;
+    }
+    if (!(zeros = calloc(max_pixels, sizeof(DWORD))))
+    {
+        free(data);
+        return E_OUTOFMEMORY;
+    }
+
+    for (i = 0; i < data->rdh.nCount; ++i)
+        dcomp_surface_clear_rect(surface, &rects[i], zeros);
+
+    TRACE("Surface %p (%ux%u): kept %u rectangle(s), discarded %lu rectangle(s) within %s.\n",
+            surface, surface->width, surface->height, count, data->rdh.nCount,
+            wine_dbgstr_rect(&data->rdh.rcBound));
+
+    /* The discarded pixels are transparent on the GPU and in the CPU mirror;
+     * have the next present carry that to the window the way it does for a
+     * drawn or scrolled region (issue 56) -- a Commit without a draw in
+     * between then shows the trim as well. */
+    if (surface->has_pending)
+        UnionRect(&surface->pending_dirty, &surface->pending_dirty, &data->rdh.rcBound);
+    else
+        surface->pending_dirty = data->rdh.rcBound;
+    surface->has_pending = TRUE;
+
+    free(zeros);
+    free(data);
     return S_OK;
 }
 
