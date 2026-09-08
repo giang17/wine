@@ -288,7 +288,17 @@ static gboolean transform_src_query_latency(struct wg_transform *transform, GstQ
      * drives the H.264 decoder itself (issue 356): a frame came back four
      * inputs late and now comes back two inputs late, and the application
      * no longer restarts the decoder at every keyframe, which left its video
-     * player black for 0.7 s each time. */
+     * player black for 0.7 s each time.
+     *
+     * gst-libav's avdec_* elements ask the same question and pick slice
+     * threading for a live source, so a single-slice stream decodes on one
+     * thread: 4.5 ms per 1080p frame and 11 ms per 4K frame on a 16-thread
+     * desktop, against 1.7 and 3.7 ms with frame threading -- whose output
+     * arrives thread-count minus one frames late, 11 to 16 frames with the
+     * 16 threads set_max_threads() allows (issue 359). A decoder that hands
+     * a synchronous caller its first frame after 17 inputs is the wrong
+     * trade for every application that drives the MFT itself; the price is
+     * paid only where neither NVDEC nor VA-API serves the H.264 MFT. */
     gst_query_set_latency(query, TRUE, 0, 0);
     return true;
 }

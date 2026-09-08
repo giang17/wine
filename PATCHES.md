@@ -214,8 +214,12 @@ This is the recommended branch. What it changes, by subsystem:
   transform answered the latency query as not live, one by the DPB bookkeeping of
   GStreamer's H.264 decoder base class. The transform now reports itself as live, which
   drops the two pipelining frames and with them the decoder restart the player performed
-  at every keyframe, where the picture went black for 0.7 s. The video window shows the
-  picture in stop and play
+  at every keyframe, where the picture went black for 0.7 s. Where neither NVDEC nor
+  VA-API serves the H.264 MFT and gst-libav's `avdec_h264` decodes instead, the live
+  answer also makes libav choose slice threading over frame threading, which returned the
+  first frame seventeen inputs late with the sixteen threads Wine allows it; a single-slice
+  stream then decodes on one thread (11 ms per 4K frame on a 16-thread desktop, still real
+  time at 30 fps). The video window shows the picture in stop and play
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
 - **Direct2D for JUCE 8.0.13+ (ntdll, wine.inf)**: JUCE 8.0.13 and later pick their
