@@ -39,6 +39,19 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
 
+/* Bumped by every change to a visual tree -- offset, opacity, visibility,
+ * content, children.  dcomp_commit_visual_tree() records the value it
+ * serialized against on the root, and Commit() writes the leaf set again only
+ * when the two differ (issue 363).  Starts at 1 so a root that has never been
+ * serialized (0) is stale by construction.  Process-wide and unlocked: a
+ * spurious mismatch costs one extra serialization, never a missed one. */
+static LONG dcomp_tree_generation = 1;
+
+static inline void dcomp_visual_tree_changed(void)
+{
+    InterlockedIncrement(&dcomp_tree_generation);
+}
+
 /* Private heap for dcomp — isolates surface/visual/target lifecycle
  * allocations (BeginDraw/EndDraw cycles, dirty-rect tracking, persistent
  * context wrappers) from the process heap. */
@@ -2082,6 +2095,15 @@ struct dcomp_visual
     /* Visual tree */
     float offset_x;
     float offset_y;
+    /* IDCompositionVisual3 (issue 363).  Opacity multiplies down the subtree and
+     * visibility hides it; both are honoured by every composite path.  OffsetZ
+     * and the depth mode are carried so a later call can read them back, but
+     * nothing here sorts by depth. */
+    float offset_z;
+    float opacity;
+    BOOL visible;
+    enum DCOMPOSITION_DEPTH_MODE depth_mode;
+    LONG serialized_gen;   /* on a root: dcomp_tree_generation as of its last serialization */
     struct dcomp_visual *parent;
     struct dcomp_visual *children;       /* head of child list (first = back) */
     struct dcomp_visual *next_sibling;   /* doubly-linked sibling list */
@@ -2192,8 +2214,16 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_QueryInterface(IDCompositionVisual
 
     TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
 
+    /* One object, one vtable: the visual carries the full IDCompositionVisual3
+     * table from creation, and every interface in the chain is the same
+     * pointer.  Cubase 15 asks for Visual3 nineteen times per start and, told
+     * no, hands nothing over that it would otherwise have faded or hidden
+     * (issue 363). */
     if (IsEqualGUID(iid, &IID_IUnknown)
-            || IsEqualGUID(iid, &IID_IDCompositionVisual))
+            || IsEqualGUID(iid, &IID_IDCompositionVisual)
+            || IsEqualGUID(iid, &IID_IDCompositionVisual2)
+            || IsEqualGUID(iid, &IID_IDCompositionVisualDebug)
+            || IsEqualGUID(iid, &IID_IDCompositionVisual3))
     {
         *out = &visual->IDCompositionVisual_iface;
         IDCompositionVisual_AddRef(*out);
@@ -2261,6 +2291,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetX(IDCompositionVisual *if
     struct dcomp_visual *visual = impl_from_IDCompositionVisual(iface);
 
     TRACE("iface %p, offset_x %.8e.\n", iface, offset_x);
+    dcomp_visual_tree_changed();
     visual->offset_x = offset_x;
     return S_OK;
 }
@@ -2277,6 +2308,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetY(IDCompositionVisual *if
     struct dcomp_visual *visual = impl_from_IDCompositionVisual(iface);
 
     TRACE("iface %p, offset_y %.8e.\n", iface, offset_y);
+    dcomp_visual_tree_changed();
     visual->offset_y = offset_y;
     return S_OK;
 }
@@ -2348,6 +2380,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
 
     FIXME("iface %p, content %p (visual: target_hwnd %p).\n",
             iface, content, visual->target_hwnd);
+    dcomp_visual_tree_changed();
 
     if (visual->content)
         IUnknown_Release(visual->content);
@@ -2435,6 +2468,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_AddVisual(IDCompositionVisual *ifa
 
     FIXME("iface %p, visual %p, insert_above %d, reference %p.\n",
             iface, visual, insert_above, reference_visual);
+    dcomp_visual_tree_changed();
 
     if (!visual)
         return E_INVALIDARG;
@@ -2490,6 +2524,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_RemoveVisual(IDCompositionVisual *
     struct dcomp_visual *child = impl_from_IDCompositionVisual(visual);
 
     FIXME("iface %p, visual %p.\n", iface, visual);
+    dcomp_visual_tree_changed();
 
     if (!visual)
         return E_INVALIDARG;
@@ -2516,6 +2551,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_RemoveAllVisuals(IDCompositionVisu
     struct dcomp_visual *child = parent->children;
 
     FIXME("iface %p.\n", iface);
+    dcomp_visual_tree_changed();
 
     while (child)
     {
@@ -2538,36 +2574,18 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetCompositeMode(IDCompositionVisu
     return S_OK;
 }
 
-static const IDCompositionVisualVtbl dcomp_visual_vtbl =
+/* The visual carries one vtable, the IDCompositionVisual3 one: the first 20
+ * slots are layout-identical to IDCompositionVisual, the next two to
+ * IDCompositionVisual2, then IDCompositionVisualDebug and IDCompositionVisual3.
+ * The this-pointers of all four are binary-identical, so the v1 methods are
+ * cast in.  Before 09/2026 there were a v1 and a v2 table, swapped in by the
+ * desktop device -- an object handed out as IDCompositionVisual2* but carrying
+ * the 20-slot v1 table ran past its end (crash). */
+static inline struct dcomp_visual *impl_from_IDCompositionVisual3(IDCompositionVisual3 *iface)
 {
-    dcomp_visual_QueryInterface,
-    dcomp_visual_AddRef,
-    dcomp_visual_Release,
-    dcomp_visual_SetOffsetXAnimation,
-    dcomp_visual_SetOffsetX,
-    dcomp_visual_SetOffsetYAnimation,
-    dcomp_visual_SetOffsetY,
-    dcomp_visual_SetTransformObject,
-    dcomp_visual_SetTransform,
-    dcomp_visual_SetTransformParent,
-    dcomp_visual_SetEffect,
-    dcomp_visual_SetBitmapInterpolationMode,
-    dcomp_visual_SetBorderMode,
-    dcomp_visual_SetClipObject,
-    dcomp_visual_SetClip,
-    dcomp_visual_SetContent,
-    dcomp_visual_AddVisual,
-    dcomp_visual_RemoveVisual,
-    dcomp_visual_RemoveAllVisuals,
-    dcomp_visual_SetCompositeMode,
-};
+    return impl_from_IDCompositionVisual((IDCompositionVisual *)iface);
+}
 
-/* IDCompositionVisual2 extends IDCompositionVisual with two setters. Provide a
- * real v2 vtable so objects returned through IDCompositionVisual2* dispatch
- * those methods correctly instead of running past the 20-slot v1 vtable
- * (crash). The first 20 slots are layout-identical to the v1 vtable and reuse
- * its methods (the IDCompositionVisual2* and IDCompositionVisual* this-pointers
- * are binary-identical), so they are cast in. */
 static HRESULT STDMETHODCALLTYPE dcomp_visual2_SetOpacityMode(IDCompositionVisual2 *iface,
         enum DCOMPOSITION_OPACITY_MODE opacity_mode)
 {
@@ -2582,7 +2600,124 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual2_SetBackFaceVisibility(IDCompositi
     return S_OK;
 }
 
-static const IDCompositionVisual2Vtbl dcomp_visual2_vtbl =
+/* IDCompositionVisualDebug: heat map and redraw-region overlays are a
+ * developer aid on Windows and draw nothing here. */
+static HRESULT STDMETHODCALLTYPE dcomp_visual_debug_EnableHeatMap(IDCompositionVisualDebug *iface,
+        const D2D1_COLOR_F *color)
+{
+    FIXME("iface %p, color %p - stub.\n", iface, color);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual_debug_DisableHeatMap(IDCompositionVisualDebug *iface)
+{
+    TRACE("iface %p.\n", iface);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual_debug_EnableRedrawRegions(IDCompositionVisualDebug *iface)
+{
+    FIXME("iface %p - stub.\n", iface);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual_debug_DisableRedrawRegions(IDCompositionVisualDebug *iface)
+{
+    TRACE("iface %p.\n", iface);
+    return S_OK;
+}
+
+/* IDCompositionVisual3 (issue 363). */
+static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetDepthMode(IDCompositionVisual3 *iface,
+        enum DCOMPOSITION_DEPTH_MODE mode)
+{
+    struct dcomp_visual *visual = impl_from_IDCompositionVisual3(iface);
+
+    TRACE("iface %p, mode %#x.\n", iface, mode);
+
+    /* Carried, not applied: children are drawn in tree order whatever the mode
+     * says.  A spatial or sorted request is worth one line, because a tree
+     * that relies on OffsetZ for its stacking will come out in the wrong order. */
+    if (mode != DCOMPOSITION_DEPTH_MODE_TREE && mode != DCOMPOSITION_DEPTH_MODE_INHERIT)
+        FIXME("iface %p, mode %#x: depth sorting is not applied, children are drawn in tree order.\n",
+                iface, mode);
+    visual->depth_mode = mode;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOffsetZAnimation(IDCompositionVisual3 *iface,
+        IDCompositionAnimation *animation)
+{
+    FIXME("iface %p, animation %p stub!\n", iface, animation);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOffsetZ(IDCompositionVisual3 *iface, float offset_z)
+{
+    struct dcomp_visual *visual = impl_from_IDCompositionVisual3(iface);
+
+    TRACE("iface %p, offset_z %.8e.\n", iface, offset_z);
+    visual->offset_z = offset_z;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOpacityAnimation(IDCompositionVisual3 *iface,
+        IDCompositionAnimation *animation)
+{
+    FIXME("iface %p, animation %p stub!\n", iface, animation);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOpacity(IDCompositionVisual3 *iface, float opacity)
+{
+    struct dcomp_visual *visual = impl_from_IDCompositionVisual3(iface);
+
+    TRACE("iface %p, opacity %.8e.\n", iface, opacity);
+    dcomp_visual_tree_changed();
+
+    /* The documented range is 0..1.  Clamp rather than refuse: an application
+     * that is told no here stops fading and keeps the visual as it was, which
+     * is worse than drawing it at the nearest legal value. */
+    if (!(opacity >= 0.0f)) opacity = 0.0f;   /* also NaN */
+    if (opacity > 1.0f) opacity = 1.0f;
+    visual->opacity = opacity;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetTransform3DObject(IDCompositionVisual3 *iface,
+        IDCompositionTransform3D *transform)
+{
+    if (transform)
+        FIXME("iface %p, transform %p stub!\n", iface, transform);
+    else
+        TRACE("iface %p, transform %p.\n", iface, transform);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetTransform3D(IDCompositionVisual3 *iface,
+        const D2D_MATRIX_4X4_F *matrix)
+{
+    static const D2D_MATRIX_4X4_F identity = {{{1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f}}};
+
+    if (matrix && memcmp(matrix, &identity, sizeof(identity)))
+        FIXME("iface %p, matrix %p stub!\n", iface, matrix);
+    else
+        TRACE("iface %p, matrix %p (identity).\n", iface, matrix);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetVisible(IDCompositionVisual3 *iface, BOOL visible)
+{
+    struct dcomp_visual *visual = impl_from_IDCompositionVisual3(iface);
+
+    TRACE("iface %p, visible %d.\n", iface, visible);
+    dcomp_visual_tree_changed();
+    visual->visible = !!visible;
+    return S_OK;
+}
+
+static const IDCompositionVisual3Vtbl dcomp_visual_vtbl =
 {
     (void *)dcomp_visual_QueryInterface,
     (void *)dcomp_visual_AddRef,
@@ -2604,9 +2739,32 @@ static const IDCompositionVisual2Vtbl dcomp_visual2_vtbl =
     (void *)dcomp_visual_RemoveVisual,
     (void *)dcomp_visual_RemoveAllVisuals,
     (void *)dcomp_visual_SetCompositeMode,
-    dcomp_visual2_SetOpacityMode,
-    dcomp_visual2_SetBackFaceVisibility,
+    /* IDCompositionVisual2 */
+    (void *)dcomp_visual2_SetOpacityMode,
+    (void *)dcomp_visual2_SetBackFaceVisibility,
+    /* IDCompositionVisualDebug */
+    (void *)dcomp_visual_debug_EnableHeatMap,
+    (void *)dcomp_visual_debug_DisableHeatMap,
+    (void *)dcomp_visual_debug_EnableRedrawRegions,
+    (void *)dcomp_visual_debug_DisableRedrawRegions,
+    /* IDCompositionVisual3 */
+    dcomp_visual3_SetDepthMode,
+    dcomp_visual3_SetOffsetZAnimation,
+    dcomp_visual3_SetOffsetZ,
+    dcomp_visual3_SetOpacityAnimation,
+    dcomp_visual3_SetOpacity,
+    dcomp_visual3_SetTransform3DObject,
+    dcomp_visual3_SetTransform3D,
+    dcomp_visual3_SetVisible,
 };
+
+/* The root's share of what its subtree is drawn with.  Its own content -- the
+ * surface or swapchain the present path draws -- is not scaled by this; see
+ * dcomp_target_present_region(). */
+static float dcomp_visual_root_opacity(const struct dcomp_visual *root)
+{
+    return root->visible ? root->opacity : 0.0f;
+}
 
 #define WM_WINE_DCOMP_SET_TARGET (WM_USER + 0x100)
 
@@ -3205,12 +3363,19 @@ struct dcomp_leaf_stats
  * removed code: an application that does build such a tree says so in the log
  * instead of losing its pixels in silence. */
 static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp_visual *visual,
-        int base_x, int base_y, unsigned int idx, struct dcomp_leaf_stats *stats)
+        int base_x, int base_y, float base_opacity, unsigned int idx, struct dcomp_leaf_stats *stats)
 {
     WCHAR prop_name[64];
     struct dcomp_visual *child;
     int vx = base_x + (int)visual->offset_x;
     int vy = base_y + (int)visual->offset_y;
+    float op = base_opacity * visual->opacity;
+
+    /* Hidden subtrees are neither written nor counted: the reader would not
+     * draw them, and the commit note should not call a root with only hidden
+     * children a tree with leaves (issue 363). */
+    if (!visual->visible || op <= 0.0f)
+        return idx;
 
     if (visual->surface_content)
     {
@@ -3270,6 +3435,13 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
                         L"__wine_dcomp_child_%u_offset", idx);
                 SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
 
+                /* Written for every leaf, opaque ones included: the slots are
+                 * reused from commit to commit and a stale factor would fade a
+                 * leaf that has since become opaque. */
+                swprintf(prop_name, ARRAY_SIZE(prop_name),
+                        L"__wine_dcomp_child_%u_opacity", idx);
+                SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)wine_dcomp_opacity_to_prop(op));
+
                 ++idx;
             }
             else
@@ -3289,7 +3461,7 @@ static unsigned int dcomp_serialize_visual_leaves(HWND target_hwnd, struct dcomp
     }
 
     for (child = visual->children; child; child = child->next_sibling)
-        idx = dcomp_serialize_visual_leaves(target_hwnd, child, vx, vy, idx, stats);
+        idx = dcomp_serialize_visual_leaves(target_hwnd, child, vx, vy, op, idx, stats);
 
     return idx;
 }
@@ -3370,6 +3542,8 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
     BOOL rootless = FALSE;
     unsigned int idx = 0;
     ULONG_PTR gen;
+    /* Read before the walk: a change that lands during it stays stale. */
+    LONG tree_gen = InterlockedCompareExchange(&dcomp_tree_generation, 0, 0);
 
     if (!root || !root->children || !target_hwnd)
     {
@@ -3379,6 +3553,8 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
         {
             SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)0);
             KillTimer(target_hwnd, DCOMP_TREE_TIMER);
+            if (root)
+                root->serialized_gen = tree_gen;
         }
 
         /* This return is the most frequent outcome in production and the only one
@@ -3424,11 +3600,13 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
         struct dcomp_visual *child;
         for (child = root->children; child; child = child->next_sibling)
             idx = dcomp_serialize_visual_leaves(target_hwnd, child,
-                    (int)root->offset_x, (int)root->offset_y, idx, &stats);
+                    (int)root->offset_x, (int)root->offset_y,
+                    dcomp_visual_root_opacity(root), idx, &stats);
     }
 
     SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)(ULONG_PTR)idx);
     SetPropW(target_hwnd, WINE_DCOMP_CHILD_GEN_PROP, (HANDLE)(gen + 1));
+    root->serialized_gen = tree_gen;
 
     /* Rootless tree (Chromium): no root Present will ever composite the
      * leaves. In-process targets get the 100ms timer as backstop; foreign-
@@ -3787,8 +3965,10 @@ static void dcomp_restore_area_to_host(struct dcomp_target *target,
             owner, top, target, target->hwnd);
 }
 
+/* opacity: 0 draws the source as it is, 1..255 scales it by opacity/256 first
+ * (see wine_dcomp_opacity_to_prop() in dcomp_layer.h). */
 static void dcomp_composite_premul_over(DWORD *dst_bits, UINT dst_w, UINT dst_h,
-        const DWORD *src_bits, UINT src_w, UINT src_h, int ox, int oy)
+        const DWORD *src_bits, UINT src_w, UINT src_h, int ox, int oy, unsigned int opacity)
 {
     int src_x = (ox < 0) ? -ox : 0;
     int src_y = (oy < 0) ? -oy : 0;
@@ -3808,7 +3988,11 @@ static void dcomp_composite_premul_over(DWORD *dst_bits, UINT dst_w, UINT dst_h,
         for (x = 0; x < copy_w; x++)
         {
             DWORD s = src_row[x];
-            BYTE sa = (s >> 24);
+            BYTE sa;
+
+            if (opacity)
+                s = wine_dcomp_scale_premul(s, opacity);
+            sa = (s >> 24);
             if (sa == 0xff)
             {
                 dst_row[x] = s;
@@ -3880,11 +4064,21 @@ static void dcomp_surface_ensure_bits(struct dcomp_surface *surface)
 }
 
 static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dcomp_visual *visual,
-        int base_x, int base_y)
+        int base_x, int base_y, float base_opacity)
 {
     struct dcomp_visual *child;
     int vx = base_x + (int)visual->offset_x;
     int vy = base_y + (int)visual->offset_y;
+    float op = base_opacity * visual->opacity;
+    unsigned int opacity;
+
+    /* An invisible visual hides its subtree; opacity multiplies down it
+     * (issue 363).  Note the backdrop of this path is the window itself: a
+     * translucent leaf composited over its own previous delivery converges to
+     * opaque across timer passes, as any leaf pixel below alpha 255 does here. */
+    if (!visual->visible || op <= 0.0f)
+        return;
+    opacity = wine_dcomp_opacity_to_prop(op);
 
     if (visual->surface_content && visual->surface_content->bits)
     {
@@ -3893,7 +4087,7 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
         dcomp_surface_ensure_bits(visual->surface_content);
         dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
                 visual->surface_content->bits, visual->surface_content->width,
-                visual->surface_content->height, vx, vy);
+                visual->surface_content->height, vx, vy, opacity);
     }
     else if (dcomp_visual_effective_texture(visual))
     {
@@ -3907,7 +4101,7 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
         if (tex->bits)
         {
             dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
-                    tex->bits, tex->bits_width, tex->bits_height, vx, vy);
+                    tex->bits, tex->bits_width, tex->bits_height, vx, vy, opacity);
         }
     }
     else if (visual->content)
@@ -3942,16 +4136,17 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
                     h = (h ^ (DWORD)(ULONG_PTR)comp_wnd) * 16777619u;
                     h = (h ^ (DWORD)dims) * 16777619u;
                     h = (h ^ (DWORD)(vx * 65599 + vy)) * 16777619u;
+                    h = (h ^ (DWORD)opacity) * 16777619u;
                     target->walk_leaf_hash = h;
                 }
                 dcomp_composite_premul_over(target->comp_bits, target->comp_width,
-                        target->comp_height, bits, LOWORD(dims), HIWORD(dims), vx, vy);
+                        target->comp_height, bits, LOWORD(dims), HIWORD(dims), vx, vy, opacity);
             }
         }
     }
 
     for (child = visual->children; child; child = child->next_sibling)
-        dcomp_target_composite_leaves(target, child, vx, vy);
+        dcomp_target_composite_leaves(target, child, vx, vy, op);
 }
 
 /* Does any visual below this one carry content of its own?  Pointer walk over
@@ -4164,12 +4359,17 @@ static BOOL dcomp_cover_frame(void)
 }
 
 static void dcomp_target_collect_covered(struct dcomp_visual *visual, int base_x, int base_y,
-        HRGN region, BOOL *unresolved)
+        float base_opacity, HRGN region, BOOL *unresolved)
 {
     struct dcomp_visual *child;
     int vx = base_x + (int)visual->offset_x;
     int vy = base_y + (int)visual->offset_y;
+    float op = base_opacity * visual->opacity;
     UINT w, h;
+
+    /* Same gate as the composite: what it would not draw covers nothing. */
+    if (!visual->visible || op <= 0.0f)
+        return;
 
     if (dcomp_visual_leaf_extent(visual, &w, &h))
     {
@@ -4190,7 +4390,7 @@ static void dcomp_target_collect_covered(struct dcomp_visual *visual, int base_x
     }
 
     for (child = visual->children; child; child = child->next_sibling)
-        dcomp_target_collect_covered(child, vx, vy, region, unresolved);
+        dcomp_target_collect_covered(child, vx, vy, op, region, unresolved);
 }
 
 static void dcomp_target_update_covered(struct dcomp_target *target, const RECT *client_rc)
@@ -4207,7 +4407,8 @@ static void dcomp_target_update_covered(struct dcomp_target *target, const RECT 
 
     for (child = target->root_visual->children; child; child = child->next_sibling)
         dcomp_target_collect_covered(child, (int)target->root_visual->offset_x,
-                (int)target->root_visual->offset_y, current, &unresolved);
+                (int)target->root_visual->offset_y,
+                dcomp_visual_root_opacity(target->root_visual), current, &unresolved);
 
     /* Only the part inside the client area counts (issue 298, review C5).  A
      * leaf larger than the window, at a negative offset or reaching past the
@@ -4725,7 +4926,8 @@ static void dcomp_target_publish_layer(struct dcomp_target *target, const RECT *
     target->comp_width = w;
     target->comp_height = h;
     for (child = root->children; child; child = child->next_sibling)
-        dcomp_target_composite_leaves(target, child, (int)root->offset_x, (int)root->offset_y);
+        dcomp_target_composite_leaves(target, child, (int)root->offset_x, (int)root->offset_y,
+                dcomp_visual_root_opacity(root));
     target->comp_bits = saved_bits;
     target->comp_width = saved_w;
     target->comp_height = saved_h;
@@ -4884,7 +5086,7 @@ static void dcomp_target_deliver_region(struct dcomp_target *target, const RECT 
 
         for (child = root->children; child; child = child->next_sibling)
             dcomp_target_composite_leaves(target, child,
-                    (int)root->offset_x, (int)root->offset_y);
+                    (int)root->offset_x, (int)root->offset_y, dcomp_visual_root_opacity(root));
     }
     LeaveCriticalSection(&target->device->cs);
 
@@ -5259,7 +5461,7 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
 
         for (child = root->children; child; child = child->next_sibling)
             dcomp_target_composite_leaves(target, child,
-                    (int)root->offset_x, (int)root->offset_y);
+                    (int)root->offset_x, (int)root->offset_y, dcomp_visual_root_opacity(root));
 
         if (++comp_tree_log <= 5 || !(comp_tree_log % 100))
             FIXME("Composited visual tree #%u onto target hwnd %p (%ldx%ld).\n",
@@ -5579,6 +5781,12 @@ static UINT64 dcomp_visual_surface_signature(const struct dcomp_visual *visual,
     int vx = base_x + (int)visual->offset_x;
     int vy = base_y + (int)visual->offset_y;
 
+    /* Opacity and visibility of every visual, leaf or container: a change on
+     * either is a new frame with the same surfaces in the same places
+     * (issue 363). */
+    sig = (sig ^ ((UINT64)(visual->visible ? 1 : 0) << 32
+            | wine_dcomp_opacity_to_prop(visual->opacity))) * 1099511628211ull;
+
     if (surf)
     {
         sig = (sig ^ (UINT_PTR)surf) * 1099511628211ull;
@@ -5613,7 +5821,11 @@ static BOOL dcomp_visual_surface_has_pending(const struct dcomp_visual *visual)
     const struct dcomp_visual *child;
 
     /* Same gate as the composite: a leaf it would skip cannot be read back
-     * there, and counting it here would present on every commit for good. */
+     * there, and counting it here would present on every commit for good.
+     * A hidden subtree is skipped the same way; its pending pixels count
+     * again once it is shown. */
+    if (!visual->visible || visual->opacity <= 0.0f)
+        return FALSE;
     if (surf && surf->has_pending && surf->bits && surf->width && surf->height)
         return TRUE;
 
@@ -5832,12 +6044,18 @@ static void dcomp_target_present_nested(struct dcomp_target *target,
  * Texture leaves are still not drawn here -- dcomp_commit_visual_tree() reports
  * those ("Leaves not composited"). */
 static void dcomp_target_composite_surface_leaves(struct dcomp_target *target,
-        struct dcomp_visual *visual, int base_x, int base_y, UINT dst_w, UINT dst_h)
+        struct dcomp_visual *visual, int base_x, int base_y, float base_opacity,
+        UINT dst_w, UINT dst_h)
 {
     struct dcomp_surface *surf = visual->surface_content;
     struct dcomp_visual *child;
     int vx = base_x + (int)visual->offset_x;
     int vy = base_y + (int)visual->offset_y;
+    float op = base_opacity * visual->opacity;
+
+    /* Hidden subtree, or faded out entirely (issue 363). */
+    if (!visual->visible || op <= 0.0f)
+        return;
 
     if (surf && surf->bits && surf->width && surf->height)
     {
@@ -5856,11 +6074,11 @@ static void dcomp_target_composite_surface_leaves(struct dcomp_target *target,
                     surf->width, surf->height, vx, vy, dst_w, dst_h);
 
         dcomp_composite_premul_over(target->comp_bits, dst_w, dst_h,
-                surf->bits, surf->width, surf->height, vx, vy);
+                surf->bits, surf->width, surf->height, vx, vy, wine_dcomp_opacity_to_prop(op));
     }
 
     for (child = visual->children; child; child = child->next_sibling)
-        dcomp_target_composite_surface_leaves(target, child, vx, vy, dst_w, dst_h);
+        dcomp_target_composite_surface_leaves(target, child, vx, vy, op, dst_w, dst_h);
 }
 
 /* Present region [left,right)x[top,bottom) of the target's root surface to its HWND.
@@ -5890,13 +6108,26 @@ static void dcomp_target_present_region(struct dcomp_target *target,
     }
 
     /* Composite the surface leaves below the root on top (premultiplied alpha
-     * over), depth first with accumulated offsets. */
+     * over), depth first with accumulated offsets and opacity. */
     {
+        struct dcomp_visual *root = target->root_visual;
         struct dcomp_visual *child;
 
-        for (child = target->root_visual->children; child; child = child->next_sibling)
+        /* The root's own surface was copied above as it is: its opacity and
+         * visibility reach its children only (issue 363).  Nothing measured
+         * sets either on a content root; say so once if something does. */
+        if (root->opacity < 1.0f || !root->visible)
+        {
+            static unsigned int root_note;
+
+            if (++root_note <= 3)
+                FIXME("Root visual %p carries opacity %.3f visible %d: applied to its children, "
+                        "not to its own surface.\n", root, root->opacity, root->visible);
+        }
+
+        for (child = root->children; child; child = child->next_sibling)
             dcomp_target_composite_surface_leaves(target, child, 0, 0,
-                    surface->width, surface->height);
+                    dcomp_visual_root_opacity(root), surface->width, surface->height);
     }
 
     target->children_sig = dcomp_target_children_signature(target);
@@ -6222,6 +6453,22 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
         struct dcomp_surface *surface;
         LONGLONG now;
 
+        /* A swapchain root or a rootless tree: the leaf set is written by the
+         * AddVisual/SetContent hooks, and wined3d (or the tree timer) draws
+         * from it.  A property change alone -- offset, opacity, visibility --
+         * has no hook, so it took effect only with the next structural change;
+         * Cubase-style fades and hides would be lost on those trees.  Written
+         * again here when something changed since the last serialization,
+         * which keeps the per-frame SetContent of Chromium at one write
+         * (issue 363).  A tree built before SetRoot is caught the same way. */
+        if (target->root_visual && !target->root_visual->surface_content
+                && target->root_visual->serialized_gen
+                        != InterlockedCompareExchange(&dcomp_tree_generation, 0, 0))
+        {
+            dcomp_commit_visual_tree(target->hwnd, target->root_visual);
+            continue;
+        }
+
         if (!target->root_visual || !target->root_visual->surface_content)
             continue;
 
@@ -6461,8 +6708,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateVisual(IDCompositionDevice *
     if (!(object = calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    object->IDCompositionVisual_iface.lpVtbl = &dcomp_visual_vtbl;
+    object->IDCompositionVisual_iface.lpVtbl = (const IDCompositionVisualVtbl *)&dcomp_visual_vtbl;
     object->refcount = 1;
+    object->opacity = 1.0f;
+    object->visible = TRUE;
 
     TRACE("Created composition visual %p.\n", object);
 
@@ -6897,11 +7146,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateVisual(
     if (FAILED(hr = dcomp_device_CreateVisual(&device->IDCompositionDevice_iface, &v1)))
         return hr;
 
-    /* The v1 path creates the object with the v1 vtable; swap it for the real
-     * IDCompositionVisual2 vtable so the Visual2-only methods dispatch
-     * correctly instead of running past the 20-slot v1 vtable. */
-    impl_from_IDCompositionVisual(v1)->IDCompositionVisual_iface.lpVtbl =
-            (const IDCompositionVisualVtbl *)&dcomp_visual2_vtbl;
+    /* One vtable for every interface in the chain (see dcomp_visual_vtbl). */
     *visual = (IDCompositionVisual2 *)v1;
     return S_OK;
 }
