@@ -277,7 +277,19 @@ static GstFlowReturn transform_sink_chain_cb(GstPad *pad, GstObject *parent, Gst
 static gboolean transform_src_query_latency(struct wg_transform *transform, GstQuery *query)
 {
     GST_LOG("transform %p, %"GST_PTR_FORMAT, transform, query);
-    gst_query_set_latency(query, transform->attrs.low_latency, 0, 0);
+
+    /* A transform has no clock and no consumer of its own: the caller pushes
+     * a sample and reads the next frame back right away, so a decoder that
+     * keeps frames in flight to pipeline decoding against display only
+     * delays the caller. The GstH264Decoder family asks upstream whether it
+     * is live before choosing that delay: nvh264dec keeps two extra frames
+     * for a non-live source and none for a live one. Report the transform as
+     * live regardless of MF_LOW_LATENCY. Measured with Cubase 15, which
+     * drives the H.264 decoder itself (issue 356): a frame came back four
+     * inputs late and now comes back two inputs late, and the application
+     * no longer restarts the decoder at every keyframe, which left its video
+     * player black for 0.7 s each time. */
+    gst_query_set_latency(query, TRUE, 0, 0);
     return true;
 }
 

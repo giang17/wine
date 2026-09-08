@@ -206,10 +206,16 @@ This is the recommended branch. What it changes, by subsystem:
   and does not upload a frame without it; `ID2D1DeviceContext::DrawImage` dropped every
   custom effect with "Unhandled effect" (effects with a single draw transform and bitmap
   inputs are now drawn through the application's pixel shader); and the decoder's pool of
-  ten D3D samples ran empty, because the GStreamer pipeline returns a frame two to four
-  inputs late and the player holds every frame it has been handed until its next drain,
-  so more than ten at a time (the pool now grows to 32 on demand). The video window
-  shows the picture in stop and play
+  ten D3D samples ran empty, because the player decodes about twelve frames ahead and
+  holds the sample of every frame in that window until it has been shown — thirteen at a
+  time, fifteen around a restart (the pool now grows to 32 on demand). The decoder also
+  returned every frame four inputs late: one held by `h264parse` until the next access
+  unit starts, two kept by `nvh264dec` to pipeline decoding against display because the
+  transform answered the latency query as not live, one by the DPB bookkeeping of
+  GStreamer's H.264 decoder base class. The transform now reports itself as live, which
+  drops the two pipelining frames and with them the decoder restart the player performed
+  at every keyframe, where the picture went black for 0.7 s. The video window shows the
+  picture in stop and play
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
 - **Direct2D for JUCE 8.0.13+ (ntdll, wine.inf)**: JUCE 8.0.13 and later pick their
