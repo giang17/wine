@@ -658,10 +658,12 @@ static void comp_buffer_alpha_copy(DWORD *dst_bits, unsigned int dst_pitch,
 
 /* Porter-Duff Over: C_out = C_src + C_dst * (1 - alpha_src)
  * Both src and dst are premultiplied alpha BGRA. */
+/* opacity: 0 draws the source as it is, 1..255 scales it by opacity/256 first
+ * (wine_dcomp_opacity_to_prop() in dcomp_layer.h). */
 static void composite_over_premul(DWORD *dst, const DWORD *src,
         unsigned int dst_stride, unsigned int src_stride,
         int dst_x, int dst_y, int src_w, int src_h,
-        int dst_total_w, int dst_total_h)
+        int dst_total_w, int dst_total_h, unsigned int opacity)
 {
     int y, x;
     int x_end = dst_x + src_w;
@@ -683,7 +685,11 @@ static void composite_over_premul(DWORD *dst, const DWORD *src,
         for (x = 0; x < width; ++x)
         {
             DWORD s = sp[x];
-            unsigned int sa = (s >> 24) & 0xff;
+            unsigned int sa;
+
+            if (opacity)
+                s = wine_dcomp_scale_premul(s, opacity);
+            sa = (s >> 24) & 0xff;
 
             if (sa == 0)
                 continue;  /* Fully transparent — skip */
@@ -764,7 +770,7 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         HWND child_wnd;
         DWORD *child_bits;
         LPARAM child_dims, child_offset;
-        unsigned int cw, ch;
+        unsigned int cw, ch, child_opacity;
         int ox, oy;
 
         swprintf(prop_name, ARRAY_SIZE(prop_name),
@@ -813,12 +819,21 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         ox = (short)LOWORD(child_offset);
         oy = (short)HIWORD(child_offset);
 
+        /* Opacity in 256ths, 0 = opaque (issue 363, see dcomp_layer.h).  A
+         * value the protocol does not define is drawn opaque. */
+        swprintf(prop_name, ARRAY_SIZE(prop_name),
+                L"__wine_dcomp_child_%u_opacity", i);
+        child_opacity = (unsigned int)(ULONG_PTR)GetPropW(swapchain->win_handle, prop_name);
+        if (child_opacity > 255)
+            child_opacity = 0;
+
         {
             static unsigned int comp_log_count;
             ++comp_log_count;
             if (comp_log_count <= 10 || !(comp_log_count % 500))
-                TRACE("Composite child #%u: wnd=%p bits=%p %ux%u at (%d,%d) onto %ux%u.\n",
-                        i, child_wnd, child_bits, cw, ch, ox, oy, dst_w, dst_h);
+                TRACE("Composite child #%u: wnd=%p bits=%p %ux%u at (%d,%d) opacity %u/256 onto %ux%u.\n",
+                        i, child_wnd, child_bits, cw, ch, ox, oy,
+                        child_opacity ? child_opacity : 256, dst_w, dst_h);
         }
 
         /* Flush GDI operations on child's comp_dc before reading bits */
@@ -831,7 +846,7 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         composite_over_premul(swapchain->comp_bits, child_bits,
                 dst_w, cw,
                 ox, oy, cw, ch,
-                dst_w, dst_h);
+                dst_w, dst_h, child_opacity);
     }
 
     gen_after = (ULONG_PTR)GetPropW(swapchain->win_handle, WINE_DCOMP_CHILD_GEN_PROP);
@@ -1007,7 +1022,7 @@ static BOOL swapchain_composite_layer(struct wined3d_swapchain *swapchain, DWORD
     for (i = 0; i < n; ++i)
         composite_over_premul(dst, layer->bits + (SIZE_T)rects[i].top * layer->width + rects[i].left,
                 dst_stride_dwords, layer->width, rects[i].left, rects[i].top,
-                rects[i].right - rects[i].left, rects[i].bottom - rects[i].top, dst_w, dst_h);
+                rects[i].right - rects[i].left, rects[i].bottom - rects[i].top, dst_w, dst_h, 0);
     ReleaseSRWLockShared(&layer->lock);
     InterlockedIncrement(&layer->drawn);
 

@@ -103,6 +103,35 @@
  * behavior. */
 #define WINE_DCOMP_CHILD_GEN_PROP   L"__wine_dcomp_child_gen"
 
+/* Opacity of a serialized leaf, __wine_dcomp_child_<i>_opacity on the target
+ * window (issue 363): 0 -- or the property missing -- draws the leaf as it is,
+ * 1..255 scales it by that many 256ths.  dcomp writes it for every leaf, so a
+ * slot reused by a leaf that has since become opaque carries no stale factor;
+ * a subtree that is hidden or faded out entirely is not serialized at all.  A
+ * wined3d half from before the property draws every leaf opaque. */
+static inline unsigned int wine_dcomp_opacity_to_prop(float opacity)
+{
+    unsigned int v;
+
+    if (opacity >= 1.0f)
+        return 0;
+    v = (unsigned int)(opacity * 256.0f + 0.5f);
+    if (v >= 256)
+        return 0;
+    return v ? v : 1;
+}
+
+/* Scale a premultiplied BGRA pixel by op/256, op in 1..255: all four channels,
+ * so the result stays premultiplied.  Two lanes per multiply; 255 * 255 + 128
+ * fits a 16-bit lane. */
+static inline DWORD wine_dcomp_scale_premul(DWORD s, unsigned int op)
+{
+    DWORD rb = ((s & 0x00ff00ff) * op + 0x00800080) >> 8;
+    DWORD ag = (((s >> 8) & 0x00ff00ff) * op + 0x00800080) >> 8;
+
+    return ((ag & 0x00ff00ff) << 8) | (rb & 0x00ff00ff);
+}
+
 /* Rectangles carried per frame before the region is given up on and its
  * bounding box published instead.  A tree of a transport playhead and a
  * dragged selection is two rectangles a thousand pixels apart, and their

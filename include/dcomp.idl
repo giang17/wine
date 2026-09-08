@@ -354,6 +354,40 @@ interface IDCompositionVisual2 : IDCompositionVisual
 
 [
     object,
+    uuid(fed2b808-5eb4-43a0-aea3-35f65280f91b),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionVisualDebug : IDCompositionVisual2
+{
+    /* C++ method: HRESULT EnableHeatMap(const D2D1_COLOR_F &color); Use pointer instead of reference */
+    HRESULT EnableHeatMap([in] const D2D1_COLOR_F *color);
+    HRESULT DisableHeatMap();
+    HRESULT EnableRedrawRegions();
+    HRESULT DisableRedrawRegions();
+}
+
+[
+    object,
+    uuid(2775f462-b6c1-4015-b0be-b3e7d6a4976d),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionVisual3 : IDCompositionVisualDebug
+{
+    HRESULT SetDepthMode([in] enum DCOMPOSITION_DEPTH_MODE mode);
+    HRESULT SetOffsetZAnimation([in] IDCompositionAnimation *animation);
+    HRESULT SetOffsetZ([in] float offset_z);
+    HRESULT SetOpacityAnimation([in] IDCompositionAnimation *animation);
+    HRESULT SetOpacity([in] float opacity);
+    HRESULT SetTransform3DObject([in] IDCompositionTransform3D *transform);
+    /* C++ method: HRESULT SetTransform(const D2D_MATRIX_4X4_F &matrix); Use pointer instead of reference */
+    HRESULT SetTransform3D([in] const D2D_MATRIX_4X4_F *matrix);
+    HRESULT SetVisible([in] BOOL visible);
+}
+
+[
+    object,
     uuid(eacdd04c-117e-4e17-88f4-d1b12b0e3d89),
     local,
     pointer_default(unique)
