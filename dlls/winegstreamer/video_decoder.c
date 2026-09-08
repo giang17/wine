@@ -450,12 +450,16 @@ static HRESULT init_allocator(struct video_decoder *decoder)
     if (FAILED(hr = IMFTransform_SetOutputType(decoder->copier, 0, decoder->output_type, 0)))
         return hr;
 
-    /* Windows hands out ten D3D samples and then reports the allocator
-     * empty (mf/tests). A pipelined GStreamer decoder returns a frame two to
-     * four inputs late, so an application that decodes ahead and drains once
-     * per frame holds more than ten samples between presentations and stalls
-     * at ten (Cubase's video player, issue 355). Keep ten eager samples and
-     * let the pool grow to 32 on demand. */
+    /* Upstream initialises the pool with ten samples, the figure mf/tests
+     * measures for the video processor; no test measures the decoder's pool
+     * on Windows. Cubase 15's video engine decodes about twelve frames ahead
+     * and holds the D3D sample of every frame in that window until the
+     * frame has been shown: thirteen samples throughout playback, up to
+     * fifteen around a decoder restart, independent of how quickly the
+     * decoder returns a frame (issues 355 and 356). With ten samples the
+     * window never fills, the allocator reports MF_E_SAMPLEALLOCATOR_EMPTY
+     * and the player stays black. Keep ten eager samples and let the pool
+     * grow to 32 on demand. */
     if (FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(decoder->allocator, 10, 32,
             decoder->attributes, decoder->output_type)))
         return hr;
