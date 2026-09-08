@@ -5406,6 +5406,33 @@ static LONGLONG dcomp_qpc_freq(void)
     return freq;
 }
 
+/* Refresh rate of the primary display, for the frame clock GetFrameStatistics
+ * reports (issue 358).  Re-queried at most once a second: the application
+ * polls the clock a couple of hundred times a second and the mode does not
+ * change between polls.  A dmDisplayFrequency of 0 or 1 means "hardware
+ * default", i.e. unknown; 60 Hz is the fallback DwmGetCompositionTimingInfo
+ * uses as well. */
+static UINT dcomp_display_frequency(void)
+{
+    static UINT cached;
+    static LONGLONG queried;
+    LONGLONG now = dcomp_qpc_now();
+    DEVMODEW mode;
+
+    if (cached && now - queried < dcomp_qpc_freq())
+        return cached;
+
+    memset(&mode, 0, sizeof(mode));
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsExW(NULL, ENUM_CURRENT_SETTINGS, &mode, 0)
+            && (mode.dmFields & DM_DISPLAYFREQUENCY) && mode.dmDisplayFrequency > 1)
+        cached = mode.dmDisplayFrequency;
+    else
+        cached = 60;
+    queried = now;
+    return cached;
+}
+
 /* Fold one subtree's surface leaves into the fingerprint, depth first with
  * accumulated offsets -- the placement is what a container visual above the
  * leaf can change without the leaf itself moving. */
@@ -6109,10 +6136,32 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_WaitForCommitCompletion(IDComposit
 static HRESULT STDMETHODCALLTYPE dcomp_device_GetFrameStatistics(IDCompositionDevice *iface,
         DCOMPOSITION_FRAME_STATISTICS *statistics)
 {
-    FIXME("iface %p, statistics %p stub!\n", iface, statistics);
+    LONGLONG freq = dcomp_qpc_freq(), now = dcomp_qpc_now(), period;
+    UINT rate = dcomp_display_frequency();
 
-    if (statistics)
-        memset(statistics, 0, sizeof(*statistics));
+    TRACE("iface %p, statistics %p.\n", iface, statistics);
+
+    if (!statistics)
+        return E_INVALIDARG;
+
+    /* Windows hands out the DWM's frame clock here: the vblank the compositor
+     * last presented on and the one it will present on next, in QPC units.
+     * We have no vblank of our own -- presents are coalesced on a timer -- so
+     * the clock is a refresh-period grid over QPC, the same one our
+     * DwmGetCompositionTimingInfo reports.  The previous stub returned zeros:
+     * a clock that never advances, and a FIXME for every call.  Cubase 15
+     * reads it 200 times a second from its GUI thread while the video player
+     * runs (a fixed 100 Hz loop, two reads per pass -- the rate does not
+     * depend on what it gets back) and uses the answer to decide whether to
+     * wait for its commit: with a real clock it calls WaitForCommitCompletion
+     * 40 % less often (issue 358). */
+    period = freq / rate;
+    statistics->currentCompositionRate.Numerator = rate;
+    statistics->currentCompositionRate.Denominator = 1;
+    statistics->timeFrequency.QuadPart = freq;
+    statistics->currentTime.QuadPart = now;
+    statistics->lastFrameTime.QuadPart = now - now % period;
+    statistics->nextEstimatedFrameTime.QuadPart = statistics->lastFrameTime.QuadPart + period;
     return S_OK;
 }
 
