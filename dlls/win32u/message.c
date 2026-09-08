@@ -2239,6 +2239,16 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
             /* fallthrough */
         default:
             send_message( hwnd, WM_SYSCOMMAND, state_cmd, 0 );
+            /* A window manager may deliver the maximized state and the geometry it chose for the
+             * maximized window in one event batch; the driver then reports a config change together
+             * with the state command. SC_MAXIMIZE has placed the window with the win32 idea of the
+             * maximized rects, which need not match where the window manager put the X window (a
+             * title bar taller than the win32 caption offsets everything painted against everything
+             * hit-tested). Apply the window manager's geometry on top, the same as when its configure
+             * arrives in a later batch. */
+            if (state_cmd == SC_MAXIMIZE && swp_flags)
+                NtUserSetWindowPos( hwnd, 0, window_rect.left, window_rect.top, window_rect.right - window_rect.left,
+                                    window_rect.bottom - window_rect.top, swp_flags );
             break;
         case 0:
             if (!swp_flags) break;
