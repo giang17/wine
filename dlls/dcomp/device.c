@@ -19,6 +19,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <math.h>
 
 #define INITGUID
 #define COBJMACROS
@@ -112,6 +113,7 @@ static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp
  * +17 pp for one view (UVI Portal), +9.9 pp for two (Live 12). */
 #define DCOMP_TREE_TIMER     ((UINT_PTR)0xDC0FFEE2)
 #define DCOMP_TREE_TIMER_MS  16
+#define DCOMP_ANIMATION_TIMER ((UINT_PTR)0xDC0FFEE3)   /* issue 364 */
 #define DCOMP_TREE_FRAME_MS  16   /* ~60 Hz rate limit for hook-driven composites */
 
 /* Measurement dial (issue 206): the tree timer period, adjustable without a
@@ -178,6 +180,8 @@ static void dcomp_send_child_mode(IUnknown *content)
 static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface);
 static LONGLONG dcomp_qpc_now(void);
 static LONGLONG dcomp_qpc_freq(void);
+struct dcomp_target;
+static BOOL dcomp_target_animate(struct dcomp_target *target, LONGLONG now, BOOL commit);
 static void dcomp_device_auto_commit(IDCompositionDevice *iface);
 
 /* =====================================================================
@@ -2083,6 +2087,379 @@ static HRESULT dcomp_effect_group_create(IDCompositionEffectGroup **out)
     return S_OK;
 }
 
+/* IDCompositionAnimation (issue 364).
+ *
+ * An animation is a piecewise function of time: cubic and sinusoidal
+ * segments, each starting at an offset in seconds from the begin time and
+ * lasting until the next one; a repeat segment that plays the stretch before
+ * it again; an end segment that fixes the final value.  The property setters
+ * take one in place of a value -- offset, opacity -- and the compositor
+ * evaluates it against its clock at every frame.
+ *
+ * Until 08.09.2026 CreateAnimation answered E_NOTIMPL.  Cubase 15 asks for one
+ * per visual it builds (130 per start) and, refused, set its values directly:
+ * the UI was complete, what was missing was the motion -- fades, slides, the
+ * animated part of a panel opening.
+ *
+ * The object only records what the application adds.  The binding on the
+ * visual takes a copy at Commit (dcomp_visual_animate below), so the
+ * application may Release or Reset the object afterwards, as the Windows
+ * documentation allows.  Transforms and clips are stubs here, so those
+ * bindings do not exist yet; the visual's offset and opacity are the ones
+ * an application can animate. */
+enum dcomp_animation_segment_kind
+{
+    DCOMP_SEGMENT_CUBIC,
+    DCOMP_SEGMENT_SINUSOIDAL,
+    DCOMP_SEGMENT_REPEAT,
+    DCOMP_SEGMENT_END,
+};
+
+struct dcomp_animation_segment
+{
+    enum dcomp_animation_segment_kind kind;
+    double offset;                  /* seconds after the begin time */
+    union
+    {
+        float cubic[4];             /* constant, linear, quadratic, cubic coefficient */
+        struct { float bias, amplitude, frequency, phase; } sinusoidal;
+        double repeat_duration;     /* the seconds before the offset, played again */
+        float end_value;
+    } u;
+};
+
+struct dcomp_animation_function
+{
+    struct dcomp_animation_segment *segments;
+    unsigned int count;
+    LONGLONG absolute_begin;        /* QPC ticks; 0 = the Commit that applies it */
+};
+
+struct dcomp_animation
+{
+    IDCompositionAnimation IDCompositionAnimation_iface;
+    LONG refcount;
+    struct dcomp_animation_function fn;
+    unsigned int capacity;
+};
+
+#define DCOMP_PI 3.14159265358979323846
+
+static float dcomp_animation_eval_segment(const struct dcomp_animation_function *fn,
+        unsigned int i, double l, unsigned int depth);
+
+/* The function's value t seconds after its begin, using only the segments
+ * before `limit' (the whole function: limit = count).  Before the first
+ * segment it holds that segment's starting value; a segment lasts until the
+ * next one begins, the last one for good. */
+static float dcomp_animation_eval_before(const struct dcomp_animation_function *fn,
+        unsigned int limit, double t, unsigned int depth)
+{
+    unsigned int i = 0;
+
+    if (!limit)
+        return 0.0f;
+    if (t < fn->segments[0].offset)
+        t = fn->segments[0].offset;
+    while (i + 1 < limit && fn->segments[i + 1].offset <= t)
+        ++i;
+    return dcomp_animation_eval_segment(fn, i, t - fn->segments[i].offset, depth);
+}
+
+static float dcomp_animation_eval_segment(const struct dcomp_animation_function *fn,
+        unsigned int i, double l, unsigned int depth)
+{
+    const struct dcomp_animation_segment *s = &fn->segments[i];
+
+    switch (s->kind)
+    {
+    case DCOMP_SEGMENT_CUBIC:
+        return (float)(s->u.cubic[0] + l * (s->u.cubic[1] + l * (s->u.cubic[2] + l * s->u.cubic[3])));
+    case DCOMP_SEGMENT_SINUSOIDAL:
+        return (float)(s->u.sinusoidal.bias + s->u.sinusoidal.amplitude
+                * sin(2.0 * DCOMP_PI * s->u.sinusoidal.frequency * l
+                        + s->u.sinusoidal.phase * DCOMP_PI / 180.0));
+    case DCOMP_SEGMENT_REPEAT:
+        /* The `duration' seconds before this offset, from their start again.
+         * A repeat of nothing -- no earlier segment, no positive duration --
+         * holds the value the stretch ended on.  The depth guard bounds a
+         * repeat that loops over another repeat. */
+        if (!i)
+            return 0.0f;
+        if (s->u.repeat_duration > 0.0 && depth < 8)
+            return dcomp_animation_eval_before(fn, i,
+                    s->offset - s->u.repeat_duration + fmod(l, s->u.repeat_duration), depth + 1);
+        return dcomp_animation_eval_before(fn, i, s->offset, depth + 1);
+    case DCOMP_SEGMENT_END:
+        return s->u.end_value;
+    }
+    return 0.0f;
+}
+
+/* Has the function stopped moving for good at time t?  After its end segment,
+ * or in a final segment that is flat.  A final cubic with a slope or a final
+ * repeat runs for as long as the visual lives -- that is what the application
+ * asked for. */
+static BOOL dcomp_animation_settled(const struct dcomp_animation_function *fn, double t)
+{
+    const struct dcomp_animation_segment *last;
+
+    if (!fn->count)
+        return TRUE;
+    last = &fn->segments[fn->count - 1];
+    if (t < last->offset)
+        return FALSE;
+    switch (last->kind)
+    {
+    case DCOMP_SEGMENT_END:
+        return TRUE;
+    case DCOMP_SEGMENT_CUBIC:
+        return !last->u.cubic[1] && !last->u.cubic[2] && !last->u.cubic[3];
+    case DCOMP_SEGMENT_SINUSOIDAL:
+        return !last->u.sinusoidal.amplitude || !last->u.sinusoidal.frequency;
+    case DCOMP_SEGMENT_REPEAT:
+        return last->u.repeat_duration <= 0.0 || fn->count < 2;
+    }
+    return TRUE;
+}
+
+static inline struct dcomp_animation *impl_from_IDCompositionAnimation(IDCompositionAnimation *iface)
+{
+    return CONTAINING_RECORD(iface, struct dcomp_animation, IDCompositionAnimation_iface);
+}
+
+static const IDCompositionAnimationVtbl dcomp_animation_vtbl;
+
+/* Our own animation object, or NULL for anything else -- the bindings copy
+ * the segments out of it, so it has to be ours. */
+static struct dcomp_animation *unsafe_impl_from_IDCompositionAnimation(IDCompositionAnimation *iface)
+{
+    if (!iface || iface->lpVtbl != &dcomp_animation_vtbl)
+        return NULL;
+    return impl_from_IDCompositionAnimation(iface);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_animation_QueryInterface(IDCompositionAnimation *iface,
+        REFIID iid, void **out)
+{
+    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+
+    if (IsEqualGUID(iid, &IID_IDCompositionAnimation) || IsEqualGUID(iid, &IID_IUnknown))
+    {
+        IDCompositionAnimation_AddRef(iface);
+        *out = iface;
+        return S_OK;
+    }
+
+    WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_animation_AddRef(IDCompositionAnimation *iface)
+{
+    struct dcomp_animation *animation = impl_from_IDCompositionAnimation(iface);
+    ULONG refcount = InterlockedIncrement(&animation->refcount);
+
+    TRACE("%p, refcount %lu.\n", iface, refcount);
+    return refcount;
+}
+
+static ULONG STDMETHODCALLTYPE dcomp_animation_Release(IDCompositionAnimation *iface)
+{
+    struct dcomp_animation *animation = impl_from_IDCompositionAnimation(iface);
+    ULONG refcount = InterlockedDecrement(&animation->refcount);
+
+    TRACE("%p, refcount %lu.\n", iface, refcount);
+
+    if (!refcount)
+    {
+        free(animation->fn.segments);
+        free(animation);
+    }
+    return refcount;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_animation_Reset(IDCompositionAnimation *iface)
+{
+    struct dcomp_animation *animation = impl_from_IDCompositionAnimation(iface);
+
+    TRACE("iface %p.\n", iface);
+
+    animation->fn.count = 0;
+    animation->fn.absolute_begin = 0;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_animation_SetAbsoluteBeginTime(IDCompositionAnimation *iface,
+        LARGE_INTEGER time)
+{
+    struct dcomp_animation *animation = impl_from_IDCompositionAnimation(iface);
+
+    TRACE("iface %p, time %s.\n", iface, wine_dbgstr_longlong(time.QuadPart));
+
+    /* In the units of GetFrameStatistics, i.e. QPC ticks. */
+    animation->fn.absolute_begin = time.QuadPart;
+    return S_OK;
+}
+
+/* Segments are a function of time: each has to start at or after the one
+ * before it, and nothing follows the end. */
+static HRESULT dcomp_animation_add(struct dcomp_animation *animation,
+        const struct dcomp_animation_segment *segment)
+{
+    struct dcomp_animation_function *fn = &animation->fn;
+
+    if (!(segment->offset >= 0.0))   /* also NaN */
+        return E_INVALIDARG;
+    if (fn->count)
+    {
+        const struct dcomp_animation_segment *last = &fn->segments[fn->count - 1];
+
+        if (last->kind == DCOMP_SEGMENT_END || segment->offset < last->offset)
+        {
+            WARN("Segment at %.3f s after %s at %.3f s refused.\n", segment->offset,
+                    last->kind == DCOMP_SEGMENT_END ? "the end" : "a segment", last->offset);
+            return E_INVALIDARG;
+        }
+    }
+    if (fn->count == animation->capacity)
+    {
+        unsigned int capacity = animation->capacity ? animation->capacity * 2 : 4;
+        struct dcomp_animation_segment *segments;
+
+        if (!(segments = realloc(fn->segments, capacity * sizeof(*segments))))
+            return E_OUTOFMEMORY;
+        fn->segments = segments;
+        animation->capacity = capacity;
+    }
+    fn->segments[fn->count++] = *segment;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_animation_AddCubic(IDCompositionAnimation *iface, double offset,
+        float constant_coefficient, float linear_coefficient, float quadratic_coefficient,
+        float cubic_coefficient)
+{
+    struct dcomp_animation *animation = impl_from_IDCompositionAnimation(iface);
+    struct dcomp_animation_segment segment;
+
+    TRACE("iface %p, offset %.3f, constant %.8e, linear %.8e, quadratic %.8e, cubic %.8e.\n",
+            iface, offset, constant_coefficient, linear_coefficient, quadratic_coefficient,
+            cubic_coefficient);
+
+    segment.kind = DCOMP_SEGMENT_CUBIC;
+    segment.offset = offset;
+    segment.u.cubic[0] = constant_coefficient;
+    segment.u.cubic[1] = linear_coefficient;
+    segment.u.cubic[2] = quadratic_coefficient;
+    segment.u.cubic[3] = cubic_coefficient;
+    return dcomp_animation_add(animation, &segment);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_animation_AddSinusoidal(IDCompositionAnimation *iface,
+        double offset, float bias, float amplitude, float frequency, float phase)
+{
+    struct dcomp_animation *animation = impl_from_IDCompositionAnimation(iface);
+    struct dcomp_animation_segment segment;
+
+    TRACE("iface %p, offset %.3f, bias %.8e, amplitude %.8e, frequency %.8e, phase %.8e.\n",
+            iface, offset, bias, amplitude, frequency, phase);
+
+    segment.kind = DCOMP_SEGMENT_SINUSOIDAL;
+    segment.offset = offset;
+    segment.u.sinusoidal.bias = bias;
+    segment.u.sinusoidal.amplitude = amplitude;
+    segment.u.sinusoidal.frequency = frequency;
+    segment.u.sinusoidal.phase = phase;
+    return dcomp_animation_add(animation, &segment);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_animation_AddRepeat(IDCompositionAnimation *iface,
+        double offset, double duration)
+{
+    struct dcomp_animation *animation = impl_from_IDCompositionAnimation(iface);
+    struct dcomp_animation_segment segment;
+
+    TRACE("iface %p, offset %.3f, duration %.3f.\n", iface, offset, duration);
+
+    if (!(duration > 0.0) || duration > offset)
+        WARN("Repeat of %.3f s at %.3f s: nothing to play again.\n", duration, offset);
+    segment.kind = DCOMP_SEGMENT_REPEAT;
+    segment.offset = offset;
+    segment.u.repeat_duration = duration;
+    return dcomp_animation_add(animation, &segment);
+}
+
+static HRESULT STDMETHODCALLTYPE dcomp_animation_End(IDCompositionAnimation *iface, double offset,
+        float value)
+{
+    struct dcomp_animation *animation = impl_from_IDCompositionAnimation(iface);
+    struct dcomp_animation_segment segment;
+
+    TRACE("iface %p, offset %.3f, value %.8e.\n", iface, offset, value);
+
+    segment.kind = DCOMP_SEGMENT_END;
+    segment.offset = offset;
+    segment.u.end_value = value;
+    return dcomp_animation_add(animation, &segment);
+}
+
+static const IDCompositionAnimationVtbl dcomp_animation_vtbl =
+{
+    dcomp_animation_QueryInterface,
+    dcomp_animation_AddRef,
+    dcomp_animation_Release,
+    dcomp_animation_Reset,
+    dcomp_animation_SetAbsoluteBeginTime,
+    dcomp_animation_AddCubic,
+    dcomp_animation_AddSinusoidal,
+    dcomp_animation_AddRepeat,
+    dcomp_animation_End,
+};
+
+static HRESULT dcomp_animation_create(IDCompositionAnimation **out)
+{
+    struct dcomp_animation *animation;
+
+    if (!out)
+        return E_INVALIDARG;
+
+    *out = NULL;
+    if (!(animation = calloc(1, sizeof(*animation))))
+        return E_OUTOFMEMORY;
+
+    animation->IDCompositionAnimation_iface.lpVtbl = &dcomp_animation_vtbl;
+    animation->refcount = 1;
+
+    TRACE("Created animation %p.\n", animation);
+
+    *out = &animation->IDCompositionAnimation_iface;
+    return S_OK;
+}
+
+/* The visual properties an animation can drive. */
+enum dcomp_animated_property
+{
+    DCOMP_ANIMATED_OFFSET_X,
+    DCOMP_ANIMATED_OFFSET_Y,
+    DCOMP_ANIMATED_OFFSET_Z,
+    DCOMP_ANIMATED_OPACITY,
+    DCOMP_ANIMATED_COUNT,
+};
+
+/* An animation bound to one property of a visual.  `pending' is what the
+ * setter was handed; the next Commit takes it over as a copy in `fn' with
+ * the begin time resolved, and from then on the property follows the copy at
+ * every frame until the function settles or a plain setter replaces it. */
+struct dcomp_visual_animation
+{
+    IDCompositionAnimation *pending;
+    struct dcomp_animation_function fn;
+    LONGLONG begin;
+    BOOL active;
+};
+
 struct dcomp_visual
 {
     IDCompositionVisual IDCompositionVisual_iface;
@@ -2103,12 +2480,114 @@ struct dcomp_visual
     float opacity;
     BOOL visible;
     enum DCOMPOSITION_DEPTH_MODE depth_mode;
+    struct dcomp_visual_animation animations[DCOMP_ANIMATED_COUNT];   /* issue 364 */
     LONG serialized_gen;   /* on a root: dcomp_tree_generation as of its last serialization */
     struct dcomp_visual *parent;
     struct dcomp_visual *children;       /* head of child list (first = back) */
     struct dcomp_visual *next_sibling;   /* doubly-linked sibling list */
     struct dcomp_visual *prev_sibling;
 };
+
+/* Drop what is bound to one property: the plain setter of that property
+ * replaces the animation with its value. */
+static void dcomp_visual_animation_clear(struct dcomp_visual_animation *animation)
+{
+    if (animation->pending)
+        IDCompositionAnimation_Release(animation->pending);
+    animation->pending = NULL;
+    free(animation->fn.segments);
+    animation->fn.segments = NULL;
+    animation->fn.count = 0;
+    animation->active = FALSE;
+}
+
+static HRESULT dcomp_visual_set_animation(struct dcomp_visual *visual,
+        enum dcomp_animated_property property, IDCompositionAnimation *animation)
+{
+    struct dcomp_visual_animation *binding = &visual->animations[property];
+
+    if (!unsafe_impl_from_IDCompositionAnimation(animation))
+    {
+        WARN("Visual %p, property %u: %p is not an animation of ours.\n", visual, property, animation);
+        return E_INVALIDARG;
+    }
+
+    dcomp_visual_tree_changed();
+    IDCompositionAnimation_AddRef(animation);
+    if (binding->pending)
+        IDCompositionAnimation_Release(binding->pending);
+    binding->pending = animation;
+    return S_OK;
+}
+
+/* Take the pending animations of a subtree over (at a Commit), then move every
+ * active one to time `now'.  Returns whether anything is still in motion.
+ * Runs under the device lock, like every reader of the properties it writes. */
+static BOOL dcomp_visual_animate(struct dcomp_visual *visual, LONGLONG now, BOOL commit)
+{
+    struct dcomp_visual *child;
+    BOOL active = FALSE;
+    unsigned int p;
+
+    for (p = 0; p < DCOMP_ANIMATED_COUNT; ++p)
+    {
+        struct dcomp_visual_animation *binding = &visual->animations[p];
+        float value;
+        double t;
+
+        if (commit && binding->pending)
+        {
+            struct dcomp_animation *animation = unsafe_impl_from_IDCompositionAnimation(binding->pending);
+            const struct dcomp_animation_function *fn = &animation->fn;
+
+            free(binding->fn.segments);
+            binding->fn.segments = NULL;
+            binding->fn.count = 0;
+            if (fn->count && (binding->fn.segments = malloc(fn->count * sizeof(*fn->segments))))
+            {
+                memcpy(binding->fn.segments, fn->segments, fn->count * sizeof(*fn->segments));
+                binding->fn.count = fn->count;
+            }
+            binding->begin = fn->absolute_begin ? fn->absolute_begin : now;
+            binding->active = binding->fn.count > 0;
+            TRACE("Visual %p, property %u: animation %p with %u segments begins at %s.\n",
+                    visual, p, animation, binding->fn.count, wine_dbgstr_longlong(binding->begin));
+            IDCompositionAnimation_Release(binding->pending);
+            binding->pending = NULL;
+        }
+        if (!binding->active)
+            continue;
+
+        t = (double)(now - binding->begin) / dcomp_qpc_freq();
+        value = dcomp_animation_eval_before(&binding->fn, binding->fn.count, t, 0);
+        switch (p)
+        {
+        case DCOMP_ANIMATED_OFFSET_X: visual->offset_x = value; break;
+        case DCOMP_ANIMATED_OFFSET_Y: visual->offset_y = value; break;
+        case DCOMP_ANIMATED_OFFSET_Z: visual->offset_z = value; break;
+        case DCOMP_ANIMATED_OPACITY:
+            if (!(value >= 0.0f)) value = 0.0f;
+            if (value > 1.0f) value = 1.0f;
+            visual->opacity = value;
+            break;
+        }
+        if (dcomp_animation_settled(&binding->fn, t))
+        {
+            TRACE("Visual %p, property %u: settled at %.8e after %.3f s.\n", visual, p, value, t);
+            free(binding->fn.segments);
+            binding->fn.segments = NULL;
+            binding->fn.count = 0;
+            binding->active = FALSE;
+        }
+        else
+            active = TRUE;
+    }
+
+    for (child = visual->children; child; child = child->next_sibling)
+        if (dcomp_visual_animate(child, now, commit))
+            active = TRUE;
+    return active;
+}
 
 static inline struct dcomp_visual *impl_from_IDCompositionVisual(IDCompositionVisual *iface)
 {
@@ -2274,6 +2753,11 @@ static ULONG STDMETHODCALLTYPE dcomp_visual_Release(IDCompositionVisual *iface)
 
         if (visual->content)
             IUnknown_Release(visual->content);
+        {
+            unsigned int p;
+            for (p = 0; p < DCOMP_ANIMATED_COUNT; ++p)
+                dcomp_visual_animation_clear(&visual->animations[p]);
+        }
         free(visual);
     }
     return refcount;
@@ -2282,8 +2766,10 @@ static ULONG STDMETHODCALLTYPE dcomp_visual_Release(IDCompositionVisual *iface)
 static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetXAnimation(IDCompositionVisual *iface,
         IDCompositionAnimation *animation)
 {
-    FIXME("iface %p, animation %p stub!\n", iface, animation);
-    return S_OK;
+    struct dcomp_visual *visual = impl_from_IDCompositionVisual(iface);
+
+    TRACE("iface %p, animation %p.\n", iface, animation);
+    return dcomp_visual_set_animation(visual, DCOMP_ANIMATED_OFFSET_X, animation);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetX(IDCompositionVisual *iface, float offset_x)
@@ -2292,6 +2778,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetX(IDCompositionVisual *if
 
     TRACE("iface %p, offset_x %.8e.\n", iface, offset_x);
     dcomp_visual_tree_changed();
+    dcomp_visual_animation_clear(&visual->animations[DCOMP_ANIMATED_OFFSET_X]);
     visual->offset_x = offset_x;
     return S_OK;
 }
@@ -2299,8 +2786,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetX(IDCompositionVisual *if
 static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetYAnimation(IDCompositionVisual *iface,
         IDCompositionAnimation *animation)
 {
-    FIXME("iface %p, animation %p stub!\n", iface, animation);
-    return S_OK;
+    struct dcomp_visual *visual = impl_from_IDCompositionVisual(iface);
+
+    TRACE("iface %p, animation %p.\n", iface, animation);
+    return dcomp_visual_set_animation(visual, DCOMP_ANIMATED_OFFSET_Y, animation);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetY(IDCompositionVisual *iface, float offset_y)
@@ -2309,6 +2798,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetOffsetY(IDCompositionVisual *if
 
     TRACE("iface %p, offset_y %.8e.\n", iface, offset_y);
     dcomp_visual_tree_changed();
+    dcomp_visual_animation_clear(&visual->animations[DCOMP_ANIMATED_OFFSET_Y]);
     visual->offset_y = offset_y;
     return S_OK;
 }
@@ -2648,8 +3138,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetDepthMode(IDCompositionVisual3
 static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOffsetZAnimation(IDCompositionVisual3 *iface,
         IDCompositionAnimation *animation)
 {
-    FIXME("iface %p, animation %p stub!\n", iface, animation);
-    return S_OK;
+    struct dcomp_visual *visual = impl_from_IDCompositionVisual3(iface);
+
+    TRACE("iface %p, animation %p.\n", iface, animation);
+    return dcomp_visual_set_animation(visual, DCOMP_ANIMATED_OFFSET_Z, animation);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOffsetZ(IDCompositionVisual3 *iface, float offset_z)
@@ -2657,6 +3149,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOffsetZ(IDCompositionVisual3 *
     struct dcomp_visual *visual = impl_from_IDCompositionVisual3(iface);
 
     TRACE("iface %p, offset_z %.8e.\n", iface, offset_z);
+    dcomp_visual_animation_clear(&visual->animations[DCOMP_ANIMATED_OFFSET_Z]);
     visual->offset_z = offset_z;
     return S_OK;
 }
@@ -2664,8 +3157,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOffsetZ(IDCompositionVisual3 *
 static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOpacityAnimation(IDCompositionVisual3 *iface,
         IDCompositionAnimation *animation)
 {
-    FIXME("iface %p, animation %p stub!\n", iface, animation);
-    return S_OK;
+    struct dcomp_visual *visual = impl_from_IDCompositionVisual3(iface);
+
+    TRACE("iface %p, animation %p.\n", iface, animation);
+    return dcomp_visual_set_animation(visual, DCOMP_ANIMATED_OPACITY, animation);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOpacity(IDCompositionVisual3 *iface, float opacity)
@@ -2674,6 +3169,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual3_SetOpacity(IDCompositionVisual3 *
 
     TRACE("iface %p, opacity %.8e.\n", iface, opacity);
     dcomp_visual_tree_changed();
+    dcomp_visual_animation_clear(&visual->animations[DCOMP_ANIMATED_OPACITY]);
 
     /* The documented range is 0..1.  Clamp rather than refuse: an application
      * that is told no here stops fading and keeps the visual as it was, which
@@ -3045,7 +3541,10 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
 
         /* Stop tree compositing (safe even if the hwnd is already gone) */
         if (target->hwnd)
+        {
             KillTimer(target->hwnd, DCOMP_TREE_TIMER);
+            KillTimer(target->hwnd, DCOMP_ANIMATION_TIMER);
+        }
 
         /* Remove WndProc subclass (Phase 5).  Restore only while the window still
          * refers to us and our procedure is the installed one: a resize creates a
@@ -5361,6 +5860,9 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
         return;
 
     EnterCriticalSection(&target->device->cs);
+    /* The tree timer is this path's clock: move the animations before the
+     * walk reads the offsets and opacities (issue 364). */
+    dcomp_target_animate(target, dcomp_qpc_now(), FALSE);
     dcomp_target_update_covered(target, &rc);
     LeaveCriticalSection(&target->device->cs);
 
@@ -6217,6 +6719,56 @@ static void dcomp_target_flush_present(struct dcomp_target *target, struct dcomp
     target->last_present_qpc = dcomp_qpc_now();
 }
 
+/* Move a target's tree to `now' -- taking pending animations over when this
+ * is a Commit -- and keep the frames coming while something is in motion
+ * (issue 364).  A surface root presents on Commit and a swapchain root when
+ * the application presents, so on those a timer on the window re-presents
+ * the one and re-serializes the other at ~60 Hz until the last function has
+ * settled.  A rootless tree is driven by its own tree timer, which moves the
+ * tree itself (dcomp_target_composite_tree).  A foreign target has no
+ * subclass to receive the timer; its tree still moves on every Commit. */
+static BOOL dcomp_target_animate(struct dcomp_target *target, LONGLONG now, BOOL commit)
+{
+    BOOL active;
+
+    if (!target->root_visual)
+        return FALSE;
+    active = dcomp_visual_animate(target->root_visual, now, commit);
+    if (target->foreign || !target->hwnd)
+        return active;
+    if (active && (target->root_visual->surface_content || target->root_visual->content))
+        SetTimer(target->hwnd, DCOMP_ANIMATION_TIMER, DCOMP_TREE_FRAME_MS, NULL);
+    else if (!active)
+        KillTimer(target->hwnd, DCOMP_ANIMATION_TIMER);
+    return active;
+}
+
+static void dcomp_target_animation_tick(struct dcomp_target *target)
+{
+    struct dcomp_visual *root;
+
+    if (!target->device)
+        return;
+    EnterCriticalSection(&target->device->cs);
+    dcomp_target_animate(target, dcomp_qpc_now(), FALSE);
+    if ((root = target->root_visual))
+    {
+        if (root->surface_content)
+        {
+            struct dcomp_surface *surface = root->surface_content;
+
+            /* The children's fingerprint has moved with them; the same gate
+             * as Commit decides whether that reaches the window. */
+            if (surface->bits && surface->width && surface->height && target->comp_bits
+                    && (surface->has_pending || dcomp_target_children_need_present(target)))
+                dcomp_target_flush_present(target, surface);
+        }
+        else if (root->content)
+            dcomp_commit_visual_tree(target->hwnd, root);
+    }
+    LeaveCriticalSection(&target->device->cs);
+}
+
 /* Phase 5: WndProc subclass — suppresses WM_ERASEBKGND to prevent white-on-open.
  * WM_PAINT is forwarded to the original WndProc so that VSTGUI can call
  * BeginDraw → Render → EndDraw → Commit in response to paint requests. */
@@ -6283,6 +6835,12 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         if (wparam == DCOMP_TREE_TIMER)
         {
             dcomp_target_composite_tree(target, TRUE);
+            return 0;
+        }
+        /* Animations on a surface or swapchain root (issue 364). */
+        if (wparam == DCOMP_ANIMATION_TIMER)
+        {
+            dcomp_target_animation_tick(target);
             return 0;
         }
         break;
@@ -6413,6 +6971,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
          * wndproc of its own; restoring NULL would leave the window without a
          * procedure at all. */
         KillTimer(hwnd, DCOMP_TREE_TIMER);
+        KillTimer(hwnd, DCOMP_ANIMATION_TIMER);
         /* Tell our delivery thread to stop, but do not wait for it here: it may
          * be inside a GDI call on the very window being torn down, and blocking
          * the GUI thread on that is exactly what this thread exists to avoid.
@@ -6451,7 +7010,12 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
     for (target = device->targets; target; target = target->next_target)
     {
         struct dcomp_surface *surface;
-        LONGLONG now;
+        LONGLONG now = dcomp_qpc_now();
+
+        /* Animations bound since the last Commit begin now, running ones move
+         * to now, and on a root that presents only from here a timer keeps
+         * them moving between Commits (issue 364). */
+        dcomp_target_animate(target, now, TRUE);
 
         /* A swapchain root or a rootless tree: the leaf set is written by the
          * AddVisual/SetContent hooks, and wined3d (or the tree timer) draws
@@ -6493,7 +7057,6 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_Commit(IDCompositionDevice *iface)
          * region; skipping here defers readback+present to the next slot, with the WM_TIMER
          * trailing flush guaranteeing the final frame.  Forced full presents (first frame /
          * DIB recreate) always go through. */
-        now = dcomp_qpc_now();
         if (!target->comp_needs_full_present && target->last_present_qpc
                 && (now - target->last_present_qpc) * 1000 / dcomp_qpc_freq() < DCOMP_FRAME_MS)
         {
@@ -7037,10 +7600,9 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateRectangleClip(IDCompositionD
 static HRESULT STDMETHODCALLTYPE dcomp_device_CreateAnimation(IDCompositionDevice *iface,
         IDCompositionAnimation **animation)
 {
-    FIXME("iface %p, animation %p stub!\n", iface, animation);
+    TRACE("iface %p, animation %p.\n", iface, animation);
 
-    *animation = NULL;
-    return E_NOTIMPL;
+    return dcomp_animation_create(animation);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_device_CheckDeviceState(IDCompositionDevice *iface,
@@ -7323,10 +7885,9 @@ static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateRectangleClip(
 static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateAnimation(
         IDCompositionDesktopDevice *iface, IDCompositionAnimation **animation)
 {
-    FIXME("iface %p, animation %p stub!\n", iface, animation);
+    TRACE("iface %p, animation %p.\n", iface, animation);
 
-    *animation = NULL;
-    return E_NOTIMPL;
+    return dcomp_animation_create(animation);
 }
 
 static HRESULT STDMETHODCALLTYPE dcomp_desktop_device_CreateTargetForHwnd(
