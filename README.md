@@ -15,9 +15,26 @@
 <p align="center">
   <a href="PATCHES.md">Full patch documentation</a> ·
   <a href="#quick-start">Quick start</a> ·
+  <a href="#verifying-this-fork">Verifying this fork</a> ·
   <a href="#which-branch">Which branch?</a> ·
   <a href="#tested-applications">Tested applications</a>
 </p>
+
+> [!IMPORTANT]
+> **This repository holds source code and nothing else.**
+> There are no releases, no binary assets and no installers here — nothing to download and
+> run. The patches are compiled locally ([Quick start](#quick-start)), and the complete
+> difference from upstream Wine can be checked before building
+> ([Verifying this fork](#verifying-this-fork)).
+>
+> **No application software is distributed here.** Every DAW, application and plugin shown
+> or listed on this page runs from a purchased licence or from the vendor's own demo or
+> trial version.
+>
+> **This is a private project**, published so that the work reaches the Wine community
+> instead of staying on one machine. It is not affiliated with the Wine project, WineHQ or
+> CodeWeavers, nor with Steinberg, Image-Line, Ableton or any other vendor named here; all
+> product names are used only to say what was tested.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/cubase15-pro-mixconsole.png" width="100%" alt="Cubase Pro 15 running on this fork">
@@ -100,6 +117,59 @@ Two things are worth knowing before the first run, both explained in
   brings no measured benefit for this class of application.
 
 Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**.
+
+## Verifying this fork
+
+GitHub records this repository as a fork of
+[wine-mirror/wine](https://github.com/wine-mirror/wine), so nothing here has to be taken on
+trust: the full history is checkable against the upstream release it was built on. Upstream
+supplies the base tag, so add it as a remote first — this repository carries only the
+tags up to `wine-11.5`.
+
+```bash
+git remote add upstream https://github.com/wine-mirror/wine.git
+git fetch upstream --tags
+
+# BASE is the branch's base tag: wine-11.0 for d2d1-dcomp-11.0,
+# the matching wine-11.<N> for a rolling branch.
+BASE=wine-11.0
+
+# Does this branch descend from the released tag, or from a rewritten history?
+git merge-base --is-ancestor $BASE HEAD && echo "descends from $BASE"
+
+# Every commit added on top of it, and the complete diff
+git log --oneline $BASE..HEAD
+git diff --stat $BASE..HEAD
+```
+
+That diff is the whole of what this fork adds, and this command sorts it by area, so the
+shape is visible without reading it line by line:
+
+```bash
+git diff --name-only $BASE..HEAD | cut -d/ -f1 | sort | uniq -c | sort -rn
+```
+
+On `d2d1-dcomp-11.0` the weight sits in `dlls/`, followed by `include/` and `scripts/`,
+then `programs/` and `server/`, with single files for the loader's `wine.inf.in`, the font
+setup guide, `.gitignore` and the documents at the top level.
+
+The only remaining entries are `configure` and `configure.ac`, and those are worth reading
+in full, because the build system is where a fork could hide something that runs before any
+of the code does:
+
+```bash
+git diff $BASE..HEAD -- configure.ac
+```
+
+On `d2d1-dcomp-11.0` it holds three changes and no more: detection for the X Damage
+extension, two `WINE_CONFIG_MAKEFILE` lines for the modules this fork adds (`pwrshsip` and
+`windows.security.authentication.web.core`), and a `--match 'wine-*'` argument on the
+`git describe` call that stamps the version string, so that a working or backup tag closer
+to HEAD than the release tag cannot end up in a built binary's reported version. The
+generated `configure` mirrors those same three and nothing else.
+
+Rolling branches are rebased onto each new devel tag rather than merged, so their history
+is rewritten by design; the same check against the newer `BASE` applies to each of them.
 
 ## Which branch?
 
