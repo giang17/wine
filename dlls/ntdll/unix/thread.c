@@ -1511,11 +1511,103 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
 
 
 /***********************************************************************
+ *           unlink_wait_on_address_entry
+ *
+ * A thread terminated from outside may be asleep in RtlWaitOnAddress. Its
+ * queue entry would stay linked, and the next RtlWakeAddressSingle() on that
+ * address would spend its wake-up on the dead thread. For a critical section
+ * that leaves the released lock unowned until another waiter's timeout fires
+ * (5 s in RtlpWaitForCriticalSection). The PE side publishes the entry in the
+ * TEB only while it does not hold the queue lock, so taking the lock here is
+ * safe.
+ *
+ * The server signals the thread handle as soon as it has processed the
+ * terminate request, before this thread runs its SIGQUIT handler. A waker may
+ * therefore already have unlinked the entry and spent its wake-up on this
+ * thread. In that case the wake-up is handed on to the next waiter on the same
+ * address, as RtlWakeAddressSingle() would have done.
+ */
+static void unlink_wait_on_address_entry(void)
+{
+    TEB *teb = NtCurrentTeb();
+    struct wait_on_address_entry *entry = teb->ReservedForPerf;
+    DWORD tid = 0;
+#ifdef _WIN64
+    WOW_TEB *teb32 = get_wow_teb( teb );
+
+    if (teb32 && teb32->ReservedForPerf)
+    {
+        struct wait_on_address_entry32 *entry32 = ULongToPtr( teb32->ReservedForPerf );
+        LONG *lock = ULongToPtr( entry32->lock );
+
+        teb32->ReservedForPerf = 0;
+        while (InterlockedCompareExchange( lock, -1, 0 )) sched_yield();
+        if (entry32->addr)
+        {
+            struct wait_on_address_entry32 *next = ULongToPtr( entry32->next );
+            struct wait_on_address_entry32 *prev = ULongToPtr( entry32->prev );
+
+            entry32->addr = 0;
+            next->prev = entry32->prev;
+            prev->next = entry32->next;
+        }
+        else
+        {
+            struct wait_on_address_entry32 *head = ULongToPtr( entry32->queue ), *e;
+
+            for (e = ULongToPtr( head->next ); e != head; e = ULongToPtr( e->next ))
+            {
+                struct wait_on_address_entry32 *next, *prev;
+
+                if (e->addr != entry32->wait_addr) continue;
+                next = ULongToPtr( e->next );
+                prev = ULongToPtr( e->prev );
+                e->addr = 0;
+                next->prev = e->prev;
+                prev->next = e->next;
+                tid = e->tid;
+                break;
+            }
+        }
+        InterlockedExchange( lock, 0 );
+        if (tid) NtAlertThreadByThreadId( ULongToHandle( tid ) );
+        tid = 0;
+    }
+#endif
+    if (!entry) return;
+    teb->ReservedForPerf = NULL;
+
+    while (InterlockedCompareExchange( entry->lock, -1, 0 )) sched_yield();
+    if (entry->addr)
+    {
+        entry->addr = NULL;
+        list_remove( &entry->entry );
+    }
+    else
+    {
+        struct wait_on_address_entry *e;
+
+        LIST_FOR_EACH_ENTRY( e, entry->queue, struct wait_on_address_entry, entry )
+        {
+            if (e->addr != entry->wait_addr) continue;
+            e->addr = NULL;
+            list_remove( &e->entry );
+            tid = e->tid;
+            break;
+        }
+    }
+    InterlockedExchange( entry->lock, 0 );
+    if (tid) NtAlertThreadByThreadId( ULongToHandle( tid ) );
+}
+
+
+/***********************************************************************
  *           abort_thread
  */
 void abort_thread( int status )
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+    unlink_wait_on_address_entry();
     if (InterlockedDecrement( &nb_threads ) <= 0) abort_process( status );
     pthread_exit_wrapper( status );
 }
