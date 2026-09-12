@@ -2261,12 +2261,14 @@ static BOOL seen_dir( struct dirstack *dirstack, const WCHAR *path )
     return FALSE;
 }
 
-/* optimize queries of the form WHERE Name='...' [OR Name='...']* */
-static UINT seed_dirs( struct dirstack *dirstack, const struct expr *cond, WCHAR root, UINT *count )
+/* optimize queries of the form WHERE Name='...' [OR Name='...']*; returns TRUE if the
+ * condition has that form, with *count the number of directories seeded for this drive
+ * (zero when no value names it, in which case the drive cannot contribute a row) */
+static BOOL seed_dirs( struct dirstack *dirstack, const struct expr *cond, WCHAR root, UINT *count )
 {
     const struct expr *left, *right;
 
-    if (!cond || cond->type != EXPR_COMPLEX) return *count = 0;
+    if (!cond || cond->type != EXPR_COMPLEX) return FALSE;
 
     left = cond->u.expr.left;
     right = cond->u.expr.right;
@@ -2277,38 +2279,42 @@ static UINT seed_dirs( struct dirstack *dirstack, const struct expr *cond, WCHAR
         const WCHAR *str = NULL;
 
         if (left->type == EXPR_PROPVAL && right->type == EXPR_SVAL &&
-            !wcscmp( left->u.propval->name, L"Name" ) &&
-            towupper( right->u.sval[0] ) == towupper( root ))
+            !wcsicmp( left->u.propval->name, L"Name" ))
         {
             str = right->u.sval;
         }
         else if (left->type == EXPR_SVAL && right->type == EXPR_PROPVAL &&
-                 !wcscmp( right->u.propval->name, L"Name" ) &&
-                 towupper( left->u.sval[0] ) == towupper( root ))
+                 !wcsicmp( right->u.propval->name, L"Name" ))
         {
             str = left->u.sval;
         }
-        if (str && (path = build_dirname( str, &len )))
+        if (!str) return FALSE;
+        if (towupper( str[0] ) != towupper( root )) return TRUE;
+        if (!(path = build_dirname( str, &len ))) return FALSE;
+        if (seen_dir( dirstack, path ))
         {
-            if (seen_dir( dirstack, path ))
-            {
-                free( path );
-                return ++*count;
-            }
-            else if (push_dir( dirstack, path, len )) return ++*count;
             free( path );
-            return *count = 0;
+            (*count)++;
+            return TRUE;
         }
+        if (push_dir( dirstack, path, len ))
+        {
+            (*count)++;
+            return TRUE;
+        }
+        free( path );
+        return FALSE;
     }
     else if (cond->u.expr.op == OP_OR)
     {
         UINT left_count = 0, right_count = 0;
 
-        if (!(seed_dirs( dirstack, left, root, &left_count ))) return *count = 0;
-        if (!(seed_dirs( dirstack, right, root, &right_count ))) return *count = 0;
-        return *count += left_count + right_count;
+        if (!seed_dirs( dirstack, left, root, &left_count )) return FALSE;
+        if (!seed_dirs( dirstack, right, root, &right_count )) return FALSE;
+        *count += left_count + right_count;
+        return TRUE;
     }
-    return *count = 0;
+    return FALSE;
 }
 
 static WCHAR *append_path( const WCHAR *path, const WCHAR *segment, UINT *len )
@@ -2382,6 +2388,7 @@ static enum fill_status fill_datafile( struct table *table, const struct expr *c
 
         num_expected_rows = 0;
         if (!seed_dirs( dirstack, cond, root[0], &num_expected_rows )) clear_dirstack( dirstack );
+        else if (!num_expected_rows) continue;
 
         for (;;)
         {
@@ -2511,6 +2518,7 @@ static enum fill_status fill_directory( struct table *table, const struct expr *
 
         num_expected_rows = 0;
         if (!seed_dirs( dirstack, cond, root[0], &num_expected_rows )) clear_dirstack( dirstack );
+        else if (!num_expected_rows) continue;
 
         for (;;)
         {
