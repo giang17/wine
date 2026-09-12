@@ -880,15 +880,16 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                  *
                  * Child windows (embedded plugins) have no whole_window, so GL
                  * swap would write to an invisible drawable.  Force GDI blit for
-                 * those — it writes to the window surface via comp_dc. */
+                 * those — it writes to the window surface via comp_dc.  The
+                 * present path is decided before the window switch: a present
+                 * that runs once the swapchain points at the target binds the GL
+                 * context by the flags it finds, and a forced-GDI swapchain must
+                 * keep its context off the target (backup DC) so the target never
+                 * gets a pixel format. */
                 {
                     HWND target_parent_toplevel = GetAncestor(target_hwnd, GA_PARENT);
                     BOOL is_toplevel = !target_parent_toplevel
                             || target_parent_toplevel == GetDesktopWindow();
-
-                    wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, target_hwnd);
-                    /* Remember the subclassed target for teardown in d3d11_swapchain_Release. */
-                    swapchain->target_hwnd = target_hwnd;
 
                     if (is_toplevel)
                     {
@@ -901,6 +902,10 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                     {
                         wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, TRUE);
                     }
+
+                    wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, target_hwnd);
+                    /* Remember the subclassed target for teardown in d3d11_swapchain_Release. */
+                    swapchain->target_hwnd = target_hwnd;
                 }
 
                 /* Set premultiplied alpha blending if the swapchain uses it.
