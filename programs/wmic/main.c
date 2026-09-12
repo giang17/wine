@@ -50,6 +50,7 @@ alias_map[] =
     { L"computersystem", L"Win32_ComputerSystem" },
     { L"cpu", L"Win32_Processor" },
     { L"csproduct", L"Win32_ComputerSystemProduct" },
+    { L"datafile", L"CIM_DataFile" },
     { L"diskdrive", L"Win32_DiskDrive" },
     { L"logicaldisk", L"Win32_LogicalDisk" },
     { L"memorychip", L"Win32_PhysicalMemory" },
@@ -124,7 +125,7 @@ static HRESULT append_property( IWbemClassObject *obj, const WCHAR *prop, WCHAR 
 {
     HRESULT hr;
 
-    if (FAILED(hr = IWbemClassObject_Get( obj, prop, 0, NULL, NULL, NULL ))) return hr;
+    if (obj && FAILED(hr = IWbemClassObject_Get( obj, prop, 0, NULL, NULL, NULL ))) return hr;
     if (*proplist) wcscat( proplist, L"," );
     wcscat( proplist, prop );
     return S_OK;
@@ -142,13 +143,14 @@ static HRESULT process_property_list( IWbemClassObject *obj, int argc, WCHAR *ar
 
     for (i = 0; i < argc; i++)
     {
+        if (argv[i][0] == '/') continue;
         if (!(str = wcsdup( argv[i] )))
         {
             free( stripped );
             return E_OUTOFMEMORY;
         }
 
-        /* Validate that every requested property is supported. */
+        /* Validate that every requested property is supported, if there is an object to check against. */
         ptr = wcstok_s( str, L",", &ctx );
         if (!ptr)
         {
@@ -322,20 +324,64 @@ static void output_values( IEnumWbemClassObject *result )
     }
 }
 
-static int query_prop( const WCHAR *class, int argc, WCHAR *argv[] )
+/* Rebuild the WHERE clause from the argument vector.  CommandLineToArgvW() has
+ * stripped the double quotes, so a property=value pair whose value is neither a
+ * quoted string nor a number gets its quotes back: name="C:\\dir\\file.exe" arrives
+ * as name=C:\\dir\\file.exe and is passed on as name="C:\\dir\\file.exe". */
+static WCHAR *build_condition( int argc, WCHAR *argv[] )
+{
+    WCHAR *ret, *ptr;
+    UINT i, len = 0;
+
+    for (i = 0; i < argc; i++) len += wcslen( argv[i] ) + 3;
+    if (!(ret = malloc( (len + 1) * sizeof(*ret) ))) return NULL;
+
+    ptr = ret;
+    for (i = 0; i < argc; i++)
+    {
+        const WCHAR *eq = wcschr( argv[i], '=' ), *value = eq ? eq + 1 : NULL;
+        BOOL quote = FALSE;
+
+        if (value && eq > argv[i])
+        {
+            while (*value == ' ') value++;
+            quote = *value && *value != '\'' && *value != '"' && !iswdigit( *value ) && *value != '-';
+        }
+        if (i) *ptr++ = ' ';
+        if (quote)
+        {
+            memcpy( ptr, argv[i], (value - argv[i]) * sizeof(*ptr) );
+            ptr += value - argv[i];
+            *ptr++ = '"';
+            wcscpy( ptr, value );
+            ptr += wcslen( value );
+            *ptr++ = '"';
+        }
+        else
+        {
+            wcscpy( ptr, argv[i] );
+            ptr += wcslen( argv[i] );
+        }
+    }
+    *ptr = 0;
+    return ret;
+}
+
+static int query_prop( const WCHAR *class, const WCHAR *cond, int argc, WCHAR *argv[] )
 {
     HRESULT hr;
     IWbemLocator *locator = NULL;
     IWbemServices *services = NULL;
     IEnumWbemClassObject *result = NULL;
     LONG flags = WBEM_FLAG_RETURN_IMMEDIATELY;
-    BSTR path = NULL, wql = NULL, query = NULL, str = NULL;
-    WCHAR *proplist = NULL;
+    BSTR path = NULL, wql = NULL, query = NULL;
+    WCHAR *proplist = NULL, *check = NULL;
     int len, ret = -1;
     IWbemClassObject *obj;
+    ULONG count;
     int i;
 
-    WINE_TRACE( "%s", debugstr_w(class) );
+    WINE_TRACE( "%s where %s:", debugstr_w(class), debugstr_w(cond) );
     for (i = 0; i < argc; i++) WINE_TRACE( " %s", debugstr_w(argv[i]) );
     WINE_TRACE( "\n" );
 
@@ -351,31 +397,44 @@ static int query_prop( const WCHAR *class, int argc, WCHAR *argv[] )
     hr = IWbemLocator_ConnectServer( locator, path, NULL, NULL, NULL, 0, NULL, NULL, &services );
     if (hr != S_OK) goto done;
 
-    if (!(str = SysAllocString( class ))) goto done;
-    hr = IWbemServices_GetObject( services, str, 0, NULL, &obj, NULL );
-    SysFreeString( str );
-    if (hr != S_OK)
-    {
-        WARN("Unrecognized class %s.\n", debugstr_w(class));
-        goto done;
-    }
-
-    /* Check that this class supports all requested properties. */
-    hr = process_property_list( obj, argc, argv, &proplist );
-    IWbemClassObject_Release( obj );
-    if (FAILED(hr))
+    /* Getting the class object would enumerate every instance, which for CIM_DataFile
+     * means every file on every fixed drive. Run the query first and check the property
+     * list against the first object it returns. */
+    if (FAILED(process_property_list( NULL, argc, argv, &proplist ))) goto done;
+    if (!*proplist)
     {
         output_error( STRING_INVALID_QUERY );
         goto done;
     }
 
     len = lstrlenW( class ) + lstrlenW( proplist ) + ARRAY_SIZE(L"SELECT * FROM ");
+    if (cond) len += lstrlenW( cond ) + ARRAY_SIZE(L" WHERE ");
     if (!(query = SysAllocStringLen( NULL, len ))) goto done;
-    swprintf( query, len, L"SELECT %s FROM %s", proplist, class );
+    if (cond)
+        swprintf( query, len, L"SELECT %s FROM %s WHERE %s", proplist, class, cond );
+    else
+        swprintf( query, len, L"SELECT %s FROM %s", proplist, class );
 
     if (!(wql = SysAllocString(L"WQL" ))) goto done;
     hr = IWbemServices_ExecQuery( services, wql, query, flags, NULL, &result );
     if (hr != S_OK) goto done;
+
+    IEnumWbemClassObject_Next( result, WBEM_INFINITE, 1, &obj, &count );
+    if (!count)
+    {
+        output_error( STRING_NO_INSTANCES );
+        ret = 0;
+        goto done;
+    }
+    hr = process_property_list( obj, argc, argv, &check );
+    IWbemClassObject_Release( obj );
+    free( check );
+    if (FAILED(hr))
+    {
+        output_error( STRING_INVALID_QUERY );
+        goto done;
+    }
+    IEnumWbemClassObject_Reset( result );
 
     if (option_value)
         output_values( result );
@@ -399,7 +458,8 @@ done:
 static int process_args( int argc, WCHAR *argv[] )
 {
     const WCHAR *class;
-    int i, j;
+    WCHAR *cond = NULL;
+    int i, j, ret;
 
     if (!wcscmp( argv[0], L"/?" ))
     {
@@ -446,7 +506,15 @@ static int process_args( int argc, WCHAR *argv[] )
         i = 1;
     }
 
-    if (!wcsicmp( argv[i], L"get" ))
+    if (i < argc && !wcsicmp( argv[i], L"where" ))
+    {
+        for (j = ++i; j < argc && wcsicmp( argv[j], L"get" ); j++) {}
+        if (j == i) goto not_supported;
+        if (!(cond = build_condition( j - i, argv + i ))) return 1;
+        i = j;
+    }
+
+    if (i < argc && !wcsicmp( argv[i], L"get" ))
     {
         i++;
         for (j = i; j < argc; j++)
@@ -455,13 +523,18 @@ static int process_args( int argc, WCHAR *argv[] )
             {
                 if (i >= argc) goto not_supported;
                 option_value = TRUE;
-                return query_prop( class, argc - i - 1, argv + i );
+                ret = query_prop( class, cond, argc - i - 1, argv + i );
+                free( cond );
+                return ret;
             }
         }
-        return query_prop( class, argc - i, argv + i );
+        ret = query_prop( class, cond, argc - i, argv + i );
+        free( cond );
+        return ret;
     }
 
 not_supported:
+    free( cond );
     output_error( STRING_COMMAND_NOT_SUPPORTED );
     return 1;
 }
