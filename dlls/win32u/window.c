@@ -1603,7 +1603,16 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
         return FALSE;
     }
     if (!internal) win->pixel_format = format;
-    if (format) win->clip_clients = TRUE;
+    if (format && !win->clip_clients)
+    {
+        win->clip_clients = TRUE;
+        /* A DC of this window that already exists is bound to an ancestor's
+         * window surface, while from now on that surface's region excludes
+         * this window's client area (window_clips_clients()).  Everything
+         * painted through such a DC would land in surface bits the flush no
+         * longer copies.  Make those DCs recompute their visible region. */
+        invalidate_dce( win, NULL );
+    }
     release_win_ptr( win );
 
     update_window_state( hwnd );
