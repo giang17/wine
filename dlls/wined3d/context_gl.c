@@ -1325,19 +1325,43 @@ static void context_restore_gl_context(const struct wined3d_gl_info *gl_info, HD
 
 static void wined3d_context_gl_update_window(struct wined3d_context_gl *context_gl)
 {
-    if (!context_gl->c.swapchain)
+    struct wined3d_swapchain *swapchain = context_gl->c.swapchain;
+    BOOL private = FALSE;
+    HDC dc;
+
+    if (!swapchain)
         return;
 
-    if (context_gl->window == context_gl->c.swapchain->win_handle &&
-        context_gl->dc == context_gl->c.swapchain->dc)
+    /* A swapchain that only ever presents by GDI blit never swaps to its
+     * window, so its GL context has no business on that window's DC.  Making
+     * the context current there gives the window a pixel format, and win32u
+     * then treats it as an OpenGL window: the server takes its client area
+     * out of the top-level's surface region, and every DC of the window
+     * paints straight into the X window (one XPutImage per blit, no shared
+     * memory) instead of into the surface the flush copies.  For an embedded
+     * composition target that is a full-window XPutImage per present on top
+     * of dxgi's WM_PAINT re-blit, plus a context switch whenever the same
+     * thread presents another swapchain.  Keep such a context on the device's
+     * backup DC instead -- the present path takes the GDI branch for it
+     * anyway, and the window only matters for drawable coordinates. */
+    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+            && (dc = wined3d_device_gl_get_backup_dc(wined3d_device_gl(context_gl->c.device))))
+        private = TRUE;
+    else
+        dc = swapchain->dc;
+
+    if (context_gl->dc == dc && (private || context_gl->window == swapchain->win_handle))
+    {
+        context_gl->window = swapchain->win_handle;
         return;
+    }
 
-    TRACE("Updating context %p window from %p to %p.\n",
-            context_gl, context_gl->window, context_gl->c.swapchain->win_handle);
+    TRACE("Updating context %p window from %p to %p, dc %p (%s).\n",
+            context_gl, context_gl->window, swapchain->win_handle, dc, private ? "backup" : "window");
 
-    context_gl->window = context_gl->c.swapchain->win_handle;
-    context_gl->dc = context_gl->c.swapchain->dc;
-    context_gl->dc_is_private = FALSE;
+    context_gl->window = swapchain->win_handle;
+    context_gl->dc = dc;
+    context_gl->dc_is_private = private;
     context_gl->dc_has_format = FALSE;
     context_gl->needs_set = 1;
     context_gl->valid = 1;
