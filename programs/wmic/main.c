@@ -86,6 +86,14 @@ static int WINAPIV output_string( const WCHAR *msg, ... )
             _setmode( STDOUT_FILENO, _O_U16TEXT );
             bom_count = wprintf( L"\xfeff" );
         }
+        else
+        {
+            /* Don't rely on the mode stdout was inherited in: the CRT handle block a
+             * parent can pass in STARTUPINFO.lpReserved2 (Node.js does, and cmd.exe
+             * hands it on) leaves a pipe in binary mode, in which wprintf() would
+             * write raw UTF-16 without a BOM. */
+            _setmode( STDOUT_FILENO, _O_TEXT );
+        }
         bom = TRUE;
     }
 
