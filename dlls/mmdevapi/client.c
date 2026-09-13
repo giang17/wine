@@ -1204,6 +1204,10 @@ static HRESULT WINAPI client_GetSharedModeEnginePeriod(IAudioClient3 *iface,
           unit_period_frames, min_period_frames,
           max_period_frames);
 
+    if (!format || !default_period_frames || !unit_period_frames
+            || !min_period_frames || !max_period_frames)
+        return E_POINTER;
+
     if (FAILED(hr = get_periods(This, &def_period, &min_period)))
         return hr;
 
