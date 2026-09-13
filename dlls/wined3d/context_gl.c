@@ -1343,8 +1343,21 @@ static void wined3d_context_gl_update_window(struct wined3d_context_gl *context_
      * of dxgi's WM_PAINT re-blit, plus a context switch whenever the same
      * thread presents another swapchain.  Keep such a context on the device's
      * backup DC instead -- the present path takes the GDI branch for it
-     * anyway, and the window only matters for drawable coordinates. */
-    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+     * anyway, and the window only matters for drawable coordinates.
+     *
+     * The same holds for a FLIP_SEQUENTIAL or SEQUENTIAL swapchain without
+     * PREFER_GL_PRESENT: swapchain_gl_present() blits those by GDI on every
+     * present, and dxgi only prefers GL for the top levels it binds.  Bound
+     * to the window DC, the context gave a child window's client area an
+     * offscreen GL client window that never received a frame, and win32u's
+     * flush of the old drawable on every context switch copied that window
+     * onto the top level: Groove Agent 5's plug-in view (an HWND swapchain on
+     * a WS_CHILD) flashed a stale frame each time a tooltip's composition
+     * swapchain moved between its popup and its composition window. */
+    if (((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+                || (!(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
+                    && (swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
+                        || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_SEQUENTIAL)))
             && (dc = wined3d_device_gl_get_backup_dc(wined3d_device_gl(context_gl->c.device))))
         private = TRUE;
     else
