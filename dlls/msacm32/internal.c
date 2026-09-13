@@ -742,7 +742,15 @@ PWINE_ACMDRIVERID MSACM_UnregisterDriver(PWINE_ACMDRIVERID p)
     PWINE_ACMDRIVERID pNextACMDriverID;
 
     while (p->pACMDriverList)
-	acmDriverClose((HACMDRIVER) p->pACMDriverList, 0);
+    {
+        PWINE_ACMDRIVER pad = p->pACMDriverList;
+
+        if (acmDriverClose((HACMDRIVER)pad, 0) == MMSYSERR_NOERROR && p->pACMDriverList != pad)
+            continue;
+        /* A head entry that acmDriverClose() does not take off the list would be retried forever. */
+        WARN("cannot close driver %p of %s, dropping the remaining list\n", pad, debugstr_w(p->pszDriverAlias));
+        p->pACMDriverList = NULL;
+    }
 
     HeapFree(MSACM_hHeap, 0, p->pszDriverAlias);
     HeapFree(MSACM_hHeap, 0, p->pszFileName);
