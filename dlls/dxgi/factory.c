@@ -562,18 +562,23 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
 
         case WM_PAINT:
         {
-            PAINTSTRUCT ps;
-            HDC comp_dc = (HDC)GetPropW(hwnd, L"__wine_dcomp_comp_dc");
-            LPARAM dims = (LPARAM)GetPropW(hwnd, L"__wine_dcomp_comp_size");
-
-            BeginPaint(hwnd, &ps);
-            if (comp_dc && dims)
-            {
-                unsigned int w = LOWORD(dims);
-                unsigned int h = HIWORD(dims);
-                BitBlt(ps.hdc, 0, 0, w, h, comp_dc, 0, 0, SRCCOPY);
-            }
-            EndPaint(hwnd, &ps);
+            /* Let the application paint first, as the full-mode subclass
+             * does.  A popup's first present goes out before the window is
+             * shown, and on the GL path that frame is lost (the swap hits a
+             * client window whose top level is not viewable yet, and there
+             * is no buffer to repeat it from).  The WM_PAINT that follows
+             * the map is the application's cue to present again: Groove
+             * Agent 5's tooltips presented a second time in exactly that
+             * paint under the full-mode subclass and stayed dark under this
+             * one, which swallowed the paint.  Then re-blit the composition
+             * buffer via GetDC so the swapchain content stays on top of what
+             * the application painted (its EndPaint already validated the
+             * update region, a second BeginPaint would get an empty clip). */
+            if (orig)
+                CallWindowProcW(orig, hwnd, msg, wparam, lparam);
+            else
+                DefWindowProcW(hwnd, msg, wparam, lparam);
+            dcomp_reblit_comp_buffer(hwnd, "popup-paint");
             ValidateRect(hwnd, NULL);
             return 0;
         }
@@ -981,6 +986,30 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
 
                     if (dcomp_subclassed_target_count > 0)
                         is_popup_mode = TRUE;
+
+                    /* A tooltip-sized WS_POPUP top level without caption or
+                     * owner is a popup even as the first target this process
+                     * binds.  Groove Agent 5 draws its main view through an
+                     * HWND swapchain that never comes through here, so every
+                     * tooltip arrived with count 0, took full mode, and the
+                     * 200 ms timer Present pushed the flip chain's second,
+                     * never drawn back buffer to the window: the tooltip went
+                     * black after ~200 ms on the GL and the GDI path alike.
+                     * The count stays the discriminator for everything else;
+                     * no main window is 64 px high. */
+                    if (!is_popup_mode && (target_style & WS_POPUP) && !(target_style & WS_CAPTION)
+                            && !target_parent && !GetWindow(target_hwnd, GW_OWNER))
+                    {
+                        RECT wr;
+
+                        if (GetWindowRect(target_hwnd, &wr) && wr.bottom - wr.top <= 64)
+                        {
+                            is_popup_mode = TRUE;
+                            FIXME("DComp popup-detect: target %p is a tooltip-sized owner-less popup (%ldx%ld), "
+                                    "popup mode despite count 0.\n", target_hwnd,
+                                    wr.right - wr.left, wr.bottom - wr.top);
+                        }
+                    }
 
                     /* Never chain a second subclass onto ourselves.  A resize makes
                      * the app recreate its composition swapchain, so we land here
