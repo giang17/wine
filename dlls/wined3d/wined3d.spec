@@ -316,6 +316,7 @@
 @ cdecl wined3d_swapchain_set_force_gdi_present(ptr long)
 @ cdecl wined3d_swapchain_set_prefer_gl_present(ptr long)
 @ cdecl wined3d_swapchain_set_dirty_rects(ptr ptr long)
+@ cdecl wined3d_swapchain_set_scroll_rect(ptr ptr ptr)
 @ cdecl wined3d_swapchain_set_premultiplied_alpha(ptr long)
 
 @ cdecl wined3d_swapchain_state_create(ptr ptr ptr ptr ptr)

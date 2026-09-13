@@ -382,6 +382,21 @@ void CDECL wined3d_swapchain_set_dirty_rects(struct wined3d_swapchain *swapchain
     swapchain->present_dirty_rect_count = count;
 }
 
+void CDECL wined3d_swapchain_set_scroll_rect(struct wined3d_swapchain *swapchain,
+        const RECT *rect, const POINT *offset)
+{
+    TRACE("swapchain %p, rect %s, offset %s.\n", swapchain, wine_dbgstr_rect(rect), wine_dbgstr_point(offset));
+
+    if (!rect || !offset || (!offset->x && !offset->y) || IsRectEmpty(rect))
+    {
+        swapchain->present_scroll_valid = FALSE;
+        return;
+    }
+    swapchain->present_scroll_rect = *rect;
+    swapchain->present_scroll_offset = *offset;
+    swapchain->present_scroll_valid = TRUE;
+}
+
 HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
         const RECT *src_rect, const RECT *dst_rect, HWND dst_window_override,
         unsigned int swap_interval, uint32_t flags)
@@ -1021,6 +1036,49 @@ static BOOL swapchain_composite_layer(struct wined3d_swapchain *swapchain, DWORD
     return TRUE;
 }
 
+/* Present1 scroll: move the previous frame's content within the composition
+ * buffer before this frame's dirty rects are copied over it.  "rect" is the
+ * area of the new frame that receives the shifted content, its source is the
+ * same area moved back by the offset; both are clipped to the buffer and the
+ * clipped extent is shared so source and destination stay aligned.  Rows are
+ * walked away from the direction of travel so overlapping rows are read
+ * before they are overwritten. */
+static void comp_buffer_scroll(DWORD *bits, unsigned int stride, int buf_w, int buf_h,
+        const RECT *rect, int dx, int dy)
+{
+    int l = rect->left, t = rect->top, r = rect->right, b = rect->bottom;
+    int sl, st, sr, sb, w, h, y;
+
+    if (l < 0) l = 0;
+    if (t < 0) t = 0;
+    if (r > buf_w) r = buf_w;
+    if (b > buf_h) b = buf_h;
+
+    sl = l - dx; st = t - dy; sr = r - dx; sb = b - dy;
+    if (sl < 0) { l -= sl; sl = 0; }
+    if (st < 0) { t -= st; st = 0; }
+    if (sr > buf_w) { r -= sr - buf_w; sr = buf_w; }
+    if (sb > buf_h) { b -= sb - buf_h; sb = buf_h; }
+
+    w = r - l;
+    h = b - t;
+    if (w <= 0 || h <= 0)
+        return;
+
+    if (dy > 0)
+    {
+        for (y = h - 1; y >= 0; --y)
+            memmove((char *)bits + (t + y) * stride + l * 4,
+                    (char *)bits + (st + y) * stride + sl * 4, w * 4);
+    }
+    else
+    {
+        for (y = 0; y < h; ++y)
+            memmove((char *)bits + (t + y) * stride + l * 4,
+                    (char *)bits + (st + y) * stride + sl * 4, w * 4);
+    }
+}
+
 static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         struct wined3d_context *context, const RECT *src_rect, const RECT *dst_rect)
 {
@@ -1156,7 +1214,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
              * zero-initialized; the regular dirty-/full-present paths below
              * fill it from this present's actual content. */
         }
-        if (swapchain->cs_present_dirty_rect_count > 0)
+        if (swapchain->cs_present_dirty_rect_count > 0 || swapchain->cs_present_scroll_valid)
         {
             /* Dirty rects: accumulate only changed regions into comp buffer.
              * Use alpha-aware copy to preserve existing content under transparent
@@ -1169,6 +1227,46 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
             if (use_alpha_copy)
                 GdiFlush();
+
+            /* Present1 scroll rect (issue 371): the app redraws only what the
+             * scroll uncovers and reports just that as dirty (Groove Agent 5:
+             * a 2..62 px strip plus the scrollbar column per wheel step); the
+             * shifted area must come from the previous composition frame, the
+             * back buffer of a flip chain holds an older one.  Applied in the
+             * dirty-rect coordinate space of the target buffer, before the
+             * dirty rects are copied over it. */
+            if (swapchain->cs_present_scroll_valid)
+            {
+                const RECT *sr = &swapchain->cs_present_scroll_rect;
+                RECT scaled;
+                int ox = swapchain->cs_present_scroll_offset.x;
+                int oy = swapchain->cs_present_scroll_offset.y;
+
+                scaled.left = src_w ? sr->left * (int)dst_w / (int)src_w : sr->left;
+                scaled.top = src_h ? sr->top * (int)dst_h / (int)src_h : sr->top;
+                scaled.right = src_w ? sr->right * (int)dst_w / (int)src_w : sr->right;
+                scaled.bottom = src_h ? sr->bottom * (int)dst_h / (int)src_h : sr->bottom;
+                if (src_w) ox = ox * (int)dst_w / (int)src_w;
+                if (src_h) oy = oy * (int)dst_h / (int)src_h;
+
+                if (use_alpha_copy)
+                {
+                    DWORD *target = swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits;
+                    unsigned int stride = swapchain->surface_bits ? swapchain->surface_width * 4 : swapchain->comp_width * 4;
+                    int tgt_w = swapchain->surface_bits ? (int)swapchain->surface_width : (int)swapchain->comp_width;
+                    int tgt_h = swapchain->surface_bits ? (int)swapchain->surface_height : (int)swapchain->comp_height;
+
+                    comp_buffer_scroll(target, stride, tgt_w, tgt_h, &scaled, ox, oy);
+                }
+                else
+                {
+                    BitBlt(swapchain->comp_dc, scaled.left, scaled.top,
+                            scaled.right - scaled.left, scaled.bottom - scaled.top,
+                            swapchain->comp_dc, scaled.left - ox, scaled.top - oy, SRCCOPY);
+                }
+                TRACE("Scrolled %s by (%d,%d) in the composition buffer, %u dirty rects follow.\n",
+                        wine_dbgstr_rect(&scaled), ox, oy, swapchain->cs_present_dirty_rect_count);
+            }
 
             for (i = 0; i < swapchain->cs_present_dirty_rect_count; ++i)
             {
@@ -1229,7 +1327,8 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
             {
                 static unsigned int dirty_blit_count;
                 ++dirty_blit_count;
-                if (dirty_blit_count <= 10 || !(dirty_blit_count % 500))
+                if (swapchain->cs_present_dirty_rect_count
+                        && (dirty_blit_count <= 10 || !(dirty_blit_count % 500)))
                 {
                     const RECT *dr0 = &swapchain->cs_present_dirty_rects[0];
                     TRACE("Dirty blit #%u: win %p, %u rects, r0=(%ld,%ld)-(%ld,%ld) %s, buf=%ux%u.\n",
@@ -1379,6 +1478,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
             WARN("Failed to set __wine_dcomp_comp_bits property.\n");
 
         swapchain->cs_present_dirty_rect_count = 0;
+        swapchain->cs_present_scroll_valid = FALSE;
     }
     else
     {
