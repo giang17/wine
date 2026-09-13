@@ -803,6 +803,9 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_Present1(IDXGISwapChain4 *iface
     {
         wined3d_swapchain_set_dirty_rects(swapchain->wined3d_swapchain, NULL, 0);
     }
+    wined3d_swapchain_set_scroll_rect(swapchain->wined3d_swapchain,
+            present_parameters ? present_parameters->pScrollRect : NULL,
+            present_parameters ? present_parameters->pScrollOffset : NULL);
 
     return d3d11_swapchain_present(swapchain, sync_interval, flags);
 }

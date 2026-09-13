@@ -175,6 +175,9 @@ struct wined3d_cs_present
      * (which the app may concurrently overwrite for the next frame). */
     RECT present_dirty_rects[16];
     unsigned int present_dirty_rect_count;
+    RECT present_scroll_rect;
+    POINT present_scroll_offset;
+    BOOL present_scroll_valid;
 };
 
 struct wined3d_cs_clear
@@ -733,6 +736,9 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
     if (op->present_dirty_rect_count)
         memcpy(swapchain->cs_present_dirty_rects, op->present_dirty_rects,
                 op->present_dirty_rect_count * sizeof(*swapchain->cs_present_dirty_rects));
+    swapchain->cs_present_scroll_valid = op->present_scroll_valid;
+    swapchain->cs_present_scroll_rect = op->present_scroll_rect;
+    swapchain->cs_present_scroll_offset = op->present_scroll_offset;
 
     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
 
@@ -847,6 +853,10 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
      * Reset here on the app thread rather than on the CS thread after the blit,
      * so the client buffer is never written from two threads. */
     swapchain->present_dirty_rect_count = 0;
+    op->present_scroll_valid = swapchain->present_scroll_valid;
+    op->present_scroll_rect = swapchain->present_scroll_rect;
+    op->present_scroll_offset = swapchain->present_scroll_offset;
+    swapchain->present_scroll_valid = FALSE;
 
 
     wined3d_resource_reference(&swapchain->front_buffer->resource);

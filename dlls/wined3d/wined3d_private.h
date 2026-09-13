@@ -4180,6 +4180,15 @@ struct wined3d_swapchain
     unsigned int present_dirty_rect_count;
     RECT cs_present_dirty_rects[16];
     unsigned int cs_present_dirty_rect_count;
+    /* Present1 scroll rect/offset, same client -> op -> CS hand-off as the
+     * dirty rects.  The rect is the area of the new frame that receives the
+     * previous frame's content shifted by the offset. */
+    RECT present_scroll_rect;
+    POINT present_scroll_offset;
+    BOOL present_scroll_valid;
+    RECT cs_present_scroll_rect;
+    POINT cs_present_scroll_offset;
+    BOOL cs_present_scroll_valid;
     HWND last_blit_window;
 
     /* DComp composition buffer (persistent, for dirty-rect accumulation) */
