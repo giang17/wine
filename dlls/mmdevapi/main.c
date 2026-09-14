@@ -34,6 +34,9 @@
 #include "propkeydef.h"
 #include "mmdeviceapi.h"
 #include "dbt.h"
+#include "plugplay.h"
+#include "rpcasync.h"
+#include "wine/exception.h"
 #include "mmsystem.h"
 #include "dsound.h"
 #include "audioclient.h"
@@ -377,15 +380,114 @@ static BOOL CALLBACK post_device_change( HWND hwnd, LPARAM lparam )
     return TRUE;
 }
 
-/* The MIDI driver saw a device appear or go away.  Windows broadcasts
- * WM_DEVICECHANGE / DBT_DEVNODES_CHANGED to every top-level window when
- * that happens, and applications re-enumerate on it; the Wine PnP
- * manager only does that for devices with a kernel driver, so raise it
- * here for this process' windows. */
-static void notify_device_change(void)
+void __RPC_FAR * __RPC_USER MIDL_user_allocate( SIZE_T len )
 {
-    TRACE( "MIDI device set changed, posting WM_DEVICECHANGE\n" );
-    EnumWindows( post_device_change, 0 );
+    return malloc( len );
+}
+
+void __RPC_USER MIDL_user_free( void __RPC_FAR *ptr )
+{
+    free( ptr );
+}
+
+static LONG WINAPI rpc_filter( EXCEPTION_POINTERS *eptr )
+{
+    return I_RpcExceptionFilter( eptr->ExceptionRecord->ExceptionCode );
+}
+
+static BOOL plugplay_bind(void)
+{
+    static BOOL bound;
+    RPC_WSTR binding_str;
+    RPC_STATUS err;
+
+    if (bound) return TRUE;
+    if ((err = RpcStringBindingComposeW( NULL, (RPC_WSTR)L"ncacn_np", NULL, (RPC_WSTR)L"\\pipe\\wine_plugplay",
+                                         NULL, &binding_str )))
+    {
+        WARN( "RpcStringBindingCompose() failed, error %#lx\n", err );
+        return FALSE;
+    }
+    err = RpcBindingFromStringBindingW( binding_str, &plugplay_binding_handle );
+    RpcStringFreeW( &binding_str );
+    if (err)
+    {
+        WARN( "RpcBindingFromStringBinding() failed, error %#lx\n", err );
+        return FALSE;
+    }
+    bound = TRUE;
+    return TRUE;
+}
+
+/* Hand a device interface event to the PnP manager, which broadcasts
+ * WM_DEVICECHANGE / DBT_DEVNODES_CHANGED and delivers the interface
+ * arrival or removal to everything registered through
+ * RegisterDeviceNotification() with a matching class. */
+static BOOL send_interface_event( DWORD code, const GUID *category, const WCHAR *path )
+{
+    DEV_BROADCAST_DEVICEINTERFACE_W *iface;
+    unsigned int size;
+    BOOL ret = TRUE;
+
+    size = offsetof( DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name[wcslen( path ) + 1] );
+    if (!(iface = calloc( 1, size ))) return FALSE;
+    iface->dbcc_size = size;
+    iface->dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    iface->dbcc_classguid = *category;
+    wcscpy( iface->dbcc_name, path );
+
+    __TRY
+    {
+        plugplay_send_event( path, code, (BYTE *)iface, size );
+    }
+    __EXCEPT(rpc_filter)
+    {
+        WARN( "Failed to send event, exception %#lx\n", GetExceptionCode() );
+        ret = FALSE;
+    }
+    __ENDTRY
+
+    free( iface );
+    return ret;
+}
+
+/* The MIDI driver saw a sequencer port appear or go away.  On Windows a
+ * MIDI port is a kernel streaming filter: the PnP manager reports its
+ * KSCATEGORY_AUDIO interface (plus KSCATEGORY_CAPTURE for an input and
+ * KSCATEGORY_RENDER for an output) as DBT_DEVICEARRIVAL or
+ * DBT_DEVICEREMOVECOMPLETE to windows registered for those classes, and
+ * broadcasts DBT_DEVNODES_CHANGED to everyone else.  Applications such as
+ * Ableton Live only re-enumerate on the former, frameworks such as JUCE on
+ * the latter.  The Wine PnP manager knows nothing about sequencer ports, so
+ * the events are raised from here under a synthetic device path; if the
+ * manager cannot be reached, DBT_DEVNODES_CHANGED is at least posted to
+ * this process' own windows. */
+static void notify_device_change( const struct notify_context *notify )
+{
+    static const GUID KSCATEGORY_AUDIO_GUID   = {0x6994ad04, 0x93ef, 0x11d0, {0xa3, 0xcc, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96}};
+    static const GUID KSCATEGORY_CAPTURE_GUID = {0x65e8773d, 0x8f56, 0x11d0, {0xa3, 0xb9, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96}};
+    static const GUID KSCATEGORY_RENDER_GUID  = {0x65e8773e, 0x8f56, 0x11d0, {0xa3, 0xb9, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96}};
+    DWORD code = notify->dev_id ? DBT_DEVICEARRIVAL : DBT_DEVICEREMOVECOMPLETE;
+    unsigned int client = notify->param_1, port = notify->param_2;
+    WCHAR path[80];
+    BOOL sent = FALSE;
+
+    TRACE( "MIDI port %u:%u %s\n", client, port, notify->dev_id ? "arrived" : "removed" );
+
+    if (plugplay_bind())
+    {
+        swprintf( path, ARRAY_SIZE(path), L"\\\\?\\ALSA#SEQ#%u_%u#{6994ad04-93ef-11d0-a3cc-00a0c9223196}", client, port );
+        sent = send_interface_event( code, &KSCATEGORY_AUDIO_GUID, path );
+        swprintf( path, ARRAY_SIZE(path), L"\\\\?\\ALSA#SEQ#%u_%u#{65e8773d-8f56-11d0-a3b9-00a0c9223196}", client, port );
+        sent = send_interface_event( code, &KSCATEGORY_CAPTURE_GUID, path ) || sent;
+        swprintf( path, ARRAY_SIZE(path), L"\\\\?\\ALSA#SEQ#%u_%u#{65e8773e-8f56-11d0-a3b9-00a0c9223196}", client, port );
+        sent = send_interface_event( code, &KSCATEGORY_RENDER_GUID, path ) || sent;
+    }
+    if (!sent)
+    {
+        TRACE( "PnP manager not reachable, posting WM_DEVICECHANGE to own windows\n" );
+        EnumWindows( post_device_change, 0 );
+    }
 }
 
 static DWORD WINAPI notify_thread( void *p )
@@ -403,7 +505,7 @@ static DWORD WINAPI notify_thread( void *p )
         MIDI_CALL( midi_notify_wait, &params );
         if (quit) break;
         if (!notify.send_notify) continue;
-        if (notify.msg == MIDI_NOTIFY_DEVICE_CHANGE) notify_device_change();
+        if (notify.msg == MIDI_NOTIFY_DEVICE_CHANGE) notify_device_change( &notify );
         else notify_client(&notify);
     }
     return 0;
