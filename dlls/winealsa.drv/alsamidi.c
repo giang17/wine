@@ -1141,6 +1141,9 @@ static UINT midi_out_get_devcaps(WORD dev_id, MIDIOUTCAPSW *caps, UINT size)
 
     if (dev_id >= num_dests) return MMSYSERR_BADDEVICEID;
     if (!caps) return MMSYSERR_INVALPARAM;
+    /* the port went away: keep the id, but let the application see that
+     * there is no device behind it any more */
+    if (!dests[dev_id].present) return MMSYSERR_NODRIVER;
 
     memcpy(caps, &dests[dev_id].caps, min(size, sizeof(*caps)));
 
@@ -1567,6 +1570,9 @@ static UINT midi_in_get_devcaps(WORD dev_id, MIDIINCAPSW *caps, UINT size)
 
     if (dev_id >= num_srcs) return MMSYSERR_BADDEVICEID;
     if (!caps) return MMSYSERR_INVALPARAM;
+    /* the port went away: keep the id, but let the application see that
+     * there is no device behind it any more */
+    if (!srcs[dev_id].present) return MMSYSERR_NODRIVER;
 
     memcpy(caps, &srcs[dev_id].caps, min(size, sizeof(*caps)));
 
