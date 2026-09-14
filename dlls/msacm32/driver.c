@@ -197,6 +197,8 @@ MMRESULT WINAPI acmDriverClose(HACMDRIVER had, DWORD fdwClose)
 
     padid = pad->obj.pACMDriverID;
 
+    EnterCriticalSection(&MSACM_cs);
+
     /* remove driver from list */
     for (tpad = &(padid->pACMDriverList); *tpad; tpad = &((*tpad)->pNextACMDriver)) {
 	if (*tpad == pad) {
@@ -205,11 +207,14 @@ MMRESULT WINAPI acmDriverClose(HACMDRIVER had, DWORD fdwClose)
 	}
     }
 
-    /* close driver if it has been opened */
+    if (pad->pLocalDrvrInst)
+        MSACM_CloseLocalDriver(pad->pLocalDrvrInst);
+
+    LeaveCriticalSection(&MSACM_cs);
+
+    /* close driver if it has been opened; not under the lock, see MSACM_cs */
     if (pad->hDrvr && !pad->pLocalDrvrInst)
 	CloseDriver(pad->hDrvr, 0, 0);
-    else if (pad->pLocalDrvrInst)
-        MSACM_CloseLocalDriver(pad->pLocalDrvrInst);
 
     pad->obj.dwType = 0;
     HeapFree(MSACM_hHeap, 0, pad);
@@ -574,7 +579,9 @@ MMRESULT WINAPI acmDriverOpen(PHACMDRIVER phad, HACMDRIVERID hadid, DWORD fdwOpe
         adod.pszAliasName = NULL;
         adod.dnDevNode = 0;
 
+        EnterCriticalSection(&MSACM_cs);
         pad->pLocalDrvrInst = MSACM_OpenLocalDriver(padid->pLocalDriver, (DWORD_PTR)&adod);
+        LeaveCriticalSection(&MSACM_cs);
         if (!pad->pLocalDrvrInst)
         {
             ret = adod.dwError;
@@ -585,8 +592,10 @@ MMRESULT WINAPI acmDriverOpen(PHACMDRIVER phad, HACMDRIVERID hadid, DWORD fdwOpe
     }
 
     /* insert new pad at beg of list */
+    EnterCriticalSection(&MSACM_cs);
     pad->pNextACMDriver = padid->pACMDriverList;
     padid->pACMDriverList = pad;
+    LeaveCriticalSection(&MSACM_cs);
 
     /* FIXME: Create a WINE_ACMDRIVER32 */
     *phad = (HACMDRIVER)pad;
