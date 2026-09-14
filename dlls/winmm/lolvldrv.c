@@ -104,9 +104,11 @@ static BOOL MMDRV_GrowMlds(UINT type, UINT count)
  * the ones that appeared since the driver was loaded.  Windows enumerates
  * MIDI devices on every midiIn/OutGetNumDevs() call, so a device plugged
  * in after the process started shows up as a new id at the end of the
- * list.  Devices that went away keep their id (opening them fails), which
+ * list.  A device that went away keeps its id (opening it fails), which
  * keeps ids stable for open handles and for applications that persist
- * device numbers.
+ * device numbers; the driver drops trailing absent devices from its count,
+ * and the id table shrinks with it.  Open handles do not live in the id
+ * table, so shrinking does not affect them.
  */
 static void MMDRV_Refresh(UINT type)
 {
@@ -126,14 +128,22 @@ static void MMDRV_Refresh(UINT type)
 
         have = part->nIDMax - part->nIDMin;
         count = part->fnMessage32(0, MMDRV_GetNumDevsMsg[type], 0L, 0L, 0L);
-        if (HIWORD(count) || count <= have) continue;
+        if (HIWORD(count) || count == have) continue;
 
         if ((UINT)part->nIDMax != llType->wMaxId)
         {
             /* the ids of this driver are followed by those of another one;
-             * appending would renumber that driver's devices */
-            WARN("%s: %s now has %lu devices (had %u), cannot append behind other drivers\n",
+             * growing or shrinking would renumber that driver's devices */
+            WARN("%s: %s now has %lu devices (had %u), cannot resize behind other drivers\n",
                  llType->typestr, MMDrvs[i].drvname, count, have);
+            continue;
+        }
+        if (count < have)
+        {
+            part->nIDMax = part->nIDMin + count;
+            llType->wMaxId = part->nIDMax;
+            TRACE("%s: %s shrank from %u to %lu devices (ttop=%u)\n",
+                  llType->typestr, MMDrvs[i].drvname, have, count, llType->wMaxId);
             continue;
         }
         if (!MMDRV_GrowMlds(type, part->nIDMin + count)) continue;
