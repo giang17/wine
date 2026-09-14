@@ -612,6 +612,34 @@ static void scan_devices(void)
  * or, as a fallback, when the last scan is older than SCAN_INTERVAL_MS.
  * Windows re-enumerates on every midiIn/OutGetNumDevs() call; applications
  * that poll do so every few hundred milliseconds, hence the throttle. */
+/* Number of devices to report to winmm: up to and including the last one
+ * whose port exists.  A device that went away keeps its slot, so that an
+ * open handle stays valid and the port lands on the same id when it comes
+ * back -- but a trailing run of absent devices is dropped from the count,
+ * as Windows drops an unplugged device from the enumeration.  Absent
+ * devices below a present one stay visible and fail GETDEVCAPS. */
+static UINT num_visible_dests(void)
+{
+    unsigned int n;
+
+    devices_lock();
+    n = num_dests;
+    while (n && !dests[n - 1].present) n--;
+    devices_unlock();
+    return n;
+}
+
+static UINT num_visible_srcs(void)
+{
+    unsigned int n;
+
+    devices_lock();
+    n = num_srcs;
+    while (n && !srcs[n - 1].present) n--;
+    devices_unlock();
+    return n;
+}
+
 static void rescan_devices(void)
 {
     BOOL do_scan;
@@ -1684,7 +1712,7 @@ NTSTATUS alsa_midi_out_message(void *args)
         break;
     case MODM_GETNUMDEVS:
         rescan_devices();
-        *params->err = num_dests;
+        *params->err = num_visible_dests();
         break;
     case MODM_GETVOLUME:
         *params->err = midi_out_get_volume(params->dev_id, (UINT *)params->param_1);
@@ -1740,7 +1768,7 @@ NTSTATUS alsa_midi_in_message(void *args)
         break;
     case MIDM_GETNUMDEVS:
         rescan_devices();
-        *params->err = num_srcs;
+        *params->err = num_visible_srcs();
         break;
     case MIDM_START:
         *params->err = midi_in_start(params->dev_id);
