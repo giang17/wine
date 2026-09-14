@@ -268,8 +268,9 @@ struct midi_init_params
     UINT *err;
 };
 
-/* notify_context.msg value that is not a MIM_/MOM_ message: the driver's
- * device set changed (a port appeared or went away).  The PE side raises
+/* notify_context.msg value that is not a MIM_/MOM_ message: a port of the
+ * driver appeared (dev_id = 1) or went away (dev_id = 0); param_1/param_2
+ * identify it (for ALSA: sequencer client and port).  The PE side raises
  * WM_DEVICECHANGE for it instead of calling a client callback. */
 #define MIDI_NOTIFY_DEVICE_CHANGE 0xffff
 

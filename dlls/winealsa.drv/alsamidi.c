@@ -1286,30 +1286,36 @@ static void handle_regular_event(struct midi_src *src, snd_seq_event_t *ev)
 static void handle_announce_event(snd_seq_event_t *ev)
 {
     struct notify_context notify;
-    BOOL was_dirty;
 
     switch (ev->type)
     {
     case SND_SEQ_EVENT_PORT_START:
     case SND_SEQ_EVENT_PORT_EXIT:
-    case SND_SEQ_EVENT_PORT_CHANGE:
-    case SND_SEQ_EVENT_CLIENT_START:
-    case SND_SEQ_EVENT_CLIENT_EXIT:
         break;
+    case SND_SEQ_EVENT_PORT_CHANGE:
+    case SND_SEQ_EVENT_CLIENT_EXIT:
+        /* no port of its own to report, but the tables may be stale */
+        devices_lock();
+        devices_dirty = TRUE;
+        devices_unlock();
+        return;
     default:
         return;
     }
     if (ev->data.addr.client == snd_seq_client_id(midi_seq)) return;
 
     devices_lock();
-    was_dirty = devices_dirty;
     devices_dirty = TRUE;
     devices_unlock();
-    if (was_dirty) return;
 
+    /* one notification per port, arrival and removal alike: the PE side
+     * turns it into the interface events an application registered for */
     memset(&notify, 0, sizeof(notify));
     notify.send_notify = TRUE;
     notify.msg = MIDI_NOTIFY_DEVICE_CHANGE;
+    notify.dev_id = ev->type == SND_SEQ_EVENT_PORT_START;
+    notify.param_1 = ev->data.addr.client;
+    notify.param_2 = ev->data.addr.port;
     notify_post(&notify);
 }
 
