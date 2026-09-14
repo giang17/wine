@@ -260,6 +260,11 @@ struct midi_init_params
     UINT *err;
 };
 
+/* notify_context.msg value that is not a MIM_/MOM_ message: the driver's
+ * device set changed (a port appeared or went away).  The PE side raises
+ * WM_DEVICECHANGE for it instead of calling a client callback. */
+#define MIDI_NOTIFY_DEVICE_CHANGE 0xffff
+
 struct notify_context
 {
     BOOL send_notify;

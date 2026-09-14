@@ -33,6 +33,7 @@
 #include "propsys.h"
 #include "propkeydef.h"
 #include "mmdeviceapi.h"
+#include "dbt.h"
 #include "mmsystem.h"
 #include "dsound.h"
 #include "audioclient.h"
@@ -366,6 +367,27 @@ static void notify_client(struct notify_context *notify)
                     notify->instance, notify->param_1, notify->param_2 );
 }
 
+static BOOL CALLBACK post_device_change( HWND hwnd, LPARAM lparam )
+{
+    DWORD pid;
+
+    GetWindowThreadProcessId( hwnd, &pid );
+    if (pid == GetCurrentProcessId())
+        PostMessageW( hwnd, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0 );
+    return TRUE;
+}
+
+/* The MIDI driver saw a device appear or go away.  Windows broadcasts
+ * WM_DEVICECHANGE / DBT_DEVNODES_CHANGED to every top-level window when
+ * that happens, and applications re-enumerate on it; the Wine PnP
+ * manager only does that for devices with a kernel driver, so raise it
+ * here for this process' windows. */
+static void notify_device_change(void)
+{
+    TRACE( "MIDI device set changed, posting WM_DEVICECHANGE\n" );
+    EnumWindows( post_device_change, 0 );
+}
+
 static DWORD WINAPI notify_thread( void *p )
 {
     struct midi_notify_wait_params params;
@@ -380,7 +402,9 @@ static DWORD WINAPI notify_thread( void *p )
     {
         MIDI_CALL( midi_notify_wait, &params );
         if (quit) break;
-        if (notify.send_notify) notify_client(&notify);
+        if (!notify.send_notify) continue;
+        if (notify.msg == MIDI_NOTIFY_DEVICE_CHANGE) notify_device_change();
+        else notify_client(&notify);
     }
     return 0;
 }

@@ -44,6 +44,7 @@ typedef struct tagWINE_LLTYPE {
     UINT		wMaxId;		/* number of loaded devices (sum across all loaded drivers) */
     LPWINE_MLD		lpMlds;		/* "static" mlds to access the part though device IDs */
     int			nMapper;	/* index to mapper */
+    UINT		nMldsAlloc;	/* allocated entries in lpMlds (incl. the mapper slot at [-1]) */
 } WINE_LLTYPE;
 
 static WINE_LLTYPE llTypes[MMDRV_MAX] = {
@@ -69,6 +70,90 @@ static void MMDRV_InitSingleType(UINT type) {
     }
 }
 
+static const UINT MMDRV_GetNumDevsMsg[MMDRV_MAX] = {
+    AUXDM_GETNUMDEVS, MXDM_GETNUMDEVS, MIDM_GETNUMDEVS, MODM_GETNUMDEVS, WIDM_GETNUMDEVS, WODM_GETNUMDEVS
+};
+
+/**************************************************************************
+ * 			MMDRV_GrowMlds				[internal]
+ *
+ * Make sure the device id table of a type can hold at least 'count'
+ * entries plus the mapper slot at index -1.  Grows in chunks so that the
+ * table rarely moves while another thread holds a pointer into it.
+ */
+static BOOL MMDRV_GrowMlds(UINT type, UINT count)
+{
+    WINE_LLTYPE *llType = &llTypes[type];
+    WINE_MLD *mem;
+    UINT alloc;
+
+    if (count + 1 <= llType->nMldsAlloc) return TRUE;
+
+    alloc = max(count + 1, llType->nMldsAlloc + 64);
+    mem = llType->lpMlds ? llType->lpMlds - 1 : NULL;
+    if (!(mem = realloc(mem, sizeof(WINE_MLD) * alloc))) return FALSE;
+    llType->lpMlds = mem + 1;
+    llType->nMldsAlloc = alloc;
+    return TRUE;
+}
+
+/**************************************************************************
+ * 			MMDRV_Refresh				[internal]
+ *
+ * Ask the low-level drivers again how many devices they have and append
+ * the ones that appeared since the driver was loaded.  Windows enumerates
+ * MIDI devices on every midiIn/OutGetNumDevs() call, so a device plugged
+ * in after the process started shows up as a new id at the end of the
+ * list.  Devices that went away keep their id (opening them fails), which
+ * keeps ids stable for open handles and for applications that persist
+ * device numbers.
+ */
+static void MMDRV_Refresh(UINT type)
+{
+    WINE_LLTYPE *llType = &llTypes[type];
+    int i;
+
+    if (type != MMDRV_MIDIIN && type != MMDRV_MIDIOUT) return;
+
+    EnterCriticalSection(&WINMM_cs);
+    for (i = 0; i < MMDrvsHi; i++)
+    {
+        WINE_MM_DRIVER_PART *part = &MMDrvs[i].parts[type];
+        DWORD count;
+        UINT have, k;
+
+        if (MMDrvs[i].bIsMapper || !part->fnMessage32) continue;
+
+        have = part->nIDMax - part->nIDMin;
+        count = part->fnMessage32(0, MMDRV_GetNumDevsMsg[type], 0L, 0L, 0L);
+        if (HIWORD(count) || count <= have) continue;
+
+        if ((UINT)part->nIDMax != llType->wMaxId)
+        {
+            /* the ids of this driver are followed by those of another one;
+             * appending would renumber that driver's devices */
+            WARN("%s: %s now has %lu devices (had %u), cannot append behind other drivers\n",
+                 llType->typestr, MMDrvs[i].drvname, count, have);
+            continue;
+        }
+        if (!MMDRV_GrowMlds(type, part->nIDMin + count)) continue;
+
+        for (k = part->nIDMax; k < part->nIDMin + count; k++)
+        {
+            TRACE("%s:Trans[%u] -> %s (new)\n", llType->typestr, k, MMDrvs[i].drvname);
+            llType->lpMlds[k].uDeviceID = k;
+            llType->lpMlds[k].type = type;
+            llType->lpMlds[k].mmdIndex = i;
+            llType->lpMlds[k].dwDriverInstance = 0;
+        }
+        part->nIDMax = part->nIDMin + count;
+        llType->wMaxId = part->nIDMax;
+        TRACE("%s: %s grew from %u to %lu devices (ttop=%u)\n",
+              llType->typestr, MMDrvs[i].drvname, have, count, llType->wMaxId);
+    }
+    LeaveCriticalSection(&WINMM_cs);
+}
+
 /**************************************************************************
  * 			MMDRV_GetNum				[internal]
  */
@@ -77,6 +162,7 @@ UINT	MMDRV_GetNum(UINT type)
     TRACE("(%04x)\n", type);
     assert(type < MMDRV_MAX);
     MMDRV_InitSingleType(type);
+    MMDRV_Refresh(type);
     return llTypes[type].wMaxId;
 }
 
@@ -248,6 +334,12 @@ LPWINE_MLD	MMDRV_Get(HANDLE _hndl, UINT type, BOOL bCanBeID)
     assert(type < MMDRV_MAX);
     MMDRV_InitSingleType(type);
 
+    /* a device id past the known range may belong to a device that was
+     * plugged in after the process started */
+    if (bCanBeID && hndl >= llTypes[type].wMaxId && !(hndl & 0x8000) &&
+        hndl != (UINT16)-1 && hndl != (UINT)-1)
+        MMDRV_Refresh(type);
+
     if (hndl >= llTypes[type].wMaxId &&
 	hndl != (UINT16)-1 && hndl != (UINT)-1) {
 	if (hndl & 0x8000) {
@@ -329,7 +421,6 @@ static  BOOL	MMDRV_InitPerType(LPWINE_MM_DRIVER lpDrv, UINT type, UINT wMsg)
     DWORD			ret;
     UINT			count = 0;
     int				i, k;
-    WINE_MLD *mem;
 
     TRACE("(%p, %04x, %04x)\n", lpDrv, type, wMsg);
 
@@ -367,9 +458,7 @@ static  BOOL	MMDRV_InitPerType(LPWINE_MM_DRIVER lpDrv, UINT type, UINT wMsg)
 	  part->nIDMin, part->nIDMax, llTypes[type].wMaxId,
 	  lpDrv->drvname, llTypes[type].typestr);
     /* realloc translation table */
-    mem = llTypes[type].lpMlds ? llTypes[type].lpMlds - 1 : NULL;
-    mem = realloc(mem, sizeof(WINE_MLD) * (llTypes[type].wMaxId + 1));
-    llTypes[type].lpMlds = mem + 1;
+    if (!MMDRV_GrowMlds(type, llTypes[type].wMaxId)) return FALSE;
 
     /* re-build the translation table */
     if (lpDrv->bIsMapper) {
