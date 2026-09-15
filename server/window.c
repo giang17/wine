@@ -1387,7 +1387,16 @@ static struct region *clip_pixel_format_children( struct window *parent, struct 
     LIST_FOR_EACH_ENTRY_REV( ptr, &parent->children, struct window, entry )
     {
         if (!(ptr->style & WS_VISIBLE)) continue;
-        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+        /* A transparent child does not obscure its parent for GDI painting, but a
+         * child that presents through its own pixel format still owns its client
+         * pixels: skipping it here leaves that area in the surface region, and the
+         * next flush that covers it overwrites what was presented there.  JUCE's
+         * OpenGL native window carries WS_EX_TRANSPARENT (windowIgnoresMouseClicks),
+         * so an embedded JUCE editor flickered with the host's background whenever
+         * the host repainted its whole window. */
+        if ((ptr->ex_style & WS_EX_TRANSPARENT) &&
+            !(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD)))
+            continue;
 
         /* add the visible rect */
         set_region_rect( clip, &ptr->visible_rect );
