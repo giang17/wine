@@ -429,6 +429,8 @@ struct dwrite_fontcollection
         struct dwrite_fontset_entry **entries;
         unsigned int count;
     } set;
+
+    BOOL is_system;
 };
 
 struct dwrite_fontfamily
@@ -3418,6 +3420,59 @@ static UINT32 collection_find_family(struct dwrite_fontcollection *collection, c
     return ~0u;
 }
 
+/* A family that is not installed is looked up in the GDI FontSubstitutes key,
+ * following the chain up to three steps; if the chain ends at a family that is
+ * missing as well, the system's message font stands in (issue 384). Windows has
+ * no such step in DirectWrite, but Windows has the families that applications
+ * hardcode — Meiryo UI, Yu Gothic UI, Microsoft YaHei UI — and JUCE 5 to 7
+ * answer a miss with family 0 of the collection, which is whatever sorts first.
+ * Only entries in that key trigger this; an unknown family without one still
+ * reports exists == FALSE. */
+static UINT32 collection_find_substitute_family(struct dwrite_fontcollection *collection, const WCHAR *name)
+{
+    static const WCHAR keyW[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\FontSubstitutes";
+    WCHAR buffers[2][LF_FACESIZE + 8];
+    const WCHAR *cur = name;
+    UINT32 index = ~0u;
+    BOOL chained = FALSE;
+    unsigned int depth;
+    HKEY key;
+
+    if (!collection->is_system) return ~0u;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyW, 0, KEY_READ, &key)) return ~0u;
+
+    for (depth = 0; depth < 3; ++depth)
+    {
+        WCHAR *subst = buffers[depth & 1], *comma;
+        DWORD size = sizeof(buffers[0]) - sizeof(WCHAR), type;
+
+        if (RegQueryValueExW(key, cur, NULL, &type, (BYTE *)subst, &size) || type != REG_SZ) break;
+        subst[size / sizeof(WCHAR)] = 0;
+        if ((comma = wcschr(subst, ','))) *comma = 0;   /* "Arial,186" */
+        if (!*subst || !wcsicmp(subst, cur)) break;
+        chained = TRUE;
+        if ((index = collection_find_family(collection, subst)) != ~0u)
+        {
+            TRACE("Family %s substituted by %s (index %u).\n", debugstr_w(name), debugstr_w(subst), index);
+            break;
+        }
+        cur = subst;
+    }
+    RegCloseKey(key);
+
+    if (index == ~0u && chained)
+    {
+        NONCLIENTMETRICSW ncm;
+
+        ncm.cbSize = sizeof(ncm);
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)
+                && (index = collection_find_family(collection, ncm.lfMessageFont.lfFaceName)) != ~0u)
+            TRACE("Family %s substituted by the system UI font %s (index %u).\n", debugstr_w(name),
+                    debugstr_w(ncm.lfMessageFont.lfFaceName), index);
+    }
+    return index;
+}
+
 static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3 *iface, const WCHAR *name,
         UINT32 *index, BOOL *exists)
 {
@@ -3426,6 +3481,7 @@ static HRESULT WINAPI dwritefontcollection_FindFamilyName(IDWriteFontCollection3
     TRACE("%p, %s, %p, %p.\n", iface, debugstr_w(name), index, exists);
 
     *index = collection_find_family(collection, name);
+    if (*index == ~0u) *index = collection_find_substitute_family(collection, name);
     *exists = *index != ~0u;
     return S_OK;
 }
@@ -4963,6 +5019,8 @@ HRESULT get_system_fontcollection(IDWriteFactory7 *factory, DWRITE_FONT_FAMILY_M
     if (SUCCEEDED(hr = create_system_fontset(factory, &IID_IDWriteFontSet, (void **)&fontset)))
     {
         hr = create_font_collection_from_set(factory, fontset, family_model, &IID_IDWriteFontCollection, (void **)collection);
+        if (SUCCEEDED(hr))
+            impl_from_IDWriteFontCollection3((IDWriteFontCollection3 *)*collection)->is_system = TRUE;
         IDWriteFontSet_Release(fontset);
     }
 
