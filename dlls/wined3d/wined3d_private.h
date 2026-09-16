@@ -3695,7 +3695,6 @@ enum wined3d_cs_queue_id
 /* How long to wait for commands when there are active queries, in µs. */
 #define WINED3D_CS_COMMAND_WAIT_WITH_QUERIES_TIMEOUT 100
 /* How long to wait for the CS from the client thread, in µs. */
-#define WINED3D_CS_CLIENT_WAIT_TIMEOUT  0
 #define WINED3D_CS_QUEUE_MASK           (WINED3D_CS_QUEUE_SIZE - 1)
 
 C_ASSERT(!(WINED3D_CS_QUEUE_SIZE & (WINED3D_CS_QUEUE_SIZE - 1)));
@@ -3745,9 +3744,10 @@ struct wined3d_cs
     struct list query_poll_list;
     BOOL queries_flushed;
 
-    HANDLE event, present_event;
+    HANDLE event, present_event, progress_event;
     LONG waiting_for_event;
     LONG waiting_for_present;
+    LONG waiting_for_progress;
     LONG pending_presents;
 };
 
@@ -3890,66 +3890,13 @@ static inline void wined3d_resource_reference(struct wined3d_resource *resource)
 
 #define WINED3D_PAUSE_SPIN_COUNT 200u
 
-static inline void wined3d_pause(unsigned int *spin_count)
-{
-    static const LARGE_INTEGER timeout = {.QuadPart = WINED3D_CS_CLIENT_WAIT_TIMEOUT * -10};
-
-    if (++*spin_count >= WINED3D_PAUSE_SPIN_COUNT)
-        NtDelayExecution(FALSE, &timeout);
-}
-
 static inline BOOL wined3d_ge_wrap(ULONG x, ULONG y)
 {
     return (x - y) < UINT_MAX / 2;
 }
 C_ASSERT(WINED3D_CS_QUEUE_SIZE < UINT_MAX / 4);
 
-static inline void wined3d_resource_wait_idle(const struct wined3d_resource *resource)
-{
-    const struct wined3d_cs *cs = resource->device->cs;
-    ULONG access_time, tail, head;
-    unsigned int spin_count = 0;
-
-    if (!cs->thread || cs->thread_id == GetCurrentThreadId())
-        return;
-
-    access_time = resource->access_time;
-    head = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
-
-    /* The basic idea is that a resource is busy if tail < access_time <= head.
-     * But we have to be careful about wrap-around of the head and tail. The
-     * wined3d_ge_wrap function considers x >= y if x - y is smaller than half the
-     * UINT range. Head is at most WINED3D_CS_QUEUE_SIZE ahead of tail, because
-     * otherwise the queue memory is considered full and queue_require_space
-     * stalls. Thus wined3d_ge_wrap(head, tail) is always true. The C_ASSERT above
-     * ensures this in case we decide to grow the queue size in the future.
-     *
-     * It is possible that a resource has not been used for a long time and is idle, but the head and
-     * tail wrapped around in such a way that the previously set access time falls between head and tail.
-     * In this case we will incorrectly wait for the resource. Because we use the entire 32 bits of the
-     * counters and not just the bits needed to address the actual queue memory, this should happen rarely.
-     * If it turns out to be a problem we can switch to 64 bit counters or attempt to somehow mark the
-     * access time of resources invalid. CS packets are at least 4 byte aligned, so we could use the lower
-     * 2 bits in access_time for such a marker.
-     *
-     * Note that the access time is set before the command is submitted, so we have to wait until the
-     * tail is bigger than access_time, not equal. */
-
-    if (!wined3d_ge_wrap(head, access_time))
-        return;
-
-    for (;;)
-    {
-        tail = *(volatile ULONG *)&cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail;
-        if (head == tail) /* Queue empty. */
-            break;
-
-        if (!wined3d_ge_wrap(access_time, tail) && access_time != tail)
-            break;
-
-        wined3d_pause(&spin_count);
-    }
-}
+void wined3d_resource_wait_idle(const struct wined3d_resource *resource);
 
 struct wined3d_buffer
 {
