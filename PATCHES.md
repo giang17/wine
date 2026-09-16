@@ -456,6 +456,24 @@ and text that looks wrong in such an application is not a missing system font.
 The guide's *Which font is the application actually using?* section tells the two
 cases apart from a single `WINEDEBUG=+font,+dwrite` log.
 
+Since 2026-09-17 the branch also keeps such embedded fonts. A font that an
+application registers with `AddFontMemResourceEx` is visible to GDI in that process
+only; DirectWrite builds its system collection from the registry font list and
+never sees it, so an application that embeds its GUI font and then asks DirectWrite
+for it *by family name* gets whatever DirectWrite falls back to — JUCE 5 to 7 take
+family 0 of the collection, which under Wine is the first installed font in
+alphabetical order (the Kurzweil KM88 Editor rendered its whole interface in
+Dorico's serif *Academico* that way). `win32u` therefore writes each memory font
+to `C:\windows\fonts\wine-embedded\<hash>.<otf|ttf>` and registers it in the
+`Fonts` key the way an installer would, and `dwrite` rebuilds a cached system
+collection when that key changes. The first start of such an application still
+shows the fallback (it asks for the font before it registers it); every later
+start finds it. Font collections, bitmap fonts, PDF-style subset fonts and fonts
+whose OS/2 `fsType` forbids embedding altogether are left alone;
+`HKCU\Software\Wine\Fonts` → `PersistMemoryFonts` = `"0"` switches the feature
+off, `"installable"` limits it to fonts whose `fsType` allows installable
+embedding. `HKCU\Software\Wine\Fonts\Embedded Fonts` lists what has been kept.
+
 ### Subpixel (ClearType-style) text
 
 The subpixel text patches are inert until the prefix says it wants them. A fresh
