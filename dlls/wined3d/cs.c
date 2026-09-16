@@ -3401,11 +3401,75 @@ static void wined3d_cs_mt_submit(struct wined3d_device_context *context, enum wi
     wined3d_cs_queue_submit(&cs->queue[queue_id], cs);
 }
 
+/* Client-side wait for the CS thread to retire packets, used wherever a
+ * client thread spins on a queue's tail: wined3d_cs_queue_require_space()
+ * (queue full), wined3d_cs_mt_finish() (queue drained) and
+ * wined3d_resource_wait_idle() (resource no longer referenced by queued
+ * commands).  The CS thread signals progress_event after every packet it
+ * retires while waiting_for_progress is set (wined3d_cs_execute_next()).
+ *
+ * Spin for a short while first: the CS thread usually retires the packet
+ * within microseconds.  When it does not, it is typically blocked for a
+ * whole frame in a vsync'd swap, and yielding in a loop for that long costs
+ * a full core per client thread — Kontakt 8 maps a handful of dynamic index
+ * buffers through the CS every frame and spent 66 % of a core in
+ * NtDelayExecution(0) here.  "done" re-checks the caller's condition after
+ * the flag is set, which closes the window between the caller's last check
+ * and the flag: if the CS thread retired the packet in between, it either
+ * saw the flag and signalled (the wait then returns at once), or it did not
+ * and the flag is taken back here without waiting. */
+static void wined3d_cs_wait_for_progress(struct wined3d_cs *cs, unsigned int *spin_count,
+        bool (*done)(const void *ctx), const void *ctx)
+{
+    if (++*spin_count < WINED3D_PAUSE_SPIN_COUNT)
+    {
+        YieldProcessor();
+        return;
+    }
+
+    InterlockedExchange(&cs->waiting_for_progress, TRUE);
+    if (!done(ctx) || !InterlockedCompareExchange(&cs->waiting_for_progress, FALSE, TRUE))
+        WaitForSingleObject(cs->progress_event, INFINITE);
+}
+
+struct wined3d_cs_queue_space_ctx
+{
+    const struct wined3d_cs_queue *queue;
+    ULONG head;
+    size_t packet_size;
+};
+
+static bool wined3d_cs_queue_has_space(const void *ctx)
+{
+    const struct wined3d_cs_queue_space_ctx *c = ctx;
+    ULONG tail = (*(volatile ULONG *)&c->queue->tail) & WINED3D_CS_QUEUE_MASK;
+    ULONG head = c->head, new_pos;
+
+    /* Empty. */
+    if (head == tail)
+        return true;
+    new_pos = (head + c->packet_size) & WINED3D_CS_QUEUE_MASK;
+    /* Head ahead of tail. The caller checked the remaining size, so we only
+     * need to make sure we don't make head equal to tail. */
+    if (head > tail && (new_pos != tail))
+        return true;
+    /* Tail ahead of head. Make sure the new head is before the tail as
+     * well. Note that new_pos is 0 when it's at the end of the queue. */
+    if (new_pos < tail && new_pos)
+        return true;
+
+    TRACE_(d3d_perf)("Waiting for free space. Head %lu, tail %lu, packet size %Iu.\n",
+            head, tail, c->packet_size);
+    return false;
+}
+
 static void *wined3d_cs_queue_require_space(struct wined3d_cs_queue *queue, size_t size, struct wined3d_cs *cs)
 {
     size_t queue_size = ARRAY_SIZE(queue->data);
     size_t header_size, packet_size, remaining;
+    struct wined3d_cs_queue_space_ctx space_ctx;
     struct wined3d_cs_packet *packet;
+    unsigned int spin_count = 0;
     ULONG head = queue->head & WINED3D_CS_QUEUE_MASK;
 
     header_size = FIELD_OFFSET(struct wined3d_cs_packet, data[0]);
@@ -3435,27 +3499,11 @@ static void *wined3d_cs_queue_require_space(struct wined3d_cs_queue *queue, size
         assert(!head);
     }
 
-    for (;;)
-    {
-        ULONG tail = (*(volatile ULONG *)&queue->tail) & WINED3D_CS_QUEUE_MASK;
-        ULONG new_pos;
-
-        /* Empty. */
-        if (head == tail)
-            break;
-        new_pos = (head + packet_size) & WINED3D_CS_QUEUE_MASK;
-        /* Head ahead of tail. We checked the remaining size above, so we only
-         * need to make sure we don't make head equal to tail. */
-        if (head > tail && (new_pos != tail))
-            break;
-        /* Tail ahead of head. Make sure the new head is before the tail as
-         * well. Note that new_pos is 0 when it's at the end of the queue. */
-        if (new_pos < tail && new_pos)
-            break;
-
-        TRACE_(d3d_perf)("Waiting for free space. Head %lu, tail %lu, packet size %Iu.\n",
-                head, tail, packet_size);
-    }
+    space_ctx.queue = queue;
+    space_ctx.head = head;
+    space_ctx.packet_size = packet_size;
+    while (!wined3d_cs_queue_has_space(&space_ctx))
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_cs_queue_has_space, &space_ctx);
 
     packet = (struct wined3d_cs_packet *)&queue->data[head];
     packet->size = size;
@@ -3473,6 +3521,13 @@ static void *wined3d_cs_mt_require_space(struct wined3d_device_context *context,
     return wined3d_cs_queue_require_space(&cs->queue[queue_id], size, cs);
 }
 
+static bool wined3d_cs_queue_is_drained(const void *ctx)
+{
+    const struct wined3d_cs_queue *queue = ctx;
+
+    return queue->head == *(volatile ULONG *)&queue->tail;
+}
+
 static void wined3d_cs_mt_finish(struct wined3d_device_context *context, enum wined3d_cs_queue_id queue_id)
 {
     struct wined3d_cs *cs = wined3d_cs_from_context(context);
@@ -3482,9 +3537,65 @@ static void wined3d_cs_mt_finish(struct wined3d_device_context *context, enum wi
         return wined3d_cs_st_finish(context, queue_id);
 
     TRACE_(d3d_perf)("Waiting for queue %u to be empty.\n", queue_id);
-    while (cs->queue[queue_id].head != *(volatile ULONG *)&cs->queue[queue_id].tail)
-        wined3d_pause(&spin_count);
+    while (!wined3d_cs_queue_is_drained(&cs->queue[queue_id]))
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_cs_queue_is_drained, &cs->queue[queue_id]);
     TRACE_(d3d_perf)("Queue is now empty.\n");
+}
+
+struct wined3d_resource_idle_ctx
+{
+    const struct wined3d_cs *cs;
+    ULONG access_time, head;
+};
+
+static bool wined3d_resource_is_idle(const void *ctx)
+{
+    const struct wined3d_resource_idle_ctx *c = ctx;
+    ULONG tail = *(volatile ULONG *)&c->cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail;
+
+    if (c->head == tail) /* Queue empty. */
+        return true;
+
+    return !wined3d_ge_wrap(c->access_time, tail) && c->access_time != tail;
+}
+
+void wined3d_resource_wait_idle(const struct wined3d_resource *resource)
+{
+    struct wined3d_cs *cs = resource->device->cs;
+    struct wined3d_resource_idle_ctx ctx;
+    unsigned int spin_count = 0;
+
+    if (!cs->thread || cs->thread_id == GetCurrentThreadId())
+        return;
+
+    ctx.cs = cs;
+    ctx.access_time = resource->access_time;
+    ctx.head = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
+
+    /* The basic idea is that a resource is busy if tail < access_time <= head.
+     * But we have to be careful about wrap-around of the head and tail. The
+     * wined3d_ge_wrap function considers x >= y if x - y is smaller than half the
+     * UINT range. Head is at most WINED3D_CS_QUEUE_SIZE ahead of tail, because
+     * otherwise the queue memory is considered full and queue_require_space
+     * stalls. Thus wined3d_ge_wrap(head, tail) is always true. The C_ASSERT above
+     * ensures this in case we decide to grow the queue size in the future.
+     *
+     * It is possible that a resource has not been used for a long time and is idle, but the head and
+     * tail wrapped around in such a way that the previously set access time falls between head and tail.
+     * In this case we will incorrectly wait for the resource. Because we use the entire 32 bits of the
+     * counters and not just the bits needed to address the actual queue memory, this should happen rarely.
+     * If it turns out to be a problem we can switch to 64 bit counters or attempt to somehow mark the
+     * access time of resources invalid. CS packets are at least 4 byte aligned, so we could use the lower
+     * 2 bits in access_time for such a marker.
+     *
+     * Note that the access time is set before the command is submitted, so we have to wait until the
+     * tail is bigger than access_time, not equal. */
+
+    if (!wined3d_ge_wrap(ctx.head, ctx.access_time))
+        return;
+
+    while (!wined3d_resource_is_idle(&ctx))
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_resource_is_idle, &ctx);
 }
 
 static const struct wined3d_device_context_ops wined3d_cs_mt_ops =
@@ -3583,6 +3694,10 @@ static inline bool wined3d_cs_execute_next(struct wined3d_cs *cs, struct wined3d
     }
 
     InterlockedExchange((LONG *)&queue->tail, tail);
+    /* A client thread may be blocked in wined3d_cs_wait_for_progress() until
+     * this queue moves; it sets the flag before it blocks. */
+    if (InterlockedCompareExchange(&cs->waiting_for_progress, FALSE, TRUE))
+        SetEvent(cs->progress_event);
     return true;
 }
 
@@ -3755,11 +3870,20 @@ struct wined3d_cs *wined3d_cs_create(struct wined3d_device *device,
             free(cs->data);
             goto fail;
         }
+        if (!(cs->progress_event = CreateEventW(NULL, FALSE, FALSE, NULL)))
+        {
+            ERR("Failed to create command stream progress event.\n");
+            if (cs->event)
+                CloseHandle(cs->event);
+            free(cs->data);
+            goto fail;
+        }
 
         if (!(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                 (const WCHAR *)wined3d_cs_run, &cs->wined3d_module)))
         {
             ERR("Failed to get wined3d module handle.\n");
+            CloseHandle(cs->progress_event);
             if (cs->event)
                 CloseHandle(cs->event);
             free(cs->data);
@@ -3770,6 +3894,7 @@ struct wined3d_cs *wined3d_cs_create(struct wined3d_device *device,
         {
             ERR("Failed to create wined3d command stream thread.\n");
             FreeLibrary(cs->wined3d_module);
+            CloseHandle(cs->progress_event);
             if (cs->event)
                 CloseHandle(cs->event);
             free(cs->data);
@@ -3793,6 +3918,8 @@ void wined3d_cs_destroy(struct wined3d_cs *cs)
     {
         wined3d_cs_emit_stop(cs);
         CloseHandle(cs->thread);
+        if (!CloseHandle(cs->progress_event))
+            ERR("Closing progress event failed.\n");
         if (cs->event && !CloseHandle(cs->event))
             ERR("Closing event failed.\n");
     }
