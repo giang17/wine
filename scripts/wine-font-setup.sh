@@ -200,6 +200,20 @@ have_segoe=0
 [ -f "$FONTDIR/segoeui.ttf" ] && grep -q '^"Segoe UI (TrueType)"=' "$SYSREG" 2>/dev/null \
     && have_segoe=1
 
+# DirectWrite family substitutes (issue 384).  Applications hardcode the UI
+# families every Windows ships — KORG Legacy Cell asks DirectWrite for Meiryo UI —
+# and JUCE 5 to 7 answer a missing family with family 0 of the collection, i.e.
+# whatever sorts first.  This branch's dwrite resolves a miss through the GDI
+# FontSubstitutes key, so the entries below point those families at Segoe UI
+# (dwrite falls back to the system message font when Segoe UI is absent too).
+SUBST_FAMILIES=("Malgun Gothic" "Meiryo" "Meiryo UI" "Microsoft JhengHei UI" "Microsoft YaHei UI" "Yu Gothic UI")
+SUBST_KEY='Software\\Microsoft\\Windows NT\\CurrentVersion\\FontSubstitutes'
+n_subst=0
+for fam in "${SUBST_FAMILIES[@]}"; do
+    [ -n "$(reg_value "$SYSREG" "$SUBST_KEY" "$fam")" ] && n_subst=$((n_subst + 1))
+done
+have_subst=0; [ "$n_subst" -eq "${#SUBST_FAMILIES[@]}" ] && have_subst=1
+
 # The system UI font.  The six WindowMetrics values are LOGFONTW blobs of 92
 # bytes: the height at bytes 0-3 (negative = pixels at the prefix' system DPI,
 # positive = points), the face name at byte 28 as UTF-16LE.  Applications read
@@ -254,6 +268,9 @@ printf '  %-34s %s\n' "SystemLink values well-formed" \
 printf '  %-34s %s\n' "Segoe UI (Steinberg applications)" \
     "$( [ "$have_segoe" -eq 1 ] && echo present \
         || echo "absent — Cubase 15 Hub crashes without it; not installable by this script" )"
+printf '  %-34s %s\n' "DirectWrite family substitutes" \
+    "$( [ "$have_subst" -eq 1 ] && echo "present (${#SUBST_FAMILIES[@]} UI families -> Segoe UI)" \
+        || echo "missing ($n_subst of ${#SUBST_FAMILIES[@]})" )"
 printf '  %-34s %s\n' "system UI font (WindowMetrics)" \
     "$( if [ "$menu_face" = "Segoe UI" ]; then echo "Segoe UI ${menu_pt}pt"; \
         elif [ "$have_segoe" -eq 1 ]; then echo "${menu_face:-unset} ${menu_pt:+${menu_pt}pt }— Wine default; Segoe UI 9pt on apply"; \
@@ -276,7 +293,7 @@ fi
 if [ "$CHECK_ONLY" -eq 1 ]; then
     echo
     if [ "$have_fonts" -eq 1 ] && [ "$have_link" -eq 1 ] && [ "$have_rendering" -eq 1 ] &&
-       [ "$mangled_links" -eq 0 ] && [ "$have_uifont" -eq 1 ]; then
+       [ "$mangled_links" -eq 0 ] && [ "$have_uifont" -eq 1 ] && [ "$have_subst" -eq 1 ]; then
         echo "Font setup is complete."
         exit 0
     fi
@@ -360,6 +377,18 @@ WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add \
     /v "DejaVu Sans" /t REG_MULTI_SZ \
     /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f \
     </dev/null >/dev/null 2>&1
+
+# --- 4a2. DirectWrite family substitutes (issue 384) ---------------------------
+# Written only when absent, so a deliberate different target survives a re-run.
+if [ "$have_subst" -eq 0 ]; then
+    echo "  setting the DirectWrite family substitutes (-> Segoe UI)..."
+    for fam in "${SUBST_FAMILIES[@]}"; do
+        [ -n "$(reg_value "$SYSREG" "$SUBST_KEY" "$fam")" ] && continue
+        WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add \
+            'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes' \
+            /v "$fam" /t REG_SZ /d "Segoe UI" /f </dev/null >/dev/null 2>&1
+    done
+fi
 
 # --- 4b. text rendering switches ---------------------------------------------
 # This branch renders ClearType text closer to what Windows does, but every part
