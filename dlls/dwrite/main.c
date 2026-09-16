@@ -607,6 +607,8 @@ struct dwritefactory
     LONG refcount;
 
     IDWriteFontCollection *system_collections[DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE + 1];
+    FILETIME system_collections_mtime[DWRITE_FONT_FAMILY_MODEL_WEIGHT_STRETCH_STYLE + 1];
+    DWORD system_collections_check;
     IDWriteFontCollection1 *eudc_collection;
     IDWriteGdiInterop1 *gdiinterop;
     IDWriteFontFallback1 *fallback;
@@ -908,10 +910,30 @@ static struct collectionloader *factory_get_collection_loader(struct dwritefacto
     return found;
 }
 
+static void get_system_fonts_mtime(FILETIME *mtime);
+
+/* Has the registry font list changed since the cached collection was built?
+ * An application that persists a memory font (win32u, issue 383) or an
+ * installer adds values to the Fonts key while this process runs; the
+ * documentation allows check_for_updates == FALSE some latency, so poll the
+ * key's write time at most every 100 ms — Direct2D fetches the collection
+ * for every CreateTextFormat() call. */
+static BOOL system_collection_is_stale(struct dwritefactory *factory, DWRITE_FONT_FAMILY_MODEL family_model)
+{
+    DWORD now = GetTickCount();
+    FILETIME mtime;
+
+    if (now - factory->system_collections_check < 100) return FALSE;
+    factory->system_collections_check = now;
+    get_system_fonts_mtime(&mtime);
+    return CompareFileTime(&mtime, &factory->system_collections_mtime[family_model]) > 0;
+}
+
 static HRESULT factory_get_system_collection(struct dwritefactory *factory,
         DWRITE_FONT_FAMILY_MODEL family_model, REFIID riid, void **out)
 {
     IDWriteFontCollection *collection;
+    FILETIME mtime;
     HRESULT hr;
 
     *out = NULL;
@@ -922,8 +944,22 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
         return E_INVALIDARG;
     }
 
-    if (factory->system_collections[family_model])
-        return IDWriteFontCollection_QueryInterface(factory->system_collections[family_model], riid, out);
+    if ((collection = factory->system_collections[family_model]))
+    {
+        if (!system_collection_is_stale(factory, family_model))
+            return IDWriteFontCollection_QueryInterface(collection, riid, out);
+
+        /* Drop the cached collection and rebuild it below. The slot is a weak
+         * reference for isolated factories (the collection detaches itself with
+         * a compare-exchange that no longer matches) and a strong one for the
+         * shared factory. */
+        TRACE("System font list changed, rebuilding the cached collection.\n");
+        if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], NULL, collection) == collection
+                && &factory->IDWriteFactory7_iface == shared_factory)
+            IDWriteFontCollection_Release(collection);
+    }
+
+    get_system_fonts_mtime(&mtime);
 
     if (FAILED(hr = get_system_fontcollection(&factory->IDWriteFactory7_iface, family_model, &collection)))
     {
@@ -931,6 +967,7 @@ static HRESULT factory_get_system_collection(struct dwritefactory *factory,
         return hr;
     }
 
+    factory->system_collections_mtime[family_model] = mtime;
     if (InterlockedCompareExchangePointer((void **)&factory->system_collections[family_model], collection, NULL))
         IDWriteFontCollection_Release(collection);
 
