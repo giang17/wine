@@ -474,6 +474,17 @@ whose OS/2 `fsType` forbids embedding altogether are left alone;
 off, `"installable"` limits it to fonts whose `fsType` allows installable
 embedding. `HKCU\Software\Wine\Fonts\Embedded Fonts` lists what has been kept.
 
+The other half of that fallback are families that every Windows ships and no Wine
+prefix has: KORG Legacy Cell asks DirectWrite for *Meiryo UI* for its menus and
+dialogs and ended up in the same serif. DirectWrite on Windows knows no
+substitution, but since 2026-09-17 this branch's `dwrite` resolves a family that
+`FindFamilyName` cannot find through the GDI `FontSubstitutes` key (up to three
+steps; if the chain ends at a missing family too, the system message font stands
+in), and `wine.inf` and the setup script point *Meiryo UI*, *Meiryo*, *Yu Gothic
+UI*, *Microsoft YaHei UI*, *Microsoft JhengHei UI* and *Malgun Gothic* at Segoe UI.
+Families without an entry still report "not found", so applications that probe
+for a font before bundling their own keep working. `--check` reports the entries.
+
 ### Subpixel (ClearType-style) text
 
 The subpixel text patches are inert until the prefix says it wants them. A fresh
