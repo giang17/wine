@@ -98,7 +98,14 @@ This is the recommended branch. What it changes, by subsystem:
   the log of a 9.5-minute Reaper session
 - **WineD3D**: composition buffer with dirty rect accumulation, GL buffer recycling pool
   (70 % RSS reduction), and a `vs_out` initialisation that no longer trips NVIDIA's shader
-  compiler warnings
+  compiler warnings. Client threads that wait for the command-stream thread (a map that
+  goes through the CS, a full queue, a busy resource) block on an event instead of
+  yielding in a loop — while the CS thread sits in a vsync'd swap, the loop cost a full
+  core per waiting thread; Kontakt 8, which maps dynamic index buffers through the CS
+  every frame, went from 66 % to 3 % on its render thread. What remains on NVIDIA is the
+  driver's own busy-wait for the vblank in the CS thread (`wined3d_cs` at ~95 % for a
+  static window); `__GL_YIELD=USLEEP` in the environment makes the driver sleep instead
+  and takes it to ~5 % at the same frame rate
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
 - **Per-pixel alpha for GPU-painted layered windows**: `DwmExtendFrameIntoClientArea`
   with `margins = -1` asks for full glass, which on Windows makes the client area
