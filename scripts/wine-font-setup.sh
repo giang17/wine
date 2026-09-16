@@ -258,6 +258,11 @@ printf '  %-34s %s\n' "system UI font (WindowMetrics)" \
     "$( if [ "$menu_face" = "Segoe UI" ]; then echo "Segoe UI ${menu_pt}pt"; \
         elif [ "$have_segoe" -eq 1 ]; then echo "${menu_face:-unset} ${menu_pt:+${menu_pt}pt }— Wine default; Segoe UI 9pt on apply"; \
         else echo "${menu_face:-unset} ${menu_pt:+${menu_pt}pt }— Wine default; needs the Segoe UI family first"; fi )"
+# Fonts that applications registered with AddFontMemResourceEx and that win32u
+# kept in the prefix (issue 383): informational, never counted as a gap.
+n_embedded=$(ls "$FONTDIR/wine-embedded" 2>/dev/null | wc -l)
+printf '  %-34s %s\n' "embedded fonts kept by win32u" \
+    "$( [ "$n_embedded" -gt 0 ] && echo "$n_embedded file(s) — listed under HKCU\\Software\\Wine\\Fonts\\Embedded Fonts" || echo none )"
 if [ "$mangled_links" -gt 0 ]; then
     echo
     echo "  These SystemLink values hold one character per entry:"
