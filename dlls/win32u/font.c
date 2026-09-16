@@ -6565,17 +6565,23 @@ static void load_system_bitmap_fonts(void)
     NtClose( hkey );
 }
 
-static void load_directory_fonts( WCHAR *path, UINT flags )
+static void load_directory_fonts( const WCHAR *dir, UINT flags )
 {
     IO_STATUS_BLOCK io = {{0}};
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING nt_name;
+    WCHAR path[MAX_PATH];
     HANDLE handle;
     char buf[8192];
     size_t len;
 
-    len = lstrlenW( path );
-    while (len && path[len - 1] == '\\') len--;
+    /* The directory name is appended to below; callers used to hand in their
+     * own buffer, which for the HKCU\Software\Wine\Fonts\Path entries was an
+     * exact-size allocation and overflowed on the first file (issue 382). */
+    len = lstrlenW( dir );
+    while (len && dir[len - 1] == '\\') len--;
+    if (len >= MAX_PATH - 2) return;
+    memcpy( path, dir, len * sizeof(WCHAR) );
 
     nt_name.Buffer = path;
     nt_name.MaximumLength = nt_name.Length = len * sizeof(WCHAR);
@@ -6601,7 +6607,8 @@ static void load_directory_fonts( WCHAR *path, UINT flags )
         FILE_BOTH_DIR_INFORMATION *info = (FILE_BOTH_DIR_INFORMATION *)buf;
         for (;;)
         {
-            if (!(info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            if (!(info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                len + info->FileNameLength / sizeof(WCHAR) < MAX_PATH)
             {
                 memcpy( path + len, info->FileName, info->FileNameLength );
                 path[len + info->FileNameLength / sizeof(WCHAR)] = 0;
