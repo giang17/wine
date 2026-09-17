@@ -3076,13 +3076,29 @@ void wined3d_cs_emit_decode(struct wined3d_decoder *decoder, struct wined3d_deco
 
 static void wined3d_cs_emit_stop(struct wined3d_cs *cs)
 {
+    struct wined3d_cs_queue *queue = &cs->queue[WINED3D_CS_QUEUE_DEFAULT];
     struct wined3d_cs_stop *op;
 
     op = wined3d_device_context_require_space(&cs->c, sizeof(*op), WINED3D_CS_QUEUE_DEFAULT);
     op->opcode = WINED3D_CS_OP_STOP;
 
     wined3d_device_context_submit(&cs->c, WINED3D_CS_QUEUE_DEFAULT);
-    wined3d_cs_finish(cs, WINED3D_CS_QUEUE_DEFAULT);
+
+    /* Not wined3d_cs_finish(): the CS thread retires the STOP packet outside
+     * wined3d_cs_execute_next(), by releasing the queue tails on its way out
+     * of wined3d_cs_run(), and it must not touch "cs" after that release
+     * because the caller frees it as soon as this function returns.  So it
+     * cannot take part in the waiting_for_progress protocol for this packet;
+     * instead it signals progress_event unconditionally, from a handle it
+     * copied beforehand, after releasing the tails.  Wait for that signal
+     * before looking at the tail: waiting at least once keeps the handle open
+     * until the CS thread has used it, and a spurious wake-up from a signal
+     * left over by another waiter just loops until the queue is drained. */
+    do
+    {
+        WaitForSingleObject(cs->progress_event, INFINITE);
+    }
+    while (queue->head != *(volatile ULONG *)&queue->tail);
 }
 
 static void wined3d_cs_reference_resource(struct wined3d_device_context *context, struct wined3d_resource *resource)
@@ -3759,15 +3775,18 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
     unsigned int spin_count = 0;
     struct wined3d_cs *cs = ctx;
     HMODULE wined3d_module;
+    HANDLE progress_event;
     unsigned int poll = 0;
     bool run = true;
 
     TRACE("Started.\n");
     SetThreadDescription(GetCurrentThread(), L"wined3d_cs");
 
-    /* Copy the module handle to a local variable to avoid racing with the
-     * thread freeing "cs" before the FreeLibraryAndExitThread() call. */
+    /* Copy the module handle and the progress event to local variables to
+     * avoid racing with the thread freeing "cs" before the SetEvent() and
+     * FreeLibraryAndExitThread() calls. */
     wined3d_module = cs->wined3d_module;
+    progress_event = cs->progress_event;
 
     list_init(&cs->query_poll_list);
     cs->thread_id = GetCurrentThreadId();
@@ -3805,6 +3824,9 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
 
     cs->queue[WINED3D_CS_QUEUE_MAP].tail = cs->queue[WINED3D_CS_QUEUE_MAP].head;
     cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
+    /* "cs" may be freed by wined3d_cs_destroy() from here on; wake the thread
+     * blocked in wined3d_cs_emit_stop() through the local handle only. */
+    SetEvent(progress_event);
     TRACE("Stopped.\n");
     FreeLibraryAndExitThread(wined3d_module, 0);
 }
