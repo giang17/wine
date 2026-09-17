@@ -102,7 +102,12 @@ This is the recommended branch. What it changes, by subsystem:
   goes through the CS, a full queue, a busy resource) block on an event instead of
   yielding in a loop — while the CS thread sits in a vsync'd swap, the loop cost a full
   core per waiting thread; Kontakt 8, which maps dynamic index buffers through the CS
-  every frame, went from 66 % to 3 % on its render thread. What remains on NVIDIA is the
+  every frame, went from 66 % to 3 % on its render thread. The one wait that protocol
+  cannot serve is the STOP packet at device destruction: the CS thread releases the
+  queues on its way out and must not touch the command stream afterwards, so it sets
+  the event unconditionally from a copied handle and the destroying thread waits for
+  that — a device released while the CS thread was still busy used to hang the process
+  (Cubase 15 probes and releases a D3D11 device before its splash). What remains on NVIDIA is the
   driver's own busy-wait for the vblank in the CS thread (`wined3d_cs` at ~95 % for a
   static window); `__GL_YIELD=USLEEP` in the environment makes the driver sleep instead
   and takes it to ~5 % at the same frame rate
