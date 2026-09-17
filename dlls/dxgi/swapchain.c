@@ -268,7 +268,9 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
          * remove cross-thread, so the swapchain back-reference is always
          * broken; the window-owning operations (KillTimer, WndProc restore,
          * DestroyWindow) only run when Release happens on the window's own UI
-         * thread, where they are valid. */
+         * thread, where they are valid.  The composition window is ours, so
+         * its cross-thread destruction is handed to the owning thread below
+         * instead of being skipped. */
         if (swapchain->target_hwnd)
         {
             HWND t = swapchain->target_hwnd;
@@ -293,9 +295,28 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
             if (GetPropW(GetDesktopWindow(), prop_name) == (HANDLE)swapchain->comp_wnd)
                 RemovePropW(GetDesktopWindow(), prop_name);
             RemovePropW(swapchain->comp_wnd, L"__wine_dcomp_swapchain");
-            if (IsWindow(swapchain->comp_wnd)
-                    && GetWindowThreadProcessId(swapchain->comp_wnd, NULL) == GetCurrentThreadId())
-                DestroyWindow(swapchain->comp_wnd);
+            if (IsWindow(swapchain->comp_wnd))
+            {
+                DWORD owner = GetWindowThreadProcessId(swapchain->comp_wnd, NULL);
+
+                if (owner == GetCurrentThreadId())
+                    DestroyWindow(swapchain->comp_wnd);
+                /* DestroyWindow() refuses a window of another thread, and the
+                 * window used to be left behind for the life of that thread
+                 * (issue 149).  Hand the destruction to the owner through its
+                 * queue instead: WM_CLOSE reaches dcomp_swapchain_wndproc,
+                 * which destroys the window on its own thread.  Posted, not
+                 * sent -- this Release() may run under a lock the owning
+                 * thread is waiting for.  The back-reference is already gone,
+                 * so the late WM_NCDESTROY finds no swapchain to touch. */
+                else if (PostMessageW(swapchain->comp_wnd, WM_CLOSE, 0, 0))
+                    FIXME("Composition window %p belongs to thread %04lx, released from thread %04lx: "
+                            "posted WM_CLOSE for deferred destruction.\n",
+                            swapchain->comp_wnd, owner, GetCurrentThreadId());
+                else
+                    ERR("Composition window %p (thread %04lx) is left behind, PostMessage failed, error %lu.\n",
+                            swapchain->comp_wnd, owner, GetLastError());
+            }
             swapchain->comp_wnd = NULL;
         }
         IWineDXGIFactory_Release(swapchain->factory);

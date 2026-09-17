@@ -845,6 +845,17 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
             return 1;
         case WM_NCHITTEST:
             return HTTRANSPARENT;
+        case WM_CLOSE:
+            /* Posted by d3d11_swapchain_Release when the last Release ran on
+             * another thread: DestroyWindow only works here, on the owning
+             * thread (issue 149). */
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_NCDESTROY:
+            /* Counterpart of the "Created composition window" line, so a log
+             * shows which composition windows are still alive. */
+            FIXME("Destroyed composition window %p.\n", hwnd);
+            break;
         case WM_PAINT:
         {
             PAINTSTRUCT ps;
