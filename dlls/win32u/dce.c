@@ -1373,6 +1373,18 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
     return ret;
 }
 
+/* Does a window of another process sit above this one?  Only local lookups:
+ * the walk ends at the first foreign window, and the parent of a window of
+ * this process is read from its own WND. */
+static BOOL has_foreign_ancestor( HWND hwnd )
+{
+    HWND desktop = get_desktop_window();
+
+    while ((hwnd = NtUserGetAncestor( hwnd, GA_PARENT )) && hwnd != desktop)
+        if (!is_current_process_window( hwnd )) return TRUE;
+    return FALSE;
+}
+
 /***********************************************************************
  *           NtUserGetDCEx (win32u.@)
  */
@@ -1509,6 +1521,14 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 
     /* cross-process invalidation is not supported yet, so always update the vis rgn */
     if (!is_current_process_window( hwnd )) update_vis_rgn = TRUE;
+    /* The same holds for a window of this process below a window of another
+     * process: invalidate_dce() runs in the process that moves a window, so
+     * a move of that foreign ancestor never marks the owned DC here dirty, and
+     * its visible region and device origin stay where the ancestor was.  A
+     * blit through it lands at the old position while the window has moved on
+     * (issue 387: a DirectComposition target in a WebView2 process, hosted as
+     * a child of a plugin window that FL Studio drags around). */
+    else if (!update_vis_rgn && has_foreign_ancestor( hwnd )) update_vis_rgn = TRUE;
 
     if (set_dce_flags( dce->hdc, DCHF_VALIDATEVISRGN )) update_vis_rgn = TRUE;  /* DC was dirty */
 
