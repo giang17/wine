@@ -57,7 +57,11 @@ This is the recommended branch. What it changes, by subsystem:
 - **DComp**: IDCompositionDesktopDevice implementation with a D2D1 bitmap rendering path,
   dirty-rect clipping and DIB+BitBlt presentation; IDCompositionDevice3/4/5, composition
   and dynamic textures, D3D11 BeginDraw and surface handle export; rootless visual trees
-  composited onto the target window at ~60 Hz, cross-process targets, backdrop capture
+  composited onto the target window at ~60 Hz, cross-process targets, backdrop capture;
+  when a hosted target moves, the area it leaves is handed back to the host only after a
+  round trip on our X connection, so the host's repaint cannot overtake the blit that is
+  still on its way (a docked WebView2 pane dragged in FL Studio left 3 px strips of the
+  plugin image behind, 30-70 px on a fast drag)
 - **DComp leaves in the presented frame**: a visual tree that covers only a sliver of its
   window — a transport playhead, a selection rectangle — used to be delivered *after* the
   application's present by reading back the window and blitting, a race no CPU-side blit
@@ -147,7 +151,10 @@ This is the recommended branch. What it changes, by subsystem:
   Wine, so a `WM_WINE_SETCURSOR` for an out-of-process child window (WebView2, bridged
   plug-ins) arrived with a handle the receiving process rejected and the previous cursor
   stayed — the owner now publishes each cursor's first frame in a named section and the
-  receiver builds a proxy from it
+  receiver builds a proxy from it; the owned DC of a window hosted below a window of
+  another process refreshes its visible region on every `GetDC`, since the move of that
+  foreign ancestor never marks it dirty in this process (a composition blit through the
+  stale DC landed where the pane had been, over the area the host had just erased)
 - **wineserver**: a top-level's surface flush no longer overwrites child windows that
   belong to a *different process*. Such a child draws straight into the top-level's
   drawable while the owner flushes its own surface over it with a delay — a black
