@@ -4439,6 +4439,31 @@ static BOOL dcomp_wnd_is_chromium(HWND wnd)
             || !wcscmp(cls, L"Intermediate D3D Window");
 }
 
+/* Wait until the X server has executed what this process sent so far -- the
+ * composite blit above all.  The host answers a hand-back with a flush of its
+ * own surface on its own connection, and the X server interleaves connections:
+ * a small flush overtakes a 3 MB PutImage it is still reading.  Measured on FL
+ * Studio dragging a docked WebView2 pane (issue 387): the host erased the
+ * vacated 10 px and flushed at t+2 ms; our blit, sent 1 ms earlier at the
+ * position the pane had just left, landed after it, and the repaint our
+ * hand-back asked for 2 ms later lost the same race again.  What stayed was
+ * the part of the stale blit nothing repainted afterwards: 3 px of plugin
+ * image per stop of the drag.  A pixel read through the target's DC is a
+ * round trip on our connection; when it returns, our blit is on screen and
+ * the host's flush comes after it.  The pixel must lie inside the clip box,
+ * or GDI answers from the clip without asking the driver. */
+static void dcomp_target_wait_for_output(struct dcomp_target *target)
+{
+    HDC hdc = GetDC(target->hwnd);
+    RECT box;
+
+    if (!hdc)
+        return;
+    if (GetClipBox(hdc, &box) >= SIMPLEREGION)
+        GetPixel(hdc, box.left, box.top);
+    ReleaseDC(target->hwnd, hdc);
+}
+
 /* Invalidate a screen-space area on the first visible non-Chromium ancestor
  * of the target (Chromium windows never GDI-paint, so an invalidation there
  * would be swallowed).  After a resize the vacated area may no longer belong
@@ -6152,7 +6177,10 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
                  * not a single rectangle — a safe superset of the vacated area. */
                 if ((resized || !top_moved)
                         && SubtractRect(&vacated, &target->last_blit_win_rect, &wr))
+                {
+                    dcomp_target_wait_for_output(target);
                     dcomp_restore_area_to_host(target, &vacated, "vacated");
+                }
                 /* Keep tracking at the new geometry even when this composite
                  * delivers nothing (empty clip / unchanged skip): multi-step
                  * resizes must hand back every intermediate footprint.
