@@ -3474,6 +3474,7 @@ struct dcomp_target
     /* Target-side verification: the leaf hash proves our source is unchanged,
      * never that the window still shows what we delivered (issue 107). */
     DWORD last_delivered_hash;            /* sampled hash of the last frame we blitted */
+    BOOL last_delivered_uniform;          /* that frame was one flat colour: nothing in it worth reclaiming */
     BOOL last_delivered_valid;
     DWORD target_diverged_tick;           /* GetTickCount when the window stopped matching, 0 = matches */
     /* Host-restore bookkeeping (issue 99): hand areas our blits vacated
@@ -4395,6 +4396,19 @@ static DWORD dcomp_surface_hash(const DWORD *bits, unsigned int count)
     for (i = 0; i < count; i += 64)
         h = (h ^ (bits[i] & 0x00ffffff)) * 16777619u;
     return h;
+}
+
+/* Is the composition one flat colour?  Sampled like dcomp_surface_hash().  A
+ * frame like that carries no content: re-delivering it can only ever cover
+ * what somebody else painted (issue 386). */
+static BOOL dcomp_surface_uniform(const DWORD *bits, unsigned int count)
+{
+    DWORD first = bits[0] & 0x00ffffff;
+    unsigned int i;
+
+    for (i = 64; i < count; i += 64)
+        if ((bits[i] & 0x00ffffff) != first) return FALSE;
+    return TRUE;
 }
 
 /* Host-restore gate (issue 99): when our target window hides or changes
@@ -5954,6 +5968,15 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
                 target->target_diverged_tick = 0;
             else if (!target->target_diverged_tick)
                 target->target_diverged_tick = now | 1;
+            /* A flat frame is not content we can have lost to a sibling: if
+             * the window shows something else, that something is the better
+             * picture.  Seen with EPROM's WebView2 in FL Studio (issue 386):
+             * Chromium stopped presenting into its swapchain after the pane
+             * was hidden and re-shown, left the leaf opaque black and painted
+             * the page into the window itself -- and this repair blitted the
+             * dead black leaf over it every 700 ms. */
+            else if (target->last_delivered_uniform)
+                target->target_diverged_tick = 0;
             else if (now - target->target_diverged_tick >= DCOMP_TARGET_REPAIR_MS)
             {
                 target->last_blit_leaf_valid = FALSE;
@@ -6062,6 +6085,8 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
             if (target->comp_bits)
             {
                 target->last_delivered_hash = dcomp_surface_hash(target->comp_bits,
+                        (unsigned int)(rc.right * rc.bottom));
+                target->last_delivered_uniform = dcomp_surface_uniform(target->comp_bits,
                         (unsigned int)(rc.right * rc.bottom));
                 target->last_delivered_valid = TRUE;
             }
