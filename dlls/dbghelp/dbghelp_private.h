@@ -676,6 +676,7 @@ struct dump_module
     ULONG                               size;
     DWORD                               timestamp;
     DWORD                               checksum;
+    BOOL                                referenced_by_memory; /* MiniDumpScanMemory: a dumped stack points into it */
     WCHAR                               name[MAX_PATH];
 };
 
@@ -684,6 +685,8 @@ struct dump_thread
     ULONG                               tid;
     ULONG                               prio_class;
     ULONG                               curr_prio;
+    ULONG64                             stack_start; /* stack range written to the dump (0 if none) */
+    ULONG                               stack_size;
 };
 
 struct dump_context

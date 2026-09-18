@@ -2,6 +2,7 @@ MODULE = windows.globalization.dll
 IMPORTS = combase uuid
 
 SOURCES = \
+	calendar.c \
 	classes.idl \
 	geographic_region.c \
 	main.c

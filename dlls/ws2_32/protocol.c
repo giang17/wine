@@ -2089,14 +2089,283 @@ int WINAPI WSAGetServiceClassNameByClassIdW( GUID *class, WCHAR *service, DWORD 
 }
 
 
+/* WSALookupService*() implementation for the NLA namespace: one service
+ * instance per adapter that is operationally up and has a unicast address.
+ * Used by Chromium's NetworkChangeNotifier to detect network connectivity. */
+
+#define NLA_LOOKUP_MAGIC 0x616c6e57  /* 'Wnla' */
+
+struct nla_network
+{
+    WCHAR *friendly_name;
+    char *adapter_name;
+    DWORD if_type;
+    DWORD speed;
+};
+
+struct nla_lookup
+{
+    DWORD magic;
+    DWORD control_flags;
+    unsigned int count, index;
+    struct nla_network *networks;
+};
+
+static struct nla_lookup *nla_lookup_from_handle( HANDLE handle )
+{
+    struct nla_lookup *lookup = handle;
+
+    if (!lookup || lookup->magic != NLA_LOOKUP_MAGIC) return NULL;
+    return lookup;
+}
+
+static void nla_lookup_free( struct nla_lookup *lookup )
+{
+    unsigned int i;
+
+    for (i = 0; i < lookup->count; ++i)
+    {
+        free( lookup->networks[i].friendly_name );
+        free( lookup->networks[i].adapter_name );
+    }
+    free( lookup->networks );
+    lookup->magic = 0;
+    free( lookup );
+}
+
+static BOOL nla_adapter_connected( const IP_ADAPTER_ADDRESSES *aa )
+{
+    return aa->OperStatus == IfOperStatusUp
+           && aa->IfType != IF_TYPE_SOFTWARE_LOOPBACK
+           && aa->FirstUnicastAddress;
+}
+
+static int nla_lookup_create( DWORD control_flags, struct nla_lookup **ret )
+{
+    static const ULONG gaa_flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    IP_ADAPTER_ADDRESSES *addrs = NULL, *aa;
+    struct nla_lookup *lookup;
+    unsigned int count = 0;
+    ULONG size = 0, err;
+
+    err = GetAdaptersAddresses( AF_UNSPEC, gaa_flags, NULL, NULL, &size );
+    while (err == ERROR_BUFFER_OVERFLOW)
+    {
+        IP_ADAPTER_ADDRESSES *new_addrs;
+
+        if (!(new_addrs = realloc( addrs, size )))
+        {
+            free( addrs );
+            return WSA_NOT_ENOUGH_MEMORY;
+        }
+        addrs = new_addrs;
+        err = GetAdaptersAddresses( AF_UNSPEC, gaa_flags, NULL, addrs, &size );
+    }
+    if (err != ERROR_SUCCESS && err != ERROR_NO_DATA)
+    {
+        WARN( "failed to enumerate adapters, error %lu\n", err );
+        free( addrs );
+        return WSASYSCALLFAILURE;
+    }
+    if (err == ERROR_NO_DATA)
+    {
+        free( addrs );
+        addrs = NULL;
+    }
+
+    if (!(lookup = calloc( 1, sizeof(*lookup) )))
+    {
+        free( addrs );
+        return WSA_NOT_ENOUGH_MEMORY;
+    }
+
+    for (aa = addrs; aa; aa = aa->Next)
+        if (nla_adapter_connected( aa )) ++count;
+
+    if (count && !(lookup->networks = calloc( count, sizeof(*lookup->networks) )))
+    {
+        free( lookup );
+        free( addrs );
+        return WSA_NOT_ENOUGH_MEMORY;
+    }
+
+    for (aa = addrs; aa && lookup->count < count; aa = aa->Next)
+    {
+        struct nla_network *net = &lookup->networks[lookup->count];
+        const WCHAR *name = aa->FriendlyName ? aa->FriendlyName : L"";
+        size_t name_size = (wcslen( name ) + 1) * sizeof(WCHAR);
+
+        if (!nla_adapter_connected( aa )) continue;
+
+        if (!(net->friendly_name = malloc( name_size ))
+            || !(net->adapter_name = strdup( aa->AdapterName ? aa->AdapterName : "" )))
+        {
+            free( net->friendly_name );
+            lookup->magic = NLA_LOOKUP_MAGIC;
+            nla_lookup_free( lookup );
+            free( addrs );
+            return WSA_NOT_ENOUGH_MEMORY;
+        }
+        memcpy( net->friendly_name, name, name_size );
+        net->if_type = aa->IfType;
+        net->speed = aa->TransmitLinkSpeed > ~0u ? ~0u : aa->TransmitLinkSpeed;
+        ++lookup->count;
+    }
+
+    lookup->magic = NLA_LOOKUP_MAGIC;
+    lookup->control_flags = control_flags;
+    free( addrs );
+    *ret = lookup;
+    return 0;
+}
+
+static int nla_lookup_begin( DWORD size, DWORD name_space, DWORD control_flags, HANDLE *handle )
+{
+    struct nla_lookup *lookup;
+    int err;
+
+    if (size < sizeof(WSAQUERYSETW))
+    {
+        SetLastError( WSAEINVAL );
+        return -1;
+    }
+    if (name_space != NS_ALL && name_space != NS_NLA)
+    {
+        FIXME( "name space %lu not supported\n", name_space );
+        SetLastError( WSASERVICE_NOT_FOUND );
+        return -1;
+    }
+    if ((err = nla_lookup_create( control_flags, &lookup )))
+    {
+        SetLastError( err );
+        return -1;
+    }
+    TRACE( "found %u connected network(s)\n", lookup->count );
+    *handle = lookup;
+    return 0;
+}
+
+/* WSAQUERYSETA and WSAQUERYSETW share the same layout; only the string
+ * fields differ. The result set and all variable data go into the
+ * caller-supplied buffer. */
+static int nla_fill_result( struct nla_lookup *lookup, DWORD *len, WSAQUERYSETW *results, BOOL unicode )
+{
+    static const GUID nla_service_class_guid = NLA_SERVICE_CLASS_GUID;
+    static const GUID nla_namespace_guid = NLA_NAMESPACE_GUID;
+    const struct nla_network *net = &lookup->networks[lookup->index];
+    size_t adapter_len = strlen( net->adapter_name );
+    size_t off = sizeof(WSAQUERYSETW), off_guids, off_blob = 0, off_nla = 0, off_name = 0;
+    size_t name_size, blob_size = 0;
+    char *base = (char *)results;
+
+    if (unicode)
+        name_size = (wcslen( net->friendly_name ) + 1) * sizeof(WCHAR);
+    else
+        name_size = WideCharToMultiByte( CP_ACP, 0, net->friendly_name, -1, NULL, 0, NULL, NULL );
+
+    off_guids = off;
+    off += 2 * sizeof(GUID);
+    if (lookup->control_flags & LUP_RETURN_BLOB)
+    {
+        blob_size = FIELD_OFFSET( NLA_BLOB, data.interfaceData.adapterName[adapter_len + 1] );
+        off = (off + 7) & ~(size_t)7;
+        off_blob = off;
+        off += sizeof(BLOB);
+        off_nla = off;
+        off += blob_size;
+    }
+    if (lookup->control_flags & LUP_RETURN_NAME)
+    {
+        off = (off + 1) & ~(size_t)1;
+        off_name = off;
+        off += name_size;
+    }
+
+    if (!results || *len < off)
+    {
+        *len = off;
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+
+    memset( results, 0, sizeof(*results) );
+    results->dwSize = sizeof(*results);
+    results->dwNameSpace = NS_NLA;
+
+    memcpy( base + off_guids, &nla_service_class_guid, sizeof(GUID) );
+    results->lpServiceClassId = (GUID *)(base + off_guids);
+    memcpy( base + off_guids + sizeof(GUID), &nla_namespace_guid, sizeof(GUID) );
+    results->lpNSProviderId = (GUID *)(base + off_guids + sizeof(GUID));
+
+    if (lookup->control_flags & LUP_RETURN_BLOB)
+    {
+        BLOB *blob = (BLOB *)(base + off_blob);
+        NLA_BLOB *nla_blob = (NLA_BLOB *)(base + off_nla);
+
+        memset( nla_blob, 0, blob_size );
+        nla_blob->header.type = NLA_INTERFACE;
+        nla_blob->header.dwSize = blob_size;
+        nla_blob->data.interfaceData.dwType = net->if_type;
+        nla_blob->data.interfaceData.dwSpeed = net->speed;
+        strcpy( nla_blob->data.interfaceData.adapterName, net->adapter_name );
+        blob->cbSize = blob_size;
+        blob->pBlobData = (BYTE *)nla_blob;
+        results->lpBlob = blob;
+    }
+    if (lookup->control_flags & LUP_RETURN_NAME)
+    {
+        if (unicode)
+        {
+            memcpy( base + off_name, net->friendly_name, name_size );
+            results->lpszServiceInstanceName = (WCHAR *)(base + off_name);
+        }
+        else
+        {
+            WideCharToMultiByte( CP_ACP, 0, net->friendly_name, -1, base + off_name, name_size, NULL, NULL );
+            ((WSAQUERYSETA *)results)->lpszServiceInstanceName = base + off_name;
+        }
+    }
+
+    ++lookup->index;
+    return 0;
+}
+
+static int nla_lookup_next( HANDLE handle, DWORD *len, WSAQUERYSETW *results, BOOL unicode )
+{
+    struct nla_lookup *lookup = nla_lookup_from_handle( handle );
+
+    if (!lookup)
+    {
+        SetLastError( WSA_INVALID_HANDLE );
+        return -1;
+    }
+    if (!len)
+    {
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+    if (lookup->index >= lookup->count)
+    {
+        SetLastError( WSA_E_NO_MORE );
+        return -1;
+    }
+    return nla_fill_result( lookup, len, results, unicode );
+}
+
+
 /***********************************************************************
  *      WSALookupServiceBeginA   (ws2_32.@)
  */
 int WINAPI WSALookupServiceBeginA( WSAQUERYSETA *query, DWORD flags, HANDLE *lookup )
 {
-    FIXME( "(%p %#lx %p) Stub!\n", query, flags, lookup );
-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
-    return -1;
+    TRACE( "(%p %#lx %p)\n", query, flags, lookup );
+
+    if (!query || !lookup)
+    {
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+    return nla_lookup_begin( query->dwSize, query->dwNameSpace, flags, lookup );
 }
 
 
@@ -2105,18 +2374,32 @@ int WINAPI WSALookupServiceBeginA( WSAQUERYSETA *query, DWORD flags, HANDLE *loo
  */
 int WINAPI WSALookupServiceBeginW( WSAQUERYSETW *query, DWORD flags, HANDLE *lookup )
 {
-    FIXME( "(%p %#lx %p) Stub!\n", query, flags, lookup );
-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
-    return -1;
+    TRACE( "(%p %#lx %p)\n", query, flags, lookup );
+
+    if (!query || !lookup)
+    {
+        SetLastError( WSAEFAULT );
+        return -1;
+    }
+    return nla_lookup_begin( query->dwSize, query->dwNameSpace, flags, lookup );
 }
 
 
 /***********************************************************************
  *      WSALookupServiceEnd   (ws2_32.@)
  */
-int WINAPI WSALookupServiceEnd( HANDLE lookup )
+int WINAPI WSALookupServiceEnd( HANDLE handle )
 {
-    FIXME("(%p) Stub!\n", lookup );
+    struct nla_lookup *lookup = nla_lookup_from_handle( handle );
+
+    TRACE( "(%p)\n", handle );
+
+    if (!lookup)
+    {
+        SetLastError( WSA_INVALID_HANDLE );
+        return -1;
+    }
+    nla_lookup_free( lookup );
     return 0;
 }
 
@@ -2126,9 +2409,8 @@ int WINAPI WSALookupServiceEnd( HANDLE lookup )
  */
 int WINAPI WSALookupServiceNextA( HANDLE lookup, DWORD flags, DWORD *len, WSAQUERYSETA *results )
 {
-    FIXME( "(%p %#lx %p %p) Stub!\n", lookup, flags, len, results );
-    SetLastError( WSA_E_NO_MORE );
-    return -1;
+    TRACE( "(%p %#lx %p %p)\n", lookup, flags, len, results );
+    return nla_lookup_next( lookup, len, (WSAQUERYSETW *)results, FALSE );
 }
 
 
@@ -2137,9 +2419,8 @@ int WINAPI WSALookupServiceNextA( HANDLE lookup, DWORD flags, DWORD *len, WSAQUE
  */
 int WINAPI WSALookupServiceNextW( HANDLE lookup, DWORD flags, DWORD *len, WSAQUERYSETW *results )
 {
-    FIXME( "(%p %#lx %p %p) Stub!\n", lookup, flags, len, results );
-    SetLastError( WSA_E_NO_MORE );
-    return -1;
+    TRACE( "(%p %#lx %p %p)\n", lookup, flags, len, results );
+    return nla_lookup_next( lookup, len, results, TRUE );
 }
 
 

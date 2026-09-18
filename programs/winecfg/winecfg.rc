@@ -101,6 +101,14 @@ END
 
 STRINGTABLE
 BEGIN
+    IDC_TEXT_CONTRAST_OFF    "Off (default)"
+    IDC_TEXT_CONTRAST_MEDIUM "Medium (50), as Windows renders it"
+    IDC_TEXT_CONTRAST_STRONG "Strong (70), for dark interfaces"
+    IDC_TEXT_CONTRAST_CUSTOM "Custom (%u)"
+END
+
+STRINGTABLE
+BEGIN
     IDC_SYSPARAMS_BUTTON            "Controls Background"
     IDC_SYSPARAMS_BUTTON_TEXT       "Controls Text"
     IDC_SYSPARAMS_DESKTOP           "#msgctxt#display name#Desktop"
@@ -187,6 +195,11 @@ BEGIN
     EDITTEXT    IDC_RES_DPIEDIT,188,105,23,13,ES_NUMBER|WS_TABSTOP
     LTEXT       "#msgctxt#unit: dots/inch#dpi",IDC_STATIC,215,107,30,8
     LTEXT       "This is a sample text using 10 point Tahoma",IDC_RES_FONT_PREVIEW,15,124,230,49
+
+    GROUPBOX    "Direct2D text",IDC_STATIC,8,181,244,35
+    LTEXT       "Enhanced &contrast:",IDC_STATIC,15,192,95,8
+    COMBOBOX    IDC_TEXT_CONTRAST,113,190,132,60,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT       "Running applications are unaffected until restarted.",IDC_STATIC,15,205,230,9
 END
 
 IDD_DLLCFG DIALOG  0, 0, 260, 220

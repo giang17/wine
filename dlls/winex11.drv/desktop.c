@@ -71,10 +71,16 @@ BOOL X11DRV_CreateDesktop( const WCHAR *name, UINT width, UINT height )
 
     TRACE( "%s %ux%u\n", debugstr_w(name), width, height );
 
-    /* Create window */
+    /* The VD root stays RGB24 -- an ARGB32 root breaks Wine's XRender pipeline
+     * (RenderCreatePicture BadMatch, window mapping stalls; see issue 64).  The
+     * per-pixel-alpha mini-compositor (vd_compositor.c) instead composites the
+     * ARGB32 children onto a separate ARGB32 overlay window (a true top-level
+     * that the host compositor blends with per-pixel alpha).  SubstructureNotify
+     * Mask lets the compositor receive Map/Configure/Destroy of the override-
+     * redirect top-levels that become direct children of the VD root. */
     win_attr.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask | EnterWindowMask |
                           PointerMotionMask | ButtonPressMask | ButtonReleaseMask | FocusChangeMask |
-                          StructureNotifyMask | PropertyChangeMask;
+                          StructureNotifyMask | PropertyChangeMask | SubstructureNotifyMask;
     win_attr.cursor = XCreateFontCursor( display, XC_top_left_arrow );
 
     if (default_visual.visual != DefaultVisual( display, DefaultScreen(display) ))
@@ -92,6 +98,15 @@ BOOL X11DRV_CreateDesktop( const WCHAR *name, UINT width, UINT height )
     XFlush( display );
 
     X11DRV_init_desktop( win );
+    /* The VD root is created on the thread display, but the compositor renders
+     * via the global gdi_display; sync so the window is server-visible before
+     * the compositor's XGetWindowAttributes runs on the other connection.
+     * The thread display is handed over as well: it is the connection that
+     * selected the root's SubstructureNotify and the one whose event queue
+     * X11DRV_ProcessEvents drains, so the XDamage objects have to live on it
+     * for their notifications to ever be read. */
+    XSync( display, False );
+    vd_compositor_init( display, win );
     return TRUE;
 }
 

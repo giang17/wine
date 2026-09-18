@@ -1141,10 +1141,16 @@ static void scissorrect(struct wined3d_context *context, const struct wined3d_st
         {
             r = &state->scissor_rects[i];
 
+            /* An empty rect (right <= left) is a legal D3D state meaning
+             * "rasterise nothing", but a negative extent makes GL reject the
+             * whole call -- including the other rects in the array -- and leave
+             * the previous scissor in force, so the application keeps drawing
+             * into the area it just asked to exclude. Zero is valid in GL and
+             * rasterises nothing, which is what was asked for. */
             sr[i * 4] = r->left;
             sr[i * 4 + 1] = r->top;
-            sr[i * 4 + 2] = r->right - r->left;
-            sr[i * 4 + 3] = r->bottom - r->top;
+            sr[i * 4 + 2] = max(r->right - r->left, 0);
+            sr[i * 4 + 3] = max(r->bottom - r->top, 0);
         }
 
         if (context->scissor_rect_count > state->scissor_rect_count)
@@ -1160,7 +1166,8 @@ static void scissorrect(struct wined3d_context *context, const struct wined3d_st
     else
     {
         r = &state->scissor_rects[0];
-        gl_info->gl_ops.gl.p_glScissor(r->left, r->top, r->right - r->left, r->bottom - r->top);
+        gl_info->gl_ops.gl.p_glScissor(r->left, r->top,
+                max(r->right - r->left, 0), max(r->bottom - r->top, 0));
         checkGLcall("glScissor");
     }
 }

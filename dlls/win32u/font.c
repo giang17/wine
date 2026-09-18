@@ -30,6 +30,10 @@
 #include <string.h>
 #include <assert.h>
 #include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "ntstatus.h"
 #include "winerror.h"
@@ -192,7 +196,12 @@ static const WCHAR font_assoc_keyW[] =
 };
 
 static UINT font_smoothing = GGO_BITMAP;
-static UINT subpixel_orientation = GGO_GRAY4_BITMAP;
+static UINT subpixel_orientation = WINE_GGO_HRGB_BITMAP;
+/* Set when the prefix carries its own FontSmoothing value, including an
+ * explicit zero. A fresh prefix has none, so this distinguishes "the user
+ * configured Windows-side smoothing" from "nothing was said and the host
+ * should decide". */
+static BOOL font_smoothing_from_prefix;
 static BOOL antialias_fakes = TRUE;
 static struct font_gamma_ramp font_gamma_ramp;
 
@@ -1521,6 +1530,8 @@ static const WCHAR microsoft_sans_serifW[] =
     {'M','i','c','r','o','s','o','f','t',' ','S','a','n','s',' ','S','e','r','i','f',0};
 static const WCHAR tahomaW[] =
     {'T','a','h','o','m','a',0};
+static const WCHAR dejavu_sansW[] =
+    {'D','e','j','a','V','u',' ','S','a','n','s',0};
 static const WCHAR ms_gothicW[] =
     {'M','S',' ','G','o','t','h','i','c',0};
 static const WCHAR ms_p_gothicW[] =
@@ -1672,6 +1683,31 @@ static const char system_link_tahoma_non_cjk[] =
     "MSYH.TTC,Microsoft YaHei UI\0"
     "MALGUN.TTF,Malgun Gothic\0"
     "SEGUISYM.TTF,Segoe UI Symbol\0";
+
+/* The Tahoma chain with the two symbol fallback fonts this branch relies on in
+ * front of it: DejaVu Sans for arrows and general coverage, Noto Sans Symbols2
+ * for U+2B00-2BFF (the rating stars in Serum 2's native menus). They are stock
+ * defaults rather than something a setup script writes once, because
+ * update_font_system_link_info() rewrites this key whenever the code page of
+ * the running process differs from the recorded one - a single process started
+ * under LC_ALL=C is enough - and used to drop the entries again. An entry whose
+ * file is not installed is skipped by load_system_links(), so the chain is
+ * harmless in a prefix without the fonts. */
+static const char system_link_tahoma_symbols_non_cjk[] =
+    "DejaVuSans.ttf,DejaVu Sans\0"
+    "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2\0"
+    "MSGOTHIC.TTC,MS UI Gothic\0"
+    "MINGLIU.TTC,PMingLiU\0"
+    "SIMSUN.TTC,SimSun\0"
+    "GULIM.TTC,Gulim\0"
+    "YUGOTHM.TTC,Yu Gothic UI\0"
+    "MSJH.TTC,Microsoft JhengHei UI\0"
+    "MSYH.TTC,Microsoft YaHei UI\0"
+    "MALGUN.TTF,Malgun Gothic\0"
+    "SEGUISYM.TTF,Segoe UI Symbol\0";
+
+static const char system_link_dejavu_sans[] =
+    "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2\0";
 
 static const char system_link_ms_gothic[] =
     "MINGLIU.TTC,MingLiU\0"
@@ -1930,7 +1966,7 @@ default_system_link[] =
 {
     {
         tahomaW, TRUE,
-        system_link_tahoma_non_cjk, sizeof(system_link_tahoma_non_cjk),
+        system_link_tahoma_symbols_non_cjk, sizeof(system_link_tahoma_symbols_non_cjk),
         system_link_tahoma_sc,      sizeof(system_link_tahoma_sc),
         system_link_tahoma_tc,      sizeof(system_link_tahoma_tc),
         system_link_tahoma_jp,      sizeof(system_link_tahoma_jp),
@@ -1977,6 +2013,7 @@ default_system_link[] =
     { meiryo_ui_boldW,               FALSE, system_link_meiryo_ui_bold,               sizeof(system_link_meiryo_ui_bold) },
     { ms_minchoW,                    FALSE, system_link_ms_mincho,                    sizeof(system_link_ms_mincho) },
     { ms_p_minchoW,                  FALSE, system_link_ms_p_mincho,                  sizeof(system_link_ms_p_mincho) },
+    { dejavu_sansW,                  FALSE, system_link_dejavu_sans,                  sizeof(system_link_dejavu_sans) },
 };
 
 static void populate_system_links( const WCHAR *name, const WCHAR * const *values )
@@ -4534,16 +4571,6 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
         BOOL can_use_bitmap = !!(NtGdiGetDeviceCaps( dc->hSelf, TEXTCAPS ) & TC_RA_ABLE);
 
         NtGdiExtGetObjectW( hfont, sizeof(lf), &lf );
-        switch (lf.lfQuality)
-        {
-        case NONANTIALIASED_QUALITY:
-            if (!*aa_flags) *aa_flags = GGO_BITMAP;
-            break;
-        case ANTIALIASED_QUALITY:
-            if (!*aa_flags) *aa_flags = GGO_GRAY4_BITMAP;
-            break;
-        }
-
         if (lf.lfOutPrecision == OUT_TT_ONLY_PRECIS)
             can_use_bitmap = FALSE;
 
@@ -4587,13 +4614,51 @@ static HFONT font_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
 
         if (font)
         {
-            if (!*aa_flags) *aa_flags = font->aa_flags;
+            UINT incoming = *aa_flags;
+            BOOL host_default = !!(incoming & WINE_GGO_AA_FROM_HOST);
+
+            incoming &= ~WINE_GGO_AA_FROM_HOST;
+
+            /* Preserve real device constraints first. XRender also passes a
+             * nonzero choice, but tags it as a host default so application
+             * quality and an explicit prefix policy can legitimately
+             * override it. */
+            if (incoming && !host_default)
+                *aa_flags = incoming;
+            else switch (lf.lfQuality)
+            {
+            case NONANTIALIASED_QUALITY:
+                *aa_flags = GGO_BITMAP;
+                break;
+            case ANTIALIASED_QUALITY:
+                *aa_flags = GGO_GRAY4_BITMAP;
+                break;
+            case CLEARTYPE_QUALITY:
+            case CLEARTYPE_NATURAL_QUALITY:
+                if (font_smoothing_from_prefix)
+                    *aa_flags = subpixel_orientation;
+                else if (incoming == WINE_GGO_HRGB_BITMAP || incoming == WINE_GGO_HBGR_BITMAP
+                        || incoming == WINE_GGO_VRGB_BITMAP || incoming == WINE_GGO_VBGR_BITMAP)
+                    *aa_flags = incoming;
+                else
+                    *aa_flags = subpixel_orientation;
+                break;
+            default:
+                if (font_smoothing_from_prefix)
+                    *aa_flags = font_smoothing;
+                else if (host_default)
+                    *aa_flags = incoming;
+                else
+                    *aa_flags = font->aa_flags;
+                break;
+            }
+
             if (!*aa_flags)
             {
                 if (lf.lfQuality == CLEARTYPE_QUALITY || lf.lfQuality == CLEARTYPE_NATURAL_QUALITY)
                     *aa_flags = subpixel_orientation;
                 else
-                    *aa_flags = font_smoothing;
+                    *aa_flags = font_smoothing_from_prefix ? font_smoothing : GGO_GRAY4_BITMAP;
             }
             *aa_flags = font_funcs->get_aa_flags( font, *aa_flags, antialias_fakes );
         }
@@ -4744,12 +4809,37 @@ static UINT init_font_options(void)
                 break;
             }
         }
-        if (get_key_value( key, "FontSmoothing", &val ) && val /* enabled */)
+        if (get_key_value( key, "FontSmoothing", &val ))
         {
-            if (get_key_value( key, "FontSmoothingType", &val ) && val == 2 /* FE_FONTSMOOTHINGCLEARTYPE */)
-                font_smoothing = subpixel_orientation;
+            font_smoothing_from_prefix = val != 2;
+            if (!val)
+            {
+                font_smoothing = GGO_BITMAP;
+                font_smoothing_from_prefix = TRUE;
+            }
+            else if (get_key_value( key, "FontSmoothingType", &val ))
+            {
+                font_smoothing = val == 2 /* FE_FONTSMOOTHINGCLEARTYPE */
+                        ? subpixel_orientation : GGO_GRAY4_BITMAP;
+                /* sysparams_init seeds FontSmoothing="2" with
+                 * FE_FONTSMOOTHINGSTANDARD into every new prefix, so only
+                 * that pair records nothing the user chose. The launcher
+                 * uses FontSmoothing="1" with STANDARD as its deliberate
+                 * greyscale marker; ClearType is also explicit. */
+                if (val == 2) font_smoothing_from_prefix = TRUE;
+            }
             else
                 font_smoothing = GGO_GRAY4_BITMAP;
+        }
+        /* WINE_DISABLE_PREFIX_FONT_SMOOTHING=1 gives the host's fontconfig
+         * back its precedence, for a desktop whose own setting should govern
+         * Windows applications too. */
+        if (font_smoothing_from_prefix)
+        {
+            const char *disable = getenv( "WINE_DISABLE_PREFIX_FONT_SMOOTHING" );
+
+            if (disable && *disable && *disable != '0')
+                font_smoothing_from_prefix = FALSE;
         }
         if (get_key_value( key, "FontSmoothingGamma", &val ) && val)
         {
@@ -6479,17 +6569,23 @@ static void load_system_bitmap_fonts(void)
     NtClose( hkey );
 }
 
-static void load_directory_fonts( WCHAR *path, UINT flags )
+static void load_directory_fonts( const WCHAR *dir, UINT flags )
 {
     IO_STATUS_BLOCK io = {{0}};
     OBJECT_ATTRIBUTES attr;
     UNICODE_STRING nt_name;
+    WCHAR path[MAX_PATH];
     HANDLE handle;
     char buf[8192];
     size_t len;
 
-    len = lstrlenW( path );
-    while (len && path[len - 1] == '\\') len--;
+    /* The directory name is appended to below; callers used to hand in their
+     * own buffer, which for the HKCU\Software\Wine\Fonts\Path entries was an
+     * exact-size allocation and overflowed on the first file (issue 382). */
+    len = lstrlenW( dir );
+    while (len && dir[len - 1] == '\\') len--;
+    if (len >= MAX_PATH - 2) return;
+    memcpy( path, dir, len * sizeof(WCHAR) );
 
     nt_name.Buffer = path;
     nt_name.MaximumLength = nt_name.Length = len * sizeof(WCHAR);
@@ -6515,7 +6611,8 @@ static void load_directory_fonts( WCHAR *path, UINT flags )
         FILE_BOTH_DIR_INFORMATION *info = (FILE_BOTH_DIR_INFORMATION *)buf;
         for (;;)
         {
-            if (!(info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            if (!(info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                len + info->FileNameLength / sizeof(WCHAR) < MAX_PATH)
             {
                 memcpy( path + len, info->FileName, info->FileNameLength );
                 path[len + info->FileNameLength / sizeof(WCHAR)] = 0;
@@ -6799,13 +6896,230 @@ INT WINAPI NtGdiAddFontResourceW( const WCHAR *str, ULONG size, ULONG files, DWO
 }
 
 /***********************************************************************
+ * Persisting fonts added from memory (issue 383)
+ *
+ * A font registered with AddFontMemResourceEx() exists only in this process's
+ * GDI font list. DirectWrite builds its system collection from the registry
+ * font list and never sees it, so an application that embeds its GUI font and
+ * then asks DirectWrite for the family by name gets a fallback (JUCE 5-7 take
+ * family 0 of the collection, whatever sorts first). Write the font to
+ * C:\windows\fonts\wine-embedded\<hash>.<ext> and register it the way an
+ * installer would: from the next process start on, GDI and DirectWrite both
+ * load it, and a DirectWrite factory that already holds a collection rebuilds
+ * it when the key's write time changes.
+ *
+ * HKCU\Software\Wine\Fonts\PersistMemoryFonts: "0" disables this,
+ * "installable" limits it to fonts whose OS/2 fsType allows installable
+ * embedding. Fonts with restricted-license embedding, PDF-style subset fonts
+ * (ABCDEF+Name), font collections and bitmap fonts are never persisted.
+ */
+
+#define EMBEDDED_FONT_MAX_SIZE (32u << 20)
+
+enum persist_mem_fonts_mode { PERSIST_MEM_FONTS_OFF, PERSIST_MEM_FONTS_INSTALLABLE, PERSIST_MEM_FONTS_ALL };
+
+static enum persist_mem_fonts_mode get_persist_mem_fonts_mode(void)
+{
+    char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[64 * sizeof(WCHAR)])];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
+    static const WCHAR installableW[] = {'i','n','s','t','a','l','l','a','b','l','e',0};
+    WCHAR *value;
+    ULONG len;
+
+    if (!wine_fonts_key) return PERSIST_MEM_FONTS_ALL;
+    if (!(len = query_reg_ascii_value( wine_fonts_key, "PersistMemoryFonts", info, sizeof(buffer) )))
+        return PERSIST_MEM_FONTS_ALL;
+    if (info->Type == REG_DWORD && len >= sizeof(DWORD))
+        return *(const DWORD *)info->Data ? PERSIST_MEM_FONTS_ALL : PERSIST_MEM_FONTS_OFF;
+    if (info->Type != REG_SZ) return PERSIST_MEM_FONTS_ALL;
+    value = (WCHAR *)info->Data;
+    value[min( len / sizeof(WCHAR), 63 )] = 0;
+    if (value[0] == '0' && !value[1]) return PERSIST_MEM_FONTS_OFF;
+    if (!wcsicmp( value, installableW )) return PERSIST_MEM_FONTS_INSTALLABLE;
+    return PERSIST_MEM_FONTS_ALL;
+}
+
+static inline UINT get_be16( const BYTE *p ) { return (p[0] << 8) | p[1]; }
+static inline UINT get_be32( const BYTE *p ) { return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]; }
+
+/* Extension for a single sfnt font (TrueType or CFF), NULL for collections
+ * and anything else. Returns the OS/2 fsType embedding bits in *fstype. */
+static const char *sfnt_extension( const BYTE *data, SIZE_T size, UINT *fstype )
+{
+    UINT tag, i, count;
+
+    *fstype = 0;
+    if (size < 12) return NULL;
+    tag = get_be32( data );
+    if (tag != 0x00010000 && tag != 0x4f54544f /* OTTO */ && tag != 0x74727565 /* true */) return NULL;
+    count = get_be16( data + 4 );
+    if (size < 12 + (SIZE_T)count * 16) return NULL;
+    for (i = 0; i < count; i++)
+    {
+        const BYTE *rec = data + 12 + i * 16;
+        UINT off = get_be32( rec + 8 ), len = get_be32( rec + 12 );
+        if (!memcmp( rec, "OS/2", 4 ) && len >= 10 && off <= size - 10)
+            *fstype = get_be16( data + off + 8 );
+    }
+    return tag == 0x4f54544f ? "otf" : "ttf";
+}
+
+static UINT64 fnv1a64( const BYTE *data, SIZE_T size )
+{
+    UINT64 hash = 0xcbf29ce484222325ull;
+    while (size--) hash = (hash ^ *data++) * 0x100000001b3ull;
+    return hash;
+}
+
+/* PDF-style subset fonts carry a six-letter tag and a plus sign in front of the name */
+static BOOL is_subset_font_name( const WCHAR *name )
+{
+    unsigned int i;
+    for (i = 0; i < 6; i++) if (name[i] < 'A' || name[i] > 'Z') return FALSE;
+    return name[6] == '+';
+}
+
+static void create_embedded_fonts_dir( const WCHAR *nt_path )
+{
+    char *unix_name = NULL;
+
+    ntdll_get_unix_file_name( nt_path, &unix_name, FILE_OPEN_IF );
+    if (!unix_name) return;
+    mkdir( unix_name, 0755 );
+    free( unix_name );
+}
+
+static BOOL write_embedded_font_file( const WCHAR *nt_path, const void *data, SIZE_T size )
+{
+    char *unix_name = NULL;
+    struct stat st;
+    SIZE_T done = 0;
+    BOOL ret = FALSE;
+    int fd;
+
+    ntdll_get_unix_file_name( nt_path, &unix_name, FILE_OPEN_IF );
+    if (!unix_name) return FALSE;
+
+    if (!stat( unix_name, &st )) ret = (st.st_size == (off_t)size);   /* content-addressed: same name, same bytes */
+    else if ((fd = open( unix_name, O_WRONLY | O_CREAT | O_EXCL, 0644 )) != -1)
+    {
+        while (done < size)
+        {
+            ssize_t n = write( fd, (const char *)data + done, size - done );
+            if (n <= 0) break;
+            done += n;
+        }
+        close( fd );
+        if (!(ret = (done == size))) unlink( unix_name );
+    }
+    else ret = (errno == EEXIST);   /* another process wrote it first */
+
+    free( unix_name );
+    return ret;
+}
+
+/* the full name of a scalable face created from this memory block, if any */
+static BOOL get_mem_font_full_name( const void *data, WCHAR *full_name )
+{
+    struct gdi_font_family *family;
+    struct gdi_font_face *face;
+
+    WINE_RB_FOR_EACH_ENTRY( family, &family_name_tree, struct gdi_font_family, name_entry )
+    {
+        LIST_FOR_EACH_ENTRY( face, &family->faces, struct gdi_font_face, entry )
+        {
+            if (face->data_ptr != data || !face->scalable || (face->flags & ADDFONT_VERTICAL_FONT)) continue;
+            lstrcpynW( full_name, face->full_name, LF_FULLFACESIZE );
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void persist_mem_font( const void *data, SIZE_T size, const WCHAR *full_name )
+{
+    static const WCHAR subdirW[] = {'w','i','n','e','-','e','m','b','e','d','d','e','d',0};
+    static const WCHAR embedded_fontsW[] = {'E','m','b','e','d','d','e','d',' ','F','o','n','t','s'};
+    static const char hex[] = "0123456789abcdef";
+    char value_buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[MAX_PATH * sizeof(WCHAR)])];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)value_buffer;
+    WCHAR path[MAX_PATH], value[LF_FULLFACESIZE + 12];
+    const WCHAR *dos_path;
+    enum persist_mem_fonts_mode mode;
+    const char *ext;
+    UINT fstype, i, len;
+    UINT64 hash;
+    HKEY key;
+
+    if ((mode = get_persist_mem_fonts_mode()) == PERSIST_MEM_FONTS_OFF) return;
+    if (size > EMBEDDED_FONT_MAX_SIZE || !(ext = sfnt_extension( data, size, &fstype ))) return;
+    if (fstype & 0x0002)
+    {
+        TRACE( "not persisting %s: restricted license embedding (fsType %#x)\n", debugstr_w(full_name), fstype );
+        return;
+    }
+    if (mode == PERSIST_MEM_FONTS_INSTALLABLE && (fstype & 0x000e))
+    {
+        TRACE( "not persisting %s: fsType %#x is not installable\n", debugstr_w(full_name), fstype );
+        return;
+    }
+    if (is_subset_font_name( full_name ))
+    {
+        TRACE( "not persisting %s: subset font\n", debugstr_w(full_name) );
+        return;
+    }
+
+    get_fonts_win_dir_path( subdirW, path );
+    create_embedded_fonts_dir( path );
+
+    hash = fnv1a64( data, size );
+    len = lstrlenW( path );
+    path[len++] = '\\';
+    for (i = 0; i < 16; i++) path[len++] = hex[(hash >> (60 - 4 * i)) & 0xf];
+    path[len++] = '.';
+    for (i = 0; ext[i]; i++) path[len++] = ext[i];
+    path[len] = 0;
+
+    if (!write_embedded_font_file( path, data, size ))
+    {
+        WARN( "failed to write %s for %s\n", debugstr_w(path), debugstr_w(full_name) );
+        return;
+    }
+
+    dos_path = path + ARRAY_SIZE(nt_prefixW);
+    lstrcpyW( value, full_name );
+    lstrcatW( value, true_type_suffixW );
+    len = (lstrlenW( dos_path ) + 1) * sizeof(WCHAR);
+
+    if (!(key = reg_create_key( NULL, fonts_winnt_config_keyW, sizeof(fonts_winnt_config_keyW), 0, NULL )))
+        return;
+    if (query_reg_value( key, value, info, sizeof(value_buffer) ) == len && info->Type == REG_SZ &&
+        !memcmp( info->Data, dos_path, len ))
+    {
+        NtClose( key );
+        return;
+    }
+    set_reg_value( key, value, REG_SZ, dos_path, len );
+    NtClose( key );
+
+    if ((key = reg_create_key( wine_fonts_key, embedded_fontsW, sizeof(embedded_fontsW), 0, NULL )))
+    {
+        set_reg_value( key, value, REG_SZ, dos_path, len );
+        NtClose( key );
+    }
+    TRACE( "persisted %s as %s (fsType %#x)\n", debugstr_w(full_name), debugstr_w(dos_path), fstype );
+}
+
+/***********************************************************************
  *           NtGdiAddFontMemResourceEx    (win32u.@)
  */
 HANDLE WINAPI NtGdiAddFontMemResourceEx( void *ptr, DWORD size, void *dv, ULONG dv_size,
                                          DWORD *count )
 {
+    WCHAR full_name[LF_FULLFACESIZE];
     HANDLE ret;
     DWORD num_fonts;
+    BOOL persist;
     void *copy;
 
     if (!ptr || !size || !count)
@@ -6819,6 +7133,7 @@ HANDLE WINAPI NtGdiAddFontMemResourceEx( void *ptr, DWORD size, void *dv, ULONG 
 
     pthread_mutex_lock( &font_lock );
     num_fonts = font_funcs->add_mem_font( copy, size, ADDFONT_ALLOW_BITMAP | ADDFONT_ADD_RESOURCE );
+    persist = num_fonts && get_mem_font_full_name( copy, full_name );
     pthread_mutex_unlock( &font_lock );
 
     if (!num_fonts)
@@ -6826,6 +7141,7 @@ HANDLE WINAPI NtGdiAddFontMemResourceEx( void *ptr, DWORD size, void *dv, ULONG 
         free( copy );
         return NULL;
     }
+    if (persist) persist_mem_font( copy, size, full_name );
 
     /* FIXME: is the handle only for use in RemoveFontMemResourceEx or should it be a true handle?
      * For now return something unique but quite random

@@ -61,6 +61,7 @@ AddReg=\
     ControlClass,\
     CurrentVersion,\
     Debugger,\
+    JuceHosts,\
     DirectX,\
     Fonts,\
     LicenseInformation,\
@@ -115,6 +116,7 @@ CopyFiles=NlsFiles,WinmdFiles
 AddReg=\
     CurrentVersion,\
     Debugger,\
+    JuceHosts,\
     DirectX,\
     LicenseInformation,\
     MCI,\
@@ -419,6 +421,37 @@ HKLM,%CurrentVersionNT%\AeDebug,"Auto",2,"1"
 HKCU,Software\Wine\Debug,"RelayExclude",2,"ntdll.RtlEnterCriticalSection;ntdll.RtlTryEnterCriticalSection;ntdll.RtlLeaveCriticalSection;kernel32.48;kernel32.49;kernel32.94;kernel32.95;kernel32.96;kernel32.97;kernel32.98;kernel32.TlsGetValue;kernel32.TlsSetValue;kernel32.FlsGetValue;kernel32.FlsSetValue;kernel32.SetLastError"
 HKCU,Software\Wine\Debug,"RelayFromExclude",2,"winex11.drv;winemac.drv;user32;gdi32;advapi32;kernel32"
 
+[JuceHosts]
+; JUCE 8.0.13+ picks its renderer with GetProcAddress(ntdll, "wine_get_version") and
+; falls back to GDI whenever that succeeds.  This branch implements the Direct2D and
+; DirectComposition surface JUCE needs, so the export is hidden inside the plug-in
+; hosts (ntdll HideWineVersion, see PATCHES.md).  Flag 2 never overwrites a value
+; that is already set, so "N" for one host stays an exception.  Standalone
+; applications are left alone: PACE/iLok protected ones need the Wine answer.
+HKCU,"Software\Wine\AppDefaults\reaper.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\FL64.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Studio Pro.exe","HideWineVersion",2,"Y"
+; Studio One, the predecessor of Studio Pro, keeps one executable name across its versions
+HKCU,"Software\Wine\AppDefaults\Studio One.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Intro.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Lite.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Standard.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Suite.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Ableton Live 12 Trial.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\yabridge-host.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\yabridge-host-32.exe","HideWineVersion",2,"Y"
+; Bitwig runs plug-ins in its audio engine or in separate plug-in hosts, named per CPU variant
+HKCU,"Software\Wine\AppDefaults\BitwigAudioEngine-X64-AVX2.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\BitwigAudioEngine-X64-SSE41.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X64-AVX2.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X64-SSE41.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\BitwigPluginHost-X86-SSE41.exe","HideWineVersion",2,"Y"
+; Cubase is named per major version and loads its VST3 plug-ins in-process
+HKCU,"Software\Wine\AppDefaults\Cubase12.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Cubase13.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Cubase14.exe","HideWineVersion",2,"Y"
+HKCU,"Software\Wine\AppDefaults\Cubase15.exe","HideWineVersion",2,"Y"
+
 [DirectX]
 HKLM,Software\Microsoft\DirectX,"Version",,"4.09.00.0904"
 HKLM,Software\Microsoft\DirectX,"InstalledVersion",1,00,00,00,09,00,00,00,00
@@ -516,6 +549,11 @@ HKLM,%FontSubStr%,"Courier New Greek,161",,"Courier New,161"
 HKLM,%FontSubStr%,"Courier New TUR,162",,"Courier New,162"
 HKLM,%FontSubStr%,"Helv",,"MS Sans Serif"
 HKLM,%FontSubStr%,"Helvetica",,"Arial"
+HKLM,%FontSubStr%,"Malgun Gothic",,"Segoe UI"
+HKLM,%FontSubStr%,"Meiryo",,"Segoe UI"
+HKLM,%FontSubStr%,"Meiryo UI",,"Segoe UI"
+HKLM,%FontSubStr%,"Microsoft JhengHei UI",,"Segoe UI"
+HKLM,%FontSubStr%,"Microsoft YaHei UI",,"Segoe UI"
 HKLM,%FontSubStr%,"MS Shell Dlg 2",,"Tahoma"
 HKLM,%FontSubStr%,"Times",,"Times New Roman"
 HKLM,%FontSubStr%,"Times New Roman Baltic,186",,"Times New Roman,186"
@@ -523,6 +561,7 @@ HKLM,%FontSubStr%,"Times New Roman CE,238",,"Times New Roman,238"
 HKLM,%FontSubStr%,"Times New Roman CYR,204",,"Times New Roman,204"
 HKLM,%FontSubStr%,"Times New Roman Greek,161",,"Times New Roman,161"
 HKLM,%FontSubStr%,"Times New Roman TUR,162",,"Times New Roman,162"
+HKLM,%FontSubStr%,"Yu Gothic UI",,"Segoe UI"
 HKLM,System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts,"LogPixels",0x10003,0x00000060
 
 [MCI]
@@ -707,6 +746,7 @@ HKLM,SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86,"Version",2,"14.42.344
 11,,msmpeg2vdec.dll,1
 11,,msvdsp.dll,1
 11,,msvproc.dll,1
+11,,pwrshsip.dll,1
 11,,qcap.dll,1
 11,,qedit.dll,1
 11,,resampledmo.dll,1

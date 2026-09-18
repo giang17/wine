@@ -302,6 +302,10 @@ static BOOL search_path(const WCHAR *firstParam, WCHAR **full_path)
         GetFullPathNameW(firstParam, ARRAY_SIZE(pathtosearch), pathtosearch, NULL);
         lastSlash = wcsrchr(pathtosearch, '\\');
         if (lastSlash && wcschr(lastSlash, '.') != NULL) extensionsupplied = TRUE;
+        if (!lastSlash || lstrlenW(lastSlash + 1) >= MAX_PATH) {
+            return FALSE;
+        }
+
         lstrcpyW(stemofsearch, lastSlash+1);
 
         /* Reduce pathtosearch to a path with trailing '\' to support c:\a.bat and

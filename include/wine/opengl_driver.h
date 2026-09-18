@@ -275,6 +275,9 @@ W32KAPI void *opengl_drawable_create( const struct opengl_drawable_funcs *funcs,
                                       struct client_surface *client, const SIZE *size );
 W32KAPI void opengl_drawable_add_ref( struct opengl_drawable *drawable );
 W32KAPI void opengl_drawable_release( struct opengl_drawable *drawable );
+/* issue-250: release a DC's drawable, parking it on the window for
+ * reuse instead of destroying it.  win32u-internal, not a driver entry point. */
+extern void release_dc_opengl_drawable( struct opengl_drawable *drawable );
 
 W32KAPI void set_window_opengl_drawable( HWND hwnd, struct opengl_drawable *drawable, BOOL current );
 

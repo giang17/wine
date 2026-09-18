@@ -52,6 +52,40 @@
 #include "wine/list.h"
 #include "wine/rbtree.h"
 
+/* Private heap for wined3d — isolates high-frequency alloc/free churn from
+ * the process heap to prevent RSS growth from ntdll heap fragmentation.
+ * HeapDestroy at DLL_PROCESS_DETACH returns all memory to the OS at once. */
+extern HANDLE wined3d_heap;
+
+static inline void *wined3d_private_alloc(size_t size)
+{
+    return HeapAlloc(wined3d_heap, 0, size);
+}
+
+static inline void *wined3d_private_calloc(size_t count, size_t size)
+{
+    if (size && count > (~(size_t)0) / size)
+        return NULL;
+    return HeapAlloc(wined3d_heap, HEAP_ZERO_MEMORY, count * size);
+}
+
+static inline void *wined3d_private_realloc(void *ptr, size_t size)
+{
+    if (!ptr) return HeapAlloc(wined3d_heap, 0, size);
+    return HeapReAlloc(wined3d_heap, 0, ptr, size);
+}
+
+static inline void wined3d_private_free(void *ptr)
+{
+    if (ptr) HeapFree(wined3d_heap, 0, ptr);
+}
+
+/* Redirect standard C allocators to wined3d private heap */
+#define malloc(s)       wined3d_private_alloc(s)
+#define calloc(c, s)    wined3d_private_calloc(c, s)
+#define realloc(p, s)   wined3d_private_realloc(p, s)
+#define free(p)         wined3d_private_free(p)
+
 static inline size_t align(size_t addr, size_t alignment)
 {
     return (addr + (alignment - 1)) & ~(alignment - 1);
@@ -2082,6 +2116,7 @@ struct wined3d_pixel_format
     int auxBuffers;
     int numSamples;
     int swap_method;
+    int transparent; /* TEMPORARY issue-250: WGL_TRANSPARENT_ARB, flags an ARGB-visual format */
 };
 
 enum wined3d_pci_vendor
@@ -3109,6 +3144,13 @@ struct wined3d_device
     UINT context_count;
 
     CRITICAL_SECTION bo_map_lock;
+
+    /* Pool of freed wined3d_bo_gl structs for recycling.
+     * Reduces malloc/free churn from Map(WRITE_DISCARD).
+     * Protected by bo_map_lock. */
+    struct wined3d_bo *bo_gl_free_pool;
+    SIZE_T bo_gl_free_pool_count;
+#define WINED3D_BO_GL_FREE_POOL_MAX 256
 };
 
 void wined3d_device_cleanup(struct wined3d_device *device);
@@ -3657,7 +3699,6 @@ enum wined3d_cs_queue_id
 /* How long to wait for commands when there are active queries, in µs. */
 #define WINED3D_CS_COMMAND_WAIT_WITH_QUERIES_TIMEOUT 100
 /* How long to wait for the CS from the client thread, in µs. */
-#define WINED3D_CS_CLIENT_WAIT_TIMEOUT  0
 #define WINED3D_CS_QUEUE_MASK           (WINED3D_CS_QUEUE_SIZE - 1)
 
 C_ASSERT(!(WINED3D_CS_QUEUE_SIZE & (WINED3D_CS_QUEUE_SIZE - 1)));
@@ -3707,8 +3748,9 @@ struct wined3d_cs
     struct list query_poll_list;
     BOOL queries_flushed;
 
-    HANDLE event;
+    HANDLE event, progress_event;
     LONG waiting_for_event;
+    LONG waiting_for_progress;
 };
 
 static inline void wined3d_device_context_lock(struct wined3d_device_context *context)
@@ -3850,66 +3892,13 @@ static inline void wined3d_resource_reference(struct wined3d_resource *resource)
 
 #define WINED3D_PAUSE_SPIN_COUNT 200u
 
-static inline void wined3d_pause(unsigned int *spin_count)
-{
-    static const LARGE_INTEGER timeout = {.QuadPart = WINED3D_CS_CLIENT_WAIT_TIMEOUT * -10};
-
-    if (++*spin_count >= WINED3D_PAUSE_SPIN_COUNT)
-        NtDelayExecution(FALSE, &timeout);
-}
-
 static inline BOOL wined3d_ge_wrap(ULONG x, ULONG y)
 {
     return (x - y) < UINT_MAX / 2;
 }
 C_ASSERT(WINED3D_CS_QUEUE_SIZE < UINT_MAX / 4);
 
-static inline void wined3d_resource_wait_idle(const struct wined3d_resource *resource)
-{
-    const struct wined3d_cs *cs = resource->device->cs;
-    ULONG access_time, tail, head;
-    unsigned int spin_count = 0;
-
-    if (!cs->thread || cs->thread_id == GetCurrentThreadId())
-        return;
-
-    access_time = resource->access_time;
-    head = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
-
-    /* The basic idea is that a resource is busy if tail < access_time <= head.
-     * But we have to be careful about wrap-around of the head and tail. The
-     * wined3d_ge_wrap function considers x >= y if x - y is smaller than half the
-     * UINT range. Head is at most WINED3D_CS_QUEUE_SIZE ahead of tail, because
-     * otherwise the queue memory is considered full and queue_require_space
-     * stalls. Thus wined3d_ge_wrap(head, tail) is always true. The C_ASSERT above
-     * ensures this in case we decide to grow the queue size in the future.
-     *
-     * It is possible that a resource has not been used for a long time and is idle, but the head and
-     * tail wrapped around in such a way that the previously set access time falls between head and tail.
-     * In this case we will incorrectly wait for the resource. Because we use the entire 32 bits of the
-     * counters and not just the bits needed to address the actual queue memory, this should happen rarely.
-     * If it turns out to be a problem we can switch to 64 bit counters or attempt to somehow mark the
-     * access time of resources invalid. CS packets are at least 4 byte aligned, so we could use the lower
-     * 2 bits in access_time for such a marker.
-     *
-     * Note that the access time is set before the command is submitted, so we have to wait until the
-     * tail is bigger than access_time, not equal. */
-
-    if (!wined3d_ge_wrap(head, access_time))
-        return;
-
-    for (;;)
-    {
-        tail = *(volatile ULONG *)&cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail;
-        if (head == tail) /* Queue empty. */
-            break;
-
-        if (!wined3d_ge_wrap(access_time, tail) && access_time != tail)
-            break;
-
-        wined3d_pause(&spin_count);
-    }
-}
+void wined3d_resource_wait_idle(const struct wined3d_resource *resource);
 
 struct wined3d_buffer
 {
@@ -4127,11 +4116,66 @@ struct wined3d_swapchain
     struct wined3d_swapchain_state state;
     HWND win_handle;
     HDC dc;
+
+    /* DComp dirty rect tracking for Present1.
+     * present_dirty_rects[] is the client-side "pending" buffer written by
+     * wined3d_swapchain_set_dirty_rects on the app thread.  It is snapshotted
+     * into the present CS op at emit time and must NOT be read on the CS thread
+     * (the app may already be writing the next frame's rects).  The CS-thread
+     * present path reads cs_present_dirty_rects[] instead, which is filled from
+     * the op in wined3d_cs_exec_present and only ever touched on the CS thread. */
+    RECT present_dirty_rects[16];
+    unsigned int present_dirty_rect_count;
+    RECT cs_present_dirty_rects[16];
+    unsigned int cs_present_dirty_rect_count;
+    /* Present1 scroll rect/offset, same client -> op -> CS hand-off as the
+     * dirty rects.  The rect is the area of the new frame that receives the
+     * previous frame's content shifted by the offset. */
+    RECT present_scroll_rect;
+    POINT present_scroll_offset;
+    BOOL present_scroll_valid;
+    RECT cs_present_scroll_rect;
+    POINT cs_present_scroll_offset;
+    BOOL cs_present_scroll_valid;
+    HWND last_blit_window;
+
+    /* DComp composition buffer (persistent, for dirty-rect accumulation) */
+    HDC comp_dc;
+    HBITMAP comp_bitmap;
+    HGDIOBJ comp_old_bitmap;
+    DWORD *comp_bits;
+    unsigned int comp_width;
+    unsigned int comp_height;
+
+    /* Per-visual surface buffer (persistent, separate from comp_buffer) */
+    DWORD *surface_bits;
+    unsigned int surface_width;
+    unsigned int surface_height;
+    BOOL surface_valid;
+
+    /* The leaf layer dcomp publishes for this window, so it can be drawn into
+     * the frame between swapchain_blit() and wglSwapBuffers() (issue 206).  The
+     * texture is persistent because only the published box is uploaded per
+     * present, not the whole layer.
+     *
+     * layer_sink records that we counted ourselves into the sink property and
+     * have to count out again, and doubles as the gate that keeps a swapchain
+     * which never composites out of the lookup altogether.  layer is a cache of
+     * the property; dcomp never frees the structure and never removes the
+     * property, so one successful lookup holds for the swapchain's life, and
+     * layer_lookup backs the unsuccessful ones off. */
+    struct wine_dcomp_layer *layer;
+    unsigned int layer_lookup;
+    struct wined3d_texture *layer_texture;
+    unsigned int layer_tex_width;
+    unsigned int layer_tex_height;
+    BOOL layer_sink;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);
 void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain);
 struct wined3d_output * wined3d_swapchain_get_output(const struct wined3d_swapchain *swapchain);
+bool wined3d_swapchain_keeps_back_buffers(const struct wined3d_swapchain *swapchain);
 void swapchain_update_draw_bindings(struct wined3d_swapchain *swapchain);
 void swapchain_set_max_frame_latency(struct wined3d_swapchain *swapchain,
         const struct wined3d_device *device);

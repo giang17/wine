@@ -501,6 +501,42 @@ void create_lnk_(int line, const WCHAR* path, lnk_desc_t* desc)
     IShellLinkA_Release(sl);
 }
 
+static void check_lnk_target_forms(const WCHAR *lnkfile, const char *shortpath, const char *longdir)
+{
+    char longpath[MAX_PATH], buffer[MAX_PATH], expected_short[MAX_PATH];
+    IShellLinkA *sl;
+    IPersistFile *pf;
+    HRESULT r;
+
+    strcpy(longpath, longdir);
+    strcat(longpath, "\\test.txt");
+    r = GetShortPathNameA(longpath, expected_short, sizeof(expected_short));
+    ok(r && r < sizeof(expected_short), "GetShortPathName failed (%ld), err %ld\n", r, GetLastError());
+
+    r = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkA, (void **)&sl);
+    ok(r == S_OK, "no IID_IShellLinkA (0x%08lx)\n", r);
+    if (r != S_OK) return;
+    r = IShellLinkA_QueryInterface(sl, &IID_IPersistFile, (void **)&pf);
+    ok(r == S_OK, "no IID_IPersistFile (0x%08lx)\n", r);
+    r = IPersistFile_Load(pf, lnkfile, STGM_READ);
+    ok(r == S_OK, "load failed (0x%08lx)\n", r);
+    IPersistFile_Release(pf);
+
+    r = IShellLinkA_GetPath(sl, buffer, sizeof(buffer), NULL, 0);
+    ok(r == S_OK, "GetPath failed (0x%08lx)\n", r);
+    ok(!lstrcmpiA(buffer, longpath), "GetPath(0) returned '%s' instead of '%s'\n", buffer, longpath);
+
+    r = IShellLinkA_GetPath(sl, buffer, sizeof(buffer), NULL, SLGP_SHORTPATH);
+    ok(r == S_OK, "GetPath failed (0x%08lx)\n", r);
+    ok(!lstrcmpiA(buffer, expected_short), "GetPath(SHORTPATH) returned '%s' instead of '%s'\n", buffer, expected_short);
+
+    r = IShellLinkA_GetPath(sl, buffer, sizeof(buffer), NULL, SLGP_RAWPATH);
+    ok(r == S_OK, "GetPath failed (0x%08lx)\n", r);
+    ok(!lstrcmpiA(buffer, shortpath), "GetPath(RAWPATH) returned '%s' instead of '%s'\n", buffer, shortpath);
+
+    IShellLinkA_Release(sl);
+}
+
 static void check_lnk_(int line, const WCHAR* path, lnk_desc_t* desc, int todo)
 {
     HRESULT r;
@@ -780,6 +816,10 @@ static void test_load_save(void)
     create_lnk(lnkfile, &desc);
     desc.path=realpath;
     check_lnk(lnkfile, &desc, 0x0);
+
+    /* Without SLGP_RAWPATH the target comes back as the long path, with
+     * SLGP_SHORTPATH as the short one; the raw path keeps the 8.3 form. */
+    check_lnk_target_forms(lnkfile, realpath, mydir);
 
     r = DeleteFileA(mypath);
     ok(r, "failed to delete file %s (%ld)\n", mypath, GetLastError());

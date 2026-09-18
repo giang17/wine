@@ -30,6 +30,11 @@ static NTSTATUS (WINAPI *pNtWaitForAlertByThreadId)(void *addr, const LARGE_INTE
 
 #define WINED3D_INITIAL_CS_SIZE 4096
 
+/* Posted to a swapchain window after each executed present so the dcomp
+ * subclass puts the delivered leaves back over the presented frame
+ * (issue 206).  Kept in sync with dlls/dcomp/device.c and dlls/dxgi/factory.c. */
+#define WM_WINE_DCOMP_PRESENT_FLUSH (WM_USER + 0x102)
+
 struct wined3d_deferred_upload
 {
     struct wined3d_resource *resource;
@@ -166,6 +171,14 @@ struct wined3d_cs_present
     RECT dst_rect;
     unsigned int swap_interval;
     uint32_t flags;
+    /* Snapshot of the composition dirty rects at emit time, handed off to the
+     * CS thread so the present path does not read the live client-side buffer
+     * (which the app may concurrently overwrite for the next frame). */
+    RECT present_dirty_rects[16];
+    unsigned int present_dirty_rect_count;
+    RECT present_scroll_rect;
+    POINT present_scroll_offset;
+    BOOL present_scroll_valid;
 };
 
 struct wined3d_cs_clear
@@ -724,7 +737,56 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
                     &src_rect, WINED3D_BLT_ALPHA_TEST, NULL, WINED3D_TEXF_POINT);
     }
 
+    /* Publish this frame's dirty rects into the CS-thread-only active buffer
+     * that swapchain_blit_gdi reads.  Only the CS thread touches
+     * cs_present_dirty_rects[], so the present path is free of the client/CS
+     * data race on the live present_dirty_rects[] buffer. */
+    swapchain->cs_present_dirty_rect_count = op->present_dirty_rect_count;
+    if (op->present_dirty_rect_count)
+        memcpy(swapchain->cs_present_dirty_rects, op->present_dirty_rects,
+                op->present_dirty_rect_count * sizeof(*swapchain->cs_present_dirty_rects));
+    swapchain->cs_present_scroll_valid = op->present_scroll_valid;
+    swapchain->cs_present_scroll_rect = op->present_scroll_rect;
+    swapchain->cs_present_scroll_offset = op->present_scroll_offset;
+
     swapchain->swapchain_ops->swapchain_present(swapchain, &op->src_rect, &op->dst_rect, op->swap_interval, op->flags);
+
+    /* The present above was the last writer of the window.  A dcomp tree that
+     * delivers leaves into the same window below the coverage threshold has
+     * to put them back NOW, not at its next tree-timer tick -- the gap between
+     * the two is the playhead flicker of issue 206.  Signal only: posted to
+     * the window's owning thread, never blitted from this CS thread -- GDI on
+     * a window from a foreign thread is what broke selection drags in Studio
+     * Pro (issue 190).  Windows without the property (no in-process dcomp
+     * target, composition swapchains) pay one GetPropW per present. */
+    if (swapchain->win_handle
+            && GetPropW(swapchain->win_handle, L"__wine_dcomp_present_flush"))
+        PostMessageW(swapchain->win_handle, WM_WINE_DCOMP_PRESENT_FLUSH, 0, 0);
+
+    /* Copy the just-presented content back into back_buffer[0] so the app can
+     * do incremental rendering (DirtyRects).  After rotation,
+     * back_buffers[N-1] has the presented frame; copy it to back_buffers[0].
+     * This MUST happen in the CS thread (not from DXGI) to avoid a race with
+     * the frame latency event that wakes the app.
+     *
+     * Only meaningful where the buffers were rotated in the first place: this
+     * copy exists to undo the rotation, and doing it without one would
+     * overwrite what the application just drew.  Both halves therefore ask
+     * wined3d_swapchain_keeps_back_buffers() instead of testing the swap effect
+     * on their own. */
+    if ((desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
+            || desc->swap_effect == WINED3D_SWAP_EFFECT_FLIP_DISCARD)
+            && desc->backbuffer_count >= 2
+            && !wined3d_swapchain_keeps_back_buffers(swapchain))
+    {
+        struct wined3d_texture *copy_src = swapchain->back_buffers[desc->backbuffer_count - 1];
+        struct wined3d_texture *copy_dst = swapchain->back_buffers[0];
+        RECT copy_rect;
+
+        SetRect(&copy_rect, 0, 0, copy_dst->resource.width, copy_dst->resource.height);
+        wined3d_device_context_blt(&cs->c, copy_dst, 0, &copy_rect,
+                copy_src, 0, &copy_rect, 0, NULL, WINED3D_TEXF_POINT);
+    }
 
     /* Discard buffers if the swap effect allows it. */
     back_buffer = swapchain->back_buffers[desc->backbuffer_count - 1];
@@ -784,6 +846,27 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
     op->dst_rect = *dst_rect;
     op->swap_interval = swap_interval;
     op->flags = flags;
+
+    /* Snapshot the client-side dirty rects into the op.  This runs on the app
+     * thread under wined3d_mutex (held by wined3d_swapchain_present), in program
+     * order after wined3d_swapchain_set_dirty_rects, so it captures this frame's
+     * rects; the CS thread later reads them from the op, never from the live
+     * swapchain buffer. */
+    op->present_dirty_rect_count = swapchain->present_dirty_rect_count;
+    if (swapchain->present_dirty_rect_count)
+        memcpy(op->present_dirty_rects, swapchain->present_dirty_rects,
+                swapchain->present_dirty_rect_count * sizeof(*op->present_dirty_rects));
+    /* Consume the pending rects: they apply to exactly this present.  A
+     * subsequent plain Present() that does not call set_dirty_rects() (only
+     * Present1 does) must then present a full frame, not re-use stale rects.
+     * Reset here on the app thread rather than on the CS thread after the blit,
+     * so the client buffer is never written from two threads. */
+    swapchain->present_dirty_rect_count = 0;
+    op->present_scroll_valid = swapchain->present_scroll_valid;
+    op->present_scroll_rect = swapchain->present_scroll_rect;
+    op->present_scroll_offset = swapchain->present_scroll_offset;
+    swapchain->present_scroll_valid = FALSE;
+
 
     wined3d_resource_reference(&swapchain->front_buffer->resource);
     for (i = 0; i < swapchain->state.desc.backbuffer_count; ++i)
@@ -2854,7 +2937,8 @@ void wined3d_device_context_emit_update_sub_resource(struct wined3d_device_conte
     if (resource->type == WINED3D_RTYPE_BUFFER && box->right - box->left == resource->size)
         invalidate_client_address(resource);
 
-    if (context->ops->map_upload_bo(context, resource, sub_resource_idx, &map_desc, box, WINED3D_MAP_WRITE))
+    if (context->ops->map_upload_bo(context, resource, sub_resource_idx, &map_desc, box,
+            WINED3D_MAP_WRITE | ((resource->type == WINED3D_RTYPE_BUFFER) ? WINED3D_MAP_DISCARD : 0)))
     {
         const struct wined3d_format *format = resource->format;
 
@@ -3055,13 +3139,29 @@ void wined3d_cs_emit_decode(struct wined3d_decoder *decoder, struct wined3d_deco
 
 static void wined3d_cs_emit_stop(struct wined3d_cs *cs)
 {
+    struct wined3d_cs_queue *queue = &cs->queue[WINED3D_CS_QUEUE_DEFAULT];
     struct wined3d_cs_stop *op;
 
     op = wined3d_device_context_require_space(&cs->c, sizeof(*op), WINED3D_CS_QUEUE_DEFAULT);
     op->opcode = WINED3D_CS_OP_STOP;
 
     wined3d_device_context_submit(&cs->c, WINED3D_CS_QUEUE_DEFAULT);
-    wined3d_cs_finish(cs, WINED3D_CS_QUEUE_DEFAULT);
+
+    /* Not wined3d_cs_finish(): the CS thread retires the STOP packet outside
+     * wined3d_cs_execute_next(), by releasing the queue tails on its way out
+     * of wined3d_cs_run(), and it must not touch "cs" after that release
+     * because the caller frees it as soon as this function returns.  So it
+     * cannot take part in the waiting_for_progress protocol for this packet;
+     * instead it signals progress_event unconditionally, from a handle it
+     * copied beforehand, after releasing the tails.  Wait for that signal
+     * before looking at the tail: waiting at least once keeps the handle open
+     * until the CS thread has used it, and a spurious wake-up from a signal
+     * left over by another waiter just loops until the queue is drained. */
+    do
+    {
+        WaitForSingleObject(cs->progress_event, INFINITE);
+    }
+    while (queue->head != *(volatile ULONG *)&queue->tail);
 }
 
 static void wined3d_cs_reference_resource(struct wined3d_device_context *context, struct wined3d_resource *resource)
@@ -3403,11 +3503,75 @@ static void wined3d_cs_mt_submit(struct wined3d_device_context *context, enum wi
     wined3d_cs_queue_submit(&cs->queue[queue_id], cs);
 }
 
+/* Client-side wait for the CS thread to retire packets, used wherever a
+ * client thread spins on a queue's tail: wined3d_cs_queue_require_space()
+ * (queue full), wined3d_cs_mt_finish() (queue drained) and
+ * wined3d_resource_wait_idle() (resource no longer referenced by queued
+ * commands).  The CS thread signals progress_event after every packet it
+ * retires while waiting_for_progress is set (wined3d_cs_execute_next()).
+ *
+ * Spin for a short while first: the CS thread usually retires the packet
+ * within microseconds.  When it does not, it is typically blocked for a
+ * whole frame in a vsync'd swap, and yielding in a loop for that long costs
+ * a full core per client thread — Kontakt 8 maps a handful of dynamic index
+ * buffers through the CS every frame and spent 66 % of a core in
+ * NtDelayExecution(0) here.  "done" re-checks the caller's condition after
+ * the flag is set, which closes the window between the caller's last check
+ * and the flag: if the CS thread retired the packet in between, it either
+ * saw the flag and signalled (the wait then returns at once), or it did not
+ * and the flag is taken back here without waiting. */
+static void wined3d_cs_wait_for_progress(struct wined3d_cs *cs, unsigned int *spin_count,
+        bool (*done)(const void *ctx), const void *ctx)
+{
+    if (++*spin_count < WINED3D_PAUSE_SPIN_COUNT)
+    {
+        YieldProcessor();
+        return;
+    }
+
+    InterlockedExchange(&cs->waiting_for_progress, TRUE);
+    if (!done(ctx) || !InterlockedCompareExchange(&cs->waiting_for_progress, FALSE, TRUE))
+        WaitForSingleObject(cs->progress_event, INFINITE);
+}
+
+struct wined3d_cs_queue_space_ctx
+{
+    const struct wined3d_cs_queue *queue;
+    ULONG head;
+    size_t packet_size;
+};
+
+static bool wined3d_cs_queue_has_space(const void *ctx)
+{
+    const struct wined3d_cs_queue_space_ctx *c = ctx;
+    ULONG tail = (*(volatile ULONG *)&c->queue->tail) & WINED3D_CS_QUEUE_MASK;
+    ULONG head = c->head, new_pos;
+
+    /* Empty. */
+    if (head == tail)
+        return true;
+    new_pos = (head + c->packet_size) & WINED3D_CS_QUEUE_MASK;
+    /* Head ahead of tail. The caller checked the remaining size, so we only
+     * need to make sure we don't make head equal to tail. */
+    if (head > tail && (new_pos != tail))
+        return true;
+    /* Tail ahead of head. Make sure the new head is before the tail as
+     * well. Note that new_pos is 0 when it's at the end of the queue. */
+    if (new_pos < tail && new_pos)
+        return true;
+
+    TRACE_(d3d_perf)("Waiting for free space. Head %lu, tail %lu, packet size %Iu.\n",
+            head, tail, c->packet_size);
+    return false;
+}
+
 static void *wined3d_cs_queue_require_space(struct wined3d_cs_queue *queue, size_t size, struct wined3d_cs *cs)
 {
     size_t queue_size = ARRAY_SIZE(queue->data);
     size_t header_size, packet_size, remaining;
+    struct wined3d_cs_queue_space_ctx space_ctx;
     struct wined3d_cs_packet *packet;
+    unsigned int spin_count = 0;
     ULONG head = queue->head & WINED3D_CS_QUEUE_MASK;
 
     header_size = FIELD_OFFSET(struct wined3d_cs_packet, data[0]);
@@ -3437,27 +3601,11 @@ static void *wined3d_cs_queue_require_space(struct wined3d_cs_queue *queue, size
         assert(!head);
     }
 
-    for (;;)
-    {
-        ULONG tail = (*(volatile ULONG *)&queue->tail) & WINED3D_CS_QUEUE_MASK;
-        ULONG new_pos;
-
-        /* Empty. */
-        if (head == tail)
-            break;
-        new_pos = (head + packet_size) & WINED3D_CS_QUEUE_MASK;
-        /* Head ahead of tail. We checked the remaining size above, so we only
-         * need to make sure we don't make head equal to tail. */
-        if (head > tail && (new_pos != tail))
-            break;
-        /* Tail ahead of head. Make sure the new head is before the tail as
-         * well. Note that new_pos is 0 when it's at the end of the queue. */
-        if (new_pos < tail && new_pos)
-            break;
-
-        TRACE_(d3d_perf)("Waiting for free space. Head %lu, tail %lu, packet size %Iu.\n",
-                head, tail, packet_size);
-    }
+    space_ctx.queue = queue;
+    space_ctx.head = head;
+    space_ctx.packet_size = packet_size;
+    while (!wined3d_cs_queue_has_space(&space_ctx))
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_cs_queue_has_space, &space_ctx);
 
     packet = (struct wined3d_cs_packet *)&queue->data[head];
     packet->size = size;
@@ -3475,6 +3623,13 @@ static void *wined3d_cs_mt_require_space(struct wined3d_device_context *context,
     return wined3d_cs_queue_require_space(&cs->queue[queue_id], size, cs);
 }
 
+static bool wined3d_cs_queue_is_drained(const void *ctx)
+{
+    const struct wined3d_cs_queue *queue = ctx;
+
+    return queue->head == *(volatile ULONG *)&queue->tail;
+}
+
 static void wined3d_cs_mt_finish(struct wined3d_device_context *context, enum wined3d_cs_queue_id queue_id)
 {
     struct wined3d_cs *cs = wined3d_cs_from_context(context);
@@ -3484,9 +3639,65 @@ static void wined3d_cs_mt_finish(struct wined3d_device_context *context, enum wi
         return wined3d_cs_st_finish(context, queue_id);
 
     TRACE_(d3d_perf)("Waiting for queue %u to be empty.\n", queue_id);
-    while (cs->queue[queue_id].head != *(volatile ULONG *)&cs->queue[queue_id].tail)
-        wined3d_pause(&spin_count);
+    while (!wined3d_cs_queue_is_drained(&cs->queue[queue_id]))
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_cs_queue_is_drained, &cs->queue[queue_id]);
     TRACE_(d3d_perf)("Queue is now empty.\n");
+}
+
+struct wined3d_resource_idle_ctx
+{
+    const struct wined3d_cs *cs;
+    ULONG access_time, head;
+};
+
+static bool wined3d_resource_is_idle(const void *ctx)
+{
+    const struct wined3d_resource_idle_ctx *c = ctx;
+    ULONG tail = *(volatile ULONG *)&c->cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail;
+
+    if (c->head == tail) /* Queue empty. */
+        return true;
+
+    return !wined3d_ge_wrap(c->access_time, tail) && c->access_time != tail;
+}
+
+void wined3d_resource_wait_idle(const struct wined3d_resource *resource)
+{
+    struct wined3d_cs *cs = resource->device->cs;
+    struct wined3d_resource_idle_ctx ctx;
+    unsigned int spin_count = 0;
+
+    if (!cs->thread || cs->thread_id == GetCurrentThreadId())
+        return;
+
+    ctx.cs = cs;
+    ctx.access_time = resource->access_time;
+    ctx.head = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
+
+    /* The basic idea is that a resource is busy if tail < access_time <= head.
+     * But we have to be careful about wrap-around of the head and tail. The
+     * wined3d_ge_wrap function considers x >= y if x - y is smaller than half the
+     * UINT range. Head is at most WINED3D_CS_QUEUE_SIZE ahead of tail, because
+     * otherwise the queue memory is considered full and queue_require_space
+     * stalls. Thus wined3d_ge_wrap(head, tail) is always true. The C_ASSERT above
+     * ensures this in case we decide to grow the queue size in the future.
+     *
+     * It is possible that a resource has not been used for a long time and is idle, but the head and
+     * tail wrapped around in such a way that the previously set access time falls between head and tail.
+     * In this case we will incorrectly wait for the resource. Because we use the entire 32 bits of the
+     * counters and not just the bits needed to address the actual queue memory, this should happen rarely.
+     * If it turns out to be a problem we can switch to 64 bit counters or attempt to somehow mark the
+     * access time of resources invalid. CS packets are at least 4 byte aligned, so we could use the lower
+     * 2 bits in access_time for such a marker.
+     *
+     * Note that the access time is set before the command is submitted, so we have to wait until the
+     * tail is bigger than access_time, not equal. */
+
+    if (!wined3d_ge_wrap(ctx.head, ctx.access_time))
+        return;
+
+    while (!wined3d_resource_is_idle(&ctx))
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_resource_is_idle, &ctx);
 }
 
 static const struct wined3d_device_context_ops wined3d_cs_mt_ops =
@@ -3585,6 +3796,10 @@ static inline bool wined3d_cs_execute_next(struct wined3d_cs *cs, struct wined3d
     }
 
     InterlockedExchange((LONG *)&queue->tail, tail);
+    /* A client thread may be blocked in wined3d_cs_wait_for_progress() until
+     * this queue moves; it sets the flag before it blocks. */
+    if (InterlockedCompareExchange(&cs->waiting_for_progress, FALSE, TRUE))
+        SetEvent(cs->progress_event);
     return true;
 }
 
@@ -3623,15 +3838,18 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
     unsigned int spin_count = 0;
     struct wined3d_cs *cs = ctx;
     HMODULE wined3d_module;
+    HANDLE progress_event;
     unsigned int poll = 0;
     bool run = true;
 
     TRACE("Started.\n");
     SetThreadDescription(GetCurrentThread(), L"wined3d_cs");
 
-    /* Copy the module handle to a local variable to avoid racing with the
-     * thread freeing "cs" before the FreeLibraryAndExitThread() call. */
+    /* Copy the module handle and the progress event to local variables to
+     * avoid racing with the thread freeing "cs" before the SetEvent() and
+     * FreeLibraryAndExitThread() calls. */
     wined3d_module = cs->wined3d_module;
+    progress_event = cs->progress_event;
 
     list_init(&cs->query_poll_list);
     cs->thread_id = GetCurrentThreadId();
@@ -3669,6 +3887,9 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
 
     cs->queue[WINED3D_CS_QUEUE_MAP].tail = cs->queue[WINED3D_CS_QUEUE_MAP].head;
     cs->queue[WINED3D_CS_QUEUE_DEFAULT].tail = cs->queue[WINED3D_CS_QUEUE_DEFAULT].head;
+    /* "cs" may be freed by wined3d_cs_destroy() from here on; wake the thread
+     * blocked in wined3d_cs_emit_stop() through the local handle only. */
+    SetEvent(progress_event);
     TRACE("Stopped.\n");
     FreeLibraryAndExitThread(wined3d_module, 0);
 }
@@ -3757,11 +3978,20 @@ struct wined3d_cs *wined3d_cs_create(struct wined3d_device *device,
             free(cs->data);
             goto fail;
         }
+        if (!(cs->progress_event = CreateEventW(NULL, FALSE, FALSE, NULL)))
+        {
+            ERR("Failed to create command stream progress event.\n");
+            if (cs->event)
+                CloseHandle(cs->event);
+            free(cs->data);
+            goto fail;
+        }
 
         if (!(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                 (const WCHAR *)wined3d_cs_run, &cs->wined3d_module)))
         {
             ERR("Failed to get wined3d module handle.\n");
+            CloseHandle(cs->progress_event);
             if (cs->event)
                 CloseHandle(cs->event);
             free(cs->data);
@@ -3772,6 +4002,7 @@ struct wined3d_cs *wined3d_cs_create(struct wined3d_device *device,
         {
             ERR("Failed to create wined3d command stream thread.\n");
             FreeLibrary(cs->wined3d_module);
+            CloseHandle(cs->progress_event);
             if (cs->event)
                 CloseHandle(cs->event);
             free(cs->data);
@@ -3795,6 +4026,8 @@ void wined3d_cs_destroy(struct wined3d_cs *cs)
     {
         wined3d_cs_emit_stop(cs);
         CloseHandle(cs->thread);
+        if (!CloseHandle(cs->progress_event))
+            ERR("Closing progress event failed.\n");
         if (cs->event && !CloseHandle(cs->event))
             ERR("Closing event failed.\n");
     }
@@ -4748,8 +4981,24 @@ static void wined3d_command_list_destroy_object(void *object)
         {
             if (!--bo->refcount)
             {
+                struct wined3d_device *device = list->device;
+
                 wined3d_context_destroy_bo(context, bo);
-                free(bo);
+
+                /* Recycle the bo struct instead of freeing it. */
+                wined3d_device_bo_map_lock(device);
+                if (device->bo_gl_free_pool_count < WINED3D_BO_GL_FREE_POOL_MAX)
+                {
+                    bo->map_ptr = device->bo_gl_free_pool;
+                    device->bo_gl_free_pool = bo;
+                    ++device->bo_gl_free_pool_count;
+                    wined3d_device_bo_map_unlock(device);
+                }
+                else
+                {
+                    wined3d_device_bo_map_unlock(device);
+                    free(bo);
+                }
             }
         }
         else

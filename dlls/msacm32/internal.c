@@ -45,6 +45,19 @@ HANDLE MSACM_hHeap = NULL;
 PWINE_ACMDRIVERID MSACM_pFirstACMDriverID = NULL;
 static PWINE_ACMDRIVERID MSACM_pLastACMDriverID;
 
+/* Guards the driver id list, the open drivers of each driver id, the local
+ * drivers with their instances, and the notification windows.  Installable
+ * drivers are opened and closed through winmm, which takes the loader lock;
+ * DllMain takes MSACM_cs under the loader lock, so OpenDriver() and
+ * CloseDriver() must not be called with MSACM_cs held. */
+static CRITICAL_SECTION_DEBUG MSACM_cs_debug =
+{
+    0, 0, &MSACM_cs,
+    { &MSACM_cs_debug.ProcessLocksList, &MSACM_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": MSACM_cs") }
+};
+CRITICAL_SECTION MSACM_cs = { &MSACM_cs_debug, -1, 0, 0, 0, 0 };
+
 static DWORD MSACM_suspendBroadcastCount = 0;
 static BOOL MSACM_pendingBroadcast = FALSE;
 static PWINE_ACMNOTIFYWND MSACM_pFirstACMNotifyWnd = NULL;
@@ -313,9 +326,25 @@ PWINE_ACMDRIVERID MSACM_RegisterDriver(LPCWSTR pszDriverAlias, LPCWSTR pszFileNa
     padid->pLocalDriver = pLocalDriver;
 
     padid->pACMDriverList = NULL;
-    
+    padid->pNextACMDriverID = NULL;
+    padid->pPrevACMDriverID = NULL;
+
+    /* Fill the cache before the driver id is linked into the list, so that a
+     * concurrent enumeration does not see it half initialised.  Filling opens
+     * the driver, which must not happen under MSACM_cs. */
+    if (!padid->pszDriverAlias || !MSACM_ReadCache(padid)) {
+        if (!MSACM_FillCache(padid)) {
+            WARN("Couldn't load cache for ACM driver (%s)\n", debugstr_w(pszFileName));
+            MSACM_UnregisterDriver(padid);
+            return NULL;
+        }
+        if (padid->pszDriverAlias) MSACM_WriteCache(padid);
+    }
+
+    if (pLocalDriver) padid->fdwSupport |= ACMDRIVERDETAILS_SUPPORTF_LOCAL;
+
+    EnterCriticalSection(&MSACM_cs);
     if (pLocalDriver) {
-        padid->pPrevACMDriverID = NULL;
         padid->pNextACMDriverID = MSACM_pFirstACMDriverID;
         if (MSACM_pFirstACMDriverID)
             MSACM_pFirstACMDriverID->pPrevACMDriverID = padid;
@@ -323,7 +352,6 @@ PWINE_ACMDRIVERID MSACM_RegisterDriver(LPCWSTR pszDriverAlias, LPCWSTR pszFileNa
         if (!MSACM_pLastACMDriverID)
             MSACM_pLastACMDriverID = padid;
     } else {
-        padid->pNextACMDriverID = NULL;
         padid->pPrevACMDriverID = MSACM_pLastACMDriverID;
         if (MSACM_pLastACMDriverID)
 	    MSACM_pLastACMDriverID->pNextACMDriverID = padid;
@@ -331,14 +359,8 @@ PWINE_ACMDRIVERID MSACM_RegisterDriver(LPCWSTR pszDriverAlias, LPCWSTR pszFileNa
         if (!MSACM_pFirstACMDriverID)
 	    MSACM_pFirstACMDriverID = padid;
     }
-    /* disable the driver if we cannot load the cache */
-    if ((!padid->pszDriverAlias || !MSACM_ReadCache(padid)) && !MSACM_FillCache(padid)) {
-	WARN("Couldn't load cache for ACM driver (%s)\n", debugstr_w(pszFileName));
-	MSACM_UnregisterDriver(padid);
-	return NULL;
-    }
+    LeaveCriticalSection(&MSACM_cs);
 
-    if (pLocalDriver) padid->fdwSupport |= ACMDRIVERDETAILS_SUPPORTF_LOCAL;
     return padid;
 }
 
@@ -411,7 +433,8 @@ PWINE_ACMNOTIFYWND MSACM_RegisterNotificationWindow(HWND hNotifyWnd, DWORD dwNot
     panwnd->hNotifyWnd = hNotifyWnd;
     panwnd->dwNotifyMsg = dwNotifyMsg;
     panwnd->fdwSupport = 0;
-    
+
+    EnterCriticalSection(&MSACM_cs);
     panwnd->pNextACMNotifyWnd = NULL;
     panwnd->pPrevACMNotifyWnd = MSACM_pLastACMNotifyWnd;
     if (MSACM_pLastACMNotifyWnd)
@@ -419,6 +442,7 @@ PWINE_ACMNOTIFYWND MSACM_RegisterNotificationWindow(HWND hNotifyWnd, DWORD dwNot
     MSACM_pLastACMNotifyWnd = panwnd;
     if (!MSACM_pFirstACMNotifyWnd)
         MSACM_pFirstACMNotifyWnd = panwnd;
+    LeaveCriticalSection(&MSACM_cs);
 
     return panwnd;
 }
@@ -466,22 +490,23 @@ void MSACM_EnableNotifications(void)
  */
 PWINE_ACMNOTIFYWND MSACM_UnRegisterNotificationWindow(const WINE_ACMNOTIFYWND *panwnd)
 {
-    PWINE_ACMNOTIFYWND p;
+    PWINE_ACMNOTIFYWND p, pNext = NULL;
 
+    EnterCriticalSection(&MSACM_cs);
     for (p = MSACM_pFirstACMNotifyWnd; p; p = p->pNextACMNotifyWnd) {
         if (p == panwnd) {
-            PWINE_ACMNOTIFYWND pNext = p->pNextACMNotifyWnd;
+            pNext = p->pNextACMNotifyWnd;
 
             if (p->pPrevACMNotifyWnd) p->pPrevACMNotifyWnd->pNextACMNotifyWnd = p->pNextACMNotifyWnd;
             if (p->pNextACMNotifyWnd) p->pNextACMNotifyWnd->pPrevACMNotifyWnd = p->pPrevACMNotifyWnd;
             if (MSACM_pFirstACMNotifyWnd == p) MSACM_pFirstACMNotifyWnd = p->pNextACMNotifyWnd;
             if (MSACM_pLastACMNotifyWnd == p) MSACM_pLastACMNotifyWnd = p->pPrevACMNotifyWnd;
             HeapFree(MSACM_hHeap, 0, p);
-            
-            return pNext;
+            break;
         }
     }
-    return NULL;
+    LeaveCriticalSection(&MSACM_cs);
+    return pNext;
 }
 
 /***********************************************************************
@@ -490,7 +515,9 @@ PWINE_ACMNOTIFYWND MSACM_UnRegisterNotificationWindow(const WINE_ACMNOTIFYWND *p
 void MSACM_RePositionDriver(PWINE_ACMDRIVERID padid, DWORD dwPriority)
 {
     PWINE_ACMDRIVERID pTargetPosition = NULL;
-                
+
+    EnterCriticalSection(&MSACM_cs);
+
     /* Remove selected driver from linked list */
     if (MSACM_pFirstACMDriverID == padid) {
         MSACM_pFirstACMDriverID = padid->pNextACMDriverID;
@@ -532,6 +559,8 @@ void MSACM_RePositionDriver(PWINE_ACMDRIVERID padid, DWORD dwPriority)
     } else {
         MSACM_pLastACMDriverID = padid;
     }
+
+    LeaveCriticalSection(&MSACM_cs);
 }
 
 /***********************************************************************
@@ -703,6 +732,7 @@ void MSACM_WriteCurrentPriorities(void)
 static PWINE_ACMLOCALDRIVER MSACM_pFirstACMLocalDriver;
 static PWINE_ACMLOCALDRIVER MSACM_pLastACMLocalDriver;
 
+/* Called with MSACM_cs held. */
 static PWINE_ACMLOCALDRIVER MSACM_UnregisterLocalDriver(PWINE_ACMLOCALDRIVER paldrv)
 {
     PWINE_ACMLOCALDRIVER pNextACMLocalDriver;
@@ -742,11 +772,17 @@ PWINE_ACMDRIVERID MSACM_UnregisterDriver(PWINE_ACMDRIVERID p)
     PWINE_ACMDRIVERID pNextACMDriverID;
 
     while (p->pACMDriverList)
-	acmDriverClose((HACMDRIVER) p->pACMDriverList, 0);
+    {
+        PWINE_ACMDRIVER pad = p->pACMDriverList;
 
-    HeapFree(MSACM_hHeap, 0, p->pszDriverAlias);
-    HeapFree(MSACM_hHeap, 0, p->pszFileName);
-    HeapFree(MSACM_hHeap, 0, p->aFormatTag);
+        if (acmDriverClose((HACMDRIVER)pad, 0) == MMSYSERR_NOERROR && p->pACMDriverList != pad)
+            continue;
+        /* A head entry that acmDriverClose() does not take off the list would be retried forever. */
+        WARN("cannot close driver %p of %s, dropping the remaining list\n", pad, debugstr_w(p->pszDriverAlias));
+        p->pACMDriverList = NULL;
+    }
+
+    EnterCriticalSection(&MSACM_cs);
 
     if (p == MSACM_pFirstACMDriverID)
 	MSACM_pFirstACMDriverID = p->pNextACMDriverID;
@@ -761,6 +797,12 @@ PWINE_ACMDRIVERID MSACM_UnregisterDriver(PWINE_ACMDRIVERID p)
     pNextACMDriverID = p->pNextACMDriverID;
 
     if (p->pLocalDriver) MSACM_UnregisterLocalDriver(p->pLocalDriver);
+
+    LeaveCriticalSection(&MSACM_cs);
+
+    HeapFree(MSACM_hHeap, 0, p->pszDriverAlias);
+    HeapFree(MSACM_hHeap, 0, p->pszFileName);
+    HeapFree(MSACM_hHeap, 0, p->aFormatTag);
     HeapFree(MSACM_hHeap, 0, p);
 
     return pNextACMDriverID;
@@ -774,10 +816,8 @@ void MSACM_UnregisterAllDrivers(void)
     PWINE_ACMNOTIFYWND panwnd = MSACM_pFirstACMNotifyWnd;
     PWINE_ACMDRIVERID p = MSACM_pFirstACMDriverID;
 
-    while (p) {
-	MSACM_WriteCache(p);
+    while (p)
 	p = MSACM_UnregisterDriver(p);
-    }
     
     while (panwnd) {
 	panwnd = MSACM_UnRegisterNotificationWindow(panwnd);
@@ -853,13 +893,16 @@ PWINE_ACMLOCALDRIVER MSACM_RegisterLocalDriver(HMODULE hModule, DRIVERPROC lpDri
 
     TRACE("(%p, %p)\n", hModule, lpDriverProc);
     if (!hModule || !lpDriverProc) return NULL;
-    
+
+    EnterCriticalSection(&MSACM_cs);
+
     /* look up previous instance of local driver module */
     for (paldrv = MSACM_pFirstACMLocalDriver; paldrv; paldrv = paldrv->pNextACMLocalDrv)
     {
         if (paldrv->hModule == hModule && paldrv->lpDrvProc == lpDriverProc)
         {
             InterlockedIncrement(&paldrv->ref);
+            LeaveCriticalSection(&MSACM_cs);
             return paldrv;
         }
     }
@@ -880,8 +923,15 @@ PWINE_ACMLOCALDRIVER MSACM_RegisterLocalDriver(HMODULE hModule, DRIVERPROC lpDri
     if (!MSACM_pFirstACMLocalDriver)
 	MSACM_pFirstACMLocalDriver = paldrv;
 
+    LeaveCriticalSection(&MSACM_cs);
     return paldrv;
 }
+
+/* The local driver instance helpers below are called with MSACM_cs held.
+ * Whether an instance is the first or the last one of its module decides
+ * which driver messages it receives, so the messages are sent under the lock
+ * as well; a local driver procedure that calls back into msacm32 re-enters
+ * the critical section on the same thread. */
 
 /**************************************************************************
  *			MSACM_GetNumberOfModuleRefs		[internal]

@@ -744,8 +744,24 @@ static void wined3d_buffer_set_bo(struct wined3d_buffer *buffer, struct wined3d_
 
         if (!--prev_bo->refcount)
         {
+            struct wined3d_device *device = context->device;
+
             wined3d_context_destroy_bo(context, prev_bo);
-            free(prev_bo);
+
+            /* Recycle the bo_gl struct instead of freeing it. */
+            wined3d_device_bo_map_lock(device);
+            if (device->bo_gl_free_pool_count < WINED3D_BO_GL_FREE_POOL_MAX)
+            {
+                prev_bo->map_ptr = device->bo_gl_free_pool;
+                device->bo_gl_free_pool = prev_bo;
+                ++device->bo_gl_free_pool_count;
+                wined3d_device_bo_map_unlock(device);
+            }
+            else
+            {
+                wined3d_device_bo_map_unlock(device);
+                free(prev_bo);
+            }
         }
     }
 

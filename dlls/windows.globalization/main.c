@@ -1139,6 +1139,11 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
         *factory = &application_languages.IActivationFactory_iface;
         IUnknown_AddRef(*factory);
     }
+    else if (!wcscmp(name, RuntimeClass_Windows_Globalization_Calendar))
+    {
+        *factory = calendar_factory;
+        IUnknown_AddRef(*factory);
+    }
 
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;

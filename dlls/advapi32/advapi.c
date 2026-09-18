@@ -306,6 +306,11 @@ HWCT WINAPI OpenThreadWaitChainSession(DWORD flags, PWAITCHAINCALLBACK callback)
     return NULL;
 }
 
+VOID WINAPI CloseThreadWaitChainSession(HWCT handle)
+{
+    FIXME("handle %p stub!\n", handle);
+}
+
 BOOL WINAPI GetThreadWaitChain(HWCT handle, DWORD_PTR ctx, DWORD flags, DWORD thread_id, DWORD *node_count,
     WAITCHAIN_NODE_INFO *node_info_arr, BOOL *is_cycle)
 {

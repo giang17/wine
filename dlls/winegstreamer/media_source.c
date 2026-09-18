@@ -130,6 +130,12 @@ struct media_stream
 
     wg_parser_stream_t wg_stream;
 
+    /* Sample requests for this stream are handled on their own work queue,
+     * separate from the source's async command queue: the request handler
+     * may block indefinitely waiting for the next buffer, and must not hold
+     * up commands or the requests of the other streams. */
+    DWORD request_queue;
+
     IUnknown **token_queue;
     LONG token_queue_count;
     LONG token_queue_cap;
@@ -548,7 +554,7 @@ static void flush_token_queue(struct media_stream *stream, BOOL send)
                 command->u.request_sample.stream = stream;
                 command->u.request_sample.token = stream->token_queue[i];
 
-                hr = MFPutWorkItem(source->async_commands_queue, &source->async_commands_callback, op);
+                hr = MFPutWorkItem(stream->request_queue, &source->async_commands_callback, op);
                 IUnknown_Release(op);
             }
             if (FAILED(hr))
@@ -983,6 +989,11 @@ static ULONG WINAPI media_stream_Release(IMFMediaStream *iface)
         IMFStreamDescriptor_Release(stream->descriptor);
         IMFMediaEventQueue_Release(stream->event_queue);
         flush_token_queue(stream, FALSE);
+        /* The source normally takes the queue over in Shutdown(); a nonzero
+         * queue here means the source never made it that far (creation
+         * failure), so no work items can be in flight. */
+        if (stream->request_queue)
+            MFUnlockWorkQueue(stream->request_queue);
         free(stream);
     }
 
@@ -1097,7 +1108,7 @@ static HRESULT WINAPI media_stream_RequestSample(IMFMediaStream *iface, IUnknown
             IUnknown_AddRef(token);
         command->u.request_sample.token = token;
 
-        hr = MFPutWorkItem(source->async_commands_queue, &source->async_commands_callback, op);
+        hr = MFPutWorkItem(stream->request_queue, &source->async_commands_callback, op);
         IUnknown_Release(op);
     }
 
@@ -1136,6 +1147,13 @@ static HRESULT media_stream_create(IMFMediaSource *source, IMFStreamDescriptor *
 
     if (FAILED(hr = MFCreateEventQueue(&object->event_queue)))
     {
+        free(object);
+        return hr;
+    }
+
+    if (FAILED(hr = MFAllocateWorkQueue(&object->request_queue)))
+    {
+        IMFMediaEventQueue_Release(object->event_queue);
         free(object);
         return hr;
     }
@@ -1562,6 +1580,8 @@ static HRESULT WINAPI media_source_Pause(IMFMediaSource *iface)
 static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
 {
     struct media_source *source = impl_from_IMFMediaSource(iface);
+    DWORD *request_queues = NULL;
+    ULONG request_queue_count = 0, i;
 
     TRACE("%p.\n", iface);
 
@@ -1586,18 +1606,35 @@ static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
     IMFByteStream_Close(source->byte_stream);
     IMFByteStream_Release(source->byte_stream);
 
+    if (source->stream_count)
+        request_queues = malloc(source->stream_count * sizeof(*request_queues));
+
     while (source->stream_count--)
     {
         struct media_stream *stream = source->streams[source->stream_count];
         IMFStreamDescriptor_Release(source->descriptors[source->stream_count]);
         IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEError, &GUID_NULL, MF_E_SHUTDOWN, NULL);
         IMFMediaEventQueue_Shutdown(stream->event_queue);
+        /* The queue is drained below, after source->cs has been released:
+         * MFUnlockWorkQueue() waits for in-flight items, and an in-flight
+         * sample request needs source->cs to finish, so waiting here would
+         * deadlock. Zeroing keeps media_stream_Release() from unlocking it
+         * as well. */
+        if (request_queues)
+            request_queues[request_queue_count++] = stream->request_queue;
+        stream->request_queue = 0;
         IMFMediaStream_Release(&stream->IMFMediaStream_iface);
     }
     free(source->descriptors);
     free(source->streams);
 
     LeaveCriticalSection(&source->cs);
+
+    /* wg_parser_disconnect() above woke every blocked sample request; they
+     * complete as soon as they can take source->cs. */
+    for (i = 0; i < request_queue_count; i++)
+        MFUnlockWorkQueue(request_queues[i]);
+    free(request_queues);
 
     MFUnlockWorkQueue(source->async_commands_queue);
 

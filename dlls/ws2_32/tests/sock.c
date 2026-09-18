@@ -5796,6 +5796,105 @@ static void test_fionread_siocatmark(void)
     closesocket(server);
 }
 
+static void test_address_list_sort(void)
+{
+    static const IN6_ADDR loopback = {{IN6ADDR_LOOPBACK_INIT}};
+    static const IN6_ADDR v4_loopback = {{{0,0,0,0,0,0,0,0,0,0,0xff,0xff,127,0,0,1}}};
+    static const IN6_ADDR v4_testnet = {{{0,0,0,0,0,0,0,0,0,0,0xff,0xff,192,0,2,1}}};
+    static const IN6_ADDR documentation = {{{0x20,0x01,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1}}};
+    char in_buffer[FIELD_OFFSET(SOCKET_ADDRESS_LIST, Address[4])], out_buffer[sizeof(in_buffer)];
+    SOCKET_ADDRESS_LIST *in = (SOCKET_ADDRESS_LIST *)in_buffer, *out = (SOCKET_ADDRESS_LIST *)out_buffer;
+    SOCKADDR_IN6 addrs[4] = {{0}}, *sorted;
+    unsigned int i, j, found, pos_v4_loopback = ~0u, pos_v4_testnet = ~0u;
+    char str[64];
+    DWORD size;
+    SOCKET s;
+    int ret;
+
+    s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET)
+    {
+        skip("IPv6 is not supported\n");
+        return;
+    }
+
+    /* the addresses the sort has to move come first */
+    addrs[0].sin6_addr = v4_testnet;
+    addrs[1].sin6_addr = documentation;
+    addrs[2].sin6_addr = v4_loopback;
+    addrs[3].sin6_addr = loopback;
+    for (i = 0; i < ARRAY_SIZE(addrs); i++)
+    {
+        addrs[i].sin6_family = AF_INET6;
+        addrs[i].sin6_port = htons(443);
+        in->Address[i].lpSockaddr = (SOCKADDR *)&addrs[i];
+        in->Address[i].iSockaddrLength = sizeof(addrs[i]);
+    }
+    in->iAddressCount = ARRAY_SIZE(addrs);
+
+    size = 0xdeadbeef;
+    ret = WSAIoctl(s, SIO_ADDRESS_LIST_SORT, NULL, 0, out, sizeof(out_buffer), &size, NULL, NULL);
+    ok(ret == SOCKET_ERROR, "Got unexpected ret %d.\n", ret);
+
+    ret = WSAIoctl(s, SIO_ADDRESS_LIST_SORT, in, sizeof(in_buffer), NULL, 0, &size, NULL, NULL);
+    ok(ret == SOCKET_ERROR, "Got unexpected ret %d.\n", ret);
+
+    ret = WSAIoctl(s, SIO_ADDRESS_LIST_SORT, in, sizeof(in_buffer), out, sizeof(out_buffer), NULL, NULL, NULL);
+    ok(ret == SOCKET_ERROR, "Got unexpected ret %d.\n", ret);
+    ok(WSAGetLastError() == WSAEFAULT, "Got unexpected error %d.\n", WSAGetLastError());
+
+    memset(out_buffer, 0xcc, sizeof(out_buffer));
+    size = 0xdeadbeef;
+    ret = WSAIoctl(s, SIO_ADDRESS_LIST_SORT, in, sizeof(in_buffer), out, sizeof(out_buffer), &size, NULL, NULL);
+    ok(!ret, "Got unexpected ret %d, error %d.\n", ret, WSAGetLastError());
+    ok(!WSAGetLastError(), "Got unexpected error %d.\n", WSAGetLastError());
+    ok(size != 0xdeadbeef, "Size was not set.\n");
+    /* unreachable destinations may be dropped, but the loopback address is always usable */
+    ok(out->iAddressCount >= 1 && out->iAddressCount <= ARRAY_SIZE(addrs),
+       "Got unexpected count %d.\n", out->iAddressCount);
+    trace("%d of %u addresses kept, size %lu.\n", out->iAddressCount, (unsigned int)ARRAY_SIZE(addrs), size);
+
+    for (i = 0; i < out->iAddressCount; i++)
+    {
+        ok(out->Address[i].iSockaddrLength == sizeof(SOCKADDR_IN6),
+           "Got unexpected length %d for address %u.\n", out->Address[i].iSockaddrLength, i);
+        sorted = (SOCKADDR_IN6 *)out->Address[i].lpSockaddr;
+        ok(sorted->sin6_family == AF_INET6, "Got unexpected family %d for address %u.\n", sorted->sin6_family, i);
+        ok(sorted->sin6_port == htons(443), "Got unexpected port %d for address %u.\n", ntohs(sorted->sin6_port), i);
+        for (j = 0, found = 0; j < ARRAY_SIZE(addrs); j++)
+            if (!memcmp(&sorted->sin6_addr, &addrs[j].sin6_addr, sizeof(IN6_ADDR))) found++;
+        ok(found == 1, "Address %u is not one of the input addresses.\n", i);
+        if (!memcmp(&sorted->sin6_addr, &v4_loopback, sizeof(IN6_ADDR))) pos_v4_loopback = i;
+        if (!memcmp(&sorted->sin6_addr, &v4_testnet, sizeof(IN6_ADDR))) pos_v4_testnet = i;
+        trace("%u: %s\n", i, inet_ntop(AF_INET6, &sorted->sin6_addr, str, sizeof(str)));
+    }
+
+    /* highest precedence, always reachable, matching scope and label */
+    sorted = (SOCKADDR_IN6 *)out->Address[0].lpSockaddr;
+    ok(!memcmp(&sorted->sin6_addr, &loopback, sizeof(IN6_ADDR)), "Expected ::1 first, got %s.\n",
+       inet_ntop(AF_INET6, &sorted->sin6_addr, str, sizeof(str)));
+    /* same precedence and label, but link-local scope sorts before global scope (rule 8) */
+    ok(pos_v4_loopback != ~0u, "::ffff:127.0.0.1 was dropped.\n");
+    if (pos_v4_testnet != ~0u)
+        ok(pos_v4_loopback < pos_v4_testnet, "Expected ::ffff:127.0.0.1 (%u) before ::ffff:192.0.2.1 (%u).\n",
+           pos_v4_loopback, pos_v4_testnet);
+
+    /* sorting in place gives the same result */
+    size = 0xdeadbeef;
+    ret = WSAIoctl(s, SIO_ADDRESS_LIST_SORT, in, sizeof(in_buffer), in, sizeof(in_buffer), &size, NULL, NULL);
+    ok(!ret, "Got unexpected ret %d, error %d.\n", ret, WSAGetLastError());
+    ok(in->iAddressCount == out->iAddressCount, "Got count %d, expected %d.\n",
+       in->iAddressCount, out->iAddressCount);
+    for (i = 0; i < min(in->iAddressCount, out->iAddressCount); i++)
+    {
+        ok(!memcmp(&((SOCKADDR_IN6 *)in->Address[i].lpSockaddr)->sin6_addr,
+                   &((SOCKADDR_IN6 *)out->Address[i].lpSockaddr)->sin6_addr, sizeof(IN6_ADDR)),
+           "Address %u differs between in-place and separate sort.\n", i);
+    }
+
+    closesocket(s);
+}
+
 static void test_fionbio(void)
 {
     OVERLAPPED overlapped = {0}, *overlapped_ptr;
@@ -15083,6 +15182,7 @@ START_TEST( sock )
     test_getsockname();
 
     test_address_list_query();
+    test_address_list_sort();
     test_fionbio();
     test_fionread_siocatmark();
     test_get_extension_func();
