@@ -709,8 +709,15 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             if (wparam == DCOMP_REBLIT_TIMER_ID)
             {
                 IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+                DWORD present_thread_id = sc ? d3d11_swapchain_from_IDXGISwapChain4(sc)->present_thread_id : 0;
 
-                if (sc)
+                /* An application that presents from a render thread of its
+                 * own (Qt Quick) must stay the only presenter: the frame
+                 * latency wait in wined3d_cs_emit_present() wakes a single
+                 * waiter per device, so a second presenting thread leaves one
+                 * of the two asleep for good.  Such an application does not
+                 * depend on this timer for its frame-ready signal either. */
+                if (sc && (!present_thread_id || present_thread_id == GetCurrentThreadId()))
                 {
                     /* Present(0,0) without dirty rects.  The expensive GPU
                      * readback + StretchBlt is skipped in swapchain_blit_gdi

@@ -196,6 +196,9 @@ struct d3d11_swapchain
     LONG in_set_fullscreen_state;
     HANDLE frame_latency_event;
     DXGI_ALPHA_MODE alpha_mode;
+    /* Thread of the most recent Present().  The DComp reblit timer runs on the
+     * target window's thread and only presents when that is the same thread. */
+    DWORD present_thread_id;
 
     /* DComp composition-swapchain teardown bookkeeping (see d3d11_swapchain_Release).
      * Each composition swapchain owns one comp_wnd and subclasses at most one

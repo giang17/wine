@@ -383,6 +383,8 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
         return S_OK;
     }
 
+    swapchain->present_thread_id = GetCurrentThreadId();
+
     if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, NULL, sync_interval, 0)))
     {
         /* Back-buffer copy for FLIP_SEQUENTIAL/FLIP_DISCARD is now handled
