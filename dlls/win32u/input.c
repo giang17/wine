@@ -1988,15 +1988,15 @@ static HWND set_focus_window( HWND hwnd )
 /*******************************************************************
  *		set_active_window
  */
-BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new_active_thread_id )
+BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD other_thread_id )
 {
     HWND previous = get_active_window();
     BOOL ret;
     DWORD old_thread, new_thread;
     CBTACTIVATESTRUCT cbt;
 
-    TRACE( "hwnd %p, previous %p, mouse %u, focus %u, new_active_thread_id %04x\n",
-           hwnd, previous, mouse, focus, new_active_thread_id );
+    TRACE( "hwnd %p, previous %p, mouse %u, focus %u, other_thread_id %04x\n",
+           hwnd, previous, mouse, focus, other_thread_id );
 
     if (previous == hwnd)
     {
@@ -2049,7 +2049,8 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
         {
             if (old_thread)
             {
-                if (!new_active_thread_id) new_active_thread_id = new_thread;
+                /* when deactivating, other_thread_id is the thread taking over */
+                DWORD new_active_thread_id = new_thread ? new_thread : other_thread_id;
                 for (phwnd = list; *phwnd; phwnd++)
                 {
                     if (get_window_thread( *phwnd, NULL ) == old_thread)
@@ -2061,7 +2062,9 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
                 for (phwnd = list; *phwnd; phwnd++)
                 {
                     if (get_window_thread( *phwnd, NULL ) == new_thread)
-                        send_message( *phwnd, WM_ACTIVATEAPP, 1, old_thread );
+                        /* when activated from another thread, other_thread_id
+                         * is the thread that owned the foreground window */
+                        send_message( *phwnd, WM_ACTIVATEAPP, 1, old_thread ? old_thread : other_thread_id );
                 }
             }
             free( list );
@@ -2205,7 +2208,7 @@ BOOL WINAPI NtUserSetForegroundWindow( HWND hwnd )
 BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
 {
     BOOL ret, send_msg_old = FALSE, send_msg_new = FALSE;
-    DWORD new_thread_id;
+    DWORD new_thread_id, old_thread_id;
     HWND previous = 0;
 
     if (mouse) hwnd = get_full_window_handle( hwnd );
@@ -2228,6 +2231,8 @@ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
 
     if (ret && previous != hwnd)
     {
+        old_thread_id = previous ? get_window_thread( previous, NULL ) : 0;
+
         if (send_msg_old)  /* old window belongs to other thread */
             NtUserMessageCall( previous, WM_WINE_SETACTIVEWINDOW, 0, new_thread_id,
                                0, NtUserSendNotifyMessage, FALSE );
@@ -2235,10 +2240,10 @@ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
             ret = set_active_window( 0, NULL, mouse, TRUE, new_thread_id );
 
         if (send_msg_new)  /* new window belongs to other thread */
-            NtUserMessageCall( hwnd, WM_WINE_SETACTIVEWINDOW, (WPARAM)hwnd, 0,
+            NtUserMessageCall( hwnd, WM_WINE_SETACTIVEWINDOW, (WPARAM)hwnd, old_thread_id,
                                0, NtUserSendNotifyMessage, FALSE );
         else  /* new window belongs to us */
-            ret = set_active_window( hwnd, NULL, mouse, TRUE, 0 );
+            ret = set_active_window( hwnd, NULL, mouse, TRUE, old_thread_id );
     }
     return ret;
 }
