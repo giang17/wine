@@ -118,7 +118,10 @@ This is the recommended branch. What it changes, by subsystem:
   (Cubase 15 probes and releases a D3D11 device before its splash). What remains on NVIDIA is the
   driver's own busy-wait for the vblank in the CS thread (`wined3d_cs` at ~95 % for a
   static window); `__GL_YIELD=USLEEP` in the environment makes the driver sleep instead
-  and takes it to ~5 % at the same frame rate
+  and takes it to ~5 % at the same frame rate. Two threads presenting swapchains of the same device need no
+  fix on this base: upstream limits the frame latency with a semaphore per swapchain
+  here, which carries several waiters (the 11.0 branch, with one flag and one auto-reset
+  event per device, left the second thread asleep and counts its waiters instead)
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
 - **Per-pixel alpha for GPU-painted layered windows**: `DwmExtendFrameIntoClientArea`
   with `margins = -1` asks for full glass, which on Windows makes the client area
