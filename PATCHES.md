@@ -137,7 +137,13 @@ This is the recommended branch. What it changes, by subsystem:
   frame (visible in Ableton Live 12 when toggling the Learn View panel); a window hidden
   while its map was still unacknowledged no longer stays mapped and unpainted for the
   session (upstream fix for Wine bug 59932, cherry-picked; FL Studio's Browser panel at
-  startup)
+  startup); a per-pixel-alpha layered window on a 32-bit visual no longer gets a bounding
+  shape on every change of its contour — the compositor composes the alpha itself, and
+  the shape update made KWin repaint between the resize and the new image of an
+  animated popup, which showed a strip of it or nothing for single frames (FL Studio's
+  About fruit, 16 flickers in 36 test cycles against 0); the mask is kept as the input
+  shape, so clicks on transparent pixels still pass through, set after the image is in
+  place and at most once a second during an animation
 - **Window-surface repaints (win32u, winex11)**: a series of erase-and-repaint races in
   the window-surface path. Flushes are held back while an erase waits for its repaint,
   `XShmPutImage` is waited for before the surface is painted into again, a new surface
