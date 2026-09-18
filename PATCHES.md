@@ -96,7 +96,11 @@ This is the recommended branch. What it changes, by subsystem:
   monitored fence support. The swapchain-to-window mapping is published on the desktop
   window, whose property list is shared across the window station, so it is keyed by
   owning process id — otherwise a host application and its WebView2 child can allocate a
-  swapchain at the same address and resolve each other's window
+  swapchain at the same address and resolve each other's window; the reblit timer of a
+  DComp target window presents only on the thread that presents the swapchain — JUCE
+  does so on the window thread and needs the timer's present, Qt Quick presents from a
+  render thread, and a second presenting thread left one of the two asleep in wined3d's
+  frame latency wait (Dorico 5 froze when an entry of its VST instrument menu was picked)
 - **D3D11**: ID3D11Fence with CPU timeline semantics. The `Discard*()` hints log at TRACE
   instead of FIXME — a WebView2 plug-in issued them about 120 times per second, 95 % of
   the log of a 9.5-minute Reaper session
@@ -163,7 +167,10 @@ This is the recommended branch. What it changes, by subsystem:
   stale DC landed where the pane had been, over the area the host had just erased);
   `DisplayConfigGetDeviceInfo` answers `DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL`
   with the nominal 1000 (80 nits) instead of failing — SynthEdit 1.5 asks for it about
-  twice a second while idle
+  twice a second while idle; `WM_ACTIVATEAPP` carries the thread of the previous
+  foreground window when the activation comes from another process instead of 0 — with
+  0, Dorico 5's audio engine process and Dorico blocked on each other as soon as a
+  plug-in editor opened
 - **wineserver**: a top-level's surface flush no longer overwrites child windows that
   belong to a *different process*. Such a child draws straight into the top-level's
   drawable while the owner flushes its own surface over it with a delay — a black
