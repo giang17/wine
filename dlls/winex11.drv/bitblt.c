@@ -1590,6 +1590,9 @@ struct x11drv_window_surface
     struct x11drv_image  *image;
     BOOL                  byteswap;
     BOOL                  glass_alpha; /* per-pixel alpha from a DWM-glass window */
+    int                   shape_kind;  /* ShapeBounding or ShapeInput once a mask is set, 0 before */
+    DWORD                 input_shape_time;    /* tick of the last ShapeInput update */
+    BOOL                  input_shape_pending; /* a contour change is waiting for the throttle */
 };
 
 static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
@@ -1836,24 +1839,6 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
                 ptr[x] |= alpha_bits;
     }
 
-    if (shape_changed)
-    {
-#ifdef HAVE_LIBXSHAPE
-        if (!shape_bits)
-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, None, ShapeSet );
-        else
-        {
-            struct gdi_image_bits bits = {.ptr = (void *)shape_bits};
-            XVisualInfo vis = default_visual;
-            Pixmap shape;
-
-            vis.depth = 1;
-            shape = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, shape, ShapeSet );
-            XFreePixmap( gdi_display, shape );
-        }
-#endif /* HAVE_LIBXSHAPE */
-    }
 
     if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
@@ -1866,6 +1851,73 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
      * follows a resize - is what the server puts on screen, not what was there
      * when the flush was issued.  Wait for the request to complete. */
     XSync( gdi_display, False );
+
+#ifdef HAVE_LIBXSHAPE
+    {
+        int kind = ShapeBounding;
+
+        /* A per-pixel-alpha surface on a 32-bit visual is composited with its
+         * alpha by the window manager, so a bounding shape adds nothing to what
+         * is shown.  Setting one on every change of the contour does harm: an
+         * animated layered popup that resizes every frame (FL Studio's About
+         * fruit) made KWin show a strip of it or nothing for single frames, 16
+         * times in 36 test cycles against 0 without the bounding shape.  Keep
+         * the mask as the input shape only, so that clicks on transparent pixels
+         * still pass through, let it lag a running animation by up to a
+         * second (the first mask and a removal go out at once),
+         * and set it only after the image is in place: a shape change makes the
+         * window manager repaint, and a repaint between the resize and the put
+         * is exactly the frame that shows a strip. */
+        if (alpha_mask && ximage->depth == 32)
+        {
+            DWORD now = NtGetTickCount();
+
+            kind = ShapeInput;
+            if (shape_changed && shape_bits && surface->shape_kind == ShapeInput &&
+                now - surface->input_shape_time < 1000)
+            {
+                surface->input_shape_pending = TRUE;
+                shape_changed = FALSE;
+            }
+            else if (!shape_changed && surface->input_shape_pending && now - surface->input_shape_time >= 1000)
+            {
+                shape_changed = TRUE;
+            }
+            if (shape_changed && (NtUserGetWindowLongW( window_surface->hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT))
+                shape_changed = FALSE;  /* sync_window_input_shape keeps such windows fully click-through */
+        }
+
+        if (shape_changed)
+        {
+            /* the mask moves between the two kinds only with the visual; drop the old one */
+            if (surface->shape_kind && surface->shape_kind != kind)
+                XShapeCombineMask( gdi_display, surface->window, surface->shape_kind, 0, 0, None, ShapeSet );
+
+            if (!shape_bits)
+            {
+                XShapeCombineMask( gdi_display, surface->window, kind, 0, 0, None, ShapeSet );
+                surface->shape_kind = 0;
+            }
+            else
+            {
+                struct gdi_image_bits bits = {.ptr = (void *)shape_bits};
+                XVisualInfo vis = default_visual;
+                Pixmap shape;
+
+                vis.depth = 1;
+                shape = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
+                XShapeCombineMask( gdi_display, surface->window, kind, 0, 0, shape, ShapeSet );
+                XFreePixmap( gdi_display, shape );
+                surface->shape_kind = kind;
+            }
+            if (kind == ShapeInput)
+            {
+                surface->input_shape_time = NtGetTickCount();
+                surface->input_shape_pending = FALSE;
+            }
+        }
+    }
+#endif /* HAVE_LIBXSHAPE */
 
     return TRUE;
 }
