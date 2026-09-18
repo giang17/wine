@@ -818,7 +818,7 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
     }
 
     InterlockedDecrement(&cs->pending_presents);
-    if (InterlockedCompareExchange(&cs->waiting_for_present, FALSE, TRUE))
+    if (InterlockedCompareExchange(&cs->waiting_for_present, 0, 0))
         SetEvent(cs->present_event);
 }
 
@@ -873,19 +873,30 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
 
     /* Limit input latency by limiting the number of presents that we can get
      * ahead of the worker thread. */
+    /* More than one thread can get here for the same device, each presenting a
+     * swapchain of its own, and the wait releases the wined3d mutex.
+     * "waiting_for_present" therefore counts the waiters instead of flagging a
+     * single one: the CS thread signals the auto-reset event while the count
+     * is non-zero, and a waiter that finds room passes the signal on, because
+     * what it saw holds for the others as well.  A signal that arrives with
+     * the limit still reached is absorbed by the loop. */
     while (pending >= swapchain->max_frame_latency)
     {
-        InterlockedExchange(&cs->waiting_for_present, TRUE);
+        InterlockedIncrement(&cs->waiting_for_present);
 
         pending = InterlockedCompareExchange(&cs->pending_presents, 0, 0);
-        if (pending >= swapchain->max_frame_latency || !InterlockedCompareExchange(&cs->waiting_for_present, FALSE, TRUE))
+        if (pending >= swapchain->max_frame_latency)
         {
             TRACE_(d3d_perf)("Reached latency limit (%u frames), blocking to wait.\n", swapchain->max_frame_latency);
             wined3d_mutex_unlock();
             WaitForSingleObject(cs->present_event, INFINITE);
             wined3d_mutex_lock();
             TRACE_(d3d_perf)("Woken up from the wait.\n");
+            pending = InterlockedCompareExchange(&cs->pending_presents, 0, 0);
         }
+
+        if (InterlockedDecrement(&cs->waiting_for_present) && pending < swapchain->max_frame_latency)
+            SetEvent(cs->present_event);
     }
 }
 
