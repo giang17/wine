@@ -160,7 +160,10 @@ This is the recommended branch. What it changes, by subsystem:
   receiver builds a proxy from it; the owned DC of a window hosted below a window of
   another process refreshes its visible region on every `GetDC`, since the move of that
   foreign ancestor never marks it dirty in this process (a composition blit through the
-  stale DC landed where the pane had been, over the area the host had just erased)
+  stale DC landed where the pane had been, over the area the host had just erased);
+  `DisplayConfigGetDeviceInfo` answers `DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL`
+  with the nominal 1000 (80 nits) instead of failing — SynthEdit 1.5 asks for it about
+  twice a second while idle
 - **wineserver**: a top-level's surface flush no longer overwrites child windows that
   belong to a *different process*. Such a child draws straight into the top-level's
   drawable while the owner flushes its own surface over it with a delay — a black
