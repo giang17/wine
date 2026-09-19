@@ -101,9 +101,12 @@ This is the recommended branch. What it changes, by subsystem:
   does so on the window thread and needs the timer's present, Qt Quick presents from a
   render thread, and a second presenting thread left one of the two asleep in wined3d's
   frame latency wait (Dorico 5 froze when an entry of its VST instrument menu was picked)
-- **D3D11**: ID3D11Fence with CPU timeline semantics. The `Discard*()` hints log at TRACE
-  instead of FIXME — a WebView2 plug-in issued them about 120 times per second, 95 % of
-  the log of a 9.5-minute Reaper session
+- **D3D11**: ID3D11Fence with CPU timeline semantics. `DiscardResource()` and
+  `DiscardView()` are implemented, backported from Wine 11.18 (five upstream commits,
+  including the fixes for buffers without a structure byte stride, the sub-resource index
+  of array textures and the resource reference leaked by `DiscardView()`); before that
+  they were stubs whose FIXME made up 95 % of the log of a 9.5-minute Reaper session,
+  because a WebView2 plug-in issues `DiscardView()` dozens of times per second
 - **WineD3D**: composition buffer with dirty rect accumulation, GL buffer recycling pool
   (70 % RSS reduction), and a `vs_out` initialisation that no longer trips NVIDIA's shader
   compiler warnings. Client threads that wait for the command-stream thread (a map that
