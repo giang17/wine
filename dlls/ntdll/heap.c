@@ -169,6 +169,7 @@ C_ASSERT( HEAP_MAX_FREE_BLOCK_SIZE >= HEAP_MAX_BLOCK_REGION_SIZE );
 #define HEAP_MIN_LARGE_BLOCK_SIZE  (HEAP_MAX_USED_BLOCK_SIZE - 0x1000)
 
 #define FREE_LIST_LINEAR_BITS 2
+#define FREE_LIST_MAX_MISSES  16  /* blocks of the first free list tried before moving on to the next one */
 #define FREE_LIST_LINEAR_MASK ((1 << FREE_LIST_LINEAR_BITS) - 1)
 #define FREE_LIST_COUNT ((FIELD_BITS( struct block, block_size ) - FREE_LIST_LINEAR_BITS + 1) * (1 << FREE_LIST_LINEAR_BITS) + 1)
 /* for reference, update this when changing parameters */
@@ -1113,6 +1114,8 @@ static SUBHEAP *create_subheap( struct heap *heap, DWORD flags, SIZE_T total_siz
 static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
 {
     struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
+    struct list *next_list = &find_free_list( heap, block_size, TRUE )->entry;
+    unsigned int misses = 0;
     struct entry *entry;
     struct block *block;
     SIZE_T total_size;
@@ -1124,13 +1127,22 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
     {
         entry = LIST_ENTRY( ptr, struct entry, entry );
         block = &entry->block;
-        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK) continue;
+        if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK)
+        {
+            next_list = NULL; /* past the first list, every block is large enough */
+            continue;
+        }
         if (block_get_size( block ) >= block_size)
         {
             if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size )) return NULL;
             list_remove( &entry->entry );
             return block;
         }
+
+        /* Only the first list holds blocks that are too small. Don't walk all of them, continue
+         * with the next list instead. The last list has no upper bound and is walked fully. */
+        if (++misses == FREE_LIST_MAX_MISSES && next_list && next_list != &heap->free_lists[0].entry)
+            ptr = next_list;
     }
 
     /* make sure we can fit the block and a free entry at the end */
