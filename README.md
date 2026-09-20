@@ -134,7 +134,7 @@ Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**.
 
 ### Prebuilt package for Fedora
 
-Patrick Laimbock packages this fork for Fedora in the COPR repository
+Patrick packages this fork for Fedora in the COPR repository
 [patrickl/wine-staging-dev](https://copr.fedorainfracloud.org/coprs/patrickl/wine-staging-dev/),
 built from the spec at [codeberg.org/MusicProduction/wine](https://codeberg.org/MusicProduction/wine).
 Three differences from a build of this repository are worth knowing:
