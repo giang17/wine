@@ -142,9 +142,10 @@ Three differences from a build of this repository are worth knowing:
 - **It follows the rolling branch**, not `d2d1-dcomp-11.0`, and is synced with it as new
   commits land, so it can lag behind the newest devel tag.
 - **It is built on wine-staging.** The staging patchsets that overlap with this fork —
-  DirectComposition, AF_UNIX, two wined3d sets and `ntdll-Hide_Wine_Exports` — are left
-  out in favour of the fork's own handling, and the stack is applied on top of the
-  remaining staging patchsets. A report from this package should say so.
+  DirectComposition, AF_UNIX, two wined3d sets, `ntdll-Hide_Wine_Exports` and
+  `user32-recursive-activation`, which edits the same `set_active_window()` this fork
+  changes — are left out in favour of the fork's own handling, and the stack is applied on
+  top of the remaining staging patchsets. A report from this package should say so.
 - **It recommends `wine-dxvk`.** That package only places DXVK under `/usr/share/dxvk` and
   stays inactive until `setup_dxvk.sh` is run in a prefix. For this fork, leave it inactive.
 
