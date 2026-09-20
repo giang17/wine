@@ -127,6 +127,13 @@ This is the recommended branch. What it changes, by subsystem:
   swapchains of the same device was never woken (two threads at 20000 presents each hung
   in 3 of 3 runs, 10 of 10 complete now)
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
+- **ntdll heap**: the first-fit walk in `find_free_block()` tries 16 blocks of the first
+  free list and then continues with the next list, where every block is large enough.
+  With many free blocks of nearly the same size the walk took thousands of steps for each
+  allocation; blocks of 1 KiB and more are hit hardest, because their LFH bins need
+  thousands of live blocks before they are enabled. Dorico 6, ten mode switches: 399 → 9.9
+  steps per call, 15.5 % → 0.3 % of the process samples in the walk, 9 % less CPU time,
+  2 % more anonymous memory. `kernel32:heap` passes unchanged on both architectures
 - **Per-pixel alpha for GPU-painted layered windows**: `DwmExtendFrameIntoClientArea`
   with `margins = -1` asks for full glass, which on Windows makes the client area
   per-pixel alpha capable. Wine stubbed it, so a plugin dragging a bitmap around — Serum
