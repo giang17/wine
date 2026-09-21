@@ -1095,6 +1095,7 @@ static void window_set_mwm_hints( struct x11drv_win_data *data, const MwmHints *
 
     if (data->pending_state.wm_state == IconicState) return; /* window is iconic and may be mapped or not, don't update its state now */
 
+    if (old_hints->decorations != new_hints->decorations) data->wm_frame_changed = TRUE;
     data->pending_state.mwm_hints = *new_hints;
     data->mwm_hints_serial = NextRequest( data->display );
     TRACE( "window %p/%lx, requesting _MOTIF_WM_HINTS %s serial %lu\n", data->hwnd, data->whole_window,
@@ -1582,6 +1583,7 @@ static void window_set_net_wm_state( struct x11drv_win_data *data, UINT new_stat
         }
 
         data->pending_state.net_wm_state = new_state;
+        data->wm_frame_changed = TRUE;
         data->net_wm_state_serial = NextRequest( data->display );
         TRACE( "window %p/%lx, requesting _NET_WM_STATE %#x serial %lu\n", data->hwnd, data->whole_window,
                data->pending_state.net_wm_state, data->net_wm_state_serial );
@@ -1613,6 +1615,7 @@ static void window_set_net_wm_state( struct x11drv_win_data *data, UINT new_stat
                                      x11drv_atom(_NET_WM_STATE_MAXIMIZED_HORZ) : 0);
 
             data->pending_state.net_wm_state ^= (1 << i);
+            data->wm_frame_changed = TRUE;
             data->net_wm_state_serial = NextRequest( data->display );
             TRACE( "window %p/%lx, requesting _NET_WM_STATE %#x serial %lu\n", data->hwnd, data->whole_window,
                    data->pending_state.net_wm_state, data->net_wm_state_serial );
@@ -1690,6 +1693,8 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     data->pending_state.rect = *new_rect;
     data->pending_state.above = above;
     data->configure_serial = NextRequest( data->display );
+    data->configure_retry = data->wm_frame_changed;
+    data->wm_frame_changed = FALSE;
     TRACE( "window %p/%lx, requesting config %s mask %#x above %u, serial %lu\n", data->hwnd, data->whole_window,
            wine_dbgstr_rect(new_rect), mask, above, data->configure_serial );
     XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen, mask, &changes );
@@ -2269,6 +2274,23 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
     received = wine_dbg_sprintf( "config %s/%lu", wine_dbgstr_rect(value), serial );
     expected = *expect_serial ? wine_dbg_sprintf( ", expected %s/%lu", wine_dbgstr_rect(pending), *expect_serial ) : "";
 
+    /* A window manager reconfigures the window on its own terms when the decorations or the
+     * fullscreen state change. That event carries the serial of our configure request as soon
+     * as the server has received the request, whether or not the window manager has processed
+     * it, and would be taken for its answer. Ask once more instead of adopting it. */
+    if (*expect_serial && serial >= *expect_serial && data->configure_retry && !EqualRect( value, pending ))
+    {
+        RECT rect = data->desired_state.rect;
+
+        WARN( "%sconfig %s/%lu follows a frame change%s, requesting %s again\n", prefix,
+              wine_dbgstr_rect(value), serial, expected, wine_dbgstr_rect(&rect) );
+        data->configure_retry = FALSE;
+        *current = *pending = *value;
+        *expect_serial = 0;
+        window_set_config( data, rect, FALSE );
+        return;
+    }
+
     /* if we've delayed some config we want to continue with it, make sure handle_state_change doesn't overwrite it */
     if ((*expect_serial || window_needs_config_change_delay( data )) &&
         serial >= *expect_serial && !EqualRect( desired, pending ))
@@ -2280,6 +2302,7 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
     if (!handle_state_change( serial, expect_serial, sizeof(*value), value, desired, pending,
                               current, expected, prefix, received, NULL ))
         return;
+    data->configure_retry = FALSE;
     data->pending_state.above = FALSE; /* allow requesting it again */
 
     /* send any pending changes from the desired state */
