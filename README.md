@@ -137,7 +137,7 @@ Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**.
 Patrick packages this fork for Fedora in the COPR repository
 [patrickl/wine-staging-dev](https://copr.fedorainfracloud.org/coprs/patrickl/wine-staging-dev/),
 built from the spec at [codeberg.org/MusicProduction/wine](https://codeberg.org/MusicProduction/wine).
-Three differences from a build of this repository are worth knowing:
+Two differences from a build of this repository are worth knowing:
 
 - **It follows the rolling branch**, not `d2d1-dcomp-11.0`, and is synced with it as new
   commits land, so it can lag behind the newest devel tag.
@@ -146,8 +146,6 @@ Three differences from a build of this repository are worth knowing:
   `user32-recursive-activation`, which edits the same `set_active_window()` this fork
   changes — are left out in favour of the fork's own handling, and the stack is applied on
   top of the remaining staging patchsets. A report from this package should say so.
-- **It recommends `wine-dxvk`.** That package only places DXVK under `/usr/share/dxvk` and
-  stays inactive until `setup_dxvk.sh` is run in a prefix. For this fork, leave it inactive.
 
 The same repository carries yabridge, pipewire-wineasio, pipeasio and winetricks. Builds
 are for Fedora 44 x86_64.
