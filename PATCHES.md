@@ -177,7 +177,12 @@ This is the recommended branch. What it changes, by subsystem:
   xrender PutImage path is flushed, and a client window that will render offscreen is
   created under the dummy parent. Seen as MDI captions going dark during a resize, a
   black toolbar after a menu and a stale MDI client after a drag in SynthEdit 1.5, and as
-  a one-frame black flash on a fast resize in FL Studio
+  a one-frame black flash on a fast resize in FL Studio. An empty surface clip region now
+  disables the flush instead of lifting the clip: a top-level covered completely by a
+  child with a pixel format has nothing left to flush, and the unclipped flush painted the
+  surface over what the child had presented. A plug-in editor embedded by yabridge is
+  exactly as large as its top-level, so Mercurial Tones Dagon, which places a Direct3D 12
+  child over its whole editor, stayed black there while it rendered in a Wine-hosted DAW
 - **win32u**: menu bar items are measured through the undocumented
   `WM_UAHMEASUREMENUITEM` (0x0094), as Windows does for captioned windows: the owner gets
   an item size of 0x16, `DefWindowProc` fills in the default, and the size left in the
