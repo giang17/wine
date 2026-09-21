@@ -401,12 +401,15 @@ predictable choice, since a partial override runs one implementation's D3D11 aga
 other's DXGI; single overrides have worked here (EZ Keys 2 with `d3d10core=n`, Korg
 Modwave and Opsix with `d3d11=n`), but that combination is not something this branch
 tests. Plug-ins that drive DComp need this branch's builtin `dxgi` and cannot be pointed
-at DXVK at all: `DxgiFactory::CreateSwapChainForComposition` returns `E_NOTIMPL` there,
-and the `dxgi.enableDummyCompositionSwapchain` option that lifts it is described in DXVK's
-own `dxvk.conf` as *not a valid implementation of DirectComposition swapchains* — it makes
-a capability probe succeed, it does not composite anything. That is a stated non-goal on
-their side, not a gap: composition swapchains have no Vulkan path in DXVK, and the DComp
-handling here is built on `dxgi` and `wined3d`.
+at DXVK at all: `DxgiFactory::CreateSwapChainForComposition` returns `E_NOTIMPL` unless
+`dxgi.enableDummyCompositionSwapchain` is set, and DXVK's own `dxvk.conf` still calls that
+option *not a valid implementation of DirectComposition swapchains*. The code has moved
+past its own description, though — since the fix for DXVK issue 5053 the present path also
+runs for a swap chain with no window at all, which is the composition case. What is
+missing on that route is the other half: something has to composite the result, and
+upstream Wine's `dcomp` does not. Whether DXVK with that option drives *this* branch's
+`dcomp` has not been tested here; until it has, the per-application switch above is the
+answer, not the option.
 
 **GL present for top-level windows** (default ON): D3D11 swapchains on top-level windows
 present through the driver's SwapBuffers (EGL by default in Wine 11) directly from the GPU
