@@ -10,6 +10,17 @@
 #      and crash with an access violation if they are missing — with no useful
 #      error message.  Wine does not register fonts from that directory by
 #      itself, and `wineboot -u` does not either.
+#
+#      Where the family cannot be packaged for licensing reasons — Fedora has no
+#      mscore-fonts package and cannot have one — two separate gaps open up, and
+#      they need different answers.  A file opened BY PATH only has to exist and
+#      parse, so a metric-compatible free face copied under the MS file name
+#      closes that one offline.  A family looked up BY NAME needs an entry in the
+#      GDI FontSubstitutes key: the value name in the Fonts key is not the family,
+#      win32u reads that from the file itself (load_registry_fonts() hands the
+#      path to add_font_resource()), so a renamed file alone leaves "Arial"
+#      unresolvable.  Both are applied when the genuine fonts are not on the host;
+#      --winetricks fetches the real ones instead.
 #   2. DejaVu Sans and Noto Sans Symbols2, plus the GDI FontLink entries that
 #      make them the first fallback for symbol glyphs (star ratings, arrows in
 #      Serum 2 show up as tofu boxes otherwise).
@@ -40,12 +51,16 @@
 #
 # Usage:
 #   wine-font-setup.sh [--prefix DIR] [--wine BINARY] [--check] [--no-mscore]
-#                      [--no-rendering] [--no-uifont] [--contrast N]
+#                      [--winetricks] [--no-rendering] [--no-uifont] [--contrast N]
 #
 #   --prefix DIR    Wine prefix to operate on.  Default: $WINEPREFIX, else ~/.wine
 #   --wine BINARY   wine binary to use.  Default: wine
 #   --check         report only, change nothing
 #   --no-mscore     skip the MS Core Fonts part (step 1)
+#   --winetricks    when the MS Core Fonts are not on the host, install the
+#                   genuine ones with `winetricks -q corefonts` instead of the
+#                   free stand-ins.  This downloads them and accepts the
+#                   Microsoft EULA on your behalf, which is why it is opt-in.
 #   --no-rendering  skip the text rendering switches (step 3)
 #   --no-uifont     keep the WindowMetrics fonts, the system UI font (step 4)
 #   --contrast N    enhanced contrast, 0-100.  Default: 50, what Windows uses.
@@ -60,6 +75,7 @@ PREFIX="${WINEPREFIX:-$HOME/.wine}"
 WINE="wine"
 CHECK_ONLY=0
 DO_MSCORE=1
+DO_WINETRICKS=0
 DO_RENDERING=1
 DO_UIFONT=1
 CONTRAST=50
@@ -75,16 +91,63 @@ MSCORE=(andale arial arialbd arialbi ariali ariblk comic comicbd cour courbd
         timesbi timesi trebuc trebucbd trebucbi trebucit verdana verdanab
         verdanai verdanaz webdings)
 
+# Free stand-ins, used when the genuine family is not on the host.  Liberation
+# Sans, Serif and Mono were drawn to the metrics of Arial, Times New Roman and
+# Courier New, so line breaks and dialog layouts land where the application
+# expects them; the rest of the table is a visual approximation and nothing more.
+# Two groups are deliberately absent.  The symbol faces (Webdings, Wingdings):
+# pointing them at a Latin face draws letters where the application asked for
+# symbols, which is worse than the family being missing.  And Tahoma: Wine ships
+# its own, and the FontLink chain of step 2 is keyed on that name.  Arial Narrow
+# is absent for a third reason: "Liberation Sans Narrow" is a family on the host,
+# but DirectWrite groups its faces under the WWS family "Liberation Sans", so the
+# substitute would point at a name the collection does not carry and dwrite would
+# fall back to the system message font — measurably worse than no entry at all.
+MSCORE_FAMILY_SUBST=(
+    "Arial|Liberation Sans"
+    "Times New Roman|Liberation Serif"
+    "Courier New|Liberation Mono"
+    "Verdana|DejaVu Sans"
+    "Georgia|DejaVu Serif"
+    "Trebuchet MS|DejaVu Sans"
+    "Comic Sans MS|DejaVu Sans"
+    "Andale Mono|DejaVu Sans Mono"
+    "Impact|DejaVu Sans"
+)
+
+# The file names plugins are known to open by path, and the face to put there.
+# Only the four metric-compatible groups: a stand-in that is not metric
+# compatible still stops the crash, but it may not be what the caller draws with.
+MSCORE_FILE_SUBST=(
+    "arial.ttf|LiberationSans-Regular.ttf"
+    "arialbd.ttf|LiberationSans-Bold.ttf"
+    "ariali.ttf|LiberationSans-Italic.ttf"
+    "arialbi.ttf|LiberationSans-BoldItalic.ttf"
+    "times.ttf|LiberationSerif-Regular.ttf"
+    "timesbd.ttf|LiberationSerif-Bold.ttf"
+    "timesi.ttf|LiberationSerif-Italic.ttf"
+    "timesbi.ttf|LiberationSerif-BoldItalic.ttf"
+    "cour.ttf|LiberationMono-Regular.ttf"
+    "courbd.ttf|LiberationMono-Bold.ttf"
+    "couri.ttf|LiberationMono-Italic.ttf"
+    "courbi.ttf|LiberationMono-BoldItalic.ttf"
+    "verdana.ttf|DejaVuSans.ttf"
+    "verdanab.ttf|DejaVuSans-Bold.ttf"
+    "verdanai.ttf|DejaVuSans-Oblique.ttf"
+    "verdanaz.ttf|DejaVuSans-BoldOblique.ttf"
+)
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --prefix)    shift; PREFIX="${1:?--prefix needs a directory}" ;;
         --wine)      shift; WINE="${1:?--wine needs a binary}" ;;
         --check)     CHECK_ONLY=1 ;;
         --no-mscore) DO_MSCORE=0 ;;
+        --winetricks) DO_WINETRICKS=1 ;;
         --no-rendering) DO_RENDERING=0 ;;
         --no-uifont) DO_UIFONT=0 ;;
         --contrast)  shift; CONTRAST="${1:?--contrast needs a number 0-100}"; CONTRAST_EXPLICIT=1 ;;
-        -h|--help)   sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)   awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) echo "unknown argument: $1  (try --help)" >&2; exit 1 ;;
     esac
     shift
@@ -102,6 +165,23 @@ command -v fc-list >/dev/null 2>&1 || {
 # Locate a font file by name, case-insensitively, wherever the distro keeps it.
 find_font() {
     fc-list --format='%{file}\n' 2>/dev/null | grep -iE "/$1\$" | head -1
+}
+
+# Is a FAMILY (not a file) on the host?  fc-list reports the localised names of
+# one family as a comma separated list, so split before matching.
+have_family() {
+    fc-list --format='%{family}\n' 2>/dev/null | tr ',' '\n' | grep -qxiF "$1"
+}
+
+# A file in the prefix' Fonts directory, matched without regard to case: the
+# distributions ship "Arial.ttf", the plugins ask for "arialbd.ttf".
+prefix_font() {
+    local f base want=${1,,}
+    for f in "$FONTDIR"/*; do
+        base=${f##*/}
+        [ -f "$f" ] && [ "${base,,}" = "$want" ] && { printf '%s\n' "$base"; return 0; }
+    done
+    return 1
 }
 
 echo "Prefix: $PREFIX"
@@ -214,6 +294,23 @@ for fam in "${SUBST_FAMILIES[@]}"; do
 done
 have_subst=0; [ "$n_subst" -eq "${#SUBST_FAMILIES[@]}" ] && have_subst=1
 
+# MS Core Fonts: genuine files, free stand-ins, or nothing at all.  "Arial" is
+# the representative — it is the family the known crash cases open by path and
+# the one applications ask for by name most often.
+have_arial_file=0; [ -n "$(prefix_font arial.ttf)" ] && have_arial_file=1
+subst_arial=0
+[ -n "$(reg_value "$SYSREG" "$SUBST_KEY" "Arial")" ] && subst_arial=1
+if [ "$subst_arial" -eq 1 ]; then
+    mscore_state="free stand-ins (Liberation/DejaVu) — --winetricks installs the genuine set"
+elif [ "$have_arial_file" -eq 1 ]; then
+    mscore_state="present in the prefix"
+else
+    mscore_state="absent — plugins that open font files by path crash"
+fi
+have_mscore=0
+{ [ "$have_arial_file" -eq 1 ] || [ "$subst_arial" -eq 1 ]; } && have_mscore=1
+[ "$DO_MSCORE" -eq 1 ] || have_mscore=1   # not asked for, do not report it missing
+
 # The system UI font.  The six WindowMetrics values are LOGFONTW blobs of 92
 # bytes: the height at bytes 0-3 (negative = pixels at the prefix' system DPI,
 # positive = points), the face name at byte 28 as UTF-16LE.  Applications read
@@ -258,6 +355,7 @@ have_uifont=0
 echo "Current state of the prefix:"
 printf '  %-34s %s\n' "fonts in windows/Fonts" \
     "$( [ "$have_fonts" -eq 1 ] && echo present || echo missing )"
+printf '  %-34s %s\n' "MS Core Fonts" "$mscore_state"
 printf '  %-34s %s\n' "FontLink symbol fallback" \
     "$( [ "$have_link" -eq 1 ] && echo present || echo missing )"
 printf '  %-34s %s\n' "text rendering switches" \
@@ -293,7 +391,8 @@ fi
 if [ "$CHECK_ONLY" -eq 1 ]; then
     echo
     if [ "$have_fonts" -eq 1 ] && [ "$have_link" -eq 1 ] && [ "$have_rendering" -eq 1 ] &&
-       [ "$mangled_links" -eq 0 ] && [ "$have_uifont" -eq 1 ] && [ "$have_subst" -eq 1 ]; then
+       [ "$mangled_links" -eq 0 ] && [ "$have_uifont" -eq 1 ] && [ "$have_subst" -eq 1 ] &&
+       [ "$have_mscore" -eq 1 ]; then
         echo "Font setup is complete."
         exit 0
     fi
@@ -304,6 +403,16 @@ fi
 command -v "$WINE" >/dev/null 2>&1 || {
     echo "ERROR: wine binary not found: $WINE  (use --wine /path/to/wine)" >&2
     exit 1; }
+
+# The backup comes before the first write, not before the registry section:
+# --winetricks writes to the registry itself, from inside the copy step.
+echo
+echo "Backing up the registry..."
+stamp=$(date +%Y%m%d-%H%M%S)
+for r in system.reg user.reg; do
+    [ -f "$PREFIX/$r" ] && cp "$PREFIX/$r" "$PREFIX/$r.bak-$stamp"
+done
+echo "  saved as *.reg.bak-$stamp"
 
 # --- 3. copy the fonts into the prefix ---------------------------------------
 echo
@@ -316,37 +425,103 @@ done
 
 # MS Core Fonts live in one directory per distribution; derive it from arial.
 reg_lines=()
+subst_lines=()
+arial=""
 if [ "$DO_MSCORE" -eq 1 ]; then
     arial=$(find_font "arial.ttf")
-    if [ -n "$arial" ]; then
-        dir=$(dirname "$arial")
-        for base in "${MSCORE[@]}"; do
-            # match case-insensitively, the packaging differs between distros
-            for cand in "$dir"/*.ttf; do
-                [ -f "$cand" ] || continue
-                b=$(basename "$cand"); b_lc=$(echo "$b" | tr 'A-Z' 'a-z')
-                [ "$b_lc" = "$base.ttf" ] || continue
-                cp -f "$cand" "$FONTDIR/$b"
-                copied=$((copied + 1))
-                reg_lines+=("\"${base} (TrueType)\"=\"${b}\"")
-                break
-            done
+
+    # --winetricks runs here, and it has to run HERE: winetricks starts wine
+    # several times, and a start whose code page does not match the record under
+    # HKCU\Software\Wine\Fonts\Codepages makes Wine rewrite the FontLink
+    # SystemLink key with its own defaults.  Ahead of step 4a that costs nothing;
+    # after it, it would drop the symbol fallback on stock Wine.  winetricks
+    # takes the wine binary from $WINE, so --wine is honoured.
+    if [ -z "$arial" ] && [ "$DO_WINETRICKS" -eq 1 ]; then
+        if command -v winetricks >/dev/null 2>&1; then
+            echo "  fetching the genuine MS Core Fonts with winetricks..."
+            WINE="$WINE" WINEPREFIX="$PREFIX" winetricks -q corefonts </dev/null
+            wt_rc=$?
+            if [ "$wt_rc" -eq 0 ] && [ -n "$(prefix_font arial.ttf)" ]; then
+                echo "  MS Core Fonts installed by winetricks (registered by it too)"
+                DO_MSCORE=0     # nothing left for the branches below
+            else
+                # Both the network and the local downloader are in that path:
+                # winetricks fetches from third party mirrors with the checksums
+                # pinned in its own source, and picks up whatever downloader is
+                # installed.  A snap confined aria2c, for instance, cannot write
+                # to ~/.cache/winetricks and fails every download (seen
+                # 2026-09-21); WINETRICKS_DOWNLOADER=curl rules that one out.
+                echo "  WARNING: winetricks did not install them (exit $wt_rc) — the"
+                echo "  reason is in its output above.  WINETRICKS_DOWNLOADER=curl rules"
+                echo "  out a broken local downloader.  Falling back to the stand-ins."
+            fi
+        else
+            echo "  WARNING: --winetricks given, but winetricks is not installed"
+        fi
+    fi
+fi
+if [ "$DO_MSCORE" -eq 1 ] && [ -n "$arial" ]; then
+    dir=$(dirname "$arial")
+    for base in "${MSCORE[@]}"; do
+        # match case-insensitively, the packaging differs between distros
+        for cand in "$dir"/*.ttf; do
+            [ -f "$cand" ] || continue
+            b=$(basename "$cand"); b_lc=$(echo "$b" | tr 'A-Z' 'a-z')
+            [ "$b_lc" = "$base.ttf" ] || continue
+            cp -f "$cand" "$FONTDIR/$b"
+            copied=$((copied + 1))
+            reg_lines+=("\"${base} (TrueType)\"=\"${b}\"")
+            break
         done
-        echo "  MS Core Fonts from $dir"
+    done
+    echo "  MS Core Fonts from $dir"
+elif [ "$DO_MSCORE" -eq 1 ]; then
+    # Nothing on the host and no download asked for: close both gaps with what
+    # the distribution does ship.  The files stop the crashes of plugins that
+    # open a path, the FontSubstitutes entries make the families resolvable for
+    # GDI and for this branch's dwrite — neither replaces the other.
+    n_file_subst=0
+    for e in "${MSCORE_FILE_SUBST[@]}"; do
+        tgt=${e%%|*}; srcname=${e##*|}
+        [ -n "$(prefix_font "$tgt")" ] && continue        # never shadow a real one
+        src=$(find_font "$srcname")
+        [ -n "$src" ] || continue
+        cp -f "$src" "$FONTDIR/$tgt" || continue
+        copied=$((copied + 1)); n_file_subst=$((n_file_subst + 1))
+        # Registering them is not optional.  A file that only sits in the Fonts
+        # directory is enough for PathFileExistsW, but Wine drops the host copy
+        # of the same face from its external font list over it and never loads
+        # the prefix one, so the family disappears from the collection
+        # altogether: measured 2026-09-21, Liberation Serif and Liberation Mono
+        # gone and "Times New Roman" resolving to Tahoma, the system message
+        # font dwrite falls back to.  The value name is cosmetic — win32u takes
+        # the family from the file — but it must not collide with a full name
+        # that already exists, or load_registry_fonts() skips the entry.
+        reg_lines+=("\"${tgt%.ttf} (TrueType)\"=\"${tgt}\"")
+    done
+    for e in "${MSCORE_FAMILY_SUBST[@]}"; do
+        fam=${e%%|*}; to=${e##*|}
+        [ -n "$(reg_value "$SYSREG" "$SUBST_KEY" "$fam")" ] && continue
+        have_family "$to" || continue
+        subst_lines+=("$fam|$to")
+    done
+    if [ "$n_file_subst" -eq 0 ] && [ ${#subst_lines[@]} -eq 0 ]; then
+        echo "  MS Core Fonts: free stand-ins already in place"
     else
-        echo "  MS Core Fonts not installed — skipping (install msttcorefonts to"
-        echo "  avoid crashes in plugins that open font files directly)"
+        echo "  MS Core Fonts not installed on the host — using free stand-ins:"
+        echo "    $n_file_subst file(s) under the MS names, ${#subst_lines[@]} family substitute(s)"
+        echo "    metrics match for Arial, Times New Roman and Courier New only;"
+        echo "    Verdana, Georgia, Impact, Comic Sans, Trebuchet and Andale shift."
+        echo "    Segoe UI cannot be covered this way and is not in winetricks either."
+        echo "  For the genuine files instead:"
+        echo "    re-run with --winetricks, or:  WINEPREFIX=$PREFIX winetricks -q corefonts"
+        echo "    Debian/Ubuntu: ttf-mscorefonts-installer   Arch: ttf-ms-fonts"
+        echo "    Fedora ships no package — the family is not redistributable."
     fi
 fi
 echo "  $copied font file(s) copied"
 
 # --- 4. registry ---------------------------------------------------------------
-stamp=$(date +%Y%m%d-%H%M%S)
-for r in system.reg user.reg; do
-    [ -f "$PREFIX/$r" ] && cp "$PREFIX/$r" "$PREFIX/$r.bak-$stamp"
-done
-echo "  Registry backed up as *.reg.bak-$stamp"
-
 # regedit is a Windows program: hand it a WINDOWS path. A Unix path is read as a
 # Windows path and the import silently does nothing.
 if [ ${#reg_lines[@]} -gt 0 ]; then
@@ -377,6 +552,17 @@ WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add \
     /v "DejaVu Sans" /t REG_MULTI_SZ \
     /d "NotoSansSymbols2-Regular.ttf,Noto Sans Symbols2" /f \
     </dev/null >/dev/null 2>&1
+
+# --- 4a1. MS Core Font family substitutes (only when the genuine ones are absent)
+# Collected in step 3, written here, where the registry backup is already taken.
+if [ ${#subst_lines[@]} -gt 0 ]; then
+    echo "  setting the MS Core Font substitutes (-> Liberation/DejaVu)..."
+    for e in "${subst_lines[@]}"; do
+        WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add \
+            'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes' \
+            /v "${e%%|*}" /t REG_SZ /d "${e##*|}" /f </dev/null >/dev/null 2>&1
+    done
+fi
 
 # --- 4a2. DirectWrite family substitutes (issue 384) ---------------------------
 # Written only when absent, so a deliberate different target survives a re-run.
