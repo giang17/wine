@@ -7119,6 +7119,24 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 return ret;
             }
 
+            /* The root shows a swapchain of another dxgi (issue 397).  The
+             * application draws into that swapchain from its WM_PAINT -- JUCE 8
+             * paints nowhere else -- so the message has to reach it, and the
+             * frame it presents is read back right after, ahead of the readback
+             * throttle, and put into the window. */
+            if (target->root_visual->foreign_proxy)
+            {
+                struct dcomp_texture *texture = target->root_visual->foreign_proxy->texture_content;
+                LRESULT ret = orig_wndproc
+                        ? CallWindowProcW(orig_wndproc, hwnd, msg, wparam, lparam)
+                        : DefWindowProcW(hwnd, msg, wparam, lparam);
+
+                if (texture)
+                    texture->last_readback_tick = 0;
+                dcomp_target_composite_tree(target, FALSE);
+                return ret;
+            }
+
             BeginPaint(hwnd, &ps);
             EndPaint(hwnd, &ps);
             return 0;
