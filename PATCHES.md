@@ -144,7 +144,15 @@ This is the recommended branch. What it changes, by subsystem:
   On by default; `WINE_ARGB_PIXFMT=0` turns the whole path off without a rebuild. Smoke
   tested across Korg Trinity, EPROM Memory Rites, FL Studio, Fender Studio Pro 8 and
   Ableton Live 12
-- **winex11**: DComp window support, backing store; ownerless TOOLWINDOW popups are no
+- **winex11**: fullscreen switches hold against the window manager's own reconfiguration.
+  After a decoration or `_NET_WM_STATE` change the first `ConfigureNotify` that carries the
+  serial of our configure request but another geometry is the window manager's reaction to
+  that change, not its answer; it is no longer adopted, the desired geometry is requested
+  once more (Ableton Live 12 came back from F11 smaller by the frame extents every time —
+  upstream behaviour up to 11.18). And KWin acknowledges `_NET_WM_STATE_FULLSCREEN` before it
+  reconfigures the window: the config from before is now waited out instead of applied, which
+  took the window out of fullscreen again (Fender Studio Pro 8 reached fullscreen in about
+  half of the attempts, a regression of this branch); DComp window support, backing store; ownerless TOOLWINDOW popups are no
   longer folded into the active window's group, given a transient_for owner, or mapped as
   UTILITY — this fixes sticky, wrongly decorated and always-on-top plugin menus on KDE;
   the opaque black X expose background is suppressed while a GL/D3D client window is taken
