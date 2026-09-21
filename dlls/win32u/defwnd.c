@@ -2444,6 +2444,10 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
             return handle_nc_hit_test( hwnd, pt );
         }
 
+    case WM_UAHMEASUREMENUITEM:
+        measure_menu_bar_item( hwnd, (struct uah_measure_menu_item *)lparam );
+        break;
+
     case WM_NCPAINT:
         return handle_nc_paint( hwnd, (HRGN)wparam );
 
