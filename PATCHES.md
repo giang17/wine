@@ -170,7 +170,15 @@ This is the recommended branch. What it changes, by subsystem:
   created under the dummy parent. Seen as MDI captions going dark during a resize, a
   black toolbar after a menu and a stale MDI client after a drag in SynthEdit 1.5, and as
   a one-frame black flash on a fast resize in FL Studio
-- **win32u**: transparent (0x00) surface init for ARGB popups; the system arrow is shown
+- **win32u**: menu bar items are measured through the undocumented
+  `WM_UAHMEASUREMENUITEM` (0x0094), as Windows does for captioned windows: the owner gets
+  an item size of 0x16, `DefWindowProc` fills in the default, and the size left in the
+  structure is used (32-bit processes included). Ableton Live 12 makes its menu bar 4 px
+  taller this way and adds the same 4 px when sizing its main window; without the message
+  the window grew until it hit the maximum height and lost its frame (Wine bug 57955).
+  This replaces two earlier workarounds for the same bug (suppressed reentrant size-only
+  `WM_WINDOWPOSCHANGED`, lifted `window == visible` decoration gate in winex11), both
+  removed; transparent (0x00) surface init for ARGB popups; the system arrow is shown
   again when an application hides the cursor and sets none; cursors are process-local in
   Wine, so a `WM_WINE_SETCURSOR` for an out-of-process child window (WebView2, bridged
   plug-ins) arrived with a handle the receiving process rejected and the previous cursor
