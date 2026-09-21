@@ -204,7 +204,7 @@ if [ "$missing" -gt 0 ]; then
     echo
     echo "=> Install them first (package names vary by distribution):"
     echo "     Debian/Ubuntu : fonts-dejavu-core  fonts-noto-core"
-    echo "     Fedora        : dejavu-sans-fonts  google-noto-sans-symbols2-fonts"
+    echo "     Fedora        : dejavu-sans-fonts  google-noto-sans-symbols-2-fonts"
     echo "     Arch          : ttf-dejavu         noto-fonts"
     exit 2
 fi
@@ -513,6 +513,12 @@ elif [ "$DO_MSCORE" -eq 1 ]; then
         echo "    metrics match for Arial, Times New Roman and Courier New only;"
         echo "    Verdana, Georgia, Impact, Comic Sans, Trebuchet and Andale shift."
         echo "    Segoe UI cannot be covered this way and is not in winetricks either."
+        if ! have_family "Liberation Sans"; then
+            echo "    Liberation is not installed — without it only the DejaVu entries apply:"
+            echo "      Debian/Ubuntu : fonts-liberation"
+            echo "      Fedora        : liberation-sans-fonts liberation-serif-fonts liberation-mono-fonts"
+            echo "      Arch          : ttf-liberation"
+        fi
         echo "  For the genuine files instead:"
         echo "    re-run with --winetricks, or:  WINEPREFIX=$PREFIX winetricks -q corefonts"
         echo "    Debian/Ubuntu: ttf-mscorefonts-installer   Arch: ttf-ms-fonts"
