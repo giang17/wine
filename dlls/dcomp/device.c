@@ -1556,6 +1556,8 @@ struct dcomp_texture
     IDCompositionTexture IDCompositionTexture_iface;
     LONG refcount;
     ID3D11Texture2D *texture;         /* wrapped app texture */
+    IDXGISwapChain1 *swapchain;       /* foreign composition swapchain: buffer 0 stands in for
+                                       * the texture, fetched per readback and never held */
     D3D11_TEXTURE2D_DESC desc;        /* cached at creation */
     D2D_RECT_U source_rect;
     BOOL has_source_rect;
@@ -1628,6 +1630,8 @@ static ULONG STDMETHODCALLTYPE dcomp_texture_Release(IDCompositionTexture *iface
             ID3D11Texture2D_Release(texture->staging);
         if (texture->texture)
             ID3D11Texture2D_Release(texture->texture);
+        if (texture->swapchain)
+            IDXGISwapChain1_Release(texture->swapchain);
         free(texture->bits);
         free(texture);
     }
@@ -1706,7 +1710,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_texture_GetAvailableFence(IDCompositionTe
  * last_tree_composite_tick). Fills texture->bits with the BGRA
  * premultiplied source_rect window; both the tree-composite and the
  * serializer path consume the buffer like DComp surface bits. */
-static void dcomp_texture_ensure_bits(struct dcomp_texture *texture)
+static void dcomp_texture_readback(struct dcomp_texture *texture)
 {
     D3D11_TEXTURE2D_DESC staging_desc;
     D3D11_MAPPED_SUBRESOURCE map;
@@ -1714,12 +1718,7 @@ static void dcomp_texture_ensure_bits(struct dcomp_texture *texture)
     ID3D11Device *device;
     UINT x, y, w, h, row;
     BOOL swizzle = FALSE;
-    DWORD now = GetTickCount();
     HRESULT hr;
-
-    if (texture->bits && now - texture->last_readback_tick < DCOMP_TREE_FRAME_MS)
-        return;
-    texture->last_readback_tick = now;
 
     switch (texture->desc.Format)
     {
@@ -1841,6 +1840,56 @@ static void dcomp_texture_ensure_bits(struct dcomp_texture *texture)
 done:
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
+}
+
+/* A composition swapchain this dxgi did not create -- DXVK's, in practice -- has no
+ * composition window to hand over, so its content is read back like a texture's.
+ * Buffer 0 holds the frame of the last Present, in DXVK as in wined3d.  The
+ * reference lasts for one readback only: a back buffer held across frames makes
+ * the application's ResizeBuffers() fail. */
+static BOOL dcomp_texture_acquire_swapchain_buffer(struct dcomp_texture *texture)
+{
+    D3D11_TEXTURE2D_DESC desc;
+    HRESULT hr;
+
+    if (FAILED(hr = IDXGISwapChain1_GetBuffer(texture->swapchain, 0, &IID_ID3D11Texture2D,
+            (void **)&texture->texture)))
+    {
+        WARN("Failed to get buffer 0 of swapchain %p, hr %#lx.\n", texture->swapchain, hr);
+        texture->texture = NULL;
+        return FALSE;
+    }
+
+    ID3D11Texture2D_GetDesc(texture->texture, &desc);
+    if (desc.Width != texture->desc.Width || desc.Height != texture->desc.Height
+            || desc.Format != texture->desc.Format)
+    {
+        if (texture->staging)
+            ID3D11Texture2D_Release(texture->staging);
+        texture->staging = NULL;
+    }
+    texture->desc = desc;
+    return TRUE;
+}
+
+static void dcomp_texture_ensure_bits(struct dcomp_texture *texture)
+{
+    DWORD now = GetTickCount();
+
+    if (texture->bits && now - texture->last_readback_tick < DCOMP_TREE_FRAME_MS)
+        return;
+    texture->last_readback_tick = now;
+
+    if (texture->swapchain && !dcomp_texture_acquire_swapchain_buffer(texture))
+        return;
+
+    dcomp_texture_readback(texture);
+
+    if (texture->swapchain)
+    {
+        ID3D11Texture2D_Release(texture->texture);
+        texture->texture = NULL;
+    }
 }
 
 static const IDCompositionTextureVtbl dcomp_texture_vtbl =
@@ -2468,6 +2517,11 @@ struct dcomp_visual
     struct dcomp_surface *surface_content; /* non-NULL if content is a DComp surface */
     struct dcomp_texture *texture_content; /* non-NULL if content is a composition texture */
     struct dcomp_dynamic_texture *dynamic_content; /* non-NULL if content is a dynamic texture */
+    /* Content that is a swapchain of another dxgi lives in an internal child that
+     * shows it as a texture; the visual itself stays without content, so every walk
+     * that starts at the children of a root reaches it. */
+    struct dcomp_visual *foreign_proxy;
+    BOOL is_foreign_proxy;
     HWND target_hwnd;
     /* Visual tree */
     float offset_x;
@@ -2607,6 +2661,7 @@ static inline struct dcomp_texture *dcomp_visual_effective_texture(struct dcomp_
 
 static void dcomp_visual_try_reparent(struct dcomp_visual *visual);
 static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root);
+static const IDCompositionVisual3Vtbl dcomp_visual_vtbl;
 
 /* Visual tree linked-list helpers */
 static void dcomp_visual_unlink(struct dcomp_visual *child)
@@ -2862,6 +2917,98 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetClip(IDCompositionVisual *iface
     return S_OK;
 }
 
+/* Is this content a swapchain that some other dxgi created?  Ours publish their
+ * composition window on the desktop window the moment they are created, so a
+ * swapchain without that property is not one of ours.  Delivery of our own is a
+ * window handover (dcomp_visual_try_reparent), and there is no window to hand
+ * over here: DXVK's composition swapchain presents into nothing. */
+static IDXGISwapChain1 *dcomp_content_as_foreign_swapchain(IUnknown *content)
+{
+    IDXGISwapChain1 *swapchain;
+    WCHAR prop_name[64];
+
+    if (FAILED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain1, (void **)&swapchain)))
+        return NULL;
+
+    swprintf(prop_name, ARRAY_SIZE(prop_name),
+            WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)content);
+    if (GetPropW(GetDesktopWindow(), prop_name))
+    {
+        IDXGISwapChain1_Release(swapchain);
+        return NULL;
+    }
+    return swapchain;
+}
+
+static void dcomp_visual_drop_foreign_proxy(struct dcomp_visual *visual)
+{
+    struct dcomp_visual *proxy = visual->foreign_proxy;
+
+    if (!proxy)
+        return;
+    visual->foreign_proxy = NULL;
+    dcomp_visual_unlink(proxy);
+    IDCompositionVisual_Release(&proxy->IDCompositionVisual_iface);
+}
+
+/* Show a foreign swapchain through an internal child at the bottom of the
+ * visual's children, where the content of a visual belongs.  The child is an
+ * ordinary texture visual in every respect but its source, so the composite
+ * walks, the coverage test and the tree timer need to know nothing about it.
+ * Takes over the swapchain reference. */
+static BOOL dcomp_visual_attach_foreign_swapchain(struct dcomp_visual *visual, IDXGISwapChain1 *swapchain)
+{
+    struct dcomp_texture *texture;
+    struct dcomp_visual *proxy;
+    DXGI_SWAP_CHAIN_DESC1 desc = {0};
+
+    if (!(texture = calloc(1, sizeof(*texture))))
+        goto fail;
+    if (!(proxy = calloc(1, sizeof(*proxy))))
+    {
+        free(texture);
+        goto fail;
+    }
+
+    texture->IDCompositionTexture_iface.lpVtbl = &dcomp_texture_vtbl;
+    texture->refcount = 1;
+    texture->swapchain = swapchain;
+    texture->alpha_mode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    texture->color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    if (SUCCEEDED(IDXGISwapChain1_GetDesc1(swapchain, &desc)))
+    {
+        /* Enough for the size questions asked before the first readback; the
+         * readback replaces it with the description of the buffer itself. */
+        texture->desc.Width = desc.Width;
+        texture->desc.Height = desc.Height;
+        texture->desc.Format = desc.Format;
+        if (desc.AlphaMode == DXGI_ALPHA_MODE_IGNORE)
+            texture->alpha_mode = DXGI_ALPHA_MODE_IGNORE;
+    }
+
+    proxy->IDCompositionVisual_iface.lpVtbl = (const IDCompositionVisualVtbl *)&dcomp_visual_vtbl;
+    proxy->refcount = 1;   /* the parent's reference, as AddVisual() would take it */
+    proxy->opacity = 1.0f;
+    proxy->visible = TRUE;
+    proxy->is_foreign_proxy = TRUE;
+    proxy->target_hwnd = visual->target_hwnd;
+    /* The proxy owns the texture the way an application's visual would. */
+    proxy->content = (IUnknown *)&texture->IDCompositionTexture_iface;
+    proxy->texture_content = texture;
+
+    dcomp_visual_prepend(visual, proxy);
+    visual->foreign_proxy = proxy;
+
+    FIXME("Visual %p: content %p is a swapchain of another dxgi (%ux%u, format %#x), "
+            "reading it back instead of switching a window.\n",
+            visual, swapchain, desc.Width, desc.Height, desc.Format);
+    return TRUE;
+
+fail:
+    IDXGISwapChain1_Release(swapchain);
+    return FALSE;
+}
+
 static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *iface,
         IUnknown *content)
 {
@@ -2874,11 +3021,22 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_SetContent(IDCompositionVisual *if
 
     if (visual->content)
         IUnknown_Release(visual->content);
+    dcomp_visual_drop_foreign_proxy(visual);
 
     visual->content = content;
     visual->surface_content = NULL;
     visual->texture_content = NULL;
     visual->dynamic_content = NULL;
+    if (content)
+    {
+        IDXGISwapChain1 *foreign;
+
+        /* The proxy holds the swapchain; the visual itself has to stay without
+         * content, or the tree counts as one whose root presents for itself. */
+        if ((foreign = dcomp_content_as_foreign_swapchain(content))
+                && dcomp_visual_attach_foreign_swapchain(visual, foreign))
+            content = visual->content = NULL;
+    }
     if (content)
     {
         IDCompositionDynamicTexture *dynamic_iface;
@@ -2979,6 +3137,9 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_AddVisual(IDCompositionVisual *ifa
         /* No reference: insert_above=TRUE → on top (end), FALSE → at bottom (start) */
         if (insert_above)
             dcomp_visual_append(parent, child);
+        /* The bottom of the children is still above the parent's own content. */
+        else if (parent->foreign_proxy)
+            dcomp_visual_insert_after(parent->foreign_proxy, child);
         else
             dcomp_visual_prepend(parent, child);
     }
@@ -3049,10 +3210,14 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_RemoveAllVisuals(IDCompositionVisu
         child->parent = NULL;
         child->prev_sibling = NULL;
         child->next_sibling = NULL;
-        IDCompositionVisual_Release(&child->IDCompositionVisual_iface);
+        /* Not one of the application's visuals: it is the parent's content. */
+        if (!child->is_foreign_proxy)
+            IDCompositionVisual_Release(&child->IDCompositionVisual_iface);
         child = next;
     }
     parent->children = NULL;
+    if (parent->foreign_proxy)
+        dcomp_visual_prepend(parent, parent->foreign_proxy);
 
     return S_OK;
 }
@@ -3268,6 +3433,10 @@ static void dcomp_visual_try_reparent(struct dcomp_visual *visual)
 {
     WCHAR prop_name[64];
     HWND comp_wnd;
+
+    /* Read back, not handed over: there is no window to switch. */
+    if (visual->foreign_proxy)
+        return;
 
     if (!visual->content || !visual->target_hwnd)
     {
