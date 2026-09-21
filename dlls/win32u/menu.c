@@ -2006,9 +2006,9 @@ static void get_bitmap_item_size( struct menu_item *item, SIZE *size, HWND owner
     }
 }
 
-/* Calculate the size of the menu item and store it in item->rect */
-static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, INT org_x, INT org_y,
-                                 BOOL menu_bar, struct menu *menu )
+/* Calculate the default size of the menu item and store it in item->rect */
+static void calc_default_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, INT org_x, INT org_y,
+                                         BOOL menu_bar, struct menu *menu )
 {
     UINT check_bitmap_width = get_system_metrics( SM_CXMENUCHECK );
     UINT arrow_bitmap_width;
@@ -2154,6 +2154,53 @@ static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, IN
     }
     item->rect.bottom += item_height;
     TRACE( "%s\n", wine_dbgstr_rect( &item->rect ));
+}
+
+/* Calculate the size of the menu item and store it in item->rect */
+static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, INT org_x, INT org_y,
+                                 BOOL menu_bar, struct menu *menu )
+{
+    struct uah_measure_menu_item uah = {0};
+
+    /* The items of a menu bar are measured through WM_UAHMEASUREMENUITEM, which lets the
+     * owner override the size DefWindowProc fills in. The message is part of the non-client
+     * theming: captioned windows only, and not for owner-drawn items. */
+    if (!menu_bar || (item->fType & (MF_OWNERDRAW | MF_SEPARATOR)) ||
+        (get_window_long( owner, GWL_STYLE ) & WS_CAPTION) != WS_CAPTION)
+    {
+        calc_default_menu_item_size( hdc, item, owner, org_x, org_y, menu_bar, menu );
+        return;
+    }
+
+    if (!od_item_height) od_item_height = HIWORD( get_dialog_base_units() );
+
+    uah.mis.CtlType    = ODT_MENU;
+    uah.mis.itemID     = item->wID;
+    uah.mis.itemHeight = od_item_height;
+    uah.mis.itemData   = item->dwItemData;
+    uah.menu.hmenu     = menu->handle;
+    uah.menu.hdc       = hdc;
+    uah.menu.flags     = 0xa00;
+    uah.item.pos       = item - menu->items;
+    send_message( owner, WM_UAHMEASUREMENUITEM, 0, (LPARAM)&uah );
+
+    SetRect( &item->rect, org_x, org_y, org_x + uah.mis.itemWidth, org_y + uah.mis.itemHeight );
+    TRACE( "%s\n", wine_dbgstr_rect( &item->rect ));
+}
+
+/* default handling of WM_UAHMEASUREMENUITEM */
+void measure_menu_bar_item( HWND hwnd, struct uah_measure_menu_item *uah )
+{
+    struct menu *menu;
+    struct menu_item *item;
+
+    if (!uah || !(menu = unsafe_menu_ptr( uah->menu.hmenu ))) return;
+    if (uah->item.pos < 0 || uah->item.pos >= menu->nItems) return;
+
+    item = &menu->items[uah->item.pos];
+    calc_default_menu_item_size( uah->menu.hdc, item, hwnd, 0, 0, TRUE, menu );
+    uah->mis.itemWidth  = item->rect.right;
+    uah->mis.itemHeight = item->rect.bottom;
 }
 
 /* Calculate the size of the menu bar */

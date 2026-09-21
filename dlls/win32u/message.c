@@ -1725,6 +1725,9 @@ size_t user_message_size( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
     case WM_MEASUREITEM:
         size = sizeof(MEASUREITEMSTRUCT);
         break;
+    case WM_UAHMEASUREMENUITEM:
+        size = sizeof(struct uah_measure_menu_item);
+        break;
     case WM_DELETEITEM:
         size = sizeof(DELETEITEMSTRUCT);
         break;
@@ -2033,6 +2036,9 @@ static void copy_user_result( void *buffer, size_t size, LRESULT result, UINT me
         break;
     case WM_MEASUREITEM:
         copy_size = sizeof(MEASUREITEMSTRUCT);
+        break;
+    case WM_UAHMEASUREMENUITEM:
+        copy_size = sizeof(struct uah_measure_menu_item);
         break;
     case WM_WINDOWPOSCHANGING:
         copy_size = sizeof(WINDOWPOS);
