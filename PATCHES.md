@@ -393,14 +393,18 @@ NT synchronisation then runs in the kernel instead of through the wineserver, an
 audio thread keeps up at 64 samples / 48 kHz without xruns (measured here with Serum 2 and
 FL Studio).
 
-**DXVK**: not a hard conflict, but the two do not combine — DXVK replaces the builtin
-`dxgi.dll` and `d3d11.dll`, and the composition-swapchain and DComp popup handling of this
-branch live in `dxgi` (the GL present in `wined3d`). The simplest setup is to not install
-DXVK at all. If you keep it, switch the whole trio per application
-(`WINEDLLOVERRIDES="d3d11,dxgi,d3d10core=n"` for DXVK, `=b` for this branch) — overriding
-part of it mixes DXVK's D3D11 with Wine's DXGI, which use different internal COM interfaces
-and crash. DComp-based plug-ins (Serum 2, Korg Trinity, Pianoteq 9) gain nothing from DXVK:
-their D2D1 draws go through a bitmap+BitBlt path, not the DXGI swapchain.
+**DXVK**: not a hard conflict, but the two do not combine inside one application — in a
+prefix DXVK replaces `dxgi.dll` and `d3d11.dll`, while this branch's composition-swapchain
+and DComp popup handling live in `dxgi` (the GL present in `wined3d`). The simplest setup
+is to leave DXVK out of the prefix; the package alone changes nothing, it takes effect
+once `setup_dxvk.sh` has run there. If it is needed for something else on the same
+machine, select per application: `WINEDLLOVERRIDES="d3d11,dxgi,d3d10core=n"` takes the
+prefix copies (DXVK), `=b` the builtins of this branch. Moving the trio together is the
+predictable choice, since a partial override runs one implementation's D3D11 against the
+other's DXGI; single overrides have worked here (EZ Keys 2 with `d3d10core=n`, Korg
+Modwave and Opsix with `d3d11=n`), but that combination is not something this branch
+tests. Plug-ins that drive DComp need this branch's builtin `dxgi` and cannot be pointed
+at DXVK at all.
 
 **GL present for top-level windows** (default ON): D3D11 swapchains on top-level windows
 present through the driver's SwapBuffers (EGL by default in Wine 11) directly from the GPU
