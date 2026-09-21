@@ -2043,7 +2043,7 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
     RECT rect, old_rect = data->rects.window, new_rect;
     unsigned long old_generation, generation;
     long old_monitors[4], monitors[4];
-    BOOL was_moved;
+    BOOL was_moved, covers_monitor;
     UINT flags;
 
     if (!data->managed) return 0; /* unmanaged windows are managed by the Win32 side */
@@ -2056,8 +2056,12 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
      * the X window: it is drawn where the window manager put it, but hit testing still uses the
      * position we recorded, and everything the application draws relative to its window origin is
      * offset by the difference (e.g. Ableton Live 12's menu bar is visible but not clickable). */
-    was_moved = data->is_fullscreen && (data->current_state.rect.left != data->rects.visible.left ||
-                                        data->current_state.rect.top != data->rects.visible.top);
+    /* Only once the window manager has made the window cover a monitor: until then its config is
+     * the geometry from before the fullscreen request, not a move to the monitor origin. */
+    covers_monitor = xinerama_get_fullscreen_monitors( &data->current_state.rect, &generation, monitors );
+    was_moved = data->is_fullscreen && covers_monitor &&
+                (data->current_state.rect.left != data->rects.visible.left ||
+                 data->current_state.rect.top != data->rects.visible.top);
 
     if (data->wm_state_serial) return 0; /* another WM_STATE update is pending, wait for it to complete */
     /* A window manager may keep _NET_WM_STATE bits we asked it to clear: KWin keeps
@@ -2077,6 +2081,10 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
      * or the win32 rects keep an origin the X window doesn't have. */
     if (data->is_fullscreen && !was_moved)
     {
+        /* The window manager acknowledges _NET_WM_STATE_FULLSCREEN before it reconfigures the
+         * window. In between all requests are complete and the current config is still the old
+         * one; applying it would take the window out of fullscreen on the win32 side. */
+        if (!covers_monitor && (data->current_state.net_wm_state & (1 << NET_WM_STATE_FULLSCREEN))) return 0;
         if (xinerama_get_fullscreen_monitors( &data->rects.visible, &old_generation, old_monitors )
             && xinerama_get_fullscreen_monitors( &data->current_state.rect, &generation, monitors )
             && !memcmp( old_monitors, monitors, sizeof(monitors) ))
