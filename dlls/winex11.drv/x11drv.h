@@ -731,6 +731,8 @@ struct x11drv_win_data
     unsigned long mwm_hints_serial;    /* serial of last pending _MOTIF_WM_HINTS request */
     unsigned long wm_normal_hints_serial;/* serial of last pending WM_NORMAL_HINTS request */
     unsigned long configure_serial;    /* serial of last pending configure request */
+    BOOL          wm_frame_changed;    /* decorations or _NET_WM_STATE were requested since the last configure request */
+    BOOL          configure_retry;     /* the pending configure request follows such a change and may be re-issued once */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
     unsigned long state_locks;         /* X11 state requests lock while updating win32 state */
 };
