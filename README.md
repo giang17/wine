@@ -126,9 +126,12 @@ Two things are worth knowing before the first run, both explained in
   including the `HideWineVersion` entries that keep JUCE 8.0.13+ plugins on the Direct2D
   path instead of its Wine-detecting GDI fallback. Copying DLLs by hand without it fails
   silently — the plugins simply keep rendering with GDI.
-- **Do not install DXVK.** It replaces `dxgi.dll` and `d3d11.dll` and therefore bypasses
-  the composition-swapchain path this fork is built on. It is not needed here, and it
-  brings no measured benefit for this class of application.
+- **Leave DXVK out of the prefix.** It replaces `dxgi.dll` and `d3d11.dll` there, and this
+  fork's composition-swapchain and DComp popup handling live in `dxgi` — an application
+  that uses them then runs on DXVK's stack instead. Nothing here needs it, and it brought
+  no speed-up in the setup this fork is developed on. If DXVK is needed for something else
+  on the same machine, PATCHES.md has the per-application switch; the whole trio
+  `d3d11,dxgi,d3d10core` has to move together.
 
 Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**.
 
