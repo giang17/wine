@@ -31,6 +31,12 @@ sudo apt install fonts-dejavu-core fonts-noto-core ttf-mscorefonts-installer
 
 The script locates them through fontconfig, so other distribution paths work too.
 
+The MS Core Fonts are the one item that cannot be packaged everywhere: the
+licence allows redistribution only as the original, unmodified installers, so
+Fedora has no package for them and cannot have one. See
+[Where the MS Core Fonts cannot be packaged](#where-the-ms-core-fonts-cannot-be-packaged)
+for what the script does there instead.
+
 ## 0. MS Core Fonts (Arial, Verdana, etc.) — plugin stability
 
 **Problem (discovered 2026-04-03):** some plugins ship their own D3D9/OpenGL rendering
@@ -62,6 +68,56 @@ for f in /usr/share/fonts/truetype/msttcorefonts/*.ttf; do
     /v "$name (TrueType)" /t REG_SZ /d "$(basename "$f")" /f 2>/dev/null
 done
 ```
+
+### Where the MS Core Fonts cannot be packaged
+
+On a distribution without an msttcorefonts package the absence shows up as two
+separate failures, and they need two separate answers.
+
+| | What breaks | What fixes it |
+|---|---|---|
+| **By path** | `PathFileExistsW(C:\windows\Fonts\Arialbd.ttf)` returns 0, the plugin crashes in its own engine | any parseable TTF at that path |
+| **By name** | `FindFamilyName("Arial")` misses; JUCE 5-7 then take family 0 of the collection, Steinberg's framework dereferences NULL | an entry in the GDI `FontSubstitutes` key |
+
+The second one is not fixed by the first. The value name in the `Fonts` key is
+not the family: `load_registry_fonts()` hands the path to `add_font_resource()`
+and win32u reads the family out of the file, so a Liberation face copied to
+`arial.ttf` is registered as *Liberation Sans*. Only the substitute key makes
+*Arial* resolvable — for GDI, and for this branch's dwrite, which looks a missing
+family up there (`dlls/dwrite/font.c`, `collection_find_substitute_family()`).
+
+`wine-font-setup.sh` applies both when the genuine fonts are not on the host:
+Liberation Sans, Serif and Mono under the Arial, Times New Roman and Courier New
+file names (those three are metric compatible, so line breaks and dialog layouts
+do not move), DejaVu for the rest, plus the matching substitute entries.
+Measured on a prefix with no MS Core Fonts (2026-09-21): before, four of the
+families report `exists=0`; afterwards all of them resolve to their stand-in.
+
+Two things the stand-ins deliberately leave alone. The symbol faces (Webdings,
+Wingdings) — pointing them at a Latin face draws letters where the application
+asked for symbols, and Wine ships its own anyway. And Tahoma, which Wine also
+ships and which the FontLink chain of section 1 is keyed on.
+
+**Registering the stand-ins is not optional.** A file that only sits in the Fonts
+directory satisfies `PathFileExistsW`, but Wine drops the host copy of the same
+face over it and never loads the prefix one, so the family disappears from the
+collection: measured 2026-09-21, Liberation Serif and Liberation Mono gone and
+`Times New Roman` resolving to Tahoma, the system message font dwrite falls back
+to.
+
+For the genuine files there is `--winetricks`, which runs `winetricks -q
+corefonts`. It is opt-in because it downloads them and accepts the Microsoft
+EULA on the caller's behalf, and because the download is the fragile part — it
+goes to third party mirrors with the checksums pinned inside winetricks, and the
+local downloader is in the path too (a snap confined `aria2c` cannot write to
+`~/.cache/winetricks`; `WINETRICKS_DOWNLOADER=curl` gets around that). The step
+runs before the FontLink entries of section 1 on purpose: winetricks starts wine
+several times, and a start whose code page does not match the record under
+`HKCU\Software\Wine\Fonts\Codepages` makes Wine rewrite the SystemLink key
+with its own defaults.
+
+Neither route covers **Segoe UI** — there is no package and no winetricks verb
+for it. Section 2b describes what depends on it.
 
 ### Debugging font-related plugin crashes
 
