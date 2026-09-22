@@ -287,14 +287,6 @@ static LONG tmpnam_s_unique;
 static LONG wtmpnam_unique;
 static LONG wtmpnam_s_unique;
 
-/* The UCRT places the names in the temporary directory and marks each
- * function with its own letter; msvcrt uses "\s" for all four. */
-#if _MSVCR_VER >= 140
-#define TMPNAM_PREFIX(c) (c)
-#else
-#define TMPNAM_PREFIX(c) 's'
-#endif
-
 #define TOUL(x) (ULONGLONG)(x)
 static const ULONGLONG WCEXE = TOUL('e') << 32 | TOUL('x') << 16 | TOUL('e');
 static const ULONGLONG WCBAT = TOUL('b') << 32 | TOUL('a') << 16 | TOUL('t');
@@ -5063,27 +5055,28 @@ void CDECL setbuf(FILE* file, char *buf)
 }
 
 #if _MSVCR_VER >= 140
+static wchar_t tmpnam_dir[MAX_PATH];
+
+static BOOL WINAPI init_tmpnam_dir(INIT_ONCE *once, void *param, void **context)
+{
+    DWORD len = GetTempPathW(ARRAY_SIZE(tmpnam_dir), tmpnam_dir);
+
+    if (!len || len >= ARRAY_SIZE(tmpnam_dir))
+    {
+        tmpnam_dir[0] = '\\';
+        tmpnam_dir[1] = 0;
+    }
+    return TRUE;
+}
+
 /* INTERNAL: directory the tmpnam() family places its names in: the temporary
  * directory as found on first use, kept for the lifetime of the process even
  * if the environment changes or the directory does not exist */
 static const wchar_t *get_tmpnam_dir(void)
 {
-    static wchar_t *tmpnam_dir;
-    wchar_t buf[MAX_PATH], *dir;
-    DWORD len;
+    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
 
-    if (tmpnam_dir) return tmpnam_dir;
-
-    len = GetTempPathW(ARRAY_SIZE(buf), buf);
-    if (!len || len >= ARRAY_SIZE(buf))
-    {
-        buf[0] = '\\';
-        buf[1] = 0;
-        len = 1;
-    }
-    if (!(dir = malloc((len + 1) * sizeof(*dir)))) return L"\\";
-    memcpy(dir, buf, (len + 1) * sizeof(*dir));
-    if (InterlockedCompareExchangePointer((void **)&tmpnam_dir, dir, NULL)) free(dir);
+    InitOnceExecuteOnce(&init_once, init_tmpnam_dir, NULL, NULL);
     return tmpnam_dir;
 }
 #endif
@@ -5110,7 +5103,8 @@ static int tmpnam_helper(char *s, size_t size, LONG *tmpnam_unique, int tmp_max,
     }
     convert_wcs_to_acp_utf8(dir, p, dir_len + 1);
     p += dir_len;
-    size -= dir_len;
+    *p++ = prefix;
+    size -= dir_len + 1;
     digits = msvcrt_int_to_base(GetCurrentProcessId(), 36, tmpstr);
 #else
     if (size < 3) {
@@ -5119,11 +5113,10 @@ static int tmpnam_helper(char *s, size_t size, LONG *tmpnam_unique, int tmp_max,
         return ERANGE;
     }
     *p++ = '\\';
-    size--;
+    *p++ = 's';
+    size -= 2;
     digits = msvcrt_int_to_base(GetCurrentProcessId(), 32, tmpstr);
 #endif
-    *p++ = prefix;
-    size--;
     if (digits+1 > size) {
         *s = 0;
         *_errno() = ERANGE;
@@ -5167,7 +5160,7 @@ static int tmpnam_helper(char *s, size_t size, LONG *tmpnam_unique, int tmp_max,
 
 int CDECL tmpnam_s(char *s, size_t size)
 {
-    return tmpnam_helper(s, size, &tmpnam_s_unique, TMP_MAX_S, TMPNAM_PREFIX('u'));
+    return tmpnam_helper(s, size, &tmpnam_s_unique, TMP_MAX_S, 'u');
 }
 
 /*********************************************************************
@@ -5182,10 +5175,10 @@ char * CDECL tmpnam(char *s)
       data->tmpnam_buffer = malloc(MAX_PATH);
 
     s = data->tmpnam_buffer;
-    return tmpnam_helper(s, MAX_PATH, &tmpnam_unique, TMP_MAX, TMPNAM_PREFIX('s')) ? NULL : s;
+    return tmpnam_helper(s, MAX_PATH, &tmpnam_unique, TMP_MAX, 's') ? NULL : s;
   }
 
-  return tmpnam_helper(s, -1, &tmpnam_unique, TMP_MAX, TMPNAM_PREFIX('s')) ? NULL : s;
+  return tmpnam_helper(s, -1, &tmpnam_unique, TMP_MAX, 's') ? NULL : s;
 }
 
 static int wtmpnam_helper(wchar_t *s, size_t size, LONG *tmpnam_unique, int tmp_max, wchar_t prefix)
@@ -5210,7 +5203,8 @@ static int wtmpnam_helper(wchar_t *s, size_t size, LONG *tmpnam_unique, int tmp_
     }
     memcpy(p, dir, dir_len * sizeof(*dir));
     p += dir_len;
-    size -= dir_len;
+    *p++ = prefix;
+    size -= dir_len + 1;
     digits = msvcrt_int_to_base_w(GetCurrentProcessId(), 36, tmpstr);
 #else
     if (size < 3) {
@@ -5219,11 +5213,10 @@ static int wtmpnam_helper(wchar_t *s, size_t size, LONG *tmpnam_unique, int tmp_
         return ERANGE;
     }
     *p++ = '\\';
-    size--;
+    *p++ = 's';
+    size -= 2;
     digits = msvcrt_int_to_base_w(GetCurrentProcessId(), 32, tmpstr);
 #endif
-    *p++ = prefix;
-    size--;
     if (digits+1 > size) {
         *s = 0;
         *_errno() = ERANGE;
@@ -5270,7 +5263,7 @@ static int wtmpnam_helper(wchar_t *s, size_t size, LONG *tmpnam_unique, int tmp_
  */
 int CDECL _wtmpnam_s(wchar_t *s, size_t size)
 {
-    return wtmpnam_helper(s, size, &wtmpnam_s_unique, TMP_MAX_S, TMPNAM_PREFIX('x'));
+    return wtmpnam_helper(s, size, &wtmpnam_s_unique, TMP_MAX_S, 'x');
 }
 
 /*********************************************************************
@@ -5285,10 +5278,10 @@ wchar_t * CDECL _wtmpnam(wchar_t *s)
             data->wtmpnam_buffer = malloc(sizeof(wchar_t[MAX_PATH]));
 
         s = data->wtmpnam_buffer;
-        return wtmpnam_helper(s, MAX_PATH, &wtmpnam_unique, TMP_MAX, TMPNAM_PREFIX('v')) ? NULL : s;
+        return wtmpnam_helper(s, MAX_PATH, &wtmpnam_unique, TMP_MAX, 'v') ? NULL : s;
     }
 
-    return wtmpnam_helper(s, -1, &wtmpnam_unique, TMP_MAX, TMPNAM_PREFIX('v')) ? NULL : s;
+    return wtmpnam_helper(s, -1, &wtmpnam_unique, TMP_MAX, 'v') ? NULL : s;
 }
 
 /*********************************************************************
