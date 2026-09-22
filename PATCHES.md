@@ -180,6 +180,13 @@ This is the recommended branch. What it changes, by subsystem:
   surface over what the child had presented. A plug-in editor embedded by yabridge is
   exactly as large as its top-level, so Mercurial Tones Dagon, which places a Direct3D 12
   child over its whole editor, stayed black there while it rendered in a Wine-hosted DAW
+- **win32u**: a window that loses its window surface for direct drawing no longer gets the
+  surface's pixels copied over its client area when a pixel format is set on it. The switch
+  happens in the first window position change after the client surface was attached, the
+  window DC draws over the attached client window, and the copy landed on top of a frame
+  the application had already presented; Dorico 6's Qt toolbar popups (top levels drawn
+  through a composition swapchain) came up black in one of four openings when the first
+  GL swap won that race. Upstream has the same copy;
 - **win32u**: the menu bar of a captioned window is measured and drawn through the
   undocumented non-client theming messages, as on Windows: `WM_UAHMEASUREMENUITEM`
   (0x0094) per item with an item size of 0x16, `WM_UAHINITMENU` (0x0093) before measuring
