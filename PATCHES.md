@@ -272,7 +272,7 @@ This is the recommended branch. What it changes, by subsystem:
   Measured on Windows 10. libzmq builds its signaller socket pair from `_wtmpnam_s()` and
   `_wmkdir()`; with the root form a process whose current drive is `Z:` cannot create
   the directory and Native Instruments Kontakt 7 aborted at start-up when launched from
-  a Unix working directory
+  a Unix working directory. Upstream since wine-11.19 (`d8e85ca62a5`, MR 12102)
 - **AF_UNIX sockets (ws2_32, wineserver, ntdll)**: Unix-domain socket support, based on
   the long-standing wine-staging patch set plus hardening and five conformance fixes of
   our own — a socket is given its family before bind, a bound socket is reported as a
