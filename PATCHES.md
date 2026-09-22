@@ -488,7 +488,10 @@ present through the driver's SwapBuffers (EGL by default in Wine 11) directly fr
 instead of the GDI readback path — this removes a large per-frame GPU→CPU copy (order of
 650 MB/s display-server traffic during continuous UI activity in Ableton Live) and fixes
 main-window flicker when an app hosts WebView2 content (Ableton Live's Learn View).
-`WS_CHILD` and `WS_POPUP` windows keep the GDI path. Adopted from shibco/ableton-linux
+`WS_CHILD` and `WS_POPUP` windows keep the GDI path, unless their flip-model or sequential
+swapchain has a back buffer the GDI path cannot hand to a DC (any format other than the BGR
+ones, e.g. `R8G8B8A8_UNORM`): those present through GL as well, because the GDI path drew
+nothing for them — VirtualDJ 2026 showed only black windows. Adopted from shibco/ableton-linux
 patch 0055 (diagnosis: ClickSentinel). If you see misplaced frames, set
 `WINE_DISABLE_GL_PRESENT=1` to restore the GDI path for every window.
 
