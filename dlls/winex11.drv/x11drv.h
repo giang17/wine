@@ -688,6 +688,7 @@ struct x11drv_win_data
     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
     UINT        black_expose_bg : 1; /* X paints an opaque black background on expose */
     UINT        wants_argb : 1; /* window needs a per-pixel alpha capable visual (ULW / DWM glass) */
+    UINT        ulw_surface : 1; /* the window surface carries UpdateLayeredWindow() content */
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
     Pixmap         icon_mask;

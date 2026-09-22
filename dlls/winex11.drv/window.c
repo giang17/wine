@@ -3103,6 +3103,7 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
         {
             data->layered = FALSE;
             data->wants_argb = 0;
+            data->ulw_surface = 0;
             set_window_visual( data, &default_visual, FALSE );
             sync_window_opacity( data->display, data->whole_window, 0, 0 );
         }

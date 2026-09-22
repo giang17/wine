@@ -1590,6 +1590,7 @@ struct x11drv_window_surface
     struct x11drv_image  *image;
     BOOL                  byteswap;
     BOOL                  glass_alpha; /* per-pixel alpha from a DWM-glass window */
+    BOOL                  ulw;         /* the surface carries UpdateLayeredWindow() content */
     int                   shape_kind;  /* ShapeBounding or ShapeInput once a mask is set, 0 before */
     DWORD                 input_shape_time;    /* tick of the last ShapeInput update */
     BOOL                  input_shape_pending; /* a contour change is waiting for the throttle */
@@ -1787,6 +1788,18 @@ static void x11drv_surface_set_clip( struct window_surface *window_surface, cons
      * the surface over what the child presented. */
     if (!rects)
         XSetClipMask( gdi_display, surface->gc, None );
+    else if (!count && surface->ulw)
+    {
+        /* The region of a window with a pixel format leaves out its client area,
+         * and for a window painted through UpdateLayeredWindow() that is the whole
+         * window - but the surface is what the application shows, not the swap
+         * chain it rendered the frame with (WPF renders a popup through Direct3D 9
+         * and hands the frame to UpdateLayeredWindow()).  Paint it unclipped; the
+         * client window is rendered offscreen for such a window, see
+         * needs_offscreen_rendering(). */
+        TRACE( "surface %p carries UpdateLayeredWindow() content, painting it unclipped\n", surface );
+        XSetClipMask( gdi_display, surface->gc, None );
+    }
     else if (!count)
         XSetClipRectangles( gdi_display, surface->gc, 0, 0, NULL, 0, YXBanded );
     else if ((xrects = xrectangles_from_rects( rects, count )))
@@ -2057,10 +2070,12 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
     {
         data->layered = TRUE;
         data->wants_argb = 1; /* UpdateLayeredWindow always needs per-pixel alpha */
+        data->ulw_surface = 1; /* consulted by needs_offscreen_rendering() */
         if (!data->embedded && argb_visual.visualid) set_window_visual( data, &argb_visual, TRUE );
     }
     else
     {
+        data->ulw_surface = 0;
         /* a DWM-glass window is per-pixel alpha capable even without ULW */
         update_window_argb_visual( data );
         /* Keep direct drawing for a glass window and only change the visual.
@@ -2078,6 +2093,7 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
     *surface = create_surface( data->hwnd, data->whole_window, &data->vis, surface_rect,
                                (layered || data->wants_argb) ? data->use_alpha : FALSE,
                                !layered && data->wants_argb );
+    if (*surface) get_x11_surface( *surface )->ulw = layered;
 
 done:
     release_win_data( data );
