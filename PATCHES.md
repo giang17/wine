@@ -449,16 +449,16 @@ test window comes out pixel-identical to the builtin run. Plug-ins that draw int
 surface instead of a swapchain (Serum 2) do not need the option: their Direct2D runs on
 DXVK's D3D11 and the surface reaches the window through this branch's blit as before —
 measured complete and stable. What decides whether a swapchain plug-in is usable is DXVK
-itself: two things in DXVK 3.1.1 get in the way, both found with an app-free reproducer.
-The first `Present1` with dirty rects after a single full `Present` composed over black — a
-deferred-clear regression for shared images, DXVK issue 5919, fixed upstream in `8438318`.
-And the back buffers stay incomplete across `Present1` with dirty rects, which is how
-JUCE 8 paints, so a readback alternates between two partial frames (KORG Trinity flickered
-at 60 Hz); that is not a DXVK bug from the application's side and stays fork-only:
-`patches/dxvk/` copies the composed frame back into the next back buffer, and with that
-build Trinity is stable. Until a DXVK release carries `8438318`, the per-application switch
-above remains the answer for JUCE plug-ins; the readback path costs nothing while no
-foreign swapchain is set as content.
+itself: two things in DXVK 3.1.1 get in the way, both found with an app-free reproducer
+and both fixed in DXVK master the same day (issue 5919). The first `Present1` with dirty
+rects after a single full `Present` composed over black — a deferred-clear regression for
+shared images, `8438318`. And the back buffers stayed incomplete across `Present1` with
+dirty rects, which is how JUCE 8 paints, so a readback alternated between two partial
+frames (KORG Trinity flickered at 60 Hz) — `ba62c42` writes the composed frame back into
+the last back buffer, as native D3D does, measured against Windows 10. With a DXVK build
+from master at or past `ba62c42`, Trinity through this branch's readback is stable; with
+3.1.1 the per-application switch above remains the answer for JUCE plug-ins. The readback
+path costs nothing while no foreign swapchain is set as content.
 
 **GL present for top-level windows** (default ON): D3D11 swapchains on top-level windows
 present through the driver's SwapBuffers (EGL by default in Wine 11) directly from the GPU
