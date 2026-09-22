@@ -415,9 +415,20 @@ option *not a valid implementation of DirectComposition swapchains*. The code ha
 past its own description, though — since the fix for DXVK issue 5053 the present path also
 runs for a swap chain with no window at all, which is the composition case. What is
 missing on that route is the other half: something has to composite the result, and
-upstream Wine's `dcomp` does not. Whether DXVK with that option drives *this* branch's
-`dcomp` has not been tested here; until it has, the per-application switch above is the
-answer, not the option.
+upstream Wine's `dcomp` does not. This branch's `dcomp` now does: a swapchain that
+publishes no composition window of this `dxgi` is read back through public D3D11
+(buffer 0 into a staging texture, fetched per readback and never held) and composited
+like a composition texture, with `WM_PAINT` passed on to the application, which draws
+into its swapchain from there. Measured with the option set: a reproducer shows the
+swapchain colour over the whole client area where it showed the window's own before, and
+a JUCE 8 test window comes out pixel-identical to the builtin run. What decides whether a
+real plug-in is usable that way is DXVK itself: DXVK 3.1.1 leaves the back buffer
+incomplete across `Present1` with dirty rects, which is how JUCE 8 paints, so a readback
+alternates between two partial frames (KORG Trinity flickered at 60 Hz) — reported with
+an app-free reproducer as DXVK issue 5919, fix proposed as DXVK PR 5920, and stable with
+that fix. Until DXVK carries it, the per-application switch above remains the answer for
+DComp plug-ins; the readback path costs nothing while no foreign swapchain is set as
+content.
 
 **GL present for top-level windows** (default ON): D3D11 swapchains on top-level windows
 present through the driver's SwapBuffers (EGL by default in Wine 11) directly from the GPU
