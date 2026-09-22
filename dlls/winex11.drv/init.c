@@ -220,6 +220,18 @@ static BOOL needs_client_window_clipping( HWND hwnd )
     return ret > 0;
 }
 
+/* Does the window's content arrive through UpdateLayeredWindow()? */
+static BOOL has_ulw_surface( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+    BOOL ret;
+
+    if (!(data = get_win_data( hwnd ))) return FALSE;
+    ret = data->ulw_surface;
+    release_win_data( data );
+    return ret;
+}
+
 static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw )
 {
     static const WCHAR dcomp_target_propW[] =
@@ -228,6 +240,17 @@ static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw )
         {'_','_','w','i','n','e','_','d','3','d','_','h','w','n','d','_','t','a','r','g','e','t',0};
 
     if (!raw && NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
+    /* A window painted through UpdateLayeredWindow() shows its window surface.  A
+     * client window that a Direct3D swap chain put on it covers that surface and
+     * shows whatever it last presented: WPF renders a popup (menu, tooltip, combo
+     * box drop-down) through Direct3D 9, reads the frame back and hands it to
+     * UpdateLayeredWindow(), and never presents again.  Attached to the top-level,
+     * the client window then shows a stale frame or undefined pixmap content -
+     * SynthEdit 1.5's menus came up as a copy of the screen below them or black
+     * (WineHQ bug 60173 has the same for every WPF menu).  Render it offscreen:
+     * the surface is what is shown, and a present blits over it only while the
+     * application still presents. */
+    if (has_ulw_surface( hwnd )) return TRUE;
     if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow())
     {
         /* DComp target windows render via their own BitBlt path (comp_dc → GetDC),
