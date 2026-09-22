@@ -180,13 +180,21 @@ This is the recommended branch. What it changes, by subsystem:
   surface over what the child had presented. A plug-in editor embedded by yabridge is
   exactly as large as its top-level, so Mercurial Tones Dagon, which places a Direct3D 12
   child over its whole editor, stayed black there while it rendered in a Wine-hosted DAW
-- **win32u**: menu bar items are measured through the undocumented
-  `WM_UAHMEASUREMENUITEM` (0x0094), as Windows does for captioned windows: the owner gets
-  an item size of 0x16, `DefWindowProc` fills in the default, and the size left in the
-  structure is used (32-bit processes included). Ableton Live 12 makes its menu bar 4 px
-  taller this way and adds the same 4 px when sizing its main window; without the message
-  the window grew until it hit the maximum height and lost its frame (Wine bug 57955).
-  This replaces two earlier workarounds for the same bug (suppressed reentrant size-only
+- **win32u**: the menu bar of a captioned window is measured and drawn through the
+  undocumented non-client theming messages, as on Windows: `WM_UAHMEASUREMENUITEM`
+  (0x0094) per item with an item size of 0x16, `WM_UAHINITMENU` (0x0093) before measuring
+  and painting, `WM_UAHDRAWMENU` (0x0091) for the bar background and `WM_UAHDRAWMENUITEM`
+  (0x0092) per item with a `DRAWITEMSTRUCT` in window coordinates and the states
+  `ODS_SELECTED`, `ODS_GRAYED|ODS_DISABLED` and `ODS_INACTIVE`. `DefWindowProc` measures
+  and draws the default, so an application that does not handle the messages gets the
+  previous result; one that does can override the size and paint the bar itself (the line
+  below the bar stays, as on Windows). A single owner-drawn item takes the whole bar back
+  to the classic path, again as measured on Windows 10 (32-bit processes included).
+  Ableton Live 12 makes its menu bar 4 px taller this way and adds the same 4 px when
+  sizing its main window; without the measure message the window grew until it hit the
+  maximum height and lost its frame (Wine bug 57955), and without the draw messages its
+  bar stayed light instead of the dark bar Live paints on Windows. This replaces two
+  earlier workarounds for the same bug (suppressed reentrant size-only
   `WM_WINDOWPOSCHANGED`, lifted `window == visible` decoration gate in winex11), both
   removed; transparent (0x00) surface init for ARGB popups; the system arrow is shown
   again when an application hides the cursor and sets none; cursors are process-local in
