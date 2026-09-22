@@ -1728,6 +1728,13 @@ size_t user_message_size( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
     case WM_UAHMEASUREMENUITEM:
         size = sizeof(struct uah_measure_menu_item);
         break;
+    case WM_UAHDRAWMENU:
+    case WM_UAHINITMENU:
+        size = sizeof(struct uah_menu);
+        break;
+    case WM_UAHDRAWMENUITEM:
+        size = sizeof(struct uah_draw_menu_item);
+        break;
     case WM_DELETEITEM:
         size = sizeof(DELETEITEMSTRUCT);
         break;

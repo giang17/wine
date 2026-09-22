@@ -1681,8 +1681,11 @@ static inline LONG_PTR NtUserSetPrivateData( HWND hwnd, UINT offset, UINT size, 
     return NtUserCallHwndParam( hwnd, (UINT_PTR)&params, NtUserCallHwndParam_SetPrivateData );
 }
 
-/* undocumented message sent to the owner of a menu bar to measure its items,
+/* undocumented messages sent to the owner of a menu bar to draw and measure it,
  * part of the non-client theming */
+#define WM_UAHDRAWMENU        0x0091
+#define WM_UAHDRAWMENUITEM    0x0092
+#define WM_UAHINITMENU        0x0093
 #define WM_UAHMEASUREMENUITEM 0x0094
 
 struct uah_menu
@@ -1702,6 +1705,13 @@ struct uah_menu_item
 struct uah_measure_menu_item
 {
     MEASUREITEMSTRUCT    mis;
+    struct uah_menu      menu;
+    struct uah_menu_item item;
+};
+
+struct uah_draw_menu_item
+{
+    DRAWITEMSTRUCT       dis;
     struct uah_menu      menu;
     struct uah_menu_item item;
 };
