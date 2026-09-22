@@ -250,13 +250,20 @@ This is the recommended branch. What it changes, by subsystem:
   XDamage-driven compositor assembles frames off screen and composites them through an
   ARGB overlay onto an opaque child window, so translucent plugin popups and drop shadows
   blend correctly instead of showing black or leftover pixels
+- **msvcrt (ucrtbase)**: the tmpnam() family returns names in the temporary directory as
+  the UCRT does (`<temp>\u<pid>.<n>`, one prefix letter per function, base 36), instead
+  of the `\s<pid>.<n>` form in the drive root that only the classic msvcrt.dll uses.
+  Measured on Windows 10. libzmq builds its signaller socket pair from `_wtmpnam_s()` and
+  `_wmkdir()`; with the root form a process whose current drive is `Z:` cannot create
+  the directory and Native Instruments Kontakt 7 aborted at start-up when launched from
+  a Unix working directory
 - **AF_UNIX sockets (ws2_32, wineserver, ntdll)**: Unix-domain socket support, based on
   the long-standing wine-staging patch set plus hardening and five conformance fixes of
   our own — a socket is given its family before bind, a bound socket is reported as a
   reparse point by GetFileAttributes and can be opened and queried through CreateFile with
-  FSCTL_GET_REPARSE_POINT, an unbound socket is auto-bound with a path, and short addresses
-  are handled. With these the ws2_32 AF_UNIX conformance tests run at all (upstream they
-  skip) and pass. Needed by applications that talk to a local helper over a Unix socket;
+  FSCTL_GET_REPARSE_POINT, and an address carrying only the family (namelen 2) is accepted
+  and leaves the socket unnamed, as measured on Windows. With these the ws2_32 AF_UNIX
+  conformance tests run at all (upstream they skip) and pass. Needed by applications that talk to a local helper over a Unix socket;
   FL Studio's Cloud plugins install normally instead of spinning on a socket that never
   appears
 - **Keyboard input into out-of-process content (wineserver, winex11)**: a process that
