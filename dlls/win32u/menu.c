@@ -2146,6 +2146,31 @@ static void calc_default_menu_item_size( HDC hdc, struct menu_item *item, HWND o
     TRACE( "%s\n", wine_dbgstr_rect( &item->rect ));
 }
 
+/* Whether the menu bar of a window goes through the WM_UAH* messages of the non-client
+ * theming. Measured on Windows 10: only captioned windows, and a single owner-drawn item
+ * takes the whole bar back to the classic path, its text items included. */
+static BOOL menu_bar_is_themed( struct menu *menu, HWND owner )
+{
+    UINT i;
+
+    if ((get_window_long( owner, GWL_STYLE ) & WS_CAPTION) != WS_CAPTION) return FALSE;
+    for (i = 0; i < menu->nItems; i++)
+        if (menu->items[i].fType & MF_OWNERDRAW) return FALSE;
+    return TRUE;
+}
+
+/* flags of struct uah_menu, as observed on Windows 10 */
+#define UAH_MENU_IN_MENU_LOOP 0x004   /* an item is being tracked */
+#define UAH_MENU_INACTIVE     0x010   /* the window is not the active one */
+#define UAH_MENU_WHOLE_BAR    0x200   /* the item is drawn as part of the whole bar */
+#define UAH_MENU_BASE         0x800
+
+static void send_uah_init_menu( HWND owner, struct menu *menu, HDC hdc, DWORD flags )
+{
+    struct uah_menu uah = { menu->handle, hdc, flags };
+    send_message( owner, WM_UAHINITMENU, 0, (LPARAM)&uah );
+}
+
 /* Calculate the size of the menu item and store it in item->rect */
 static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, INT org_x, INT org_y,
                                  BOOL menu_bar, struct menu *menu )
@@ -2153,10 +2178,8 @@ static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, IN
     struct uah_measure_menu_item uah = {0};
 
     /* The items of a menu bar are measured through WM_UAHMEASUREMENUITEM, which lets the
-     * owner override the size DefWindowProc fills in. The message is part of the non-client
-     * theming: captioned windows only, and not for owner-drawn items. */
-    if (!menu_bar || (item->fType & (MF_OWNERDRAW | MF_SEPARATOR)) ||
-        (get_window_long( owner, GWL_STYLE ) & WS_CAPTION) != WS_CAPTION)
+     * owner override the size DefWindowProc fills in. */
+    if (!menu_bar || (item->fType & MF_SEPARATOR) || !menu_bar_is_themed( menu, owner ))
     {
         calc_default_menu_item_size( hdc, item, owner, org_x, org_y, menu_bar, menu );
         return;
@@ -2209,6 +2232,7 @@ static void calc_menu_bar_size( HDC hdc, RECT *rect, struct menu *menu, HWND own
     start = 0;
     help_pos = ~0u;
     menu->textOffset = 0;
+    if (menu_bar_is_themed( menu, owner )) send_uah_init_menu( owner, menu, hdc, UAH_MENU_WHOLE_BAR );
     while (start < menu->nItems)
     {
         item = &menu->items[start];
@@ -2432,9 +2456,9 @@ got_bitmap:
     NtGdiDeleteObjectApp( mem_hdc );
 }
 
-/* Draw a single menu item */
-static void draw_menu_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
-                            struct menu_item *item, BOOL menu_bar, UINT odaction )
+/* Draw a single menu item the default way */
+static void draw_default_menu_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
+                                    struct menu_item *item, BOOL menu_bar, UINT odaction )
 {
     UINT arrow_width = 0, arrow_height = 0;
     HRGN old_clip = NULL, clip;
@@ -2781,6 +2805,79 @@ done:
     if (old_clip) NtGdiDeleteObjectApp( old_clip );
 }
 
+static DWORD get_uah_menu_flags( HWND hwnd, DWORD flags )
+{
+    flags |= UAH_MENU_BASE;
+    if (top_popup) flags |= UAH_MENU_IN_MENU_LOOP;
+    if (!(win_get_flags( hwnd ) & WIN_NCACTIVATED)) flags |= UAH_MENU_INACTIVE;
+    return flags;
+}
+
+/* Draw one item of a themed menu bar through WM_UAHDRAWMENUITEM. The owner draws it
+ * itself or lets DefWindowProc do it (draw_menu_bar_item); the return value is ignored,
+ * as on Windows. Accelerators are always shown here, so ODS_NOACCEL is never set. */
+static void draw_uah_menu_bar_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
+                                    struct menu_item *item, UINT odaction, DWORD flags )
+{
+    struct uah_draw_menu_item uah = {0};
+    RECT rect = item->rect;
+
+    adjust_menu_item_rect( menu, &rect );
+
+    uah.dis.CtlType    = ODT_MENU;
+    uah.dis.itemID     = item->wID;
+    uah.dis.itemAction = odaction;
+    if (item->fState & MF_GRAYED) uah.dis.itemState |= ODS_GRAYED | ODS_DISABLED;
+    if (item->fState & MF_HILITE) uah.dis.itemState |= ODS_SELECTED;
+    if (flags & UAH_MENU_INACTIVE) uah.dis.itemState |= ODS_INACTIVE;
+    uah.dis.hwndItem   = (HWND)menu->handle;
+    uah.dis.hDC        = hdc;
+    uah.dis.rcItem     = rect;
+    uah.dis.itemData   = item->dwItemData;
+    uah.menu.hmenu     = menu->handle;
+    uah.menu.hdc       = hdc;
+    uah.menu.flags     = flags;
+    uah.item.pos       = item - menu->items;
+
+    TRACE( "owner %p item %d action %#x state %#x rect %s flags %#lx\n", owner, uah.item.pos,
+           odaction, uah.dis.itemState, wine_dbgstr_rect( &rect ), (long)flags );
+    send_message( owner, WM_UAHDRAWMENUITEM, 0, (LPARAM)&uah );
+}
+
+/* Draw a single menu item */
+static void draw_menu_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
+                            struct menu_item *item, BOOL menu_bar, UINT odaction )
+{
+    if (menu_bar && !(item->fType & (MF_SEPARATOR | MF_SYSMENU)) && menu_bar_is_themed( menu, owner ))
+        draw_uah_menu_bar_item( hwnd, menu, owner, hdc, item, odaction, get_uah_menu_flags( hwnd, 0 ));
+    else
+        draw_default_menu_item( hwnd, menu, owner, hdc, item, menu_bar, odaction );
+}
+
+/* default handling of WM_UAHDRAWMENU: the background of the menu bar */
+void draw_menu_bar_background( HWND hwnd, struct uah_menu *uah )
+{
+    BOOL flat_menu = FALSE;
+    struct menu *menu;
+
+    if (!uah || !(menu = unsafe_menu_ptr( uah->hmenu ))) return;
+
+    NtUserSystemParametersInfo( SPI_GETFLATMENU, 0, &flat_menu, 0 );
+    fill_rect( uah->hdc, &menu->items_rect, get_sys_color_brush( flat_menu ? COLOR_MENUBAR : COLOR_MENU ));
+}
+
+/* default handling of WM_UAHDRAWMENUITEM */
+void draw_menu_bar_item( HWND hwnd, struct uah_draw_menu_item *uah )
+{
+    struct menu *menu;
+
+    if (!uah || !(menu = unsafe_menu_ptr( uah->menu.hmenu ))) return;
+    if (uah->item.pos < 0 || uah->item.pos >= menu->nItems) return;
+
+    draw_default_menu_item( hwnd, menu, hwnd, uah->dis.hDC, &menu->items[uah->item.pos], TRUE,
+                            uah->dis.itemAction );
+}
+
 /***********************************************************************
  *           NtUserDrawMenuBarTemp   (win32u.@)
  */
@@ -2807,7 +2904,30 @@ DWORD WINAPI NtUserDrawMenuBarTemp( HWND hwnd, HDC hdc, RECT *rect, HMENU handle
 
     rect->bottom = rect->top + menu->Height;
 
-    fill_rect( hdc, rect, get_sys_color_brush( flat_menu ? COLOR_MENUBAR : COLOR_MENU ));
+    /* A themed menu bar is drawn through WM_UAHDRAWMENU and one WM_UAHDRAWMENUITEM per
+     * item, with the default drawing in DefWindowProc. The line below the bar is drawn
+     * here in both cases: on Windows it stays even when the owner paints the bar itself. */
+    if (menu_bar_is_themed( menu, hwnd ))
+    {
+        DWORD flags = get_uah_menu_flags( hwnd, UAH_MENU_WHOLE_BAR );
+        struct uah_menu uah = { menu->handle, hdc, flags };
+
+        send_uah_init_menu( hwnd, menu, hdc, flags );
+        send_message( hwnd, WM_UAHDRAWMENU, 0, (LPARAM)&uah );
+        for (i = 0; i < menu->nItems; i++)
+        {
+            if (menu->items[i].fType & (MF_SEPARATOR | MF_SYSMENU))
+                draw_default_menu_item( hwnd, menu, hwnd, hdc, &menu->items[i], TRUE, ODA_DRAWENTIRE );
+            else
+                draw_uah_menu_bar_item( hwnd, menu, hwnd, hdc, &menu->items[i], ODA_DRAWENTIRE, flags );
+        }
+    }
+    else
+    {
+        fill_rect( hdc, rect, get_sys_color_brush( flat_menu ? COLOR_MENUBAR : COLOR_MENU ));
+        for (i = 0; i < menu->nItems; i++)
+            draw_menu_item( hwnd, menu, hwnd, hdc, &menu->items[i], TRUE, ODA_DRAWENTIRE );
+    }
 
     NtGdiSelectPen( hdc, get_sys_color_pen( COLOR_3DFACE ));
     NtGdiMoveTo( hdc, rect->left, rect->bottom, NULL );
@@ -2815,9 +2935,6 @@ DWORD WINAPI NtUserDrawMenuBarTemp( HWND hwnd, HDC hdc, RECT *rect, HMENU handle
 
     if (menu->nItems)
     {
-        for (i = 0; i < menu->nItems; i++)
-            draw_menu_item( hwnd, menu, hwnd, hdc, &menu->items[i], TRUE, ODA_DRAWENTIRE );
-
         retvalue = menu->Height;
     }
     else

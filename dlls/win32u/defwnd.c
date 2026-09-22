@@ -2448,6 +2448,14 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
         measure_menu_bar_item( hwnd, (struct uah_measure_menu_item *)lparam );
         break;
 
+    case WM_UAHDRAWMENU:
+        draw_menu_bar_background( hwnd, (struct uah_menu *)lparam );
+        break;
+
+    case WM_UAHDRAWMENUITEM:
+        draw_menu_bar_item( hwnd, (struct uah_draw_menu_item *)lparam );
+        break;
+
     case WM_NCPAINT:
         return handle_nc_paint( hwnd, (HRGN)wparam );
 
