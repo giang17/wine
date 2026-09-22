@@ -2165,22 +2165,29 @@ static BOOL visual_style_is_active(void)
 
 /* Whether the menu bar of a window goes through the WM_UAH* messages of the non-client
  * theming. Measured on Windows 10: only captioned windows, and a single owner-drawn item
- * takes the whole bar back to the classic path, its text items included.
- *
- * The messages come from the themed non-client painting, so they are sent only while a
- * visual style is active.  An owner that paints its bar through them opens the theme's
- * MENU class for the text (Cubase 15: OpenThemeData( NULL, L"MENU" ) and DrawThemeTextEx()
- * per item), and without an active style that handle is NULL and the bar comes up with
- * a background and no text. */
+ * takes the whole bar back to the classic path, its text items included. */
 static BOOL menu_bar_is_themed( struct menu *menu, HWND owner )
 {
     UINT i;
 
     if ((get_window_long( owner, GWL_STYLE ) & WS_CAPTION) != WS_CAPTION) return FALSE;
-    if (!visual_style_is_active()) return FALSE;
     for (i = 0; i < menu->nItems; i++)
         if (menu->items[i].fType & MF_OWNERDRAW) return FALSE;
     return TRUE;
+}
+
+/* Whether the menu bar is also painted through WM_UAHDRAWMENU and WM_UAHDRAWMENUITEM.
+ * The messages come from the themed non-client painting, and an owner that paints its
+ * bar through them opens the theme's MENU class for the text (Cubase 15:
+ * OpenThemeData( NULL, L"MENU" ) and DrawThemeTextEx() per item); without an active
+ * visual style that handle is NULL and the bar came up with a background and no text.
+ * Measuring stays on WM_UAHMEASUREMENUITEM either way: the size the owner answers with
+ * is what the window's geometry is built on (Ableton Live 12's bar is 4 px taller than
+ * the default, and measured the classic way its main window grows to the maximal
+ * height, WineHQ bug 57955). */
+static BOOL menu_bar_is_drawn_themed( struct menu *menu, HWND owner )
+{
+    return menu_bar_is_themed( menu, owner ) && visual_style_is_active();
 }
 
 /* flags of struct uah_menu, as observed on Windows 10 */
@@ -2872,7 +2879,7 @@ static void draw_uah_menu_bar_item( HWND hwnd, struct menu *menu, HWND owner, HD
 static void draw_menu_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
                             struct menu_item *item, BOOL menu_bar, UINT odaction )
 {
-    if (menu_bar && !(item->fType & (MF_SEPARATOR | MF_SYSMENU)) && menu_bar_is_themed( menu, owner ))
+    if (menu_bar && !(item->fType & (MF_SEPARATOR | MF_SYSMENU)) && menu_bar_is_drawn_themed( menu, owner ))
         draw_uah_menu_bar_item( hwnd, menu, owner, hdc, item, odaction, get_uah_menu_flags( hwnd, 0 ));
     else
         draw_default_menu_item( hwnd, menu, owner, hdc, item, menu_bar, odaction );
@@ -2931,7 +2938,7 @@ DWORD WINAPI NtUserDrawMenuBarTemp( HWND hwnd, HDC hdc, RECT *rect, HMENU handle
     /* A themed menu bar is drawn through WM_UAHDRAWMENU and one WM_UAHDRAWMENUITEM per
      * item, with the default drawing in DefWindowProc. The line below the bar is drawn
      * here in both cases: on Windows it stays even when the owner paints the bar itself. */
-    if (menu_bar_is_themed( menu, hwnd ))
+    if (menu_bar_is_drawn_themed( menu, hwnd ))
     {
         DWORD flags = get_uah_menu_flags( hwnd, UAH_MENU_WHOLE_BAR );
         struct uah_menu uah = { menu->handle, hdc, flags };
