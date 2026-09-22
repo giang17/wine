@@ -1856,6 +1856,19 @@ void inherit_window_surface_bits( HWND hwnd, const RECT *window_rect, struct win
 }
 
 
+/* Whether the window's client area belongs to a client surface (a pixel format
+ * has been set on it), see set_window_pixel_format(). */
+static BOOL window_owns_client_area( HWND hwnd )
+{
+    WND *win = get_win_ptr( hwnd );
+    BOOL ret;
+
+    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+    ret = !!win->clip_clients;
+    release_win_ptr( win );
+    return ret;
+}
+
 /***********************************************************************
  *           move_window_bits_surface
  *
@@ -1869,6 +1882,7 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
     HRGN rgn = get_update_region( hwnd, &flags, NULL );
     HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
+    RECT client;
     void *bits;
 
     RECT dst = valid_rects[0];
@@ -1877,6 +1891,22 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
     OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
     OffsetRect( &dst, -window_rect->left, -window_rect->top );
+
+    /* The client area of a window that owns a client surface is not the old
+     * surface's to carry over.  The switch from a window surface to direct
+     * drawing happens in the first window position change after that client
+     * surface was attached, the window DC draws over the attached client window
+     * (IncludeInferiors in winex11), and the copy then lands on top of a frame
+     * the application may already have presented into it: Dorico 6's Qt popups,
+     * top levels drawn through a composition swapchain, came up black in one of
+     * four openings whenever the first GL swap won the race against this copy.
+     * Only the non-client area has anything to carry over. */
+    if (window_owns_client_area( hwnd ) &&
+        get_client_rect_rel( hwnd, COORDS_WINDOW, &client, get_dpi_for_window( hwnd ) ))
+    {
+        TRACE( "excluding client area %s of %p from the copy\n", wine_dbgstr_rect( &client ), hwnd );
+        NtGdiExcludeClipRect( hdc, client.left, client.top, client.right, client.bottom );
+    }
 
     window_surface_lock( old_surface );
     bits = window_surface_get_color( old_surface, info );
