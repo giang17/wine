@@ -229,11 +229,14 @@ This is the recommended branch. What it changes, by subsystem:
   twice a second while idle; `WM_ACTIVATEAPP` carries the thread of the previous
   foreground window when the activation comes from another process instead of 0 — with
   0, Dorico 5's audio engine process and Dorico blocked on each other as soon as a
-  plug-in editor opened The messages go out only while a visual style is active, as on Windows, where
-  they come from the themed non-client painting: Cubase 15 paints its bar through them
-  with the theme's MENU class (`OpenThemeData( NULL, L"MENU" )`, `DrawThemeTextEx()`), and
-  without an active style that handle is NULL and the bar came up without text. Ableton
-  Live's dark bar therefore needs a visual style enabled in winecfg.
+  plug-in editor opened The drawing messages go out only while a visual style is active, as on Windows,
+  where they come from the themed non-client painting: Cubase 15 paints its bar through
+  them with the theme's MENU class (`OpenThemeData( NULL, L"MENU" )`, `DrawThemeTextEx()`),
+  and without an active style that handle is NULL and the bar came up without text. The
+  measure message is sent either way, because the size the owner answers with is what the
+  window's geometry is built on (Live's main window grows to the maximal height without
+  it). Ableton Live's dark bar therefore needs a visual style enabled in winecfg; its
+  window geometry does not.
 - **wineserver**: a top-level's surface flush no longer overwrites child windows that
   belong to a *different process*. Such a child draws straight into the top-level's
   drawable while the owner flushes its own surface over it with a delay — a black
