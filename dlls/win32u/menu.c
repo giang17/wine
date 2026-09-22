@@ -2146,14 +2146,38 @@ static void calc_default_menu_item_size( HDC hdc, struct menu_item *item, HWND o
     TRACE( "%s\n", wine_dbgstr_rect( &item->rect ));
 }
 
+/* Whether a visual style is active: the value uxtheme reads in UXTHEME_LoadTheme(). */
+static BOOL visual_style_is_active(void)
+{
+    static const WCHAR theme_activeW[] = {'T','h','e','m','e','A','c','t','i','v','e',0};
+    char buffer[offsetof( KEY_VALUE_PARTIAL_INFORMATION, Data[8 * sizeof(WCHAR)] )];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
+    BOOL ret = FALSE;
+    HKEY key;
+
+    if (!(key = reg_open_hkcu_key( "Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager" ))) return FALSE;
+    if (query_reg_value( key, theme_activeW, info, sizeof(buffer) ) && info->Type == REG_SZ
+        && info->DataLength >= sizeof(WCHAR))
+        ret = ((const WCHAR *)info->Data)[0] != '0';
+    NtClose( key );
+    return ret;
+}
+
 /* Whether the menu bar of a window goes through the WM_UAH* messages of the non-client
  * theming. Measured on Windows 10: only captioned windows, and a single owner-drawn item
- * takes the whole bar back to the classic path, its text items included. */
+ * takes the whole bar back to the classic path, its text items included.
+ *
+ * The messages come from the themed non-client painting, so they are sent only while a
+ * visual style is active.  An owner that paints its bar through them opens the theme's
+ * MENU class for the text (Cubase 15: OpenThemeData( NULL, L"MENU" ) and DrawThemeTextEx()
+ * per item), and without an active style that handle is NULL and the bar comes up with
+ * a background and no text. */
 static BOOL menu_bar_is_themed( struct menu *menu, HWND owner )
 {
     UINT i;
 
     if ((get_window_long( owner, GWL_STYLE ) & WS_CAPTION) != WS_CAPTION) return FALSE;
+    if (!visual_style_is_active()) return FALSE;
     for (i = 0; i < menu->nItems; i++)
         if (menu->items[i].fType & MF_OWNERDRAW) return FALSE;
     return TRUE;
