@@ -403,32 +403,46 @@ prefix DXVK replaces `dxgi.dll` and `d3d11.dll`, while this branch's composition
 and DComp popup handling live in `dxgi` (the GL present in `wined3d`). The simplest setup
 is to leave DXVK out of the prefix; the package alone changes nothing, it takes effect
 once `setup_dxvk.sh` has run there. If it is needed for something else on the same
-machine, select per application: `WINEDLLOVERRIDES="d3d11,dxgi,d3d10core=n"` takes the
-prefix copies (DXVK), `=b` the builtins of this branch. Moving the trio together is the
-predictable choice, since a partial override runs one implementation's D3D11 against the
-other's DXGI; single overrides have worked here (EZ Keys 2 with `d3d10core=n`, Korg
-Modwave and Opsix with `d3d11=n`), but that combination is not something this branch
-tests. Plug-ins that drive DComp need this branch's builtin `dxgi` and cannot be pointed
-at DXVK at all: `DxgiFactory::CreateSwapChainForComposition` returns `E_NOTIMPL` unless
-`dxgi.enableDummyCompositionSwapchain` is set, and DXVK's own `dxvk.conf` still calls that
-option *not a valid implementation of DirectComposition swapchains*. The code has moved
-past its own description, though — since the fix for DXVK issue 5053 the present path also
-runs for a swap chain with no window at all, which is the composition case. What is
-missing on that route is the other half: something has to composite the result, and
-upstream Wine's `dcomp` does not. This branch's `dcomp` now does: a swapchain that
-publishes no composition window of this `dxgi` is read back through public D3D11
-(buffer 0 into a staging texture, fetched per readback and never held) and composited
-like a composition texture, with `WM_PAINT` passed on to the application, which draws
-into its swapchain from there. Measured with the option set: a reproducer shows the
-swapchain colour over the whole client area where it showed the window's own before, and
-a JUCE 8 test window comes out pixel-identical to the builtin run. What decides whether a
-real plug-in is usable that way is DXVK itself: DXVK 3.1.1 leaves the back buffer
-incomplete across `Present1` with dirty rects, which is how JUCE 8 paints, so a readback
-alternates between two partial frames (KORG Trinity flickered at 60 Hz) — reported with
-an app-free reproducer as DXVK issue 5919, fix proposed as DXVK PR 5920, and stable with
-that fix. Until DXVK carries it, the per-application switch above remains the answer for
-DComp plug-ins; the readback path costs nothing while no foreign swapchain is set as
-content.
+machine, select per application rather than per prefix. The switch is
+`WINEDLLOVERRIDES="d3d11,dxgi,d3d10core=n"` (the prefix copies, DXVK) against `=b` (the
+builtins of this branch); a setup that survives desktop-icon launches and keeps `system32`
+untouched puts DXVK's three DLLs next to the host's executable (Wine looks there first
+for native DLLs), sets the same three overrides under
+`HKCU\Software\Wine\AppDefaults\<host>.exe\DllOverrides`, and points
+`DXVK_CONFIG_FILE` in `HKCU\Environment` at a `dxvk.conf` — DXVK reads that file from the
+working directory otherwise, and hosts like REAPER change theirs before the first D3D
+call. Moving the trio together is the predictable choice, since a partial override runs
+one implementation's D3D11 against the other's DXGI; single overrides have worked here
+(EZ Keys 2 with `d3d10core=n`, Korg Modwave and Opsix with `d3d11=n`), but that
+combination is not something this branch tests. Two things not to read as "DXVK is not
+active": DXVK's HUD appears only in an image DXVK presents itself, and none of the
+plug-ins measured here let it — EZ Keys 2 draws through a Direct2D DC render target and a
+GDI blit, Serum 2 through a DComp surface and this branch's blit, JUCE 8 plug-ins through
+a composition swapchain that `dcomp` reads back — so a missing HUD says nothing, while
+`WINEDEBUG=+loaddll` (the DLL next to the host as `native`) and `DXVK_LOG_LEVEL=info` do.
+
+**DXVK and DComp plug-ins**: `DxgiFactory::CreateSwapChainForComposition` returns
+`E_NOTIMPL` unless `dxgi.enableDummyCompositionSwapchain` is set, and DXVK's own
+`dxvk.conf` still calls that option *not a valid implementation of DirectComposition
+swapchains*. The code has moved past its own description — since the fix for DXVK issue
+5053 the present path also runs for a swap chain with no window at all, which is the
+composition case. What is missing on that route is the other half: something has to
+composite the result, and upstream Wine's `dcomp` does not. This branch's `dcomp` does: a
+swapchain that publishes no composition window of this `dxgi` is read back through public
+D3D11 (buffer 0 into a staging texture, fetched per readback and never held) and composited
+like a composition texture, with `WM_PAINT` passed on to the application, which draws into
+its swapchain from there. Measured with the option set: a reproducer shows the swapchain
+colour over the whole client area where it showed the window's own before, and a JUCE 8
+test window comes out pixel-identical to the builtin run. Plug-ins that draw into a DComp
+surface instead of a swapchain (Serum 2) do not need the option: their Direct2D runs on
+DXVK's D3D11 and the surface reaches the window through this branch's blit as before —
+measured complete and stable. What decides whether a swapchain plug-in is usable is DXVK
+itself: DXVK 3.1.1 leaves the back buffer incomplete across `Present1` with dirty rects,
+which is how JUCE 8 paints, so a readback alternates between two partial frames (KORG
+Trinity flickered at 60 Hz) — reported with an app-free reproducer as DXVK issue 5919, fix
+proposed as DXVK PR 5920, and stable with that fix. Until DXVK carries it, the
+per-application switch above remains the answer for JUCE plug-ins; the readback path costs
+nothing while no foreign swapchain is set as content.
 
 **GL present for top-level windows** (default ON): D3D11 swapchains on top-level windows
 present through the driver's SwapBuffers (EGL by default in Wine 11) directly from the GPU
