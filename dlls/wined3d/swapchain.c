@@ -1837,6 +1837,50 @@ bool wined3d_swapchain_keeps_back_buffers(const struct wined3d_swapchain *swapch
     }
 }
 
+/* Whether a swapchain presents by GDI blit regardless of the present
+ * rectangles: dxgi forces the blit for a composition target, and a
+ * FLIP_SEQUENTIAL or SEQUENTIAL swapchain takes it unless it prefers GL
+ * (top-level windows, wined3d_swapchain_init()).  swapchain_gl_present()
+ * and wined3d_context_gl_update_window() decide by the same rule, so the
+ * context of a GDI-only swapchain never touches its window's DC.
+ *
+ * The blit hands the back buffer to D3DKMTCreateDCFromMemory() and so needs
+ * a DDI format for it (ddi_formats[] in utils.c: the BGR formats only).
+ * Without one swapchain_blit_gdi() returns before drawing, and nothing else
+ * presents the frame: VirtualDJ 2026 keeps two FLIP_SEQUENTIAL swapchains
+ * with R8G8B8A8_UNORM back buffers on popup-style top levels and showed
+ * only black windows (issue 406).  Such a swapchain presents through GL,
+ * as wine-11.0 does for every swapchain.  A composition target keeps the
+ * blit: dxgi composes it from the surface bits, GL cannot stand in.  The
+ * format is read from the description because ResizeBuffers() may change
+ * it, and the description is what the back buffers are created from. */
+bool wined3d_swapchain_gdi_present_forced(const struct wined3d_swapchain *swapchain)
+{
+    const struct wined3d_swapchain_desc *desc = &swapchain->state.desc;
+    const struct wined3d_format *format;
+
+    if (desc->flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+        return true;
+    if (desc->flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
+        return false;
+    if (desc->swap_effect != WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
+            && desc->swap_effect != WINED3D_SWAP_EFFECT_SEQUENTIAL)
+        return false;
+
+    format = wined3d_get_format(swapchain->device->adapter, desc->backbuffer_format, 0);
+    if (!format->ddi_format)
+    {
+        static unsigned int once;
+
+        if (!once++)
+            WARN("No DDI format for %s, presenting swapchain %p through GL.\n",
+                    debug_d3dformat(desc->backbuffer_format), swapchain);
+        return false;
+    }
+
+    return true;
+}
+
 /* Context activation is done by the caller. */
 static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, struct wined3d_context *context)
 {
@@ -1964,11 +2008,9 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
         gl_info->gl_ops.wgl.p_wglSwapBuffers(context_gl->dc);
     }
     else if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
-            || (swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+            || wined3d_swapchain_gdi_present_forced(swapchain)
             || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
-            && swapchain_present_is_partial_copy(swapchain, dst_rect))
-            || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
-            || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_SEQUENTIAL)
+            && swapchain_present_is_partial_copy(swapchain, dst_rect)))
     {
         swapchain_blit_gdi(swapchain, context, src_rect, dst_rect);
     }
