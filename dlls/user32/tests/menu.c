@@ -304,7 +304,7 @@ static void test_getmenubarinfo(void)
     ok(ret, "GetWindowRect failed.\n");
     ret = GetMenuItemRect(hwnd, hmenu, 0, &rci);
     ok(ret, "GetMenuItemRect failed.\n");
-    todo_wine ok(mbi.rcBar.left == rci.left && mbi.rcBar.top == rci.top &&
+    ok(mbi.rcBar.left == rci.left && mbi.rcBar.top == rci.top &&
             mbi.rcBar.bottom == rci.bottom && mbi.rcBar.right == rcw.right - rci.left + rcw.left,
             "rcBar: Got %s instead of (%ld,%ld)-(%ld,%ld)\n", wine_dbgstr_rect(&mbi.rcBar),
             rci.left, rci.top, rcw.right - rci.left + rcw.left, rci.bottom);
