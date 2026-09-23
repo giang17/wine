@@ -338,6 +338,11 @@ This is the recommended branch. What it changes, by subsystem:
   time at 30 fps). The video window shows the picture in stop and play
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
+- **No visual style by default (wine.inf)**: upstream activates the Light theme in every
+  new prefix. This branch creates new prefixes with `ThemeActive=0`: the classic look with
+  the win32u default colours (button face, menu and scroll bar 212 208 200), which is what
+  Reaper's own dialogs look like on Linux. The theme stays installed and can be switched on
+  in winecfg — see the note on the visual style below
 - **Direct2D for JUCE 8.0.13+ (ntdll, wine.inf)**: JUCE 8.0.13 and later pick their
   renderer with `GetProcAddress(GetModuleHandleA("ntdll"), "wine_get_version") != nullptr`
   and fall back to GDI whenever that succeeds, which bypasses this entire stack — a JUCE
@@ -436,6 +441,24 @@ entries for the plug-in hosts, see the JUCE note above. New prefixes get them at
 existing ones at their next start. If you update an installation by copying DLLs rather
 than running `make install`, copy `loader/wine.inf` as well: nothing fails when it is
 missing, the plug-in hosts simply keep rendering with GDI.
+
+**Visual style.** Upstream `wine.inf` activates the Light theme in a new prefix. This
+branch sets `ThemeActive` to `0` instead; the `DllName`, `ColorName` and `SizeName` entries
+stay, so winecfg still offers the theme under Desktop Integration. Existing prefixes are not
+changed, the entries carry the no-clobber flag. The reason, seen in Reaper 7.80: with the Light
+theme active, Win32 dialogs lose their 3D edges, and the first activation replaces the system
+colours with the theme's (white windows, menus and tree controls, button face 245 245 245);
+setting the classic colours again while the theme is active did not bring the grey dialog
+background back. The *WinRT theme* selector next to it only writes `Themes\Personalize\AppsUseLightTheme`,
+which `windows.ui` UISettings and uxtheme's `ShouldAppsUseDarkMode()` report to applications
+that ask; the Win32 drawing reads neither, so light and dark look the same.
+
+When switching the theme on in winecfg, two things follow. The first activation also writes
+the theme's `[SysMetrics]` fonts (Tahoma 8 and 10pt) into `WindowMetrics`, so run
+`wine-font-setup.sh` again afterwards to get Segoe UI 9pt back. And Ableton Live 12's dark
+menu bar is only drawn with an active theme, as on Windows. Switch the theme off in winecfg,
+not by deleting the registry value: only uxtheme restores the system colours and fonts it
+saved when the theme was first activated.
 
 **ntsync** (recommended, upstream Wine feature): with a kernel that provides the
 `ntsync` driver (`/dev/ntsync`), make sure `/usr/include/linux/ntsync.h` exists before
