@@ -2200,7 +2200,23 @@ static BOOL menu_bar_is_drawn_themed( struct menu *menu, HWND owner )
     return menu_bar_is_themed( menu, owner ) && visual_style_is_active();
 }
 
+/* Whether the items of a popup menu are measured through WM_UAHMEASUREMENUITEM when the
+ * popup opens. Measured on Windows 10: every popup gets it (from a menu bar, a submenu, or
+ * TrackPopupMenu, whether or not the owner has WS_CAPTION or a themed bar), separators
+ * included; a single owner-drawn item takes the whole popup back to the classic path. The
+ * system menu was not measured and stays classic. */
+static BOOL popup_menu_is_themed( struct menu *menu )
+{
+    UINT i;
+
+    if ((menu->wFlags & (MF_POPUP | MF_SYSMENU)) != MF_POPUP || !menu->hwndOwner) return FALSE;
+    for (i = 0; i < menu->nItems; i++)
+        if (menu->items[i].fType & MF_OWNERDRAW) return FALSE;
+    return TRUE;
+}
+
 /* flags of struct uah_menu, as observed on Windows 10 */
+#define UAH_MENU_POPUP        0x001   /* the menu is a popup */
 #define UAH_MENU_IN_MENU_LOOP 0x004   /* an item is being tracked */
 #define UAH_MENU_INACTIVE     0x010   /* the window is not the active one */
 #define UAH_MENU_WHOLE_BAR    0x200   /* the item is drawn as part of the whole bar */
@@ -2212,15 +2228,20 @@ static void send_uah_init_menu( HWND owner, struct menu *menu, HDC hdc, DWORD fl
     send_message( owner, WM_UAHINITMENU, 0, (LPARAM)&uah );
 }
 
-/* Calculate the size of the menu item and store it in item->rect */
+/* Calculate the size of the menu item and store it in item->rect. uah_flags are the
+ * struct uah_menu flags of the menu when it is measured through WM_UAHMEASUREMENUITEM,
+ * without UAH_MENU_BASE. */
 static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, INT org_x, INT org_y,
-                                 BOOL menu_bar, struct menu *menu )
+                                 BOOL menu_bar, struct menu *menu, DWORD uah_flags )
 {
     struct uah_measure_menu_item uah = {0};
+    BOOL themed;
 
-    /* The items of a menu bar are measured through WM_UAHMEASUREMENUITEM, which lets the
-     * owner override the size DefWindowProc fills in. */
-    if (!menu_bar || (item->fType & MF_SEPARATOR) || !menu_bar_is_themed( menu, owner ))
+    /* The items of a menu bar and of a popup are measured through WM_UAHMEASUREMENUITEM,
+     * which lets the owner override the size DefWindowProc fills in. */
+    if (menu_bar) themed = !(item->fType & MF_SEPARATOR) && menu_bar_is_themed( menu, owner );
+    else themed = popup_menu_is_themed( menu );
+    if (!themed)
     {
         calc_default_menu_item_size( hdc, item, owner, org_x, org_y, menu_bar, menu );
         return;
@@ -2234,16 +2255,19 @@ static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, IN
     uah.mis.itemData   = item->dwItemData;
     uah.menu.hmenu     = menu->handle;
     uah.menu.hdc       = hdc;
-    uah.menu.flags     = 0xa00;
+    uah.menu.flags     = UAH_MENU_BASE | uah_flags;
     uah.item.pos       = item - menu->items;
+    /* DefWindowProc measures at the origin; the tab position of a popup item is absolute */
+    item->xTab = 0;
     send_message( owner, WM_UAHMEASUREMENUITEM, 0, (LPARAM)&uah );
 
     SetRect( &item->rect, org_x, org_y, org_x + uah.mis.itemWidth, org_y + uah.mis.itemHeight );
+    if (!menu_bar) item->xTab += org_x;
     TRACE( "%s\n", wine_dbgstr_rect( &item->rect ));
 }
 
 /* default handling of WM_UAHMEASUREMENUITEM */
-void measure_menu_bar_item( HWND hwnd, struct uah_measure_menu_item *uah )
+void measure_uah_menu_item( HWND hwnd, struct uah_measure_menu_item *uah )
 {
     struct menu *menu;
     struct menu_item *item;
@@ -2252,7 +2276,7 @@ void measure_menu_bar_item( HWND hwnd, struct uah_measure_menu_item *uah )
     if (uah->item.pos < 0 || uah->item.pos >= menu->nItems) return;
 
     item = &menu->items[uah->item.pos];
-    calc_default_menu_item_size( uah->menu.hdc, item, hwnd, 0, 0, TRUE, menu );
+    calc_default_menu_item_size( uah->menu.hdc, item, hwnd, 0, 0, !(menu->wFlags & MF_POPUP), menu );
     uah->mis.itemWidth  = item->rect.right;
     uah->mis.itemHeight = item->rect.bottom;
 }
@@ -2288,7 +2312,7 @@ static void calc_menu_bar_size( HDC hdc, RECT *rect, struct menu *menu, HWND own
             if (i != start && (item->fType & (MF_MENUBREAK | MF_MENUBARBREAK))) break;
 
             TRACE("item org=(%d, %d) %s\n", org_x, org_y, debugstr_menuitem( item ));
-            calc_menu_item_size( hdc, item, owner, org_x, org_y, TRUE, menu );
+            calc_menu_item_size( hdc, item, owner, org_x, org_y, TRUE, menu, UAH_MENU_WHOLE_BAR );
 
             if (item->rect.right > menu->items_rect.right)
             {
@@ -3181,6 +3205,8 @@ static void calc_popup_menu_size( struct menu *menu, UINT max_height )
     BOOL textandbmp = FALSE, multi_col = FALSE;
     int org_x, org_y, max_tab, max_tab_width;
     struct menu_item *item;
+    struct menu *top_menu;
+    DWORD uah_flags = UAH_MENU_POPUP;
     UINT start, i;
     HDC hdc;
 
@@ -3191,6 +3217,12 @@ static void calc_popup_menu_size( struct menu *menu, UINT max_height )
     hdc = NtUserGetDC( 0 );
 
     NtGdiSelectFont( hdc, get_menu_font( FALSE ));
+
+    /* A themed popup announces itself with WM_UAHINITMENU before its items are measured:
+     * flags 0x5 below a tracked menu bar, 0x1 from TrackPopupMenu (Windows 10). */
+    if (top_popup_hmenu && (top_menu = unsafe_menu_ptr( top_popup_hmenu )) && !(top_menu->wFlags & MF_POPUP))
+        uah_flags |= UAH_MENU_IN_MENU_LOOP;
+    if (popup_menu_is_themed( menu )) send_uah_init_menu( menu->hwndOwner, menu, hdc, uah_flags );
 
     start = 0;
     menu->textOffset = 0;
@@ -3213,7 +3245,7 @@ static void calc_popup_menu_size( struct menu *menu, UINT max_height )
                 if (i != start) break;
             }
 
-            calc_menu_item_size( hdc, item, menu->hwndOwner, org_x, org_y, FALSE, menu );
+            calc_menu_item_size( hdc, item, menu->hwndOwner, org_x, org_y, FALSE, menu, uah_flags );
             menu->items_rect.right = max( menu->items_rect.right, item->rect.right );
             org_y = item->rect.bottom;
             if (IS_STRING_ITEM( item->fType ) && item->xTab)

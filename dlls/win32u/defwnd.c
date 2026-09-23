@@ -2448,7 +2448,7 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
         }
 
     case WM_UAHMEASUREMENUITEM:
-        measure_menu_bar_item( hwnd, (struct uah_measure_menu_item *)lparam );
+        measure_uah_menu_item( hwnd, (struct uah_measure_menu_item *)lparam );
         break;
 
     case WM_UAHDRAWMENU:

@@ -123,7 +123,7 @@ extern UINT draw_nc_menu_bar( HDC hdc, RECT *rect, HWND hwnd );
 extern void end_menu( HWND hwnd );
 extern HMENU get_menu( HWND hwnd );
 extern UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y );
-extern void measure_menu_bar_item( HWND hwnd, struct uah_measure_menu_item *uah );
+extern void measure_uah_menu_item( HWND hwnd, struct uah_measure_menu_item *uah );
 extern void draw_menu_bar_background( HWND hwnd, struct uah_menu *uah );
 extern void draw_menu_bar_item( HWND hwnd, struct uah_draw_menu_item *uah );
 extern BOOL get_menu_info( HMENU handle, MENUINFO *info );
