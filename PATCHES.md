@@ -209,6 +209,14 @@ This is the recommended branch. What it changes, by subsystem:
   previous result; one that does can override the size and paint the bar itself (the line
   below the bar stays, as on Windows). A single owner-drawn item takes the whole bar back
   to the classic path, again as measured on Windows 10 (32-bit processes included).
+  The bar is laid out as on Windows: the items start at the top of the bar and are
+  `SM_CYMENU - 1` tall, the extra row of `SM_CYMENU` is the line below the bar, and
+  `GetMenuBarInfo` reports the bar as ending where the items end. Wine kept that row as
+  a border above the items and drew the line on the first client row, where the
+  non-client clip cut it off: the last row of a bar an application paints itself was
+  never painted (a light line under Live's dark bar) and the line below the bar never
+  visible. Same client area as before, the `todo_wine` on `rcBar` in the user32 menu
+  test from 2012 passes.
   Ableton Live 12 makes its menu bar 4 px taller this way and adds the same 4 px when
   sizing its main window; without the measure message the window grew until it hit the
   maximum height and lost its frame (Wine bug 57955), and without the draw messages its
