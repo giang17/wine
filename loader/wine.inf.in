@@ -1041,7 +1041,9 @@ StartType=3
 ErrorControl=1
 
 [ThemeManager]
-HKCU,"Software\Microsoft\Windows\CurrentVersion\ThemeManager","ThemeActive",2,"1"
+; No visual style in a new prefix: the classic look with the win32u default colours.
+; The Light theme stays installed and can be switched on in winecfg (Desktop Integration).
+HKCU,"Software\Microsoft\Windows\CurrentVersion\ThemeManager","ThemeActive",2,"0"
 HKCU,"Software\Microsoft\Windows\CurrentVersion\ThemeManager","DllName",2,"%10%\resources\themes\light\light.msstyles"
 HKCU,"Software\Microsoft\Windows\CurrentVersion\ThemeManager","ColorName",2,"Blue"
 HKCU,"Software\Microsoft\Windows\CurrentVersion\ThemeManager","SizeName",2,"NormalSize"
