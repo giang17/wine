@@ -1429,6 +1429,19 @@ struct dxgi_factory *unsafe_impl_from_IDXGIFactory(IDXGIFactory *iface)
     return factory;
 }
 
+/* One wined3d for every factory of the process.
+ *
+ * wined3d_create() initialises the adapters: for GL it creates a window and a
+ * context, reads the extension strings and guesses the card, for every call.
+ * Measured with VirtualDJ 2026, which calls CreateDXGIFactory1() before every
+ * frame and several times while it re-lays its skin out after a resize: 36 ms
+ * per call on llvmpipe, 60 to 480 ms on an NVIDIA card -- most of the render
+ * thread, and the seconds the window stays squashed after a resize.  On
+ * Windows and under DXVK the call costs nothing.  The adapters do not change
+ * between two factories, so the first one is kept for the whole process; each
+ * factory takes its own reference and the cache keeps one of its own. */
+static struct wined3d *dxgi_shared_wined3d;
+
 static HRESULT dxgi_factory_init(struct dxgi_factory *factory, BOOL extended)
 {
     factory->IWineDXGIFactory_iface.lpVtbl = &dxgi_factory_vtbl;
@@ -1436,7 +1449,10 @@ static HRESULT dxgi_factory_init(struct dxgi_factory *factory, BOOL extended)
     wined3d_private_store_init(&factory->private_store);
 
     wined3d_mutex_lock();
-    factory->wined3d = wined3d_create(0);
+    if (!dxgi_shared_wined3d)
+        dxgi_shared_wined3d = wined3d_create(0);
+    if ((factory->wined3d = dxgi_shared_wined3d))
+        wined3d_incref(factory->wined3d);
     wined3d_mutex_unlock();
     if (!factory->wined3d)
     {
