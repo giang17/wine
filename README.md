@@ -148,7 +148,9 @@ Two differences from a build of this repository are worth knowing:
   DirectComposition, AF_UNIX, two wined3d sets, `ntdll-Hide_Wine_Exports` and
   `user32-recursive-activation`, which edits the same `set_active_window()` this fork
   changes — are left out in favour of the fork's own handling, and the stack is applied on
-  top of the remaining staging patchsets. A report from this package should say so.
+  top of the remaining staging patchsets. Nothing is lost by that: the fork carries its own
+  version of the recursive-activation fix (Wine bug 46274). A report from this package
+  should say so.
 
 The same repository carries yabridge, pipewire-wineasio, pipeasio and winetricks. Builds
 are for Fedora 44 x86_64.
