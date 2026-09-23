@@ -237,7 +237,11 @@ This is the recommended branch. What it changes, by subsystem:
   twice a second while idle; `WM_ACTIVATEAPP` carries the thread of the previous
   foreground window when the activation comes from another process instead of 0 — with
   0, Dorico 5's audio engine process and Dorico blocked on each other as soon as a
-  plug-in editor opened The drawing messages go out only while a visual style is active, as on Windows,
+  plug-in editor opened; the CBT hook and the activation messages go out once per
+  activation, as on Windows — a window that activates itself again from its `WM_ACTIVATE`
+  handler got a second round and recursed until the stack was gone (Wine bug 46274; the
+  fix wine-staging carries as `user32-recursive-activation`, with the mark cleared on
+  every exit and only by the call that set it). The drawing messages go out only while a visual style is active, as on Windows,
   where they come from the themed non-client painting: Cubase 15 paints its bar through
   them with the theme's MENU class (`OpenThemeData( NULL, L"MENU" )`, `DrawThemeTextEx()`),
   and without an active style that handle is NULL and the bar came up without text. The
