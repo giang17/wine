@@ -2120,7 +2120,7 @@ static HWND set_focus_window( HWND hwnd )
 BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD other_thread_id )
 {
     HWND previous = get_active_window();
-    BOOL ret;
+    BOOL ret, marked = FALSE;
     DWORD old_thread, new_thread;
     CBTACTIVATESTRUCT cbt;
 
@@ -2133,16 +2133,24 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD oth
         goto done;
     }
 
-    /* call CBT hook chain */
-    cbt.fMouse     = mouse;
-    cbt.hWndActive = previous;
-    if (call_hooks( WH_CBT, HCBT_ACTIVATE, (WPARAM)hwnd, (LPARAM)&cbt, sizeof(cbt) )) return FALSE;
-
-    if (is_window( previous ))
+    /* Windows runs the CBT hook and sends the activation messages once per activation:
+     * a window that activates itself again from its WM_ACTIVATE handler does not get a
+     * second round (bug 46274). The mark is cleared by the call that set it, so a nested
+     * call leaves the outer one's mark alone. */
+    marked = !(win_set_flags( hwnd, WIN_IS_IN_ACTIVATION, 0 ) & WIN_IS_IN_ACTIVATION);
+    if (marked)
     {
-        send_message( previous, WM_NCACTIVATE, FALSE, (LPARAM)hwnd );
-        send_message( previous, WM_ACTIVATE,
-                      MAKEWPARAM( WA_INACTIVE, is_iconic(previous) ? 0x20 : 0 ), (LPARAM)hwnd );
+        /* call CBT hook chain */
+        cbt.fMouse     = mouse;
+        cbt.hWndActive = previous;
+        if (call_hooks( WH_CBT, HCBT_ACTIVATE, (WPARAM)hwnd, (LPARAM)&cbt, sizeof(cbt) )) goto failed;
+
+        if (is_window( previous ))
+        {
+            send_message( previous, WM_NCACTIVATE, FALSE, (LPARAM)hwnd );
+            send_message( previous, WM_ACTIVATE,
+                          MAKEWPARAM( WA_INACTIVE, is_iconic(previous) ? 0x20 : 0 ), (LPARAM)hwnd );
+        }
     }
 
     SERVER_START_REQ( set_active_window )
@@ -2152,7 +2160,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD oth
             previous = wine_server_ptr_handle( reply->previous );
     }
     SERVER_END_REQ;
-    if (!ret) return FALSE;
+    if (!ret) goto failed;
     if (prev) *prev = previous;
     if (previous == hwnd) goto done;
 
@@ -2164,7 +2172,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD oth
         if (send_message( hwnd, WM_QUERYNEWPALETTE, 0, 0 ))
             send_message_timeout( HWND_BROADCAST, WM_PALETTEISCHANGING, (WPARAM)hwnd, 0,
                                   SMTO_ABORTIFHUNG, 2000, FALSE );
-        if (!is_window(hwnd)) return FALSE;
+        if (!is_window(hwnd)) goto failed;
     }
 
     old_thread = previous ? get_window_thread( previous, NULL ) : 0;
@@ -2200,7 +2208,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD oth
         }
     }
 
-    if (is_window(hwnd))
+    if (marked && is_window(hwnd))
     {
         send_message( hwnd, WM_NCACTIVATE, hwnd == NtUserGetForegroundWindow(), (LPARAM)previous );
         send_message( hwnd, WM_ACTIVATE,
@@ -2231,7 +2239,12 @@ done:
         if (hwnd == NtUserGetForegroundWindow()) user_driver->pActivateWindow( hwnd, previous );
         clip_fullscreen_window( hwnd, FALSE );
     }
+    if (marked) win_set_flags( hwnd, 0, WIN_IS_IN_ACTIVATION );
     return TRUE;
+
+failed:
+    if (marked) win_set_flags( hwnd, 0, WIN_IS_IN_ACTIVATION );
+    return FALSE;
 }
 
 /**********************************************************************
