@@ -498,6 +498,13 @@ nothing for them — VirtualDJ 2026 showed only black windows. Adopted from shib
 patch 0055 (diagnosis: ClickSentinel). If you see misplaced frames, set
 `WINE_DISABLE_GL_PRESENT=1` to restore the GDI path for every window.
 
+**One wined3d per process in dxgi**: every `CreateDXGIFactory*()` call created a new wined3d
+object, and with it a full adapter initialisation — a window, a GL context, the extension
+strings, the card guess. Measured with VirtualDJ 2026, which creates a factory before every
+frame: 36 ms per call on llvmpipe, 60–480 ms on an NVIDIA card, and a render loop throttled
+to 20 frames per second by it. The factories now share the first wined3d of the process
+(0.03 ms per call); on Windows and under DXVK the call is trivial.
+
 **Serum2 settings** (recommended — DComp gives the best performance):
 - `"Disable DirectComposition": false`
 - `"Disable Partial Redraw": false`
