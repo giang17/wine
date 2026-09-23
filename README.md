@@ -228,6 +228,7 @@ exactly each one needs, and what breaks without it — is in
 | **Korg Trinity / Prophecy** (VST3) | JUCE 8.0.13 / 8.0.12 + DComp | Fully functional on the DComp path |
 | **Pianoteq 9** (standalone + VST3) | JUCE 8.0.10 + DComp | Fully functional |
 | **Ableton Live 12** (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — decorations, move/resize, fullscreen, Splice view |
+| **VirtualDJ 2026** | Custom skin engine (D3D11 flip-model swapchains) | Runs — decks, browser, skin relayout while the window is being resized. Needs the wined3d GL present for flip-model swapchains without a BGR back buffer, without which both windows stay black, and the wined3d shared between the DXGI factories, without which the skin re-lays out only seconds after a resize |
 | **FL Studio 2026** | Custom | Runs without xruns at 64 samples / 48 kHz; Cloud plugins install and stream |
 | **Fender Studio Pro 8** | CCL (DXGI + DWrite + DComp) | Fully functional — needs the `UIAnimationManager2` implementation to start at all |
 | **EPROM — Memory Rites**, **Minimal Audio Current / Evoke / Lucid** (VST3) | JUCE 8.0.13 (+ WebView2) | Fully functional with the `HideWineVersion` entry |
