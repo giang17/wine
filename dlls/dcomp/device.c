@@ -4567,6 +4567,30 @@ static DWORD dcomp_surface_hash(const DWORD *bits, unsigned int count)
     return h;
 }
 
+/* Fold every pixel of a leaf source into the walk hash, RGB only (alpha
+ * carries noise).  Four interleaved FNV-1a chains so the pass costs what the
+ * former every-4th-pixel sampling did: with a leaf width that is a multiple
+ * of 4, a linear stride of 4 lands on the same columns of every row and never
+ * sees a 1 px wide caret in the other three -- cursor moves in FL Studio's
+ * hub prompt stayed on screen for up to seconds (issue 411).  Any stride
+ * has such widths, so sample everything. */
+static DWORD dcomp_leaf_bits_hash(DWORD h, const DWORD *bits, unsigned int count)
+{
+    DWORD h0 = h, h1 = h ^ 1, h2 = h ^ 2, h3 = h ^ 3;
+    unsigned int i = 0;
+
+    for (; i + 4 <= count; i += 4)
+    {
+        h0 = (h0 ^ (bits[i] & 0x00ffffff)) * 16777619u;
+        h1 = (h1 ^ (bits[i + 1] & 0x00ffffff)) * 16777619u;
+        h2 = (h2 ^ (bits[i + 2] & 0x00ffffff)) * 16777619u;
+        h3 = (h3 ^ (bits[i + 3] & 0x00ffffff)) * 16777619u;
+    }
+    for (; i < count; i++)
+        h0 = (h0 ^ (bits[i] & 0x00ffffff)) * 16777619u;
+    return ((((h0 * 16777619u) ^ h1) * 16777619u ^ h2) * 16777619u ^ h3) * 16777619u;
+}
+
 /* Is the composition one flat colour?  Sampled like dcomp_surface_hash().  A
  * frame like that carries no content: re-delivering it can only ever cover
  * what somebody else painted (issue 386). */
@@ -4829,17 +4853,14 @@ static void dcomp_target_composite_leaves(struct dcomp_target *target, struct dc
             if (bits && dims)
             {
                 /* Unchanged-content gate: fold this leaf's source pixels and
-                 * placement into the walk hash.  RGB only (alpha carries
-                 * noise); every 4th pixel is plenty to tell a new frame from
-                 * a re-presented one. */
+                 * placement into the walk hash.  Every pixel -- see
+                 * dcomp_leaf_bits_hash() for why sampling is not enough. */
                 if (target->walk_leaf_hash_valid && dcomp_skip_unchanged())
                 {
                     UINT64 lt = (UINT64)LOWORD(dims) * HIWORD(dims);
-                    DWORD h = target->walk_leaf_hash;
-                    unsigned int i;
+                    DWORD h;
 
-                    for (i = 0; i < (unsigned int)lt; i += 4)
-                        h = (h ^ (bits[i] & 0x00ffffff)) * 16777619u;
+                    h = dcomp_leaf_bits_hash(target->walk_leaf_hash, bits, (unsigned int)lt);
                     h = (h ^ (DWORD)(ULONG_PTR)comp_wnd) * 16777619u;
                     h = (h ^ (DWORD)dims) * 16777619u;
                     h = (h ^ (DWORD)(vx * 65599 + vy)) * 16777619u;
