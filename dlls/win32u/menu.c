@@ -2257,9 +2257,10 @@ static void calc_menu_bar_size( HDC hdc, RECT *rect, struct menu *menu, HWND own
     if (!rect || !menu || !menu->nItems) return;
 
     TRACE( "rect %p %s\n", rect, wine_dbgstr_rect( rect ));
-    /* Start with a 1 pixel top border.
-       This corresponds to the difference between SM_CYMENU and SM_CYMENUSIZE. */
-    SetRect( &menu->items_rect, 0, 0, rect->right - rect->left, 1 );
+    /* The items start at the top of the bar. The difference between SM_CYMENU and
+       SM_CYMENUSIZE is the line below the bar, which is drawn by NtUserDrawMenuBarTemp()
+       and reserved by get_menu_bar_height(), not a border above the items. */
+    SetRect( &menu->items_rect, 0, 0, rect->right - rect->left, 0 );
     start = 0;
     help_pos = ~0u;
     menu->textOffset = 0;
@@ -2328,7 +2329,8 @@ UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y )
     SetRect( &rect_bar, org_x, org_y, org_x + width, org_y + get_system_metrics( SM_CYMENU ));
     calc_menu_bar_size( hdc, &rect_bar, menu, hwnd );
     NtUserReleaseDC( hwnd, hdc );
-    return menu->Height;
+    /* the items plus the line below the bar */
+    return menu->Height ? menu->Height + 1 : 0;
 }
 
 static void draw_popup_arrow( HDC hdc, RECT rect, UINT arrow_width, UINT arrow_height )
@@ -2964,14 +2966,11 @@ DWORD WINAPI NtUserDrawMenuBarTemp( HWND hwnd, HDC hdc, RECT *rect, HMENU handle
     NtGdiMoveTo( hdc, rect->left, rect->bottom, NULL );
     NtGdiLineTo( hdc, rect->right, rect->bottom );
 
+    /* the items plus the line below the bar */
     if (menu->nItems)
-    {
-        retvalue = menu->Height;
-    }
+        retvalue = menu->Height + 1;
     else
-    {
         retvalue = get_system_metrics( SM_CYMENU );
-    }
 
     if (prev_font) NtGdiSelectFont( hdc, prev_font );
     return retvalue;
