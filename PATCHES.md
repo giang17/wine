@@ -335,7 +335,7 @@ This is the recommended branch. What it changes, by subsystem:
   time at 30 fps). The video window shows the picture in stop and play
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
-- **No visual style by default (wine.inf)**: upstream activates the Light theme in every
+- **No visual style by default (wine.inf)**: upstream activates the Aero theme in every
   new prefix. This branch creates new prefixes with `ThemeActive=0`: the classic look with
   the win32u default colours (button face, menu and scroll bar 212 208 200), which is what
   Reaper's own dialogs look like on Linux. The theme stays installed and can be switched on
@@ -439,7 +439,8 @@ existing ones at their next start. If you update an installation by copying DLLs
 than running `make install`, copy `loader/wine.inf` as well: nothing fails when it is
 missing, the plug-in hosts simply keep rendering with GDI.
 
-**Visual style.** Upstream `wine.inf` activates the Light theme in a new prefix. This
+**Visual style.** Upstream `wine.inf` activates the Aero theme (the Light theme renamed in
+wine-11.18) in a new prefix. This
 branch sets `ThemeActive` to `0` instead; the `DllName`, `ColorName` and `SizeName` entries
 stay, so winecfg still offers the theme under Desktop Integration. Existing prefixes are not
 changed, the entries carry the no-clobber flag. The reason, seen in Reaper 7.80: with the Light
