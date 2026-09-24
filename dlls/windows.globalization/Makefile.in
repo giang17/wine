@@ -1,5 +1,5 @@
 MODULE = windows.globalization.dll
-IMPORTS = combase uuid
+IMPORTS = combase uuid advapi32
 
 SOURCES = \
 	calendar.c \

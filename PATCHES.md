@@ -339,6 +339,16 @@ This is the recommended branch. What it changes, by subsystem:
   time at 30 fps). The video window shows the picture in stop and play
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
+- **windows.globalization**: `Windows.Globalization.Calendar` for the Gregorian calendar —
+  every `ICalendar` field, `Add*` and `*AsString` method with 12- and 24-hour clocks, both
+  factory interfaces and `ITimeZoneOnCalendar` with IANA time zone ids, mapped through the
+  CLDR table onto the Windows time zone rules. The conformance test holds the behaviour
+  measured on Windows 10: range 0001–9999 in local time, the day clamped when a month or
+  year changes, daylight-saving gaps rejected by `put_Hour()` but skipped by `AddDays()`,
+  and the current offset kept in a repeated hour. Other calendar systems return
+  `E_NOTIMPL`, and time zone names come from the Windows time zone data instead of ICU
+  ("W. Europe Daylight Time", "GMT+2"). Cubase 13 and 15 construct one in `headtracking.dll`
+  at load time
 - **No visual style by default (wine.inf)**: upstream activates the Aero theme in every
   new prefix. This branch creates new prefixes with `ThemeActive=0`: the classic look with
   the win32u default colours (button face, menu and scroll bar 212 208 200), which is what
@@ -574,7 +584,7 @@ these were developed against, but they are not specific to it.
 | Minimal Audio Current / Evoke / Lucid (VST3 in Reaper) | JUCE 8.0.13 | Fully functional, same `HideWineVersion` requirement as above — without it the GDI fallback leaves the background black and parts of the interface missing |
 | Minimal Hub | Tauri v2 + SvelteKit + WebView2 | Starts, signs in and installs products (an 11.8 MB update completed). Needs the `secur32`/schannel `DecryptMessage` fix from this branch: without it the `oauth/token` request stops after a partial response and the app waits indefinitely, because reqwest has no response timeout. Its installer step also shells out to `powershell Start-Process`, but in a form the `powershell` patch does not recognise — it ran both with and without that patch |
 | Fender Studio Pro 8 | CCL (DXGI + DWrite + DComp) | Fully functional — the song view draws completely and stays stable, no stale tool bar or transport and no flicker; the transport playhead and the selection rectangle no longer flicker while the transport runs, and video on the timeline plays, seeks, loops and jumps without stalling or going black. Starting at all needs the `UIAnimationManager2` and `UIAnimationTransitionLibrary2` implementation from this branch; without it the CCL framework aborts with "requires Windows 10 or later" |
-| Steinberg Cubase Pro 15.0.30 | Custom (DComp + D2D1 + DirectWrite) + WebView2 | Installs through Steinberg's own bootstrapper and runs: project window, MixConsole with live meters, Hub. Installing needs the `msi` feature-cost fix (the setup crashed before its first dialog) and the Script SIP for signed PowerShell — without `pwrshsip`/`wintrust` the installer stops at "preinstall.ps1 … not trusted". Starting needs the `Windows.Globalization.Calendar` stub, without which `headtracking.dll` aborts behind the licence splash, and the `comdlg32` folder-dialog fix, without which the Hub reports the project folder as read-only. The window itself needs the dcomp virtual-surface resize and child-surface readback work — and the d2d1 WIC target fix, without which the MixConsole level meters stay empty. The video player needs the planar NV12 textures in the OpenGL renderer, the `CPU_LOCKABLE` format bit, custom Direct2D effects and the larger decoder sample pool (see the video-player entry above) |
+| Steinberg Cubase Pro 15.0.30 | Custom (DComp + D2D1 + DirectWrite) + WebView2 | Installs through Steinberg's own bootstrapper and runs: project window, MixConsole with live meters, Hub. Installing needs the `msi` feature-cost fix (the setup crashed before its first dialog) and the Script SIP for signed PowerShell — without `pwrshsip`/`wintrust` the installer stops at "preinstall.ps1 … not trusted". Starting needs the `Windows.Globalization.Calendar` runtime class, without which `headtracking.dll` aborts behind the licence splash, and the `comdlg32` folder-dialog fix, without which the Hub reports the project folder as read-only. The window itself needs the dcomp virtual-surface resize and child-surface readback work — and the d2d1 WIC target fix, without which the MixConsole level meters stay empty. The video player needs the planar NV12 textures in the OpenGL renderer, the `CPU_LOCKABLE` format bit, custom Direct2D effects and the larger decoder sample pool (see the video-player entry above) |
 
 ## Font Setup
 
