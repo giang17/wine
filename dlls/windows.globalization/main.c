@@ -331,7 +331,7 @@ static const struct IVectorView_HSTRINGVtbl hstring_vector_vtbl =
 
 static const struct IIterable_HSTRINGVtbl iterable_view_hstring_vtbl;
 
-static HRESULT hstring_vector_create(HSTRING *values, SIZE_T count, IVectorView_HSTRING **out)
+HRESULT hstring_vector_create(HSTRING *values, SIZE_T count, IVectorView_HSTRING **out)
 {
     struct hstring_vector *impl;
 
