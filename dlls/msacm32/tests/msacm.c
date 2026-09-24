@@ -1521,6 +1521,34 @@ static void test_acmDriverAdd(void)
     ok(driver_calls.driver.close == 0, "Expected 0, got %d\n", driver_calls.driver.close);
 }
 
+static void test_acmDriverAdd_name(void)
+{
+    ACMDRIVERDETAILSA details;
+    HACMDRIVERID drvid;
+    MMRESULT res;
+
+    drvid = (HACMDRIVERID)0xdeadbeef;
+    res = acmDriverAddA(&drvid, NULL, (LPARAM)"msacm.imaadpcm", 0, ACM_DRIVERADDF_NAME);
+    ok(res == MMSYSERR_NOERROR, "Expected 0, got %d\n", res);
+    if (res != MMSYSERR_NOERROR)
+        return;
+    ok(drvid != NULL && drvid != (HACMDRIVERID)0xdeadbeef, "got driver id %p\n", drvid);
+
+    memset(&details, 0, sizeof(details));
+    details.cbStruct = sizeof(details);
+    res = acmDriverDetailsA(drvid, &details, 0);
+    ok(res == MMSYSERR_NOERROR, "Expected 0, got %d\n", res);
+    ok(details.wMid == MM_MICROSOFT, "Expected %d, got %d\n", MM_MICROSOFT, details.wMid);
+    ok(details.wPid == MM_MSFT_ACM_IMAADPCM, "Expected %d, got %d\n", MM_MSFT_ACM_IMAADPCM, details.wPid);
+
+    res = acmDriverRemove(drvid, 0);
+    ok(res == MMSYSERR_NOERROR, "Expected 0, got %d\n", res);
+
+    drvid = (HACMDRIVERID)0xdeadbeef;
+    res = acmDriverAddA(&drvid, NULL, (LPARAM)"msacm.nonexistent", 0, ACM_DRIVERADDF_NAME);
+    ok(res == MMSYSERR_INVALPARAM, "Expected 11, got %d\n", res);
+}
+
 START_TEST(msacm)
 {
     driver_tests();
@@ -1533,4 +1561,5 @@ START_TEST(msacm)
     /* Test acmDriverAdd in the end as it may conflict
      * with other tests due to codec lookup order */
     test_acmDriverAdd();
+    test_acmDriverAdd_name();
 }
