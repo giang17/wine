@@ -79,27 +79,28 @@ PWINE_ACMDRIVERID MSACM_RegisterDriverFromRegistry(LPCWSTR pszRegEntry)
     WCHAR buf[2048];
     DWORD bufLen, lRet;
     HKEY hKey;
-    PWINE_ACMDRIVERID padid = NULL;
     
     /* The requested registry entry must have the format msacm.XXXXX in order to
        be recognized in any future sessions of msacm
      */
-    if (0 == wcsnicmp(pszRegEntry, msacmW, ARRAY_SIZE(msacmW))) {
-        lRet = RegOpenKeyExW(HKEY_LOCAL_MACHINE, drvkey, 0, KEY_QUERY_VALUE, &hKey);
-        if (lRet != ERROR_SUCCESS) {
-            WARN("unable to open registry key - 0x%08lx\n", lRet);
-        } else {
-            bufLen = sizeof(buf);
-            lRet = RegQueryValueExW(hKey, pszRegEntry, NULL, NULL, (LPBYTE)buf, &bufLen);
-            if (lRet != ERROR_SUCCESS) {
-                WARN("unable to query requested subkey %s - 0x%08lx\n", debugstr_w(pszRegEntry), lRet);
-            } else {
-                MSACM_RegisterDriver(pszRegEntry, buf, 0);
-            }
-            RegCloseKey( hKey );
-        }
+    if (wcsnicmp(pszRegEntry, msacmW, ARRAY_SIZE(msacmW)))
+        return NULL;
+
+    lRet = RegOpenKeyExW(HKEY_LOCAL_MACHINE, drvkey, 0, KEY_QUERY_VALUE, &hKey);
+    if (lRet == ERROR_SUCCESS) {
+        bufLen = sizeof(buf);
+        lRet = RegQueryValueExW(hKey, pszRegEntry, NULL, NULL, (LPBYTE)buf, &bufLen);
+        RegCloseKey( hKey );
     }
-    return padid;
+    if (lRet == ERROR_SUCCESS)
+        return MSACM_RegisterDriver(pszRegEntry, buf, 0);
+
+    /* MSACM_RegisterAllDrivers() also takes drivers from system.ini */
+    if (GetPrivateProfileStringW(L"drivers32", pszRegEntry, L"", buf, ARRAY_SIZE(buf), L"system.ini"))
+        return MSACM_RegisterDriver(pszRegEntry, buf, 0);
+
+    WARN("unable to find driver %s - 0x%08lx\n", debugstr_w(pszRegEntry), lRet);
+    return NULL;
 }
 
 #if 0
