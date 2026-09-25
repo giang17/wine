@@ -155,6 +155,20 @@ Two differences from a build of this repository are worth knowing:
 The same repository carries yabridge, pipewire-wineasio, pipeasio and winetricks. Builds
 are for Fedora 44 x86_64.
 
+### Packages for Arch Linux and CachyOS
+
+[mklnln/wine-d2d1-dcomp](https://github.com/mklnln/wine-d2d1-dcomp) provides PKGBUILDs
+that install this fork to `/opt/wine-d2d1` next to the system Wine, together with a
+`WINELOADER` dispatcher for yabridge that routes only selected prefixes to the patched
+build. The packages are maintained by their author, independently of this repository, and
+are not on the AUR; they are installed from that repository.
+
+- **The source package (`PKGBUILD`)** builds the current `d2d1-dcomp-11.0` at build time.
+  Rebuilding it picks up new fixes.
+- **The prebuilt package (`PKGBUILD-bin`)** installs a fixed release build. Compare its
+  release date with this branch before relying on it, and prefer the source package for
+  current fixes. A report from either package should include the output of `wine --version`.
+
 ## Verifying this fork
 
 GitHub records this repository as a fork of
