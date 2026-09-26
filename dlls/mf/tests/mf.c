@@ -3392,6 +3392,362 @@ static const IMFClockStateSinkVtbl test_clock_sink_vtbl =
     test_clock_sink_OnClockSetRate,
 };
 
+struct test_time_source
+{
+    IMFPresentationTimeSource IMFPresentationTimeSource_iface;
+    IMFClockStateSink IMFClockStateSink_iface;
+    LONG refcount;
+    MFCLOCK_STATE state;
+    LONGLONG offset, paused_time;
+    MFTIME start_time;
+    float rate, set_rate;
+    unsigned int start_count, stop_count, pause_count, restart_count, set_rate_count;
+};
+
+static struct test_time_source *impl_time_source_from_IMFPresentationTimeSource(IMFPresentationTimeSource *iface)
+{
+    return CONTAINING_RECORD(iface, struct test_time_source, IMFPresentationTimeSource_iface);
+}
+
+static struct test_time_source *impl_time_source_from_IMFClockStateSink(IMFClockStateSink *iface)
+{
+    return CONTAINING_RECORD(iface, struct test_time_source, IMFClockStateSink_iface);
+}
+
+static HRESULT WINAPI test_time_source_QueryInterface(IMFPresentationTimeSource *iface, REFIID riid, void **obj)
+{
+    struct test_time_source *source = impl_time_source_from_IMFPresentationTimeSource(iface);
+
+    if (IsEqualIID(riid, &IID_IMFPresentationTimeSource)
+            || IsEqualIID(riid, &IID_IMFClock)
+            || IsEqualIID(riid, &IID_IUnknown))
+    {
+        *obj = &source->IMFPresentationTimeSource_iface;
+    }
+    else if (IsEqualIID(riid, &IID_IMFClockStateSink))
+    {
+        *obj = &source->IMFClockStateSink_iface;
+    }
+    else
+    {
+        *obj = NULL;
+        return E_NOINTERFACE;
+    }
+
+    IUnknown_AddRef((IUnknown *)*obj);
+    return S_OK;
+}
+
+static ULONG WINAPI test_time_source_AddRef(IMFPresentationTimeSource *iface)
+{
+    struct test_time_source *source = impl_time_source_from_IMFPresentationTimeSource(iface);
+    return InterlockedIncrement(&source->refcount);
+}
+
+static ULONG WINAPI test_time_source_Release(IMFPresentationTimeSource *iface)
+{
+    struct test_time_source *source = impl_time_source_from_IMFPresentationTimeSource(iface);
+    return InterlockedDecrement(&source->refcount);
+}
+
+static HRESULT WINAPI test_time_source_GetClockCharacteristics(IMFPresentationTimeSource *iface, DWORD *flags)
+{
+    *flags = MFCLOCK_CHARACTERISTICS_FLAG_FREQUENCY_10MHZ;
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_GetCorrelatedTime(IMFPresentationTimeSource *iface, DWORD reserved,
+        LONGLONG *clock_time, MFTIME *system_time)
+{
+    struct test_time_source *source = impl_time_source_from_IMFPresentationTimeSource(iface);
+
+    *system_time = MFGetSystemTime();
+    if (source->state == MFCLOCK_STATE_RUNNING)
+        *clock_time = source->offset + (LONGLONG)((*system_time - source->start_time) * source->rate);
+    else if (source->state == MFCLOCK_STATE_PAUSED)
+        *clock_time = source->paused_time;
+    else
+        *clock_time = 0;
+
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_GetContinuityKey(IMFPresentationTimeSource *iface, DWORD *key)
+{
+    *key = 0;
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_GetState(IMFPresentationTimeSource *iface, DWORD reserved, MFCLOCK_STATE *state)
+{
+    struct test_time_source *source = impl_time_source_from_IMFPresentationTimeSource(iface);
+    *state = source->state;
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_GetProperties(IMFPresentationTimeSource *iface, MFCLOCK_PROPERTIES *props)
+{
+    memset(props, 0, sizeof(*props));
+    props->qwClockFrequency = MFCLOCK_FREQUENCY_HNS;
+    props->dwClockTolerance = MFCLOCK_TOLERANCE_UNKNOWN;
+    props->dwClockJitter = 1;
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_GetUnderlyingClock(IMFPresentationTimeSource *iface, IMFClock **clock)
+{
+    *clock = NULL;
+    return MF_E_NO_CLOCK;
+}
+
+static const IMFPresentationTimeSourceVtbl test_time_source_vtbl =
+{
+    test_time_source_QueryInterface,
+    test_time_source_AddRef,
+    test_time_source_Release,
+    test_time_source_GetClockCharacteristics,
+    test_time_source_GetCorrelatedTime,
+    test_time_source_GetContinuityKey,
+    test_time_source_GetState,
+    test_time_source_GetProperties,
+    test_time_source_GetUnderlyingClock,
+};
+
+static HRESULT WINAPI test_time_source_sink_QueryInterface(IMFClockStateSink *iface, REFIID riid, void **obj)
+{
+    struct test_time_source *source = impl_time_source_from_IMFClockStateSink(iface);
+    return IMFPresentationTimeSource_QueryInterface(&source->IMFPresentationTimeSource_iface, riid, obj);
+}
+
+static ULONG WINAPI test_time_source_sink_AddRef(IMFClockStateSink *iface)
+{
+    struct test_time_source *source = impl_time_source_from_IMFClockStateSink(iface);
+    return IMFPresentationTimeSource_AddRef(&source->IMFPresentationTimeSource_iface);
+}
+
+static ULONG WINAPI test_time_source_sink_Release(IMFClockStateSink *iface)
+{
+    struct test_time_source *source = impl_time_source_from_IMFClockStateSink(iface);
+    return IMFPresentationTimeSource_Release(&source->IMFPresentationTimeSource_iface);
+}
+
+static HRESULT WINAPI test_time_source_sink_OnClockStart(IMFClockStateSink *iface, MFTIME system_time, LONGLONG offset)
+{
+    struct test_time_source *source = impl_time_source_from_IMFClockStateSink(iface);
+
+    source->start_count++;
+    if (offset == PRESENTATION_CURRENT_POSITION)
+    {
+        MFTIME systime;
+        IMFPresentationTimeSource_GetCorrelatedTime(&source->IMFPresentationTimeSource_iface, 0, &source->offset, &systime);
+    }
+    else
+        source->offset = offset;
+    source->start_time = system_time;
+    source->state = MFCLOCK_STATE_RUNNING;
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_sink_OnClockStop(IMFClockStateSink *iface, MFTIME system_time)
+{
+    struct test_time_source *source = impl_time_source_from_IMFClockStateSink(iface);
+
+    source->stop_count++;
+    source->state = MFCLOCK_STATE_STOPPED;
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_sink_OnClockPause(IMFClockStateSink *iface, MFTIME system_time)
+{
+    struct test_time_source *source = impl_time_source_from_IMFClockStateSink(iface);
+    MFTIME systime;
+
+    source->pause_count++;
+    IMFPresentationTimeSource_GetCorrelatedTime(&source->IMFPresentationTimeSource_iface, 0, &source->paused_time, &systime);
+    source->state = MFCLOCK_STATE_PAUSED;
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_sink_OnClockRestart(IMFClockStateSink *iface, MFTIME system_time)
+{
+    struct test_time_source *source = impl_time_source_from_IMFClockStateSink(iface);
+
+    source->restart_count++;
+    source->offset = source->paused_time;
+    source->start_time = system_time;
+    source->state = MFCLOCK_STATE_RUNNING;
+    return S_OK;
+}
+
+static HRESULT WINAPI test_time_source_sink_OnClockSetRate(IMFClockStateSink *iface, MFTIME system_time, float rate)
+{
+    struct test_time_source *source = impl_time_source_from_IMFClockStateSink(iface);
+
+    source->set_rate_count++;
+    source->set_rate = rate;
+    source->rate = rate;
+    return S_OK;
+}
+
+static const IMFClockStateSinkVtbl test_time_source_sink_vtbl =
+{
+    test_time_source_sink_QueryInterface,
+    test_time_source_sink_AddRef,
+    test_time_source_sink_Release,
+    test_time_source_sink_OnClockStart,
+    test_time_source_sink_OnClockStop,
+    test_time_source_sink_OnClockPause,
+    test_time_source_sink_OnClockRestart,
+    test_time_source_sink_OnClockSetRate,
+};
+
+static void init_test_time_source(struct test_time_source *source)
+{
+    memset(source, 0, sizeof(*source));
+    source->IMFPresentationTimeSource_iface.lpVtbl = &test_time_source_vtbl;
+    source->IMFClockStateSink_iface.lpVtbl = &test_time_source_sink_vtbl;
+    source->refcount = 1;
+    source->rate = 1.0f;
+}
+
+/* Changing the time source of a clock that is not stopped: the new source is
+ * brought into the clock's state from within SetTimeSource(), a running clock
+ * continues at its current time. */
+static void test_presentation_clock_time_source_change(void)
+{
+    struct test_time_source source1, source2, source3, source4;
+    IMFClockStateSink test_sink = { &test_clock_sink_vtbl };
+    LONGLONG time, time2, source_time;
+    IMFPresentationClock *clock;
+    IMFRateControl *rate_control;
+    MFCLOCK_STATE state;
+    MFTIME systime;
+    HRESULT hr;
+
+    init_test_time_source(&source1);
+    init_test_time_source(&source2);
+    init_test_time_source(&source3);
+    init_test_time_source(&source4);
+
+    hr = MFCreatePresentationClock(&clock);
+    ok(hr == S_OK, "Failed to create presentation clock, hr %#lx.\n", hr);
+
+    hr = IMFPresentationClock_AddClockStateSink(clock, &test_sink);
+    ok(hr == S_OK, "Failed to add a sink, hr %#lx.\n", hr);
+
+    hr = IMFPresentationClock_SetTimeSource(clock, &source1.IMFPresentationTimeSource_iface);
+    ok(hr == S_OK, "Failed to set time source, hr %#lx.\n", hr);
+    ok(!source1.start_count && !source1.stop_count && !source1.pause_count && !source1.set_rate_count,
+            "Unexpected notifications %u/%u/%u/%u.\n", source1.start_count, source1.stop_count,
+            source1.pause_count, source1.set_rate_count);
+
+    hr = IMFPresentationClock_Start(clock, 10000000);
+    ok(hr == S_OK, "Failed to start the clock, hr %#lx.\n", hr);
+    ok(source1.start_count == 1, "Unexpected start count %u.\n", source1.start_count);
+
+    Sleep(50);
+
+    hr = IMFPresentationClock_GetTime(clock, &time);
+    ok(hr == S_OK, "Failed to get time, hr %#lx.\n", hr);
+    ok(time >= 10000000, "Unexpected time %s.\n", wine_dbgstr_longlong(time));
+
+    /* Running clock: the new source is started at the current time. */
+    hr = IMFPresentationClock_SetTimeSource(clock, &source2.IMFPresentationTimeSource_iface);
+    ok(hr == S_OK, "Failed to set time source, hr %#lx.\n", hr);
+    ok(source2.start_count == 1, "Unexpected start count %u.\n", source2.start_count);
+    ok(!source2.stop_count && !source2.pause_count && !source2.restart_count && !source2.set_rate_count,
+            "Unexpected notifications %u/%u/%u/%u.\n", source2.stop_count, source2.pause_count,
+            source2.restart_count, source2.set_rate_count);
+    ok(source2.state == MFCLOCK_STATE_RUNNING, "Unexpected source state %d.\n", source2.state);
+    ok(source2.offset >= time, "Unexpected offset %s, time %s.\n", wine_dbgstr_longlong(source2.offset),
+            wine_dbgstr_longlong(time));
+    ok(source2.offset < time + 10000000, "Unexpected offset %s, time %s.\n", wine_dbgstr_longlong(source2.offset),
+            wine_dbgstr_longlong(time));
+
+    hr = IMFPresentationClock_GetState(clock, 0, &state);
+    ok(hr == S_OK, "Failed to get state, hr %#lx.\n", hr);
+    ok(state == MFCLOCK_STATE_RUNNING, "Unexpected state %d.\n", state);
+
+    hr = IMFPresentationClock_GetTime(clock, &time2);
+    ok(hr == S_OK, "Failed to get time, hr %#lx.\n", hr);
+    ok(time2 >= time, "Unexpected time %s, previous %s.\n", wine_dbgstr_longlong(time2), wine_dbgstr_longlong(time));
+
+    Sleep(50);
+
+    hr = IMFPresentationClock_GetTime(clock, &time);
+    ok(hr == S_OK, "Failed to get time, hr %#lx.\n", hr);
+    ok(time > time2, "Clock did not advance: %s, previous %s.\n", wine_dbgstr_longlong(time),
+            wine_dbgstr_longlong(time2));
+
+    /* Paused clock: the new source ends up paused at the clock's time. */
+    hr = IMFPresentationClock_Pause(clock);
+    ok(hr == S_OK, "Failed to pause the clock, hr %#lx.\n", hr);
+    ok(source2.pause_count == 1, "Unexpected pause count %u.\n", source2.pause_count);
+
+    hr = IMFPresentationClock_GetTime(clock, &time);
+    ok(hr == S_OK, "Failed to get time, hr %#lx.\n", hr);
+
+    hr = IMFPresentationClock_SetTimeSource(clock, &source3.IMFPresentationTimeSource_iface);
+    ok(hr == S_OK, "Failed to set time source, hr %#lx.\n", hr);
+    ok(source3.pause_count == 1, "Unexpected pause count %u.\n", source3.pause_count);
+    todo_wine
+    ok(!source3.start_count, "Unexpected start count %u.\n", source3.start_count);
+    ok(source3.state == MFCLOCK_STATE_PAUSED, "Unexpected source state %d.\n", source3.state);
+
+    hr = IMFPresentationClock_GetState(clock, 0, &state);
+    ok(hr == S_OK, "Failed to get state, hr %#lx.\n", hr);
+    ok(state == MFCLOCK_STATE_PAUSED, "Unexpected state %d.\n", state);
+
+    hr = IMFPresentationClock_Start(clock, PRESENTATION_CURRENT_POSITION);
+    ok(hr == S_OK, "Failed to start the clock, hr %#lx.\n", hr);
+    ok(source3.state == MFCLOCK_STATE_RUNNING, "Unexpected source state %d.\n", source3.state);
+
+    hr = IMFPresentationTimeSource_GetCorrelatedTime(&source3.IMFPresentationTimeSource_iface, 0, &source_time, &systime);
+    ok(hr == S_OK, "Failed to get time, hr %#lx.\n", hr);
+    ok(source_time >= time, "Unexpected time %s, paused at %s.\n", wine_dbgstr_longlong(source_time),
+            wine_dbgstr_longlong(time));
+
+    /* Stopped clock: the new source is stopped. */
+    hr = IMFPresentationClock_Stop(clock);
+    ok(hr == S_OK, "Failed to stop the clock, hr %#lx.\n", hr);
+    ok(source3.stop_count == 1, "Unexpected stop count %u.\n", source3.stop_count);
+
+    hr = IMFPresentationClock_SetTimeSource(clock, &source4.IMFPresentationTimeSource_iface);
+    ok(hr == S_OK, "Failed to set time source, hr %#lx.\n", hr);
+    ok(source4.stop_count == 1, "Unexpected stop count %u.\n", source4.stop_count);
+    ok(!source4.start_count && !source4.pause_count, "Unexpected notifications %u/%u.\n", source4.start_count,
+            source4.pause_count);
+    ok(source4.state == MFCLOCK_STATE_STOPPED, "Unexpected source state %d.\n", source4.state);
+
+    /* A rate other than the default is passed on before the start. */
+    hr = IMFPresentationClock_QueryInterface(clock, &IID_IMFRateControl, (void **)&rate_control);
+    ok(hr == S_OK, "Failed to get rate control, hr %#lx.\n", hr);
+
+    hr = IMFRateControl_SetRate(rate_control, FALSE, 0.5f);
+    ok(hr == S_OK, "Failed to set rate, hr %#lx.\n", hr);
+
+    hr = IMFPresentationClock_Start(clock, 0);
+    ok(hr == S_OK, "Failed to start the clock, hr %#lx.\n", hr);
+
+    init_test_time_source(&source1);
+    hr = IMFPresentationClock_SetTimeSource(clock, &source1.IMFPresentationTimeSource_iface);
+    ok(hr == S_OK, "Failed to set time source, hr %#lx.\n", hr);
+    ok(source1.set_rate_count == 1, "Unexpected rate count %u.\n", source1.set_rate_count);
+    ok(source1.set_rate == 0.5f, "Unexpected rate %f.\n", source1.set_rate);
+    ok(source1.start_count == 1, "Unexpected start count %u.\n", source1.start_count);
+    ok(source1.state == MFCLOCK_STATE_RUNNING, "Unexpected source state %d.\n", source1.state);
+
+    hr = IMFPresentationClock_Stop(clock);
+    ok(hr == S_OK, "Failed to stop the clock, hr %#lx.\n", hr);
+
+    IMFRateControl_Release(rate_control);
+
+    hr = IMFPresentationClock_RemoveClockStateSink(clock, &test_sink);
+    ok(hr == S_OK, "Failed to remove sink, hr %#lx.\n", hr);
+
+    IMFPresentationClock_Release(clock);
+}
+
 static void test_presentation_clock(void)
 {
     static const struct clock_state_test
@@ -8722,6 +9078,7 @@ START_TEST(mf)
     test_media_session_rate_control();
     test_MFShutdownObject();
     test_presentation_clock();
+    test_presentation_clock_time_source_change();
     test_sample_grabber();
     test_sample_grabber_is_mediatype_supported();
     test_sample_grabber_orientation(MFVideoFormat_RGB32);

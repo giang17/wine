@@ -350,7 +350,10 @@ This is the recommended branch. What it changes, by subsystem:
   during teardown, and the session is told when a scrub has been carried out. Together
   these fix seeking, looping, timeline jumps, playback stalling after 20-35 seconds,
   stuttering after a large seek, and a black picture after a window toggle in Fender
-  Studio Pro 8
+  Studio Pro 8. A presentation clock whose time source is replaced while it runs starts
+  the new source at its current time, as Windows does (measured on Windows 10): Studio
+  Pro installs its own time source right after each session start, and the video stayed
+  black from the clip start on and after a loop wrap because that source was never started
 - **Video players that drive the H.264 decoder themselves (wined3d, d3d11, d2d1,
   winegstreamer)**: Cubase 15 does not render video through the EVR. It drives the H.264
   decoder MFT directly: it enumerates it, hands it a DXGI device manager, receives NV12

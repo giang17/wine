@@ -363,13 +363,32 @@ static HRESULT WINAPI present_clock_SetTimeSource(IMFPresentationClock *iface,
         IMFPresentationTimeSource *time_source)
 {
     struct presentation_clock *clock = impl_from_IMFPresentationClock(iface);
+    LONGLONG clock_time = 0;
     MFCLOCK_PROPERTIES props;
     IMFClock *source_clock;
+    MFTIME system_time;
     HRESULT hr;
 
     TRACE("%p, %p.\n", iface, time_source);
 
     EnterCriticalSection(&clock->cs);
+
+    /* The clock keeps its state across a change of time source, so a source
+     * set into a clock that is not stopped has to be brought into that state:
+     * Windows calls the new source's clock state sink from within
+     * SetTimeSource(), a running clock starts the source at its current time
+     * and continues from there, a paused one pauses it, a stopped one stops it,
+     * and a rate other than the default is passed on first. The other clock
+     * state sinks are not notified. Measured on Windows 10 19044 with
+     * projects/mf-clock-timesource-probe (issue 415): Studio Pro replaces the
+     * time source of its running session clock with its own after the start;
+     * left unstarted, that source reported 0 for the whole playback and the
+     * video renderer never presented a frame. */
+    if (clock->time_source && (clock->state == MFCLOCK_STATE_RUNNING || clock->state == MFCLOCK_STATE_PAUSED))
+    {
+        if (FAILED(IMFPresentationTimeSource_GetCorrelatedTime(clock->time_source, 0, &clock_time, &system_time)))
+            clock_time = 0;
+    }
 
     if (clock->time_source)
         IMFPresentationTimeSource_Release(clock->time_source);
@@ -383,6 +402,24 @@ static HRESULT WINAPI present_clock_SetTimeSource(IMFPresentationClock *iface,
     {
         clock->time_source = time_source;
         IMFPresentationTimeSource_AddRef(clock->time_source);
+
+        system_time = MFGetSystemTime();
+        switch (clock->state)
+        {
+            case MFCLOCK_STATE_RUNNING:
+            case MFCLOCK_STATE_PAUSED:
+                if (clock->rate != 1.0f)
+                    IMFClockStateSink_OnClockSetRate(clock->time_source_sink, system_time, clock->rate);
+                IMFClockStateSink_OnClockStart(clock->time_source_sink, system_time, clock_time);
+                if (clock->state == MFCLOCK_STATE_PAUSED)
+                    IMFClockStateSink_OnClockPause(clock->time_source_sink, system_time);
+                break;
+            case MFCLOCK_STATE_STOPPED:
+                IMFClockStateSink_OnClockStop(clock->time_source_sink, system_time);
+                break;
+            default:
+                break;
+        }
     }
 
     if (SUCCEEDED(IMFPresentationTimeSource_GetUnderlyingClock(time_source, &source_clock)))
