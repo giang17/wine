@@ -102,7 +102,7 @@ static x11drv_event_handler handlers[MAX_EVENT_HANDLERS] =
     X11DRV_ButtonRelease,     /*  5 ButtonRelease */
     X11DRV_MotionNotify,      /*  6 MotionNotify */
     X11DRV_EnterNotify,       /*  7 EnterNotify */
-    NULL,                     /*  8 LeaveNotify */
+    X11DRV_LeaveNotify,       /*  8 LeaveNotify */
     X11DRV_FocusIn,           /*  9 FocusIn */
     X11DRV_FocusOut,          /* 10 FocusOut */
     X11DRV_KeymapNotify,      /* 11 KeymapNotify */

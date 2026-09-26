@@ -602,6 +602,7 @@ extern BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_MotionNotify( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *event );
+extern BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_KeymapNotify( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_DestroyNotify( HWND hwnd, XEvent *event );

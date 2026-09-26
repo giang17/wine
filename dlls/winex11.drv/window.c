@@ -567,7 +567,8 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
                                VisibilityChangeMask);
     /* for transparent windows, exclude mouse events to allow mouse pass-through */
     if (!(ex_style & WS_EX_TRANSPARENT)) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
-                                                              ButtonReleaseMask | EnterWindowMask);
+                                                              ButtonReleaseMask | EnterWindowMask |
+                                                              LeaveWindowMask);
 
     /* DComp windows: use None background_pixmap to avoid black flash on map.
      * Without this, XMapWindow shows background_pixel=0 (black) for 1 frame
