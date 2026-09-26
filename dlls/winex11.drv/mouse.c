@@ -1706,6 +1706,65 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
     return TRUE;
 }
 
+
+/***********************************************************************
+ *           X11DRV_LeaveNotify
+ *
+ * The pointer left one of our windows for a window that is not ours, such
+ * as the frame the window manager draws around it, or another client's
+ * grab took it away. No motion event follows while it stays there, so the
+ * position the server holds would stay where the pointer was last seen
+ * inside the window. After every window move the server synthesizes a
+ * WM_MOUSEMOVE at that position, and a stale one shows up as hover
+ * feedback wandering across the window while the window manager drags it.
+ *
+ * Report where the pointer is now, not where the event says it was: a
+ * crossing caused by another window being mapped over ours is queued
+ * before a warp by another process, and reporting the event position
+ * then would move the pointer back. Like a button event on a foreign
+ * window, leave the window under the position to the server: the pointer
+ * is no longer in this one, so it must not claim the point the way
+ * send_mouse_input() does for the z-order.
+ */
+BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
+{
+    XCrossingEvent *event = &xev->xcrossing;
+    Window root, child;
+    int root_x, root_y, win_x, win_y;
+    unsigned int state;
+    INPUT input;
+    POINT pt;
+
+    TRACE( "hwnd %p/%lx pos %d,%d detail %d mode %d\n",
+           hwnd, event->window, event->x, event->y, event->detail, event->mode );
+
+    if (!hwnd) return FALSE;
+    /* the pointer went into a child of ours, it did not leave the window */
+    if (event->detail == NotifyInferior) return FALSE;
+    if (hwnd == NtUserGetAncestor( get_capture_window(), GA_ROOT )) return FALSE;
+
+    if (is_old_motion_event( event->serial ))
+    {
+        TRACE( "pos %d,%d old serial %lu, ignoring\n", event->x, event->y, event->serial );
+        return FALSE;
+    }
+
+    if (!XQueryPointer( event->display, root_window, &root, &child, &root_x, &root_y, &win_x, &win_y, &state ))
+        return FALSE;
+    pt = root_to_virtual_screen( win_x, win_y );
+    TRACE( "pointer now at %s\n", wine_dbgstr_point(&pt) );
+
+    input.type           = INPUT_MOUSE;
+    input.mi.dx          = pt.x;
+    input.mi.dy          = pt.y;
+    input.mi.mouseData   = 0;
+    input.mi.dwFlags     = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    input.mi.time        = EVENT_x11_time_to_win32_time( event->time );
+    input.mi.dwExtraInfo = 0;
+    NtUserSendHardwareInput( 0, 0, &input, 0 );
+    return TRUE;
+}
+
 #ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
 
 /***********************************************************************

@@ -78,7 +78,7 @@ BOOL X11DRV_CreateDesktop( const WCHAR *name, UINT width, UINT height )
      * that the host compositor blends with per-pixel alpha).  SubstructureNotify
      * Mask lets the compositor receive Map/Configure/Destroy of the override-
      * redirect top-levels that become direct children of the VD root. */
-    win_attr.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask | EnterWindowMask |
+    win_attr.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask | EnterWindowMask | LeaveWindowMask |
                           PointerMotionMask | ButtonPressMask | ButtonReleaseMask | FocusChangeMask |
                           StructureNotifyMask | PropertyChangeMask | SubstructureNotifyMask;
     win_attr.cursor = XCreateFontCursor( display, XC_top_left_arrow );
