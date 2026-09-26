@@ -896,10 +896,15 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
         pending = InterlockedCompareExchange(&cs->pending_presents, 0, 0);
         if (pending >= swapchain->max_frame_latency)
         {
+            unsigned int held;
+
             TRACE_(d3d_perf)("Reached latency limit (%u frames), blocking to wait.\n", swapchain->max_frame_latency);
-            wined3d_mutex_unlock();
+            /* Every recursion level, not one: d3d9's Present() and
+             * wined3d_swapchain_present() both hold the mutex here, and a
+             * level left behind kept the mutex held through the wait. */
+            held = wined3d_mutex_release_all();
             WaitForSingleObject(cs->present_event, INFINITE);
-            wined3d_mutex_lock();
+            wined3d_mutex_reacquire(held);
             TRACE_(d3d_perf)("Woken up from the wait.\n");
             pending = InterlockedCompareExchange(&cs->pending_presents, 0, 0);
         }
@@ -3555,7 +3560,7 @@ static void wined3d_cs_mt_submit(struct wined3d_device_context *context, enum wi
  * and the flag is taken back here without waiting.  The same protocol guards
  * the frame-latency wait in wined3d_cs_emit_present(). */
 static void wined3d_cs_wait_for_progress(struct wined3d_cs *cs, unsigned int *spin_count,
-        bool (*done)(const void *ctx), const void *ctx)
+        bool (*done)(const void *ctx), const void *ctx, bool release_mutex)
 {
     if (++*spin_count < WINED3D_PAUSE_SPIN_COUNT)
     {
@@ -3565,7 +3570,22 @@ static void wined3d_cs_wait_for_progress(struct wined3d_cs *cs, unsigned int *sp
 
     InterlockedExchange(&cs->waiting_for_progress, TRUE);
     if (!done(ctx) || !InterlockedCompareExchange(&cs->waiting_for_progress, FALSE, TRUE))
+    {
+        /* Not while waiting for queue space: the caller has captured the
+         * queue head and writes its packet there afterwards, and a second
+         * producer on the same device (a D3D11 worker thread creating
+         * resources) would advance the head meanwhile. A finish or a
+         * resource-idle wait re-evaluates its condition after the wait and
+         * produces nothing before it holds the mutex again. */
+        unsigned int held;
+
+        InterlockedIncrement(&cs->progress_waiters);
+        held = release_mutex ? wined3d_mutex_release_all() : 0;
         WaitForSingleObject(cs->progress_event, INFINITE);
+        if (InterlockedDecrement(&cs->progress_waiters))
+            SetEvent(cs->progress_event);
+        wined3d_mutex_reacquire(held);
+    }
 }
 
 struct wined3d_cs_queue_space_ctx
@@ -3639,7 +3659,7 @@ static void *wined3d_cs_queue_require_space(struct wined3d_cs_queue *queue, size
     space_ctx.head = head;
     space_ctx.packet_size = packet_size;
     while (!wined3d_cs_queue_has_space(&space_ctx))
-        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_cs_queue_has_space, &space_ctx);
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_cs_queue_has_space, &space_ctx, false);
 
     packet = (struct wined3d_cs_packet *)&queue->data[head];
     packet->size = size;
@@ -3674,7 +3694,7 @@ static void wined3d_cs_mt_finish(struct wined3d_device_context *context, enum wi
 
     TRACE_(d3d_perf)("Waiting for queue %u to be empty.\n", queue_id);
     while (!wined3d_cs_queue_is_drained(&cs->queue[queue_id]))
-        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_cs_queue_is_drained, &cs->queue[queue_id]);
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_cs_queue_is_drained, &cs->queue[queue_id], true);
     TRACE_(d3d_perf)("Queue is now empty.\n");
 }
 
@@ -3731,7 +3751,7 @@ void wined3d_resource_wait_idle(const struct wined3d_resource *resource)
         return;
 
     while (!wined3d_resource_is_idle(&ctx))
-        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_resource_is_idle, &ctx);
+        wined3d_cs_wait_for_progress(cs, &spin_count, wined3d_resource_is_idle, &ctx, true);
 }
 
 static const struct wined3d_device_context_ops wined3d_cs_mt_ops =

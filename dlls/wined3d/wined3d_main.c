@@ -560,6 +560,34 @@ void WINAPI wined3d_mutex_lock(void)
     EnterCriticalSection(&wined3d_cs);
 }
 
+/* Give the global mutex up while a client thread waits for its command
+ * stream, and take it back afterwards (issue 414).  A thread that holds the
+ * mutex through such a wait blocks every other client thread of the process
+ * for as long as its own CS thread needs: SynthEdit's WPF chrome (D3D9) and
+ * its GMPI canvas (D3D11) render on two threads and two devices at every
+ * resize step, and the canvas thread spent ~106 ms of every ~120 ms step
+ * waiting for the mutex while the WPF thread waited, mutex held, for a
+ * make-current on its freshly resized window.  Different devices do not
+ * share client-side state under the mutex; on one device the D3D threading
+ * rules already require the application to serialise. */
+unsigned int wined3d_mutex_release_all(void)
+{
+    unsigned int count, i;
+
+    if (wined3d_cs.OwningThread != ULongToHandle(GetCurrentThreadId()))
+        return 0;
+    count = wined3d_cs.RecursionCount;
+    for (i = 0; i < count; ++i)
+        LeaveCriticalSection(&wined3d_cs);
+    return count;
+}
+
+void wined3d_mutex_reacquire(unsigned int count)
+{
+    while (count--)
+        EnterCriticalSection(&wined3d_cs);
+}
+
 void WINAPI wined3d_mutex_unlock(void)
 {
     LeaveCriticalSection(&wined3d_cs);
