@@ -2251,6 +2251,8 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         if (!user_driver->pGetWindowStateUpdates( hwnd, &state_cmd, &swp_flags, &window_rect, &foreground )) goto unlock;
         window_rect = map_rect_raw_to_virt( window_rect, get_thread_dpi() );
 
+        if (state_cmd || swp_flags) cancel_capture_for_wm_change( hwnd );
+
         if (foreground) set_foreground_window( foreground, FALSE, TRUE );
         switch (LOWORD(state_cmd))
         {

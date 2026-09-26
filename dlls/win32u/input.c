@@ -592,6 +592,35 @@ HWND get_capture(void)
     return NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndCapture : 0;
 }
 
+/* A window manager has moved, resized or changed the state of a window on its own, from a press on
+ * its frame that never reached us. On Windows that press goes to the capture window of the thread as
+ * a client click, and an application that captured the mouse to notice a click outside, e.g. to
+ * close an open menu or drop-down list, would close it. Cancel such a capture the way a modal dialog
+ * does. The menu and move/size loops grab the pointer, the press cannot have gone elsewhere; and a
+ * held mouse button means the application is dragging, possibly the window itself. */
+void cancel_capture_for_wm_change( HWND hwnd )
+{
+    static const BYTE buttons[] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 };
+    const desktop_shm_t *desktop_shm;
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    BYTE keystate[ARRAY_SIZE(buttons)] = {0};
+    GUITHREADINFO info;
+    NTSTATUS status;
+    UINT i;
+
+    info.cbSize = sizeof(info);
+    if (!NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) || !info.hwndCapture) return;
+    if (info.flags & (GUI_INMENUMODE | GUI_INMOVESIZE)) return;
+
+    while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
+        for (i = 0; i < ARRAY_SIZE(buttons); i++) keystate[i] = desktop_shm->keystate[buttons[i]];
+    if (status) return;
+    for (i = 0; i < ARRAY_SIZE(buttons); i++) if (keystate[i] & 0x80) return;
+
+    TRACE( "window manager changed %p, cancelling capture %p\n", hwnd, info.hwndCapture );
+    send_message( info.hwndCapture, WM_CANCELMODE, 0, 0 );
+}
+
 /* see GetFocus */
 HWND get_focus(void)
 {
