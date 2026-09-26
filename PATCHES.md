@@ -189,6 +189,14 @@ This is the recommended branch. What it changes, by subsystem:
   frame or undefined pixmap content, and SynthEdit 1.5's menus came up as a copy of the
   screen below them or black once the empty-region flush above was disabled. WineHQ bug
   60173 reports the same for every WPF menu, tooltip and `AllowsTransparency` window.
+- **win32u**: a mouse capture taken without a menu or move/size loop ends with
+  `WM_CANCELMODE` when the window manager moves, resizes or changes the state of a window
+  of that thread, unless a mouse button is held. The press on the window manager frame
+  never reaches Wine; on Windows it would go to the capture window as a client click. WPF
+  menus (SynthEdit 1.5) take the mouse that way, so an open menu stayed open and stayed
+  behind at its old screen position while the window was dragged away. Win32 drop-down
+  lists lose their capture the same way but have no handler for it, so they still stay
+  until the next click. WineHQ bug 12027.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
