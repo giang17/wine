@@ -1107,6 +1107,26 @@ static void window_set_mwm_hints( struct x11drv_win_data *data, const MwmHints *
 
 
 /***********************************************************************
+ *              is_close_enabled
+ *
+ * Whether the caption close button of the window is enabled: the same test as
+ * handle_wm_protocols() applies to WM_DELETE_WINDOW and as win32u uses to draw
+ * the button grayed, so that the window manager does not offer a close button
+ * that a click would then be discarded for.
+ */
+static BOOL is_close_enabled( HWND hwnd )
+{
+    HMENU sys_menu;
+    UINT state;
+
+    if (NtUserGetClassLongW( hwnd, GCL_STYLE ) & CS_NOCLOSE) return FALSE;
+    if (!(sys_menu = NtUserGetSystemMenu( hwnd, FALSE ))) return TRUE;
+    state = NtUserThunkedMenuItemInfo( sys_menu, SC_CLOSE, MF_BYCOMMAND, NtUserGetMenuState, NULL, NULL );
+    return state != 0xffffffff && !(state & (MF_DISABLED | MF_GRAYED));
+}
+
+
+/***********************************************************************
  *              set_mwm_hints
  */
 static void set_mwm_hints( struct x11drv_win_data *data, UINT style, UINT ex_style )
@@ -1130,7 +1150,7 @@ static void set_mwm_hints( struct x11drv_win_data *data, UINT style, UINT ex_sty
         if (is_window_resizable( data, style )) mwm_hints.functions |= MWM_FUNC_RESIZE;
         if (!(style & WS_DISABLED))
         {
-            mwm_hints.functions |= MWM_FUNC_CLOSE;
+            if (is_close_enabled( data->hwnd )) mwm_hints.functions |= MWM_FUNC_CLOSE;
             if (style & WS_MINIMIZEBOX) mwm_hints.functions |= MWM_FUNC_MINIMIZE;
             if (style & WS_MAXIMIZEBOX) mwm_hints.functions |= MWM_FUNC_MAXIMIZE;
 
