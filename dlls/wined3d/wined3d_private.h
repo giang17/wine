@@ -3750,6 +3750,11 @@ struct wined3d_cs
 
     HANDLE event, progress_event;
     LONG waiting_for_event;
+    /* Client threads asleep on progress_event. The CS thread signals the
+     * auto-reset event once; each woken waiter passes the signal on while
+     * others remain (issue 414: with the mutex released around the wait,
+     * two threads of one device can wait at the same time). */
+    LONG progress_waiters;
     LONG waiting_for_progress;
 };
 
