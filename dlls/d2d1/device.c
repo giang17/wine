@@ -1251,10 +1251,16 @@ static HRESULT d2d_device_context_get_scratch_buffer(struct d2d_device_context *
         ID3D11Buffer_Release(scratch->buffer);
     scratch->buffer = NULL;
 
+    /* Dynamic, written through a WRITE_DISCARD map: wined3d serves such a map
+     * from the client thread (a sub-allocated, persistently mapped buffer
+     * object), whereas an UpdateSubresource() on a DEFAULT buffer has to wait
+     * for the command stream to drain every queued draw that references the
+     * buffer and then round-trips to it - one synchronisation per primitive,
+     * 1090-1940 per 20 px resize step of the SynthEdit canvas (issue 414). */
     desc.ByteWidth = min_size + min_size / 2;
-    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.Usage = D3D11_USAGE_DYNAMIC;
     desc.BindFlags = bind_flags;
-    desc.CPUAccessFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     desc.MiscFlags = 0;
     desc.StructureByteStride = 0;
 
@@ -1264,19 +1270,19 @@ static HRESULT d2d_device_context_get_scratch_buffer(struct d2d_device_context *
 
 update:
     {
+        D3D11_MAPPED_SUBRESOURCE mapped;
         ID3D11DeviceContext *context;
-        D3D11_BOX box;
-
-        box.left = 0;
-        box.top = 0;
-        box.front = 0;
-        box.right = min_size;
-        box.bottom = 1;
-        box.back = 1;
 
         ID3D11Device1_GetImmediateContext(ctx->d3d_device, &context);
-        ID3D11DeviceContext_UpdateSubresource(context, (ID3D11Resource *)scratch->buffer,
-                0, &box, data, min_size, 0);
+        if (FAILED(hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)scratch->buffer, 0,
+                D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        {
+            WARN("Failed to map scratch buffer, hr %#lx.\n", hr);
+            ID3D11DeviceContext_Release(context);
+            return hr;
+        }
+        memcpy(mapped.pData, data, min_size);
+        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)scratch->buffer, 0);
         ID3D11DeviceContext_Release(context);
     }
 
