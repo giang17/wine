@@ -117,7 +117,8 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
     }
 
     wined3d_swapchain_state_cleanup(&swapchain->state);
-    wined3d_swapchain_set_gamma_ramp(swapchain, 0, &swapchain->orig_gamma);
+    if (swapchain->orig_gamma_saved)
+        wined3d_swapchain_set_gamma_ramp(swapchain, 0, &swapchain->orig_gamma);
 
     /* Release the swapchain's draw buffers. Make sure swapchain->back_buffers[0]
      * is the last buffer to be destroyed, FindContext() depends on that. */
@@ -564,7 +565,14 @@ void CDECL wined3d_swapchain_get_desc(const struct wined3d_swapchain *swapchain,
 HRESULT CDECL wined3d_swapchain_set_gamma_ramp(const struct wined3d_swapchain *swapchain,
         uint32_t flags, const struct wined3d_gamma_ramp *ramp)
 {
+    struct wined3d_swapchain *mutable_swapchain = (struct wined3d_swapchain *)swapchain;
     struct wined3d_output *output;
+
+    if (!mutable_swapchain->orig_gamma_saved)
+    {
+        wined3d_swapchain_get_gamma_ramp(swapchain, &mutable_swapchain->orig_gamma);
+        mutable_swapchain->orig_gamma_saved = true;
+    }
 
     TRACE("swapchain %p, flags %#x, ramp %p.\n", swapchain, flags, ramp);
 
@@ -3079,7 +3087,13 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
         }
     }
 
-    wined3d_swapchain_get_gamma_ramp(swapchain, &swapchain->orig_gamma);
+    /* The original gamma ramp is saved when the application first changes it
+     * (wined3d_swapchain_set_gamma_ramp()), not here: reading it is an X
+     * round trip on the GDI display under the wined3d mutex, and restoring it
+     * on destruction another one - 6-82 ms each while the X server is busy
+     * with a resize. WPF creates and destroys a swapchain on every resize
+     * step, and the GMPI canvas thread waited on the mutex for that long
+     * (issue 414). */
 
     wined3d_mutex_unlock();
 
