@@ -278,6 +278,84 @@ static HRESULT d2d_device_context_ensure_stencil(struct d2d_device_context *cont
  * immediate context with the d2d state swapped in; d2d_device_context_draw_finish()
  * swaps it back. Split out so that a line batch can issue several draws
  * against one setup. */
+/* Swapping the private ID3DDeviceContextState in and out around every
+ * primitive costs wined3d a full state emission each way (~20 command
+ * stream packets), and the SynthEdit canvas draws ~1740 primitives per resize
+ * step (issue 414). The state is swapped in once at BeginDraw() and back at
+ * EndDraw() instead; a draw only swaps itself when its context does not hold
+ * the state, so nested or foreign contexts keep the per-draw behaviour. The
+ * draw setup sets every state it depends on, so the state object only has to
+ * keep the application's own state out of the way. */
+static bool d2d_device_context_state_is_current(const struct d2d_device_context *context)
+{
+    return context->held_prev_state && context->device && context->device->state_owner == context;
+}
+
+static void d2d_device_context_hold_state(struct d2d_device_context *context)
+{
+    ID3D11DeviceContext1 *d3d_context;
+
+    if (!context->d3d_state || !context->device || context->held_prev_state)
+        return;
+
+    if (context->cs)
+        EnterCriticalSection(context->cs);
+    /* A nested BeginDraw() on another context of the same device takes the
+     * state over and hands it back at its EndDraw(). */
+    ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
+    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &context->held_prev_state);
+    ID3D11DeviceContext1_Release(d3d_context);
+    context->prev_state_owner = context->device->state_owner;
+    context->device->state_owner = context;
+    TRACE("context %p holds the state, previous owner %p.\n", context, context->prev_state_owner);
+    if (context->cs)
+        LeaveCriticalSection(context->cs);
+}
+
+static void d2d_device_context_release_state(struct d2d_device_context *context)
+{
+    struct d2d_device *device = context->device;
+    struct d2d_device_context *inner;
+    ID3D11DeviceContext1 *d3d_context;
+
+    if (!context->held_prev_state)
+        return;
+
+    if (context->cs)
+        EnterCriticalSection(context->cs);
+    if (device->state_owner == context)
+    {
+        ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
+        ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->held_prev_state, NULL);
+        ID3D11DeviceContext1_Release(d3d_context);
+        ID3DDeviceContextState_Release(context->held_prev_state);
+        device->state_owner = context->prev_state_owner;
+    }
+    else
+    {
+        /* EndDraw() out of order: a context that began after this one still
+         * holds the state. Let it restore this context's predecessor instead. */
+        for (inner = device->state_owner; inner && inner->prev_state_owner != context; inner = inner->prev_state_owner)
+            ;
+        if (inner)
+        {
+            ID3DDeviceContextState_Release(inner->held_prev_state);
+            inner->held_prev_state = context->held_prev_state;
+            inner->prev_state_owner = context->prev_state_owner;
+        }
+        else
+        {
+            ERR("context %p is not in the state owner chain.\n", context);
+            ID3DDeviceContextState_Release(context->held_prev_state);
+        }
+    }
+    TRACE("context %p released the state, owner now %p.\n", context, device->state_owner);
+    context->held_prev_state = NULL;
+    context->prev_state_owner = NULL;
+    if (context->cs)
+        LeaveCriticalSection(context->cs);
+}
+
 static ID3D11DeviceContext1 *d2d_device_context_draw_setup(struct d2d_device_context *render_target,
         enum d2d_shape_type shape_type, ID3D11Buffer *ib, ID3D11Buffer *vb, unsigned int vb_stride,
         struct d2d_brush *brush, struct d2d_brush *opacity_brush, ID3DDeviceContextState **prev_state)
@@ -301,7 +379,10 @@ static ID3D11DeviceContext1 *d2d_device_context_draw_setup(struct d2d_device_con
         EnterCriticalSection(render_target->cs);
 
     ID3D11Device1_GetImmediateContext1(device, &context);
-    ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, prev_state);
+    if (d2d_device_context_state_is_current(render_target))
+        *prev_state = NULL;
+    else
+        ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, prev_state);
 
     ID3D11DeviceContext1_IASetInputLayout(context, shape_resources->il);
     ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -411,9 +492,12 @@ static ID3D11DeviceContext1 *d2d_device_context_draw_setup(struct d2d_device_con
 static void d2d_device_context_draw_finish(struct d2d_device_context *render_target,
         ID3D11DeviceContext1 *context, ID3DDeviceContextState *prev_state)
 {
-    ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
+    if (prev_state)
+    {
+        ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
+        ID3DDeviceContextState_Release(prev_state);
+    }
     ID3D11DeviceContext1_Release(context);
-    ID3DDeviceContextState_Release(prev_state);
 
     if (render_target->cs)
         LeaveCriticalSection(render_target->cs);
@@ -597,6 +681,7 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
                 }
             }
         }
+        d2d_device_context_release_state(context);
         if (context->d3d_state)
             ID3DDeviceContextState_Release(context->d3d_state);
         if (context->target.object)
@@ -4187,6 +4272,8 @@ static void STDMETHODCALLTYPE d2d_device_context_BeginDraw(ID2D1DeviceContext6 *
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
         d2d_command_list_begin_draw(context->target.command_list, context);
+    else
+        d2d_device_context_hold_state(context);
 
     memset(&context->error, 0, sizeof(context->error));
 }
@@ -4217,6 +4304,8 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_EndDraw(ID2D1DeviceContext6 
         if (FAILED(hr = context->ops->device_context_present(context->outer_unknown)))
             context->error.code = hr;
     }
+
+    d2d_device_context_release_state(context);
 
     return context->error.code;
 }
@@ -5674,7 +5763,10 @@ static HRESULT d2d_device_context_draw_custom_effect(struct d2d_device_context *
     if (context->cs)
         EnterCriticalSection(context->cs);
     ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
-    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &prev_state);
+    if (d2d_device_context_state_is_current(context))
+        prev_state = NULL;
+    else
+        ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &prev_state);
 
     ID3D11DeviceContext1_IASetInputLayout(d3d_context, NULL);
     ID3D11DeviceContext1_IASetPrimitiveTopology(d3d_context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -5702,9 +5794,12 @@ static HRESULT d2d_device_context_draw_custom_effect(struct d2d_device_context *
     ID3D11DeviceContext1_Draw(d3d_context, 4, 0);
 
     ID3D11DeviceContext1_PSSetShaderResources(d3d_context, 0, input_count, null_srvs);
-    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, prev_state, NULL);
+    if (prev_state)
+    {
+        ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, prev_state, NULL);
+        ID3DDeviceContextState_Release(prev_state);
+    }
     ID3D11DeviceContext1_Release(d3d_context);
-    ID3DDeviceContextState_Release(prev_state);
     if (context->cs)
         LeaveCriticalSection(context->cs);
 

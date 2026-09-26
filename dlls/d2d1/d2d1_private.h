@@ -337,6 +337,11 @@ struct d2d_device_context
     struct d2d_device *device;
     ID3D11Device1 *d3d_device;
     ID3DDeviceContextState *d3d_state;
+    /* The application's state, held while d3d_state is swapped in for the
+     * whole BeginDraw()/EndDraw() span (issue 414); NULL otherwise. */
+    ID3DDeviceContextState *held_prev_state;
+    /* The context that held the state before this one (nested BeginDraw()). */
+    struct d2d_device_context *prev_state_owner;
     struct
     {
         ID2D1Image *object;
@@ -908,6 +913,9 @@ struct d2d_device
     ID2D1Factory1 *factory;
     IDXGIDevice *dxgi_device;
     bool allow_get_dxgi_device;
+    /* The device context whose d3d_state is currently swapped into the
+     * immediate context for a BeginDraw()/EndDraw() span, or NULL. */
+    struct d2d_device_context *state_owner;
 
     ID3D10Blob *precompiled_shape_vs[D2D_SHAPE_TYPE_COUNT];
     ID3D10Blob *precompiled_shape_ps;
