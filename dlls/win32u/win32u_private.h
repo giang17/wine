@@ -92,6 +92,7 @@ extern BOOL grab_pointer;
 extern BOOL grab_fullscreen;
 extern HWND get_active_window(void);
 extern HWND get_capture(void);
+extern void cancel_capture_for_wm_change( HWND hwnd );
 extern HWND get_focus(void);
 extern DWORD get_input_state(void);
 extern DWORD get_last_input_time(void);
