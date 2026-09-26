@@ -228,6 +228,14 @@ This is the recommended branch. What it changes, by subsystem:
   falls on a different part of the window after each step of a window manager drag; in
   SynthEdit 1.5 the menu bar items lit up one after another while the window was dragged
   by its title bar.
+- **winex11**: the window manager is offered no close function (`MWM_FUNC_CLOSE`) while the
+  window's `SC_CLOSE` is grayed, disabled or missing in its system menu or the class carries
+  `CS_NOCLOSE`. That is the test `WM_DELETE_WINDOW` is already discarded under, and the
+  state the caption close button is drawn grayed in on Windows; the hints offered the
+  function for every enabled window, so KWin drew an active close button whose click went
+  nowhere. Qt 6 grays `SC_CLOSE` for a window created without `Qt::WindowCloseButtonHint`:
+  the preferences and view options dialogs of Dorico 6 could not be closed from the title
+  bar, while `Esc` and the dialog's own button worked. The button is now drawn disabled.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
