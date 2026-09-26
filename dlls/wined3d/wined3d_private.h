@@ -4101,6 +4101,7 @@ struct wined3d_swapchain
     struct wined3d_texture **back_buffers;
     struct wined3d_texture *front_buffer;
     struct wined3d_gamma_ramp orig_gamma;
+    bool orig_gamma_saved;
     bool reapply_mode;
     const struct wined3d_format *ds_format;
     struct wined3d_palette *palette;
@@ -5154,5 +5155,7 @@ static inline bool wined3d_map_persistent(void)
 #define WINED3D_OPENGL_WINDOW_CLASS_NAME "WineD3D_OpenGL"
 
 extern CRITICAL_SECTION wined3d_command_cs;
+unsigned int wined3d_mutex_release_all(void);
+void wined3d_mutex_reacquire(unsigned int count);
 
 #endif
