@@ -40,7 +40,14 @@ This is the recommended branch. What it changes, by subsystem:
   → about 80 ms). Bitmap brushes honour WRAP and MIRROR instead of degrading to CLAMP,
   so a tiled background is tiled rather than one tile with its edge texels stretched
   (SynthEdit panels). `SetTarget(NULL)` drops the render target bindings, so a swapchain
-  back buffer is not held across `ResizeBuffers()`
+  back buffer is not held across `ResizeBuffers()` The scratch vertex and index buffers are dynamic and written through a
+  `WRITE_DISCARD` map instead of `UpdateSubresource()` — wined3d cannot rename a
+  DEFAULT buffer from the client thread and drained the command stream once per
+  primitive (1 090–1 940 synchronisations per 20 px resize step of the SynthEdit canvas,
+  212 now) — and the private device context state is swapped in once per
+  `BeginDraw()`/`EndDraw()` span rather than around every primitive (3 485 swaps per
+  step, each a full state emission both ways, 28 now); a nested `BeginDraw()` on
+  another context of the same device takes the state over and hands it back.
 - **D2D1 layers on an opaque target**: a layer bitmap inherited the target's alpha mode,
   so on a render target created as `ALPHA_MODE_IGNORE` the layer's own coverage was thrown
   away and everything drawn inside it turned the background colour, usually black. All
@@ -125,7 +132,20 @@ This is the recommended branch. What it changes, by subsystem:
   `wined3d_cs_emit_present()` counts its waiters and a woken waiter passes the signal on:
   with one flag and one auto-reset event, the second of two threads presenting
   swapchains of the same device was never woken (two threads at 20000 presents each hung
-  in 3 of 3 runs, 10 of 10 complete now)
+  in 3 of 3 runs, 10 of 10 complete now) A client thread that waits for the command stream in a finish or a
+  resource-idle wait releases the global wined3d mutex for the wait and takes it back
+  afterwards, so threads of different devices no longer serialise on each other's CS
+  thread — SynthEdit's WPF chrome (D3D9) and its GMPI canvas (D3D11) at every resize
+  step, where the canvas thread spent ~106 of ~120 ms per step on the mutex, none now.
+  The wait for queue space keeps the mutex (the producer has captured the queue head),
+  and every waiter on the progress event counts itself and passes the signal on, since
+  two threads of one device may now wait at once (Cubase 15's video engine and GUI hung
+  on the single signal otherwise). The gamma ramp is saved when an application first
+  sets one and restored only then: reading and restoring it for every swapchain was two
+  X round trips under the mutex, 6–82 ms each while the X server is busy with a resize
+  (WPF creates a swapchain per resize step), and the restore also undid a night-light
+  ramp set outside Wine whenever a windowed D3D application exited. A viewport update
+  that does not change the state emits no packet (d2d1 set it per primitive).
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
 - **ntdll heap**: the first-fit walk in `find_free_block()` tries 16 blocks of the first
   free list and then continues with the next list, where every block is large enough.
