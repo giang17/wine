@@ -2209,6 +2209,13 @@ void CDECL wined3d_device_context_set_viewports(struct wined3d_device_context *c
     }
 
     wined3d_device_context_lock(context);
+    if (viewport_count == state->viewport_count
+            && (!viewport_count || !memcmp(state->viewports, viewports, viewport_count * sizeof(*viewports))))
+    {
+        wined3d_device_context_unlock(context);
+        return;
+    }
+
     if (viewport_count)
         memcpy(state->viewports, viewports, viewport_count * sizeof(*viewports));
     else
