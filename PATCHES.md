@@ -197,6 +197,14 @@ This is the recommended branch. What it changes, by subsystem:
   behind at its old screen position while the window was dragged away. Win32 drop-down
   lists lose their capture the same way but have no handler for it, so they still stay
   until the next click. WineHQ bug 12027.
+- **winex11**: the driver reports the pointer position when the pointer leaves one of its
+  windows (`LeaveNotify`), the way it already does when the pointer enters one. Without it
+  the position the server holds stays where the pointer was last seen inside the window
+  while it sits on the frame the window manager draws, and the `WM_MOUSEMOVE` the server
+  synthesizes after every window move to resync hover state lands at that stale point. It
+  falls on a different part of the window after each step of a window manager drag; in
+  SynthEdit 1.5 the menu bar items lit up one after another while the window was dragged
+  by its title bar.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
