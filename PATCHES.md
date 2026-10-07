@@ -144,6 +144,15 @@ This is the recommended branch. What it changes, by subsystem:
   On by default; `WINE_ARGB_PIXFMT=0` turns the whole path off without a rebuild. Smoke
   tested across Korg Trinity, EPROM Memory Rites, FL Studio, Fender Studio Pro 8 and
   Ableton Live 12
+- **winex11**: an application that leaves the maximized state while keeping its window
+  rect no longer ends up at the geometry the window manager remembers from before the
+  maximize. With the rect unchanged there was nothing to request, so the window manager's
+  own restore geometry was adopted; it is now answered once with the application's rect,
+  which is where Windows leaves the window. Qt 6.5's `QWidget::restoreGeometry()` does
+  exactly this with a snapshot taken while maximized: Dorico 5 dropped out of its maximized
+  window on every switch to Engrave mode and every lower-zone toggle and shrank to its
+  previous size; it now stays screen-sized, only the maximized flag is gone, which is what
+  the application asks for (issue 18 on the public repository)
 - **winex11**: fullscreen switches hold against the window manager's own reconfiguration.
   After a decoration or `_NET_WM_STATE` change the first `ConfigureNotify` that carries the
   serial of our configure request but another geometry is the window manager's reaction to
