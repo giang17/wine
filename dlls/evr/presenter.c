@@ -107,6 +107,7 @@ struct video_presenter
     unsigned int allocator_capacity;
     IMFMediaType *media_type;
     LONGLONG frame_time_threshold;
+    ULONGLONG last_present_time;
     UINT reset_token;
     HWND video_window;
     MFVideoNormalizedRect src_rect;
@@ -117,6 +118,8 @@ struct video_presenter
     unsigned int ar_mode;
     unsigned int state;
     unsigned int flags;
+    float rate;
+    BOOL scrub_pending;
 
     struct
     {
@@ -304,6 +307,20 @@ static HRESULT video_presenter_set_media_type(struct video_presenter *presenter,
         MFRatio ratio;
         UINT64 rate, frametime;
 
+        /* video_presenter_reset_media_type() above dropped the allocator
+         * notification together with the old sample pool, and only
+         * video_presenter_start_streaming() ever installs it.  The output type is
+         * negotiated from the first sample of a topology, so a topology that is
+         * built while the renderer is already streaming - after a loop wrap, for
+         * instance - leaves the presenter without that callback.  It is the only
+         * thing that drives ProcessOutput() again once the three-sample pool has
+         * run dry, and the pool runs dry routinely: process_input() gives up at
+         * AllocateSample() roughly as often as it succeeds.  Without the callback
+         * the video branch therefore stops for good the first time a sample cannot
+         * be allocated, while the audio branch carries on. */
+        if (presenter->thread.hthread)
+            video_presenter_set_allocator_callback(presenter, &presenter->allocator_cb);
+
         presenter->media_type = media_type;
         IMFMediaType_AddRef(presenter->media_type);
 
@@ -473,6 +490,25 @@ static BOOL video_presenter_sample_queue_pop(struct video_presenter *presenter, 
 }
 
 
+static void video_presenter_flush_samples(struct video_presenter *presenter)
+{
+    IMFSample *sample;
+
+    /* The queue is only allocated once streaming has begun; a flush before that
+     * has nothing to do. */
+    if (!presenter->thread.queue.size)
+        return;
+
+    while (video_presenter_sample_queue_pop(presenter, &sample))
+        IMFSample_Release(sample);
+
+    /* The samples that were dropped here never made it to the screen, so the
+     * pacing interval must not hold back the first one that arrives after the
+     * flush. */
+    presenter->last_present_time = 0;
+    presenter->scrub_pending = TRUE;
+}
+
 static void video_presenter_sample_queue_free(struct video_presenter *presenter)
 {
     struct sample_queue *queue = &presenter->thread.queue;
@@ -504,17 +540,18 @@ static HRESULT video_presenter_get_sample_surface(IMFSample *sample, IDirect3DSu
     return hr;
 }
 
-static void video_presenter_sample_present(struct video_presenter *presenter, IMFSample *sample)
+/* Draws a sample to the video window. Fails only if the sample itself could not be
+ * used; a missing swapchain or backbuffer is not treated as an error here. */
+static HRESULT video_presenter_present_sample(struct video_presenter *presenter, IMFSample *sample)
 {
     IDirect3DSurface9 *surface, *backbuffer;
     IDirect3DDevice9 *device;
-    struct sample_queue *queue = &presenter->thread.queue;
     HRESULT hr;
 
     if (FAILED(hr = video_presenter_get_sample_surface(sample, &surface)))
     {
         WARN("Failed to get sample surface, hr %#lx.\n", hr);
-        return;
+        return hr;
     }
 
     if (presenter->swapchain)
@@ -534,11 +571,21 @@ static void video_presenter_sample_present(struct video_presenter *presenter, IM
             WARN("Failed to get a backbuffer, hr %#lx.\n", hr);
     }
 
+    IDirect3DSurface9_Release(surface);
+
+    return S_OK;
+}
+
+static void video_presenter_sample_present(struct video_presenter *presenter, IMFSample *sample)
+{
+    struct sample_queue *queue = &presenter->thread.queue;
+
+    if (FAILED(video_presenter_present_sample(presenter, sample)))
+        return;
+
     IMFSample_AddRef(sample);
     if ((sample = InterlockedExchangePointer((void **)&queue->last_presented, sample)))
         IMFSample_Release(sample);
-
-    IDirect3DSurface9_Release(surface);
 }
 
 static void video_presenter_check_queue(struct video_presenter *presenter,
@@ -556,7 +603,23 @@ static void video_presenter_check_queue(struct video_presenter *presenter,
         present = TRUE;
         wait = 0;
 
-        if (presenter->clock)
+        /* At rate 0 the presentation is scrubbing: the clock does not advance, so
+         * samples cannot be scheduled against it.  Exactly one frame is shown for
+         * the position the clock was started at, and the ones that follow are held
+         * back.  Presenting all of them instead makes the video run on its own
+         * while the transport stands still, and it keeps the sample allocator
+         * drained, which lets the source read ahead without limit. */
+        if (presenter->rate == 0.0f)
+        {
+            if (!presenter->scrub_pending)
+            {
+                present = FALSE;
+                /* Never zero: a zero wait would spin on the sample that was just
+                 * pushed back to the front of the queue. */
+                wait = max(4 * presenter->frame_time_threshold / 10000, 10);
+            }
+        }
+        else if (presenter->clock)
         {
             pts = clocktime = 0;
 
@@ -574,7 +637,36 @@ static void video_presenter_check_queue(struct video_presenter *presenter,
         }
 
         if (present)
+        {
+            /* Pace presentation to the frame interval.  Nothing above limits
+             * the rate: the clock check only defers samples that are ahead of
+             * the presentation time, and while scrubbing the clock does not
+             * advance at all.  The media session meanwhile notifies the
+             * presenter as fast as the mixer can produce output, which for a
+             * 30 fps video amounts to roughly two thousand presents per
+             * second.  Swapping a window that often leaves it showing nothing
+             * -- the frames are correct all the way into the swapchain's back
+             * buffer, they just never become visible. */
+            ULONGLONG interval = 4 * presenter->frame_time_threshold / 10000;
+            ULONGLONG now = GetTickCount64();
+
+            if (interval && presenter->last_present_time
+                    && now - presenter->last_present_time < interval)
+            {
+                wait = interval - (now - presenter->last_present_time);
+                present = FALSE;
+            }
+            else
+            {
+                presenter->last_present_time = now;
+            }
+        }
+
+        if (present)
+        {
+            presenter->scrub_pending = FALSE;
             video_presenter_sample_present(presenter, sample);
+        }
         else
             video_presenter_sample_queue_push(presenter, sample, TRUE);
 
@@ -618,6 +710,19 @@ static HRESULT video_presenter_process_input(struct video_presenter *presenter)
 
     if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
         return MF_E_SHUTDOWN;
+
+    /* The mixer pointer is cleared on every topology change, and
+     * video_presenter_attach_mixer() clears it on its own failure path as well,
+     * without putting the presenter into a state that would stop the notifications.
+     * What is left over still has a media type and still receives
+     * PROCESSINPUTNOTIFY, but has nothing to pull output from. Report that the way
+     * MFVP_MESSAGE_INVALIDATEMEDIATYPE already does, instead of calling through a
+     * NULL interface pointer. */
+    if (!presenter->mixer)
+    {
+        WARN("Mixer is not attached.\n");
+        return MF_E_INVALIDREQUEST;
+    }
 
     if (!presenter->media_type)
         return S_OK;
@@ -926,6 +1031,7 @@ static HRESULT WINAPI video_presenter_OnClockStart(IMFVideoPresenter *iface, MFT
 
     EnterCriticalSection(&presenter->cs);
     presenter->state = PRESENTER_STATE_STARTED;
+    presenter->scrub_pending = TRUE;
     LeaveCriticalSection(&presenter->cs);
 
     return S_OK;
@@ -973,9 +1079,17 @@ static HRESULT WINAPI video_presenter_OnClockRestart(IMFVideoPresenter *iface, M
 
 static HRESULT WINAPI video_presenter_OnClockSetRate(IMFVideoPresenter *iface, MFTIME systime, float rate)
 {
-    FIXME("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
+    struct video_presenter *presenter = impl_from_IMFVideoPresenter(iface);
 
-    return E_NOTIMPL;
+    TRACE("%p, %s, %f.\n", iface, debugstr_time(systime), rate);
+
+    EnterCriticalSection(&presenter->cs);
+    if (rate == 0.0f && presenter->rate != 0.0f)
+        presenter->scrub_pending = TRUE;
+    presenter->rate = rate;
+    LeaveCriticalSection(&presenter->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI video_presenter_ProcessMessage(IMFVideoPresenter *iface, MFVP_MESSAGE_TYPE message, ULONG_PTR param)
@@ -989,6 +1103,14 @@ static HRESULT WINAPI video_presenter_ProcessMessage(IMFVideoPresenter *iface, M
 
     switch (message)
     {
+        case MFVP_MESSAGE_FLUSH:
+            /* Samples that are still queued belong to the position the pipeline
+             * has just left.  Presenting them after a seek shows frames from the
+             * old position, and because the queue is only as deep as the sample
+             * allocator, holding on to them keeps every newer sample out. */
+            video_presenter_flush_samples(presenter);
+            hr = S_OK;
+            break;
         case MFVP_MESSAGE_INVALIDATEMEDIATYPE:
             if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
                 hr = MF_E_SHUTDOWN;
@@ -1474,16 +1596,30 @@ static HRESULT WINAPI video_presenter_control_GetVideoWindow(IMFVideoDisplayCont
 static HRESULT WINAPI video_presenter_control_RepaintVideo(IMFVideoDisplayControl *iface)
 {
     struct video_presenter *presenter = impl_from_IMFVideoDisplayControl(iface);
+    struct sample_queue *queue = &presenter->thread.queue;
+    IMFSample *sample;
     HRESULT hr;
 
-    FIXME("%p.\n", iface);
+    TRACE("%p.\n", iface);
 
     EnterCriticalSection(&presenter->cs);
 
     if (presenter->state == PRESENTER_STATE_SHUT_DOWN)
         hr = MF_E_SHUTDOWN;
+    else if (!(sample = InterlockedExchangePointer((void **)&queue->last_presented, NULL)))
+    {
+        WARN("No frame has been presented yet.\n");
+        hr = MF_E_INVALIDREQUEST;
+    }
     else
-        hr = E_NOTIMPL;
+    {
+        hr = video_presenter_present_sample(presenter, sample);
+
+        /* Keep the frame for further repaints, unless a newer one was presented
+         * by the streaming thread in the meantime. */
+        if (InterlockedCompareExchangePointer((void **)&queue->last_presented, sample, NULL))
+            IMFSample_Release(sample);
+    }
 
     LeaveCriticalSection(&presenter->cs);
 
@@ -2197,6 +2333,8 @@ HRESULT evr_presenter_create(IUnknown *outer, void **out)
     object->src_rect.right = object->src_rect.bottom = 1.0f;
     object->ar_mode = MFVideoARMode_PreservePicture | MFVideoARMode_PreservePixel;
     object->allocator_capacity = 3;
+    object->rate = 1.0f;
+    object->scrub_pending = TRUE;
     InitializeCriticalSection(&object->cs);
 
     if (FAILED(hr = DXVA2CreateDirect3DDeviceManager9(&object->reset_token, &object->device_manager)))

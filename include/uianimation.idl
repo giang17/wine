@@ -27,6 +27,13 @@ interface IUIAnimationInterpolator;
 interface IUIAnimationManagerEventHandler;
 interface IUIAnimationTransition;
 interface IUIAnimationTransitionLibrary;
+interface IUIAnimationStoryboard2;
+interface IUIAnimationVariable2;
+interface IUIAnimationManager2;
+interface IUIAnimationPriorityComparison2;
+interface IUIAnimationManagerEventHandler2;
+interface IUIAnimationTransition2;
+interface IUIAnimationTransitionLibrary2;
 
 typedef DOUBLE UI_ANIMATION_SECONDS;
 typedef struct { int _; } *UI_ANIMATION_KEYFRAME;
@@ -579,6 +586,209 @@ interface IUIAnimationTransitionLibrary : IUnknown
 }
 
 [
+    local,
+    object,
+    uuid(d8b6f7d4-4109-4d3f-acee-879926968cb1),
+    pointer_default(unique)
+]
+interface IUIAnimationManager2 : IUnknown
+{
+    HRESULT CreateAnimationVectorVariable(
+        [in] double *initialvalue,
+        [in] UINT32 dimension,
+        [out, retval] IUIAnimationVariable2 **variable);
+
+    HRESULT CreateAnimationVariable(
+        [in] double initialvalue,
+        [out, retval] IUIAnimationVariable2 **variable);
+
+    HRESULT ScheduleTransition(
+        [in] IUIAnimationVariable2 *variable,
+        [in] IUIAnimationTransition2 *transition,
+        [in] UI_ANIMATION_SECONDS timenow);
+
+    HRESULT CreateStoryboard(
+        [out, retval] IUIAnimationStoryboard2 **storyboard);
+
+    HRESULT FinishAllStoryboards(
+        [in] UI_ANIMATION_SECONDS completiondeadline);
+
+    HRESULT AbandonAllStoryboards();
+
+    HRESULT Update(
+        [in] UI_ANIMATION_SECONDS timenow,
+        [out] UI_ANIMATION_UPDATE_RESULT *updateresult);
+
+    HRESULT GetVariableFromTag(
+        [in] IUnknown *object,
+        [in] UINT32 id,
+        [out, retval] IUIAnimationVariable2 **variable);
+
+    HRESULT GetStoryboardFromTag(
+        [in] IUnknown *object,
+        [in] UINT32 id,
+        [out, retval] IUIAnimationStoryboard2 **storyboard);
+
+    HRESULT EstimateNextEventTime(
+        [out, retval] UI_ANIMATION_SECONDS *seconds);
+
+    HRESULT GetStatus(
+        [out, retval] UI_ANIMATION_MANAGER_STATUS *status);
+
+    HRESULT SetAnimationMode(
+        [in] UI_ANIMATION_MODE mode);
+
+    HRESULT Pause();
+
+    HRESULT Resume();
+
+    HRESULT SetManagerEventHandler(
+        [in] IUIAnimationManagerEventHandler2 *handler,
+        [in] LONG registerfornextanimationevent);
+
+    HRESULT SetCancelPriorityComparison(
+        [in] IUIAnimationPriorityComparison2 *comparison);
+
+    HRESULT SetTrimPriorityComparison(
+        [in] IUIAnimationPriorityComparison2 *comparison);
+
+    HRESULT SetCompressPriorityComparison(
+        [in] IUIAnimationPriorityComparison2 *comparison);
+
+    HRESULT SetConcludePriorityComparison(
+        [in] IUIAnimationPriorityComparison2 *comparison);
+
+    HRESULT SetDefaultLongestAcceptableDelay(
+        [in] UI_ANIMATION_SECONDS delay);
+
+    HRESULT Shutdown();
+}
+
+[
+    local,
+    object,
+    uuid(03cfae53-9580-4ee3-b363-2ece51b4af6a),
+    pointer_default(unique)
+]
+interface IUIAnimationTransitionLibrary2 : IUnknown
+{
+    HRESULT CreateInstantaneousTransition(
+        [in] double finalvalue,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateInstantaneousVectorTransition(
+        [in] double *finalvalue,
+        [in] UINT32 dimension,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateConstantTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateDiscreteTransition(
+        [in] UI_ANIMATION_SECONDS delay,
+        [in] double finalvalue,
+        [in] UI_ANIMATION_SECONDS hold,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateDiscreteVectorTransition(
+        [in] UI_ANIMATION_SECONDS delay,
+        [in] double *finalvalue,
+        [in] UINT32 dimension,
+        [in] UI_ANIMATION_SECONDS hold,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateLinearTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] double finalvalue,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateLinearVectorTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] double *finalvalue,
+        [in] UINT32 dimension,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateLinearTransitionFromSpeed(
+        [in] double speed,
+        [in] double finalvalue,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateLinearVectorTransitionFromSpeed(
+        [in] double speed,
+        [in] double *finalvalue,
+        [in] UINT32 dimension,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateSinusoidalTransitionFromVelocity(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] UI_ANIMATION_SECONDS period,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateSinusoidalTransitionFromRange(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] double minimumvalue,
+        [in] double maximumvalue,
+        [in] UI_ANIMATION_SECONDS period,
+        [in] UI_ANIMATION_SLOPE slope,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateAccelerateDecelerateTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] double finalvalue,
+        [in] double accelerationratio,
+        [in] double decelerationratio,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateReversalTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateCubicTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] double finalvalue,
+        [in] double finalvelocity,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateCubicVectorTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] double *finalvalue,
+        [in] double *finalvelocity,
+        [in] UINT32 dimension,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateSmoothStopTransition(
+        [in] UI_ANIMATION_SECONDS maximumduration,
+        [in] double finalvalue,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateParabolicTransitionFromAcceleration(
+        [in] double finalvalue,
+        [in] double finalvelocity,
+        [in] double acceleration,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateCubicBezierLinearTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] double finalvalue,
+        [in] double x1,
+        [in] double y1,
+        [in] double x2,
+        [in] double y2,
+        [out, retval] IUIAnimationTransition2 **transition);
+
+    HRESULT CreateCubicBezierLinearVectorTransition(
+        [in] UI_ANIMATION_SECONDS duration,
+        [in] double *finalvalue,
+        [in] UINT32 dimension,
+        [in] double x1,
+        [in] double y1,
+        [in] double x2,
+        [in] double y2,
+        [out, retval] IUIAnimationTransition2 **transition);
+}
+
+[
     uuid(44ca24db-1a92-4149-bab5-fb14d64b401e),
     version(1.0)
 ]
@@ -620,3 +830,8 @@ library UIAnimation
         [default] interface IUIAnimationTransitionLibrary;
     }
 }
+
+/* The version 2 classes are not part of the type library, so their class ids
+ * are declared here instead of being generated from a coclass. */
+cpp_quote("DEFINE_GUID(CLSID_UIAnimationManager2, 0xd25d8842, 0x8884, 0x4a4a, 0xb3,0x21, 0x09,0x13,0x14,0x37,0x9b,0xdd);")
+cpp_quote("DEFINE_GUID(CLSID_UIAnimationTransitionLibrary2, 0x812f944a, 0xc5c8, 0x4cd9, 0xb0,0xa6, 0xb3,0xda,0x80,0x2f,0x22,0x8d);")

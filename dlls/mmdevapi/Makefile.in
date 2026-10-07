@@ -1,6 +1,6 @@
 MODULE    = mmdevapi.dll
 IMPORTS   = ole32 oleaut32 user32 advapi32 version
-DELAYIMPORTS = winmm
+DELAYIMPORTS = winmm rpcrt4
 
 SOURCES = \
 	audiosessionmanager.c \
@@ -9,5 +9,6 @@ SOURCES = \
 	devenum.c \
 	main.c \
 	mmdevapi_classes.idl \
+	plugplay.idl \
 	session.c \
 	spatialaudio.c

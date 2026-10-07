@@ -607,6 +607,7 @@ static HRESULT on_default_action(FileDialogImpl *This)
     LPWSTR fn_iter, files = NULL, tmp_files, filter = NULL;
     UINT file_count = 0, len, i;
     int open_action;
+    BOOL missing = FALSE;
     HRESULT hr, ret = E_FAIL;
 
     len = get_file_name(This, &tmp_files);
@@ -689,12 +690,14 @@ static HRESULT on_default_action(FileDialogImpl *This)
                         {
                             FILEDLG95_OnOpenMessage(This->dlg_hwnd, 0, IDS_FILENOTEXISTING);
                             open_action = ONOPEN_BROWSE;
+                            missing = TRUE;
                         }
                     }
                     else
                     {
                         FILEDLG95_OnOpenMessage(This->dlg_hwnd, 0, IDS_FILENOTEXISTING);
                         open_action = ONOPEN_BROWSE;
+                        missing = TRUE;
                     }
                 }
             }
@@ -711,7 +714,10 @@ static HRESULT on_default_action(FileDialogImpl *This)
     }
 
 
-    if((This->options & FOS_PICKFOLDERS) && open_action == ONOPEN_BROWSE)
+    /* In folder-picking mode an existing folder is the result rather than
+     * something to browse into, but a name that does not exist stays a
+     * browse: the dialog has just told the user so and must not return it. */
+    if((This->options & FOS_PICKFOLDERS) && open_action == ONOPEN_BROWSE && !missing)
         open_action = ONOPEN_OPEN; /* FIXME: Multiple folders? */
 
     switch(open_action)

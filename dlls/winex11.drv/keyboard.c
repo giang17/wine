@@ -236,6 +236,9 @@ static WORD keyc2scan( unsigned int keycode, unsigned int state )
 }
 
 static int NumLockMask, ScrollLockMask, AltGrMask; /* mask in the XKeyEvent state */
+static int Level3ShiftMask; /* mask of the ISO_Level3_Shift (AltGr) modifier, from the modifier map */
+static BYTE Level3ShiftVkeys[8]; /* virtual keys of every keycode whose keysym is ISO_Level3_Shift / Mode_switch */
+static unsigned int Level3ShiftVkeyCount;
 
 static pthread_mutex_t kbd_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct list xkb_layouts = LIST_INIT( xkb_layouts );
@@ -2155,7 +2158,9 @@ void init_keyboard_layouts( Display *display )
     LANGID xkb_lang = 0;
     Status status;
     KeyCode *kcp;
+    KeySym keysym;
     int count;
+    int keyc;
 
     pthread_mutex_lock( &kbd_mutex );
     XDisplayKeycodes( display, &min_keycode, &max_keycode );
@@ -2178,6 +2183,12 @@ void init_keyboard_layouts( Display *display )
                 {
                     ScrollLockMask = 1 << i;
                     TRACE_(key)( "ScrollLockMask is %x\n", ScrollLockMask );
+                }
+                else if (XkbKeycodeToKeysym( display, *kcp, 0, k ) == XK_ISO_Level3_Shift ||
+                         XkbKeycodeToKeysym( display, *kcp, 0, k ) == XK_Mode_switch)
+                {
+                    Level3ShiftMask = 1 << i;
+                    TRACE_(key)( "Level3ShiftMask is %x, keycode %u\n", Level3ShiftMask, *kcp );
                 }
             }
         }
@@ -2234,6 +2245,30 @@ void init_keyboard_layouts( Display *display )
               xkb_lang, main_key_tab[kbd_layout].lcid );
 
     init_keycode_mappings( display );
+
+    /* The physical AltGr key does not have to be the keycode listed in the
+     * modifier map: XKB layouts commonly map the modifier through a virtual
+     * key (e.g. keycode 92) while the key actually pressed is a different one
+     * (e.g. keycode 108), and each may translate to a different virtual key.
+     * Collect the vkeys of every keycode whose keysym is ISO_Level3_Shift or
+     * Mode_switch, so the key-state check below matches whichever carries the
+     * pressed bit.
+     */
+    Level3ShiftVkeyCount = 0;
+    for (keyc = min_keycode; keyc <= max_keycode; keyc++)
+    {
+        WORD vkey = keyc2vkey[keyc] & 0xff;
+        unsigned int i;
+
+        keysym = XkbKeycodeToKeysym( display, keyc, 0, 0 );
+        if (keysym != XK_ISO_Level3_Shift && keysym != XK_Mode_switch) continue;
+        if (!vkey) continue;
+        for (i = 0; i < Level3ShiftVkeyCount; i++) if (Level3ShiftVkeys[i] == vkey) break;
+        if (i < Level3ShiftVkeyCount) continue;
+        if (Level3ShiftVkeyCount == sizeof(Level3ShiftVkeys)) break;
+        TRACE_(key)("Level3Shift keycode %u vkey %04X\n", keyc, vkey);
+        Level3ShiftVkeys[Level3ShiftVkeyCount++] = vkey;
+    }
 
     pthread_mutex_unlock( &kbd_mutex );
 }
@@ -2834,6 +2869,25 @@ INT X11DRV_ToUnicodeEx( UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
     /* Restore saved AltGr state */
     TRACE_(key)("AltGrMask = %04x\n", AltGrMask);
     e.state |= AltGrMask;
+
+    /* AltGrMask only reflects the last X11 key event this process handled. A
+     * process that translates keys for a window owned by another process never
+     * sees one, so it would always miss the AltGr level. The key state we are
+     * given is maintained across the thread input family and does carry the
+     * modifier, so derive the mask from it as well.
+     */
+    if (Level3ShiftMask)
+    {
+        unsigned int i;
+
+        for (i = 0; i < Level3ShiftVkeyCount; i++)
+        {
+            if (!(lpKeyState[Level3ShiftVkeys[i]] & 0x80)) continue;
+            TRACE_(key)("Level3ShiftMask = %04x (vkey %02X down)\n", Level3ShiftMask, Level3ShiftVkeys[i]);
+            e.state |= Level3ShiftMask;
+            break;
+        }
+    }
 
     TRACE_(key)("(%04X, %04X) : faked state = 0x%04x\n",
 		virtKey, scanCode, e.state);

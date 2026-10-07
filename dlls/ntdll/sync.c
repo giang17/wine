@@ -822,32 +822,44 @@ NTSTATUS WINAPI RtlSleepConditionVariableSRW( RTL_CONDITION_VARIABLE *variable, 
  * thread waiting in RtlWaitOnAddress() via NtAlertThreadByThreadId.
  */
 
-struct futex_entry
-{
-    struct list entry;
-    const void *addr;
-    DWORD tid;
-};
-
 struct futex_queue
 {
     struct list queue;
     LONG lock;
 };
 
-static struct futex_queue futex_queues[256];
+static struct futex_queue futex_queues[1024];
 
 static struct futex_queue *get_futex_queue( const void *addr )
 {
-    ULONG_PTR val = (ULONG_PTR)addr;
+    ULONG_PTR val = (ULONG_PTR)addr >> 4;
 
-    return &futex_queues[(val >> 4) % ARRAY_SIZE(futex_queues)];
+    /* Mix the bits a bit to avoid collisions on low bits. */
+    val ^= val >> 11;
+    val ^= val >> 22;
+    return &futex_queues[val % ARRAY_SIZE(futex_queues)];
 }
 
 static void spin_lock( LONG *lock )
 {
-    while (InterlockedCompareExchange( lock, -1, 0 ))
+    unsigned int i;
+
+    if (!InterlockedCompareExchange( lock, -1, 0 ))
+        return;
+
+    for (i = 0; i < 64; i++)
+    {
         YieldProcessor();
+        if (!ReadNoFence( lock ) && !InterlockedCompareExchange( lock, -1, 0 ))
+            return;
+    }
+
+    for (;;)
+    {
+        NtYieldExecution();
+        if (!ReadNoFence( lock ) && !InterlockedCompareExchange( lock, -1, 0 ))
+            return;
+    }
 }
 
 static void spin_unlock( LONG *lock )
@@ -879,7 +891,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
                                   const LARGE_INTEGER *timeout )
 {
     struct futex_queue *queue = get_futex_queue( addr );
-    struct futex_entry entry;
+    struct wait_on_address_entry entry;
     NTSTATUS ret;
 
     TRACE("addr %p cmp %p size %#Ix timeout %s\n", addr, cmp, size, debugstr_timeout( timeout ));
@@ -889,6 +901,9 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 
     entry.addr = addr;
     entry.tid = GetCurrentThreadId();
+    entry.wait_addr = addr;
+    entry.queue = &queue->queue;
+    entry.lock = &queue->lock;
 
     spin_lock( &queue->lock );
 
@@ -906,7 +921,13 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 
     spin_unlock( &queue->lock );
 
+    /* Published only while the queue lock is not held, so that abort_thread()
+     * can take the lock and unlink the entry if this thread gets terminated. */
+    NtCurrentTeb()->ReservedForPerf = &entry;
+
     ret = NtWaitForAlertByThreadId( NULL, timeout );
+
+    NtCurrentTeb()->ReservedForPerf = NULL;
 
     /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
     if (entry.addr)
@@ -929,7 +950,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 void WINAPI RtlWakeAddressAll( const void *addr )
 {
     struct futex_queue *queue = get_futex_queue( addr );
-    struct futex_entry *entry, *next;
+    struct wait_on_address_entry *entry, *next;
     unsigned int count = 0;
     HANDLE tids[256];
 
@@ -942,7 +963,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     if (!queue->queue.next)
         list_init(&queue->queue);
 
-    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &queue->queue, struct futex_entry, entry )
+    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &queue->queue, struct wait_on_address_entry, entry )
     {
         if (entry->addr == addr)
         {
@@ -970,7 +991,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
 void WINAPI RtlWakeAddressSingle( const void *addr )
 {
     struct futex_queue *queue = get_futex_queue( addr );
-    struct futex_entry *entry;
+    struct wait_on_address_entry *entry;
     DWORD tid = 0;
 
     TRACE("%p\n", addr);
@@ -982,7 +1003,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
     if (!queue->queue.next)
         list_init(&queue->queue);
 
-    LIST_FOR_EACH_ENTRY( entry, &queue->queue, struct futex_entry, entry )
+    LIST_FOR_EACH_ENTRY( entry, &queue->queue, struct wait_on_address_entry, entry )
     {
         if (entry->addr == addr)
         {

@@ -1589,6 +1589,11 @@ struct x11drv_window_surface
     GC                    gc;
     struct x11drv_image  *image;
     BOOL                  byteswap;
+    BOOL                  glass_alpha; /* per-pixel alpha from a DWM-glass window */
+    BOOL                  ulw;         /* the surface carries UpdateLayeredWindow() content */
+    int                   shape_kind;  /* ShapeBounding or ShapeInput once a mask is set, 0 before */
+    DWORD                 input_shape_time;    /* tick of the last ShapeInput update */
+    BOOL                  input_shape_pending; /* a contour change is waiting for the throttle */
 };
 
 static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
@@ -1776,8 +1781,27 @@ static void x11drv_surface_set_clip( struct window_surface *window_surface, cons
 
     TRACE( "surface %p, rects %p, count %u\n", surface, rects, count );
 
-    if (!count)
+    /* No region and an empty region are opposites: the first lifts the clip, the
+     * second leaves nothing to flush.  A top-level that a pixel format child
+     * covers completely has an empty surface region (an embedded plug-in editor
+     * is exactly as large as its top-level), and flushing it unclipped paints
+     * the surface over what the child presented. */
+    if (!rects)
         XSetClipMask( gdi_display, surface->gc, None );
+    else if (!count && surface->ulw)
+    {
+        /* The region of a window with a pixel format leaves out its client area,
+         * and for a window painted through UpdateLayeredWindow() that is the whole
+         * window - but the surface is what the application shows, not the swap
+         * chain it rendered the frame with (WPF renders a popup through Direct3D 9
+         * and hands the frame to UpdateLayeredWindow()).  Paint it unclipped; the
+         * client window is rendered offscreen for such a window, see
+         * needs_offscreen_rendering(). */
+        TRACE( "surface %p carries UpdateLayeredWindow() content, painting it unclipped\n", surface );
+        XSetClipMask( gdi_display, surface->gc, None );
+    }
+    else if (!count)
+        XSetClipRectangles( gdi_display, surface->gc, 0, 0, NULL, 0, YXBanded );
     else if ((xrects = xrectangles_from_rects( rects, count )))
     {
         XSetClipRectangles( gdi_display, surface->gc, 0, 0, xrects, count, YXBanded );
@@ -1809,6 +1833,12 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
         }
     }
 
+    /* A DWM-glass window takes its alpha from the pixels.  win32u derives
+     * alpha_bits from the LWA_ALPHA constant opacity, which would force every
+     * pixel opaque here; that constant is already applied by the window
+     * manager through _NET_WM_WINDOW_OPACITY (sync_window_opacity). */
+    if (surface->glass_alpha) alpha_bits = 0;
+
     if (src != dst)
     {
         int map[256], *mapping = get_window_surface_mapping( ximage->bits_per_pixel, map );
@@ -1829,31 +1859,85 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
                 ptr[x] |= alpha_bits;
     }
 
-    if (shape_changed)
-    {
-#ifdef HAVE_LIBXSHAPE
-        if (!shape_bits)
-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, None, ShapeSet );
-        else
-        {
-            struct gdi_image_bits bits = {.ptr = (void *)shape_bits};
-            XVisualInfo vis = default_visual;
-            Pixmap shape;
-
-            vis.depth = 1;
-            shape = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, shape, ShapeSet );
-            XFreePixmap( gdi_display, shape );
-        }
-#endif /* HAVE_LIBXSHAPE */
-    }
 
     if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
                    dirty->right - dirty->left, dirty->bottom - dirty->top );
 
-    XFlush( gdi_display );
+    /* The surface bitmap lives in the shared memory segment XShmPutImage reads
+     * from, and the server only reads it when it gets to the request.  Anything
+     * painted into the surface before then - typically a background erase that
+     * follows a resize - is what the server puts on screen, not what was there
+     * when the flush was issued.  Wait for the request to complete. */
+    XSync( gdi_display, False );
+
+#ifdef HAVE_LIBXSHAPE
+    {
+        int kind = ShapeBounding;
+
+        /* A per-pixel-alpha surface on a 32-bit visual is composited with its
+         * alpha by the window manager, so a bounding shape adds nothing to what
+         * is shown.  Setting one on every change of the contour does harm: an
+         * animated layered popup that resizes every frame (FL Studio's About
+         * fruit) made KWin show a strip of it or nothing for single frames, 16
+         * times in 36 test cycles against 0 without the bounding shape.  Keep
+         * the mask as the input shape only, so that clicks on transparent pixels
+         * still pass through, let it lag a running animation by up to a
+         * second (the first mask and a removal go out at once),
+         * and set it only after the image is in place: a shape change makes the
+         * window manager repaint, and a repaint between the resize and the put
+         * is exactly the frame that shows a strip. */
+        if (alpha_mask && ximage->depth == 32)
+        {
+            DWORD now = NtGetTickCount();
+
+            kind = ShapeInput;
+            if (shape_changed && shape_bits && surface->shape_kind == ShapeInput &&
+                now - surface->input_shape_time < 1000)
+            {
+                surface->input_shape_pending = TRUE;
+                shape_changed = FALSE;
+            }
+            else if (!shape_changed && surface->input_shape_pending && now - surface->input_shape_time >= 1000)
+            {
+                shape_changed = TRUE;
+            }
+            if (shape_changed && (NtUserGetWindowLongW( window_surface->hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT))
+                shape_changed = FALSE;  /* sync_window_input_shape keeps such windows fully click-through */
+        }
+
+        if (shape_changed)
+        {
+            /* the mask moves between the two kinds only with the visual; drop the old one */
+            if (surface->shape_kind && surface->shape_kind != kind)
+                XShapeCombineMask( gdi_display, surface->window, surface->shape_kind, 0, 0, None, ShapeSet );
+
+            if (!shape_bits)
+            {
+                XShapeCombineMask( gdi_display, surface->window, kind, 0, 0, None, ShapeSet );
+                surface->shape_kind = 0;
+            }
+            else
+            {
+                struct gdi_image_bits bits = {.ptr = (void *)shape_bits};
+                XVisualInfo vis = default_visual;
+                Pixmap shape;
+
+                vis.depth = 1;
+                shape = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
+                XShapeCombineMask( gdi_display, surface->window, kind, 0, 0, shape, ShapeSet );
+                XFreePixmap( gdi_display, shape );
+                surface->shape_kind = kind;
+            }
+            if (kind == ShapeInput)
+            {
+                surface->input_shape_time = NtGetTickCount();
+                surface->input_shape_pending = FALSE;
+            }
+        }
+    }
+#endif /* HAVE_LIBXSHAPE */
 
     return TRUE;
 }
@@ -1882,7 +1966,7 @@ static const struct window_surface_funcs x11drv_surface_funcs =
  *           create_surface
  */
 static struct window_surface *create_surface( HWND hwnd, Window window, const XVisualInfo *vis, const RECT *rect,
-                                              BOOL use_alpha )
+                                              BOOL use_alpha, BOOL glass_alpha )
 {
     const XPixmapFormatValues *format = pixmap_formats[vis->depth];
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -1941,6 +2025,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
     else
     {
         surface = get_x11_surface( window_surface );
+        surface->glass_alpha = glass_alpha;
         surface->image = image;
         surface->byteswap = byteswap;
         surface->window = window;
@@ -1985,16 +2070,31 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
     if (layered)
     {
         data->layered = TRUE;
+        data->wants_argb = 1; /* UpdateLayeredWindow always needs per-pixel alpha */
+        data->ulw_surface = 1; /* consulted by needs_offscreen_rendering() */
         if (!data->embedded && argb_visual.visualid) set_window_visual( data, &argb_visual, TRUE );
     }
-    else if (enable_direct_drawing( data, layered ))
+    else
     {
-        *surface = NULL;  /* indicate that we want to draw directly to the window */
-        goto done; /* draw directly to the window */
+        data->ulw_surface = 0;
+        /* a DWM-glass window is per-pixel alpha capable even without ULW */
+        update_window_argb_visual( data );
+        /* Keep direct drawing for a glass window and only change the visual.
+         * Forcing the win32u surface instead (as the ULW path does) was measured
+         * and rejected: it produced black frames because the content keeps
+         * arriving through the GL child window while the surface is flushed
+         * empty. */
+        if (enable_direct_drawing( data, layered ))
+        {
+            *surface = NULL;  /* indicate that we want to draw directly to the window */
+            goto done; /* draw directly to the window */
+        }
     }
 
     *surface = create_surface( data->hwnd, data->whole_window, &data->vis, surface_rect,
-                               layered ? data->use_alpha : FALSE );
+                               (layered || data->wants_argb) ? data->use_alpha : FALSE,
+                               !layered && data->wants_argb );
+    if (*surface) get_x11_surface( *surface )->ulw = layered;
 
 done:
     release_win_data( data );

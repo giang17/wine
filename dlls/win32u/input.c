@@ -592,6 +592,35 @@ HWND get_capture(void)
     return NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) ? info.hwndCapture : 0;
 }
 
+/* A window manager has moved, resized or changed the state of a window on its own, from a press on
+ * its frame that never reached us. On Windows that press goes to the capture window of the thread as
+ * a client click, and an application that captured the mouse to notice a click outside, e.g. to
+ * close an open menu or drop-down list, would close it. Cancel such a capture the way a modal dialog
+ * does. The menu and move/size loops grab the pointer, the press cannot have gone elsewhere; and a
+ * held mouse button means the application is dragging, possibly the window itself. */
+void cancel_capture_for_wm_change( HWND hwnd )
+{
+    static const BYTE buttons[] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2 };
+    const desktop_shm_t *desktop_shm;
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    BYTE keystate[ARRAY_SIZE(buttons)] = {0};
+    GUITHREADINFO info;
+    NTSTATUS status;
+    UINT i;
+
+    info.cbSize = sizeof(info);
+    if (!NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) || !info.hwndCapture) return;
+    if (info.flags & (GUI_INMENUMODE | GUI_INMOVESIZE)) return;
+
+    while ((status = get_shared_desktop( &lock, &desktop_shm )) == STATUS_PENDING)
+        for (i = 0; i < ARRAY_SIZE(buttons); i++) keystate[i] = desktop_shm->keystate[buttons[i]];
+    if (status) return;
+    for (i = 0; i < ARRAY_SIZE(buttons); i++) if (keystate[i] & 0x80) return;
+
+    TRACE( "window manager changed %p, cancelling capture %p\n", hwnd, info.hwndCapture );
+    send_message( info.hwndCapture, WM_CANCELMODE, 0, 0 );
+}
+
 /* see GetFocus */
 HWND get_focus(void)
 {
@@ -2117,15 +2146,15 @@ static HWND set_focus_window( HWND hwnd )
 /*******************************************************************
  *		set_active_window
  */
-BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new_active_thread_id )
+BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD other_thread_id )
 {
     HWND previous = get_active_window();
-    BOOL ret;
+    BOOL ret, marked = FALSE;
     DWORD old_thread, new_thread;
     CBTACTIVATESTRUCT cbt;
 
-    TRACE( "hwnd %p, previous %p, mouse %u, focus %u, new_active_thread_id %04x\n",
-           hwnd, previous, mouse, focus, new_active_thread_id );
+    TRACE( "hwnd %p, previous %p, mouse %u, focus %u, other_thread_id %04x\n",
+           hwnd, previous, mouse, focus, other_thread_id );
 
     if (previous == hwnd)
     {
@@ -2133,16 +2162,24 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
         goto done;
     }
 
-    /* call CBT hook chain */
-    cbt.fMouse     = mouse;
-    cbt.hWndActive = previous;
-    if (call_hooks( WH_CBT, HCBT_ACTIVATE, (WPARAM)hwnd, (LPARAM)&cbt, sizeof(cbt) )) return FALSE;
-
-    if (is_window( previous ))
+    /* Windows runs the CBT hook and sends the activation messages once per activation:
+     * a window that activates itself again from its WM_ACTIVATE handler does not get a
+     * second round (bug 46274). The mark is cleared by the call that set it, so a nested
+     * call leaves the outer one's mark alone. */
+    marked = !(win_set_flags( hwnd, WIN_IS_IN_ACTIVATION, 0 ) & WIN_IS_IN_ACTIVATION);
+    if (marked)
     {
-        send_message( previous, WM_NCACTIVATE, FALSE, (LPARAM)hwnd );
-        send_message( previous, WM_ACTIVATE,
-                      MAKEWPARAM( WA_INACTIVE, is_iconic(previous) ? 0x20 : 0 ), (LPARAM)hwnd );
+        /* call CBT hook chain */
+        cbt.fMouse     = mouse;
+        cbt.hWndActive = previous;
+        if (call_hooks( WH_CBT, HCBT_ACTIVATE, (WPARAM)hwnd, (LPARAM)&cbt, sizeof(cbt) )) goto failed;
+
+        if (is_window( previous ))
+        {
+            send_message( previous, WM_NCACTIVATE, FALSE, (LPARAM)hwnd );
+            send_message( previous, WM_ACTIVATE,
+                          MAKEWPARAM( WA_INACTIVE, is_iconic(previous) ? 0x20 : 0 ), (LPARAM)hwnd );
+        }
     }
 
     SERVER_START_REQ( set_active_window )
@@ -2152,7 +2189,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
             previous = wine_server_ptr_handle( reply->previous );
     }
     SERVER_END_REQ;
-    if (!ret) return FALSE;
+    if (!ret) goto failed;
     if (prev) *prev = previous;
     if (previous == hwnd) goto done;
 
@@ -2164,7 +2201,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
         if (send_message( hwnd, WM_QUERYNEWPALETTE, 0, 0 ))
             send_message_timeout( HWND_BROADCAST, WM_PALETTEISCHANGING, (WPARAM)hwnd, 0,
                                   SMTO_ABORTIFHUNG, 2000, FALSE );
-        if (!is_window(hwnd)) return FALSE;
+        if (!is_window(hwnd)) goto failed;
     }
 
     old_thread = previous ? get_window_thread( previous, NULL ) : 0;
@@ -2178,7 +2215,8 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
         {
             if (old_thread)
             {
-                if (!new_active_thread_id) new_active_thread_id = new_thread;
+                /* when deactivating, other_thread_id is the thread taking over */
+                DWORD new_active_thread_id = new_thread ? new_thread : other_thread_id;
                 for (phwnd = list; *phwnd; phwnd++)
                 {
                     if (get_window_thread( *phwnd, NULL ) == old_thread)
@@ -2190,14 +2228,16 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
                 for (phwnd = list; *phwnd; phwnd++)
                 {
                     if (get_window_thread( *phwnd, NULL ) == new_thread)
-                        send_message( *phwnd, WM_ACTIVATEAPP, 1, old_thread );
+                        /* when activated from another thread, other_thread_id
+                         * is the thread that owned the foreground window */
+                        send_message( *phwnd, WM_ACTIVATEAPP, 1, old_thread ? old_thread : other_thread_id );
                 }
             }
             free( list );
         }
     }
 
-    if (is_window(hwnd))
+    if (marked && is_window(hwnd))
     {
         send_message( hwnd, WM_NCACTIVATE, hwnd == NtUserGetForegroundWindow(), (LPARAM)previous );
         send_message( hwnd, WM_ACTIVATE,
@@ -2228,7 +2268,12 @@ done:
         if (hwnd == NtUserGetForegroundWindow()) user_driver->pActivateWindow( hwnd, previous );
         clip_fullscreen_window( hwnd, FALSE );
     }
+    if (marked) win_set_flags( hwnd, 0, WIN_IS_IN_ACTIVATION );
     return TRUE;
+
+failed:
+    if (marked) win_set_flags( hwnd, 0, WIN_IS_IN_ACTIVATION );
+    return FALSE;
 }
 
 /**********************************************************************
@@ -2334,7 +2379,7 @@ BOOL WINAPI NtUserSetForegroundWindow( HWND hwnd )
 BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
 {
     BOOL ret, send_msg_old = FALSE, send_msg_new = FALSE;
-    DWORD new_thread_id;
+    DWORD new_thread_id, old_thread_id;
     HWND previous = 0;
 
     if (mouse) hwnd = get_full_window_handle( hwnd );
@@ -2357,6 +2402,8 @@ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
 
     if (ret && previous != hwnd)
     {
+        old_thread_id = previous ? get_window_thread( previous, NULL ) : 0;
+
         if (send_msg_old)  /* old window belongs to other thread */
             NtUserMessageCall( previous, WM_WINE_SETACTIVEWINDOW, 0, new_thread_id,
                                0, NtUserSendNotifyMessage, FALSE );
@@ -2364,10 +2411,10 @@ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
             ret = set_active_window( 0, NULL, mouse, TRUE, new_thread_id );
 
         if (send_msg_new)  /* new window belongs to other thread */
-            NtUserMessageCall( hwnd, WM_WINE_SETACTIVEWINDOW, (WPARAM)hwnd, 0,
+            NtUserMessageCall( hwnd, WM_WINE_SETACTIVEWINDOW, (WPARAM)hwnd, old_thread_id,
                                0, NtUserSendNotifyMessage, FALSE );
         else  /* new window belongs to us */
-            ret = set_active_window( hwnd, NULL, mouse, TRUE, 0 );
+            ret = set_active_window( hwnd, NULL, mouse, TRUE, old_thread_id );
     }
     return ret;
 }

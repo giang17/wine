@@ -239,6 +239,20 @@ typedef struct
     ULONG itemData;
 } MEASUREITEMSTRUCT32;
 
+struct uah_menu32
+{
+    ULONG hmenu;
+    ULONG hdc;
+    DWORD flags;
+};
+
+struct uah_measure_menu_item32
+{
+    MEASUREITEMSTRUCT32  mis;
+    struct uah_menu32    menu;
+    struct uah_menu_item item;
+};
+
 typedef struct
 {
     UINT  CtlType;
@@ -251,6 +265,13 @@ typedef struct
     RECT  rcItem;
     ULONG itemData;
 } DRAWITEMSTRUCT32;
+
+struct uah_draw_menu_item32
+{
+    DRAWITEMSTRUCT32     dis;
+    struct uah_menu32    menu;
+    struct uah_menu_item item;
+};
 
 typedef struct
 {
@@ -644,6 +665,82 @@ static NTSTATUS WINAPI wow64_NtUserCallWinEventHook( void *arg, ULONG size )
                               FIELD_OFFSET( struct win_event_hook_params32, module ) + size);
 }
 
+static void uah_measure_menu_item_64to32( const struct uah_measure_menu_item *uah64,
+                                          struct uah_measure_menu_item32 *uah32 )
+{
+    uah32->mis.CtlType    = uah64->mis.CtlType;
+    uah32->mis.CtlID      = uah64->mis.CtlID;
+    uah32->mis.itemID     = uah64->mis.itemID;
+    uah32->mis.itemWidth  = uah64->mis.itemWidth;
+    uah32->mis.itemHeight = uah64->mis.itemHeight;
+    uah32->mis.itemData   = uah64->mis.itemData;
+    uah32->menu.hmenu     = HandleToUlong( uah64->menu.hmenu );
+    uah32->menu.hdc       = HandleToUlong( uah64->menu.hdc );
+    uah32->menu.flags     = uah64->menu.flags;
+    uah32->item           = uah64->item;
+}
+
+static void uah_measure_menu_item_32to64( const struct uah_measure_menu_item32 *uah32,
+                                          struct uah_measure_menu_item *uah64 )
+{
+    uah64->mis.CtlType    = uah32->mis.CtlType;
+    uah64->mis.CtlID      = uah32->mis.CtlID;
+    uah64->mis.itemID     = uah32->mis.itemID;
+    uah64->mis.itemWidth  = uah32->mis.itemWidth;
+    uah64->mis.itemHeight = uah32->mis.itemHeight;
+    uah64->mis.itemData   = uah32->mis.itemData;
+    uah64->menu.hmenu     = LongToHandle( uah32->menu.hmenu );
+    uah64->menu.hdc       = LongToHandle( uah32->menu.hdc );
+    uah64->menu.flags     = uah32->menu.flags;
+    uah64->item           = uah32->item;
+}
+
+static void uah_menu_64to32( const struct uah_menu *uah64, struct uah_menu32 *uah32 )
+{
+    uah32->hmenu = HandleToUlong( uah64->hmenu );
+    uah32->hdc   = HandleToUlong( uah64->hdc );
+    uah32->flags = uah64->flags;
+}
+
+static void uah_menu_32to64( const struct uah_menu32 *uah32, struct uah_menu *uah64 )
+{
+    uah64->hmenu = LongToHandle( uah32->hmenu );
+    uah64->hdc   = LongToHandle( uah32->hdc );
+    uah64->flags = uah32->flags;
+}
+
+static void uah_draw_menu_item_64to32( const struct uah_draw_menu_item *uah64,
+                                       struct uah_draw_menu_item32 *uah32 )
+{
+    uah32->dis.CtlType    = uah64->dis.CtlType;
+    uah32->dis.CtlID      = uah64->dis.CtlID;
+    uah32->dis.itemID     = uah64->dis.itemID;
+    uah32->dis.itemAction = uah64->dis.itemAction;
+    uah32->dis.itemState  = uah64->dis.itemState;
+    uah32->dis.hwndItem   = HandleToLong( uah64->dis.hwndItem );
+    uah32->dis.hDC        = HandleToUlong( uah64->dis.hDC );
+    uah32->dis.rcItem     = uah64->dis.rcItem;
+    uah32->dis.itemData   = uah64->dis.itemData;
+    uah_menu_64to32( &uah64->menu, &uah32->menu );
+    uah32->item           = uah64->item;
+}
+
+static void uah_draw_menu_item_32to64( const struct uah_draw_menu_item32 *uah32,
+                                       struct uah_draw_menu_item *uah64 )
+{
+    uah64->dis.CtlType    = uah32->dis.CtlType;
+    uah64->dis.CtlID      = uah32->dis.CtlID;
+    uah64->dis.itemID     = uah32->dis.itemID;
+    uah64->dis.itemAction = uah32->dis.itemAction;
+    uah64->dis.itemState  = uah32->dis.itemState;
+    uah64->dis.hwndItem   = LongToHandle( uah32->dis.hwndItem );
+    uah64->dis.hDC        = LongToHandle( uah32->dis.hDC );
+    uah64->dis.rcItem     = uah32->dis.rcItem;
+    uah64->dis.itemData   = uah32->dis.itemData;
+    uah_menu_32to64( &uah32->menu, &uah64->menu );
+    uah64->item           = uah32->item;
+}
+
 static size_t packed_message_64to32( UINT message, WPARAM wparam,
                                      const void *params64, void *params32, size_t size )
 {
@@ -713,6 +810,34 @@ static size_t packed_message_64to32( UINT message, WPARAM wparam,
             mis32.itemData   = mis64->itemData;
             memcpy( params32, &mis32, sizeof(mis32) );
             return sizeof(mis32);
+        }
+
+    case WM_UAHMEASUREMENUITEM:
+        {
+            struct uah_measure_menu_item32 uah32;
+
+            uah_measure_menu_item_64to32( params64, &uah32 );
+            memcpy( params32, &uah32, sizeof(uah32) );
+            return sizeof(uah32);
+        }
+
+    case WM_UAHDRAWMENU:
+    case WM_UAHINITMENU:
+        {
+            struct uah_menu32 uah32;
+
+            uah_menu_64to32( params64, &uah32 );
+            memcpy( params32, &uah32, sizeof(uah32) );
+            return sizeof(uah32);
+        }
+
+    case WM_UAHDRAWMENUITEM:
+        {
+            struct uah_draw_menu_item32 uah32;
+
+            uah_draw_menu_item_64to32( params64, &uah32 );
+            memcpy( params32, &uah32, sizeof(uah32) );
+            return sizeof(uah32);
         }
 
     case WM_DELETEITEM:
@@ -890,6 +1015,10 @@ static size_t packed_result_32to64( UINT message, WPARAM wparam, const void *par
             mis64->itemData   = mis32->itemData;
             return sizeof(*mis64);
         }
+
+    case WM_UAHMEASUREMENUITEM:
+        uah_measure_menu_item_32to64( params32, params64 );
+        return sizeof(struct uah_measure_menu_item);
 
     case WM_WINDOWPOSCHANGING:
     case WM_WINDOWPOSCHANGED:
@@ -3655,6 +3784,34 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             mis32->itemHeight = mis.itemHeight;
             mis32->itemData   = mis.itemData;
             return ret;
+        }
+
+    case WM_UAHMEASUREMENUITEM:
+        {
+            struct uah_measure_menu_item32 *uah32 = (void *)lparam;
+            struct uah_measure_menu_item uah;
+
+            uah_measure_menu_item_32to64( uah32, &uah );
+            ret = NtUserMessageCall( hwnd, msg, wparam, (LPARAM)&uah, result_info, type, ansi );
+            uah_measure_menu_item_64to32( &uah, uah32 );
+            return ret;
+        }
+
+    case WM_UAHDRAWMENU:
+    case WM_UAHINITMENU:
+        {
+            struct uah_menu uah;
+
+            uah_menu_32to64( (void *)lparam, &uah );
+            return NtUserMessageCall( hwnd, msg, wparam, (LPARAM)&uah, result_info, type, ansi );
+        }
+
+    case WM_UAHDRAWMENUITEM:
+        {
+            struct uah_draw_menu_item uah;
+
+            uah_draw_menu_item_32to64( (void *)lparam, &uah );
+            return NtUserMessageCall( hwnd, msg, wparam, (LPARAM)&uah, result_info, type, ansi );
         }
 
     case WM_DRAWITEM:

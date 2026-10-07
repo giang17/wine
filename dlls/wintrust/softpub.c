@@ -318,6 +318,18 @@ static DWORD SOFTPUB_VerifyImageHash(CRYPT_PROVIDER_DATA *data, HANDLE file)
     if (((ULONG_PTR)indirect->Data.pszObjId >> 16) == 0 ||
         strcmp(indirect->Data.pszObjId, SPC_PE_IMAGE_DATA_OBJID))
     {
+        /* Indirect data of a registered subject interface package: only the
+         * package that produced the message knows how the file is hashed. */
+        if (!strcmp(indirect->Data.pszObjId, SPC_SIGINFO_OBJID) &&
+            data->pPDSip->pSip && data->pPDSip->pSip->pfVerify && data->pPDSip->psSipSubjectInfo)
+        {
+            if (data->pPDSip->pSip->pfVerify(data->pPDSip->psSipSubjectInfo,
+                                             (SIP_INDIRECT_DATA *)indirect))
+                return ERROR_SUCCESS;
+            err = GetLastError();
+            TRACE("SIP verify of %s failed: %08lx\n", debugstr_a(indirect->Data.pszObjId), err);
+            return err ? err : TRUST_E_BAD_DIGEST;
+        }
         FIXME("Cannot verify hash for pszObjId=%s\n", debugstr_a(indirect->Data.pszObjId));
         return ERROR_SUCCESS;
     }

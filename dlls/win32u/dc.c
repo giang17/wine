@@ -248,7 +248,7 @@ DC *alloc_dc_ptr( DWORD magic )
  */
 static void free_dc_state( DC *dc )
 {
-    if (dc->opengl_drawable) opengl_drawable_release( dc->opengl_drawable );
+    if (dc->opengl_drawable) release_dc_opengl_drawable( dc->opengl_drawable );
     if (dc->hClipRgn) NtGdiDeleteObjectApp( dc->hClipRgn );
     if (dc->hMetaRgn) NtGdiDeleteObjectApp( dc->hMetaRgn );
     if (dc->hVisRgn) NtGdiDeleteObjectApp( dc->hVisRgn );

@@ -203,6 +203,32 @@ static Cursor get_empty_cursor(void)
 }
 
 /***********************************************************************
+ *		get_default_cursor
+ *
+ * Return a shared visible arrow cursor used as the initial cursor for newly
+ * created windows.  Without it a window keeps the X11 default of inheriting
+ * its parent's cursor; this breaks for cross-process embedded surfaces (e.g.
+ * WebView2/Chromium content windows) which never call SetCursor and whose
+ * inheritance chain to the owner window is severed once the window manager
+ * reparents the toplevel into a frame, leaving the cursor blank.
+ */
+Cursor get_default_cursor(void)
+{
+    static Cursor cursor;
+
+    if (!cursor)
+    {
+        Cursor new = XCreateFontCursor( gdi_display, XC_left_ptr );
+        /* flush so the cursor is known to the server before another display
+           connection (create_whole_window uses data->display) references it */
+        XFlush( gdi_display );
+        if (InterlockedCompareExchangePointer( (void **)&cursor, (void *)new, 0 ))
+            XFreeCursor( gdi_display, new );
+    }
+    return cursor;
+}
+
+/***********************************************************************
  *		set_window_cursor
  */
 static void set_window_cursor( Window window, HCURSOR handle )
@@ -440,6 +466,11 @@ void x11drv_xinput2_init( struct x11drv_thread_data *data )
  *
  * Start a pointer grab on the clip window.
  */
+static int clip_window_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->error_code == BadWindow);
+}
+
 static BOOL grab_clipping_window( const RECT *clip )
 {
 #ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
@@ -476,11 +507,20 @@ static BOOL grab_clipping_window( const RECT *clip )
 
     TRACE( "clipping to %s win %lx\n", wine_dbgstr_rect(clip), clip_window );
 
+    /* as in ungrab_clipping_window: the clip window can be destroyed under us
+     * when its desktop goes away, and an unhandled BadWindow would be fatal */
+    X11DRV_expect_error( data->display, clip_window_error, NULL );
     if (!data->clipping_cursor) XUnmapWindow( data->display, clip_window );
     pos = virtual_screen_to_root( clip->left, clip->top );
     XMoveResizeWindow( data->display, clip_window, pos.x, pos.y,
                        max( 1, clip->right - clip->left ), max( 1, clip->bottom - clip->top ) );
     XMapWindow( data->display, clip_window );
+    XSync( data->display, False );
+    if (X11DRV_check_error())
+    {
+        WARN( "clipping window %lx already destroyed\n", clip_window );
+        return FALSE;
+    }
 
     /* if the rectangle is shrinking we may get a pointer warp */
     if (!data->clipping_cursor || clip->left > clip_rect.left || clip->top > clip_rect.top ||
@@ -526,7 +566,13 @@ void ungrab_clipping_window(void)
     if (!clip_window) return;
 
     TRACE( "no longer clipping\n" );
+    /* the clip window belongs to the desktop window and can already be gone
+     * when a desktop is torn down (virtual desktop switch), and an unhandled
+     * BadWindow here would be fatal */
+    X11DRV_expect_error( data->display, clip_window_error, NULL );
     XUnmapWindow( data->display, clip_window );
+    XSync( data->display, False );
+    if (X11DRV_check_error()) WARN( "clipping window %lx already destroyed\n", clip_window );
     if (clipping_cursor) XUngrabPointer( data->display, CurrentTime );
     clipping_cursor = FALSE;
     data->clipping_cursor = FALSE;
@@ -1657,6 +1703,65 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
 
     pt = map_event_coords( hwnd, event->window, event->root, root, pt );
     send_mouse_input( hwnd, pt, MOUSEEVENTF_ABSOLUTE, 0, time, NULL );
+    return TRUE;
+}
+
+
+/***********************************************************************
+ *           X11DRV_LeaveNotify
+ *
+ * The pointer left one of our windows for a window that is not ours, such
+ * as the frame the window manager draws around it, or another client's
+ * grab took it away. No motion event follows while it stays there, so the
+ * position the server holds would stay where the pointer was last seen
+ * inside the window. After every window move the server synthesizes a
+ * WM_MOUSEMOVE at that position, and a stale one shows up as hover
+ * feedback wandering across the window while the window manager drags it.
+ *
+ * Report where the pointer is now, not where the event says it was: a
+ * crossing caused by another window being mapped over ours is queued
+ * before a warp by another process, and reporting the event position
+ * then would move the pointer back. Like a button event on a foreign
+ * window, leave the window under the position to the server: the pointer
+ * is no longer in this one, so it must not claim the point the way
+ * send_mouse_input() does for the z-order.
+ */
+BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
+{
+    XCrossingEvent *event = &xev->xcrossing;
+    Window root, child;
+    int root_x, root_y, win_x, win_y;
+    unsigned int state;
+    INPUT input;
+    POINT pt;
+
+    TRACE( "hwnd %p/%lx pos %d,%d detail %d mode %d\n",
+           hwnd, event->window, event->x, event->y, event->detail, event->mode );
+
+    if (!hwnd) return FALSE;
+    /* the pointer went into a child of ours, it did not leave the window */
+    if (event->detail == NotifyInferior) return FALSE;
+    if (hwnd == NtUserGetAncestor( get_capture_window(), GA_ROOT )) return FALSE;
+
+    if (is_old_motion_event( event->serial ))
+    {
+        TRACE( "pos %d,%d old serial %lu, ignoring\n", event->x, event->y, event->serial );
+        return FALSE;
+    }
+
+    if (!XQueryPointer( event->display, root_window, &root, &child, &root_x, &root_y, &win_x, &win_y, &state ))
+        return FALSE;
+    pt = root_to_virtual_screen( win_x, win_y );
+    TRACE( "pointer now at %s\n", wine_dbgstr_point(&pt) );
+
+    input.type           = INPUT_MOUSE;
+    input.mi.dx          = pt.x;
+    input.mi.dy          = pt.y;
+    input.mi.mouseData   = 0;
+    input.mi.dwFlags     = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    input.mi.time        = EVENT_x11_time_to_win32_time( event->time );
+    input.mi.dwExtraInfo = 0;
+    NtUserSendHardwareInput( 0, 0, &input, 0 );
     return TRUE;
 }
 

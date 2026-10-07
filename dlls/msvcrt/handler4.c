@@ -327,6 +327,18 @@ static inline int ip_to_state4(const cxx_function_descr_v4 *descr, DISPATCHER_CO
     return ret;
 }
 
+/* The state is stored with an offset of 2, so that the NULL value of a slot that was never set
+ * on this thread (e.g. a thread that existed before the dll was loaded) reads as -2. */
+static inline int get_catch_state(void)
+{
+    return (INT_PTR)FlsGetValue(fls_index) - 2;
+}
+
+static inline void set_catch_state(int state)
+{
+    FlsSetValue(fls_index, (void *)(INT_PTR)(state + 2));
+}
+
 static void cxx_local_unwind4(ULONG64 frame, DISPATCHER_CONTEXT *dispatch,
         const cxx_function_descr_v4 *descr, int trylevel, int last_level)
 {
@@ -382,7 +394,7 @@ static LONG CALLBACK cxx_rethrow_filter(PEXCEPTION_POINTERS eptrs, void *c)
     if (rec->ExceptionCode == CXX_EXCEPTION && !rec->ExceptionInformation[1] && !rec->ExceptionInformation[2])
         return EXCEPTION_EXECUTE_HANDLER;
 
-    FlsSetValue(fls_index, (void*)(DWORD_PTR)ctx->search_state);
+    set_catch_state(ctx->search_state);
     if (rec->ExceptionCode != CXX_EXCEPTION)
         return EXCEPTION_CONTINUE_SEARCH;
     if (rec->ExceptionInformation[1] == ctx->prev_rec->ExceptionInformation[1])
@@ -395,7 +407,7 @@ static void CALLBACK cxx_catch_cleanup(BOOL normal, void *c)
     cxx_catch_ctx *ctx = c;
     __CxxUnregisterExceptionObject(&ctx->frame_info, ctx->rethrow);
 
-    FlsSetValue(fls_index, (void*)(DWORD_PTR)ctx->unwind_state);
+    set_catch_state(ctx->unwind_state);
 }
 
 static void* WINAPI call_catch_block4(EXCEPTION_RECORD *rec)
@@ -423,7 +435,7 @@ static void* WINAPI call_catch_block4(EXCEPTION_RECORD *rec)
         {
             TRACE("detect rethrow: exception code: %lx\n", prev_rec->ExceptionCode);
             ctx.rethrow = TRUE;
-            FlsSetValue(fls_index, (void*)(DWORD_PTR)ctx.search_state);
+            set_catch_state(ctx.search_state);
 
             if (untrans_rec)
             {
@@ -441,7 +453,7 @@ static void* WINAPI call_catch_block4(EXCEPTION_RECORD *rec)
     }
     __FINALLY_CTX(cxx_catch_cleanup, &ctx)
 
-    FlsSetValue(fls_index, (void*)-2);
+    set_catch_state(-2);
     TRACE("handler returned %p, ret_addr[0] %#Ix, ret_addr[1] %#Ix.\n",
           ret_addr, rec->ExceptionInformation[8], rec->ExceptionInformation[9]);
 
@@ -680,8 +692,8 @@ EXCEPTION_DISPOSITION __cdecl __CxxFrameHandler4(EXCEPTION_RECORD *rec,
 
     TRACE("%p %Ix %p %p\n", rec, frame, context, dispatch);
 
-    trylevel = (DWORD_PTR)FlsGetValue(fls_index);
-    FlsSetValue(fls_index, (void*)-2);
+    trylevel = get_catch_state();
+    set_catch_state(-2);
 
     memset(&descr, 0, sizeof(descr));
     p = cxx_rva(*(UINT*)dispatch->HandlerData, dispatch->ImageBase);
@@ -758,7 +770,7 @@ BOOL msvcrt_init_handler4(void)
 
 void msvcrt_attach_handler4(void)
 {
-    FlsSetValue(fls_index, (void*)-2);
+    set_catch_state(-2);
 }
 
 void msvcrt_free_handler4(void)

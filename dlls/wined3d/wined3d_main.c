@@ -103,6 +103,11 @@ static CRITICAL_SECTION_DEBUG wined3d_wndproc_cs_debug =
 };
 static CRITICAL_SECTION wined3d_wndproc_cs = {&wined3d_wndproc_cs_debug, -1, 0, 0, 0, 0};
 
+/* Private heap for wined3d — avoids ntdll process heap fragmentation from
+ * high-frequency alloc/free cycles (GL buffer structs, staging buffers).
+ * Created at DLL_PROCESS_ATTACH, destroyed at DLL_PROCESS_DETACH. */
+HANDLE wined3d_heap;
+
 CRITICAL_SECTION wined3d_command_cs;
 static CRITICAL_SECTION_DEBUG wined3d_command_cs_debug =
 {
@@ -283,6 +288,16 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
     HKEY appkey = 0;
     unsigned int tmpvalue;
     WNDCLASSA wc;
+
+    /* Issue 3: route wined3d allocations to the process heap instead of a private
+     * heap (a3f6c08). The private heap and the process heap recycle the same
+     * virtual address regions under wined3d's render-path alloc/free churn; an
+     * application pointer (e.g. KORG Trinity's waveform buffer, allocated via its
+     * CRT on the process heap) then ends up in a block owned by the other heap.
+     * Wine's strict HeapReAlloc returns NULL where Windows tolerates the mismatch,
+     * and the app's unchecked realloc result faults. A single shared owner removes
+     * the cross-heap mismatch. */
+    wined3d_heap = GetProcessHeap();
 
     wined3d_context_tls_idx = TlsAlloc();
     if (wined3d_context_tls_idx == TLS_OUT_OF_INDEXES)
@@ -549,12 +564,44 @@ static BOOL wined3d_dll_destroy(HINSTANCE hInstDLL)
 
     DeleteCriticalSection(&wined3d_wndproc_cs);
     DeleteCriticalSection(&wined3d_cs);
+
+    /* Issue 3: wined3d_heap aliases the process heap (see wined3d_dll_init), so it
+     * must not be destroyed here — that would tear down the whole process. */
+
     return TRUE;
 }
 
 void WINAPI wined3d_mutex_lock(void)
 {
     EnterCriticalSection(&wined3d_cs);
+}
+
+/* Give the global mutex up while a client thread waits for its command
+ * stream, and take it back afterwards (issue 414).  A thread that holds the
+ * mutex through such a wait blocks every other client thread of the process
+ * for as long as its own CS thread needs: SynthEdit's WPF chrome (D3D9) and
+ * its GMPI canvas (D3D11) render on two threads and two devices at every
+ * resize step, and the canvas thread spent ~106 ms of every ~120 ms step
+ * waiting for the mutex while the WPF thread waited, mutex held, for a
+ * make-current on its freshly resized window.  Different devices do not
+ * share client-side state under the mutex; on one device the D3D threading
+ * rules already require the application to serialise. */
+unsigned int wined3d_mutex_release_all(void)
+{
+    unsigned int count, i;
+
+    if (wined3d_cs.OwningThread != ULongToHandle(GetCurrentThreadId()))
+        return 0;
+    count = wined3d_cs.RecursionCount;
+    for (i = 0; i < count; ++i)
+        LeaveCriticalSection(&wined3d_cs);
+    return count;
+}
+
+void wined3d_mutex_reacquire(unsigned int count)
+{
+    while (count--)
+        EnterCriticalSection(&wined3d_cs);
 }
 
 void WINAPI wined3d_mutex_unlock(void)

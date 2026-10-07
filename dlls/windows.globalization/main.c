@@ -331,7 +331,7 @@ static const struct IVectorView_HSTRINGVtbl hstring_vector_vtbl =
 
 static const struct IIterable_HSTRINGVtbl iterable_view_hstring_vtbl;
 
-static HRESULT hstring_vector_create(HSTRING *values, SIZE_T count, IVectorView_HSTRING **out)
+HRESULT hstring_vector_create(HSTRING *values, SIZE_T count, IVectorView_HSTRING **out)
 {
     struct hstring_vector *impl;
 
@@ -1137,6 +1137,11 @@ HRESULT WINAPI DllGetActivationFactory(HSTRING classid, IActivationFactory **fac
     else if (!wcscmp(name, RuntimeClass_Windows_Globalization_ApplicationLanguages))
     {
         *factory = &application_languages.IActivationFactory_iface;
+        IUnknown_AddRef(*factory);
+    }
+    else if (!wcscmp(name, RuntimeClass_Windows_Globalization_Calendar))
+    {
+        *factory = calendar_factory;
         IUnknown_AddRef(*factory);
     }
 

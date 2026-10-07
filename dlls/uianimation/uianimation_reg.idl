@@ -55,3 +55,21 @@ coclass UIAnimationTransitionLibrary
 {
     [default] interface IUIAnimationTransitionLibrary;
 }
+
+[
+    uuid(d25d8842-8884-4a4a-b321-091314379bdd),
+    threading(both)
+]
+coclass UIAnimationManager2
+{
+    [default] interface IUIAnimationManager2;
+}
+
+[
+    uuid(812f944a-c5c8-4cd9-b0a6-b3da802f228d),
+    threading(both)
+]
+coclass UIAnimationTransitionLibrary2
+{
+    [default] interface IUIAnimationTransitionLibrary2;
+}

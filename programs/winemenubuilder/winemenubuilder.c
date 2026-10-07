@@ -1510,7 +1510,10 @@ static HRESULT get_cmdline( IShellLinkW *sl, LPWSTR szPath, DWORD pathSize,
     szPath[0] = 0;
     szArgs[0] = 0;
 
-    hr = IShellLinkW_GetPath( sl, szPath, pathSize, NULL, SLGP_RAWPATH );
+    /* The resolved path, not SLGP_RAWPATH: MSI shortcuts built from a
+     * "[!file]" target store the 8.3 name, and the application started from
+     * the .desktop file would see that as its module path. */
+    hr = IShellLinkW_GetPath( sl, szPath, pathSize, NULL, 0 );
     if (hr == S_OK && szPath[0])
     {
         IShellLinkW_GetArguments( sl, szArgs, argsSize );

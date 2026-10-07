@@ -1,0 +1,902 @@
+# Wine D2D1 / DComp Patches
+
+This fork contains patches for Wine's Direct2D (d2d1), DirectComposition (dcomp),
+DirectWrite (dwrite), and related subsystems. The patches fix rendering and
+performance issues that prevented modern JUCE 8, VSTGUI and SynthEdit/GMPI based
+Windows applications from running correctly under Wine — particularly audio
+plugins (Serum2, Korg Trinity, Korg Prophecy, Pianoteq 9, VProm3) in DAWs like
+Reaper.
+
+These newer plugin frameworks rely on DirectComposition for window management
+and D2D1 for GPU-accelerated 2D rendering — APIs that were largely unimplemented
+in Wine. With these patches, plugins using DComp + D2D1 now render correctly
+and run stable in production use.
+
+**Base**: Wine 11.19 devel (`wine-11.19` tag) — this branch.
+
+## Branches
+
+| Branch | Description |
+|--------|-------------|
+| `d2d1-dcomp-11.0` | **Recommended for stable users.** Full stack on Wine 11.0 stable: D2D1 + DComp + DWrite + WineD3D performance + winex11. Actively maintained. |
+| `d2d1-dcomp-11.<N>` (newest devel) | **Recommended for devel / rolling-release users** (e.g. `wine-tkg-dev`). The same full stack as `d2d1-dcomp-11.0`, rebased onto the latest WineHQ devel tag and rolled forward roughly every 2 weeks (currently `d2d1-dcomp-11.16`). **Use the highest-numbered `d2d1-dcomp-11.*` branch**: it is always the current rolling base; lower-numbered ones are previous snapshots, superseded. Plugin-tested by the maintainer before each push. |
+| `d2d1-v6` | **Deprecated** (last update 2026-02-14). The original upstream-targeted D2D1-only series; superseded by the D2D1 work in `d2d1-dcomp-11.0`. Kept for reference. |
+
+## Full Stack (Branch: `d2d1-dcomp-11.0`)
+
+This is the recommended branch. What it changes, by subsystem:
+
+- **D2D1 rendering**: the geometry pipeline that started as `d2d1-v6` — path geometry
+  arcs, iterative constrained Delaunay triangulation with cycle detection, miter limits,
+  shader-based antialiasing for fills, outlines and text, correct stroke joins,
+  premultiplied gradient stops — plus PushLayer stencil clipping, an ImageBrush UV fix,
+  scratch-buffer reuse and a constant-buffer dirty check on the hot path, and a private
+  heap that keeps high-frequency geometry allocations out of the process heap. Cubic
+  Bézier segments are subdivided before they are approximated, so an S-shaped curve — a
+  filter response, an envelope, an EQ display — keeps its inflection instead of
+  collapsing into a plain arc, and `GetBounds()` bounds the same chain. Consecutive
+  `DrawLine()` calls with a solid brush are batched into one upload and one draw per
+  colour (Serum 2's 3D wavetable view draws 68 352 lines that way: 2D→3D toggle 1 060 ms
+  → about 80 ms). Bitmap brushes honour WRAP and MIRROR instead of degrading to CLAMP,
+  so a tiled background is tiled rather than one tile with its edge texels stretched
+  (SynthEdit panels). `SetTarget(NULL)` drops the render target bindings, so a swapchain
+  back buffer is not held across `ResizeBuffers()` The scratch vertex and index buffers are dynamic and written through a
+  `WRITE_DISCARD` map instead of `UpdateSubresource()` — wined3d cannot rename a
+  DEFAULT buffer from the client thread and drained the command stream once per
+  primitive (1 090–1 940 synchronisations per 20 px resize step of the SynthEdit canvas,
+  212 now) — and the private device context state is swapped in once per
+  `BeginDraw()`/`EndDraw()` span rather than around every primitive (3 485 swaps per
+  step, each a full state emission both ways, 28 now); a nested `BeginDraw()` on
+  another context of the same device takes the state over and hands it back.
+- **D2D1 layers on an opaque target**: a layer bitmap inherited the target's alpha mode,
+  so on a render target created as `ALPHA_MODE_IGNORE` the layer's own coverage was thrown
+  away and everything drawn inside it turned the background colour, usually black. All
+  three `PopLayer()` paths now composite the layer as premultiplied. Visible as rectangular
+  black areas swallowing clip contents and volume curves in Fender Studio Pro 8
+- **D2D1 effects and colour**: Color Management effect (registration plus the
+  scRGB → sRGB transfer function applied in the shape pixel shader),
+  ID2D1GradientStopCollection1, sRGB pixel formats for WIC-sourced bitmaps — required by
+  GMPI/SynthEdit plugins, which render linearly in 16-bit float and composite their GUI
+  through the Color Management effect. `CLSID_D2D1GaussianBlur` was registered, so
+  `CreateEffect()` succeeded, but `DrawImage()` had no case for it and drew nothing — JUCE's
+  `GlowEffect` rendered empty under Direct2D; the blur is now evaluated over three standard
+  deviations, for A8 and 8-bpc BGRA/RGBA
+- **DComp**: IDCompositionDesktopDevice implementation with a D2D1 bitmap rendering path,
+  dirty-rect clipping and DIB+BitBlt presentation; IDCompositionDevice3/4/5, composition
+  and dynamic textures, D3D11 BeginDraw and surface handle export; rootless visual trees
+  composited onto the target window at ~60 Hz, cross-process targets, backdrop capture;
+  when a hosted target moves, the area it leaves is handed back to the host only after a
+  round trip on our X connection, so the host's repaint cannot overtake the blit that is
+  still on its way (a docked WebView2 pane dragged in FL Studio left 3 px strips of the
+  plugin image behind, 30-70 px on a fast drag)
+- **DComp leaves in the presented frame**: a visual tree that covers only a sliver of its
+  window — a transport playhead, a selection rectangle — used to be delivered *after* the
+  application's present by reading back the window and blitting, a race no CPU-side blit
+  can win. Such leaves are now composited into the buffer that is about to become the
+  frame, in the GL present path. Measured on Fender Studio Pro 8: the playhead was missing
+  in 14.9 % of captured frames before and 0.0 % after. A layer nobody draws would hide the
+  leaves in every frame, so dcomp returns to the blit path on its own after about 200
+  undrawn deliveries. The Vulkan present path is untouched
+- **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
+  only the version 1 classes, so an application that creates the version 2 pair while
+  bringing up its Direct Composition engine fails there. Applications built on the CCL
+  framework — Fender Studio Pro 8, PreSonus Studio One 6.6 and newer — then abort with
+  "This application requires Windows 10 or later", the framework's generic alert for a
+  graphics engine that did not start, not a version check
+- **DWrite**: `DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC` is accepted instead of rejected,
+  IDWriteFontSet::GetMatchingFonts is implemented, and the font fallback maps
+  Miscellaneous Symbols and Arrows (U+2B00-2BFF), which fixes the star ratings in Serum 2,
+  and Geometric Shapes (U+25A0-25FF), which fixes the password mask of Fender Studio Pro's
+  login dialog (U+25CF drawn with a private font that lacks it).
+  The per-fontface glyph cache used to die with the fontface, and text layout creates one
+  per run: 17 208 fontfaces and 111 598 re-rasterisations of 196 distinct glyphs during a
+  25 s SynthEdit resize. The cache now outlives the fontface, keyed by font file and face
+  index
+- **ClearType-style subpixel text** (from Cade / @shibco, `shibco/ableton-linux`):
+  a glyph run asking for `DWRITE_TEXTURE_CLEARTYPE_3x1` used to be rendered once in
+  greyscale and copied into all three subpixels. DWrite now rasterises the outline scaled
+  three times horizontally and filters each row with the five-tap FIR FreeType uses for
+  `FT_RENDER_MODE_LCD`; D2D1 blends such runs once per colour channel; GDI takes its
+  antialiasing from the prefix rather than the host's fontconfig. Needs the registry keys
+  under *Font Setup* below — without them nothing changes. See `Related` for the origin
+- **DXGI**: composition swapchain, FLIP_SEQUENTIAL preservation, DComp popup handling,
+  monitored fence support. The swapchain-to-window mapping is published on the desktop
+  window, whose property list is shared across the window station, so it is keyed by
+  owning process id — otherwise a host application and its WebView2 child can allocate a
+  swapchain at the same address and resolve each other's window; the reblit timer of a
+  DComp target window presents only on the thread that presents the swapchain — JUCE
+  does so on the window thread and needs the timer's present, Qt Quick presents from a
+  render thread, and a second presenting thread left one of the two asleep in wined3d's
+  frame latency wait (Dorico 5 froze when an entry of its VST instrument menu was picked)
+- **D3D11**: ID3D11Fence with CPU timeline semantics. `DiscardResource()` and
+  `DiscardView()` are implemented, backported from Wine 11.18 (five upstream commits,
+  including the fixes for buffers without a structure byte stride, the sub-resource index
+  of array textures and the resource reference leaked by `DiscardView()`); before that
+  they were stubs whose FIXME made up 95 % of the log of a 9.5-minute Reaper session,
+  because a WebView2 plug-in issues `DiscardView()` dozens of times per second
+- **WineD3D**: composition buffer with dirty rect accumulation, GL buffer recycling pool
+  (70 % RSS reduction), and a `vs_out` initialisation that no longer trips NVIDIA's shader
+  compiler warnings. Client threads that wait for the command-stream thread (a map that
+  goes through the CS, a full queue, a busy resource) block on an event instead of
+  yielding in a loop — while the CS thread sits in a vsync'd swap, the loop cost a full
+  core per waiting thread; Kontakt 8, which maps dynamic index buffers through the CS
+  every frame, went from 66 % to 3 % on its render thread. The one wait that protocol
+  cannot serve is the STOP packet at device destruction: the CS thread releases the
+  queues on its way out and must not touch the command stream afterwards, so it sets
+  the event unconditionally from a copied handle and the destroying thread waits for
+  that — a device released while the CS thread was still busy used to hang the process
+  (Cubase 15 probes and releases a D3D11 device before its splash). What remains on NVIDIA is the
+  driver's own busy-wait for the vblank in the CS thread (`wined3d_cs` at ~95 % for a
+  static window); `__GL_YIELD=USLEEP` in the environment makes the driver sleep instead
+  and takes it to ~5 % at the same frame rate. The frame latency wait in
+  `wined3d_cs_emit_present()` counts its waiters and a woken waiter passes the signal on:
+  with one flag and one auto-reset event, the second of two threads presenting
+  swapchains of the same device was never woken (two threads at 20000 presents each hung
+  in 3 of 3 runs, 10 of 10 complete now) A client thread that waits for the command stream in a finish or a
+  resource-idle wait releases the global wined3d mutex for the wait and takes it back
+  afterwards, so threads of different devices no longer serialise on each other's CS
+  thread — SynthEdit's WPF chrome (D3D9) and its GMPI canvas (D3D11) at every resize
+  step, where the canvas thread spent ~106 of ~120 ms per step on the mutex, none now.
+  The wait for queue space keeps the mutex (the producer has captured the queue head),
+  and every waiter on the progress event counts itself and passes the signal on, since
+  two threads of one device may now wait at once (Cubase 15's video engine and GUI hung
+  on the single signal otherwise). The gamma ramp is saved when an application first
+  sets one and restored only then: reading and restoring it for every swapchain was two
+  X round trips under the mutex, 6–82 ms each while the X server is busy with a resize
+  (WPF creates a swapchain per resize step), and the restore also undid a night-light
+  ramp set outside Wine whenever a windowed D3D application exited. A viewport update
+  that does not change the state emits no packet (d2d1 set it per primitive).
+- **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
+- **ntdll heap**: the first-fit walk in `find_free_block()` tries 16 blocks of the first
+  free list and then continues with the next list, where every block is large enough.
+  With many free blocks of nearly the same size the walk took thousands of steps for each
+  allocation; blocks of 1 KiB and more are hit hardest, because their LFH bins need
+  thousands of live blocks before they are enabled. Dorico 6, ten mode switches: 399 → 9.9
+  steps per call, 15.5 % → 0.3 % of the process samples in the walk, 9 % less CPU time,
+  2 % more anonymous memory. `kernel32:heap` passes unchanged on both architectures
+- **Per-pixel alpha for GPU-painted layered windows**: `DwmExtendFrameIntoClientArea`
+  with `margins = -1` asks for full glass, which on Windows makes the client area
+  per-pixel alpha capable. Wine stubbed it, so a plugin dragging a bitmap around — Serum
+  2's envelope, LFO and macro handles — showed an opaque black box instead of the bitmap.
+  Alpha capability is now a property of the window: dwmapi records the request, winex11
+  keeps it in the window data, and both the window and its GL child end up on an ARGB
+  visual, chosen once when the window is created so no visual switch happens mid-drag.
+  A GL drawable released through `ReleaseDC` is parked on the window for the next DC
+  instead of being rebuilt every frame. Measured over a 20 s drag: one GL client window
+  instead of 8, no sample without a window, no brightness jump in the dragged bitmap.
+  On by default; `WINE_ARGB_PIXFMT=0` turns the whole path off without a rebuild. Smoke
+  tested across Korg Trinity, EPROM Memory Rites, FL Studio, Fender Studio Pro 8 and
+  Ableton Live 12
+- **winex11**: an application that leaves the maximized state while keeping its window
+  rect no longer ends up at the geometry the window manager remembers from before the
+  maximize. With the rect unchanged there was nothing to request, so the window manager's
+  own restore geometry was adopted; it is now answered once with the application's rect,
+  which is where Windows leaves the window. Qt 6.5's `QWidget::restoreGeometry()` does
+  exactly this with a snapshot taken while maximized: Dorico 5 dropped out of its maximized
+  window on every switch to Engrave mode and every lower-zone toggle and shrank to its
+  previous size; it now stays screen-sized, only the maximized flag is gone, which is what
+  the application asks for (issue 18 on the public repository)
+- **winex11**: fullscreen switches hold against the window manager's own reconfiguration.
+  After a decoration or `_NET_WM_STATE` change the first `ConfigureNotify` that carries the
+  serial of our configure request but another geometry is the window manager's reaction to
+  that change, not its answer; it is no longer adopted, the desired geometry is requested
+  once more (Ableton Live 12 came back from F11 smaller by the frame extents every time —
+  upstream behaviour up to 11.18). And KWin acknowledges `_NET_WM_STATE_FULLSCREEN` before it
+  reconfigures the window: the config from before is now waited out instead of applied, which
+  took the window out of fullscreen again (Fender Studio Pro 8 reached fullscreen in about
+  half of the attempts, a regression of this branch); DComp window support, backing store; ownerless TOOLWINDOW popups are no
+  longer folded into the active window's group, given a transient_for owner, or mapped as
+  UTILITY — this fixes sticky, wrongly decorated and always-on-top plugin menus on KDE;
+  the opaque black X expose background is suppressed while a GL/D3D client window is taken
+  off the screen for offscreen rendering, so the client area no longer flashes black for a
+  frame (visible in Ableton Live 12 when toggling the Learn View panel); a window hidden
+  while its map was still unacknowledged no longer stays mapped and unpainted for the
+  session (upstream fix for Wine bug 59932, cherry-picked; FL Studio's Browser panel at
+  startup); a per-pixel-alpha layered window on a 32-bit visual no longer gets a bounding
+  shape on every change of its contour — the compositor composes the alpha itself, and
+  the shape update made KWin repaint between the resize and the new image of an
+  animated popup, which showed a strip of it or nothing for single frames (FL Studio's
+  About fruit, 16 flickers in 36 test cycles against 0); the mask is kept as the input
+  shape, so clicks on transparent pixels still pass through, set after the image is in
+  place and at most once a second during an animation
+- **Window-surface repaints (win32u, winex11)**: a series of erase-and-repaint races in
+  the window-surface path. Flushes are held back while an erase waits for its repaint,
+  `XShmPutImage` is waited for before the surface is painted into again, a new surface
+  inherits its predecessor's pixels, a plain move invalidates only child windows, the
+  xrender PutImage path is flushed, and a client window that will render offscreen is
+  created under the dummy parent. Seen as MDI captions going dark during a resize, a
+  black toolbar after a menu and a stale MDI client after a drag in SynthEdit 1.5, and as
+  a one-frame black flash on a fast resize in FL Studio. An empty surface clip region now
+  disables the flush instead of lifting the clip: a top-level covered completely by a
+  child with a pixel format has nothing left to flush, and the unclipped flush painted the
+  surface over what the child had presented. A plug-in editor embedded by yabridge is
+  exactly as large as its top-level, so Mercurial Tones Dagon, which places a Direct3D 12
+  child over its whole editor, stayed black there while it rendered in a Wine-hosted DAW
+- **winex11**: a window painted through `UpdateLayeredWindow()` shows its window surface
+  even when a Direct3D swap chain targets it. The client window the swap chain puts on
+  the top-level is rendered offscreen, so it no longer covers the surface, and the surface
+  is painted unclipped although its region (the window minus its pixel format client
+  area) is empty. WPF renders a popup through Direct3D 9, hands the frame to
+  `UpdateLayeredWindow()` and never presents again; the client window then showed a stale
+  frame or undefined pixmap content, and SynthEdit 1.5's menus came up as a copy of the
+  screen below them or black once the empty-region flush above was disabled. WineHQ bug
+  60173 reports the same for every WPF menu, tooltip and `AllowsTransparency` window.
+- **win32u**: a mouse capture taken without a menu or move/size loop ends with
+  `WM_CANCELMODE` when the window manager moves, resizes or changes the state of a window
+  of that thread, unless a mouse button is held. The press on the window manager frame
+  never reaches Wine; on Windows it would go to the capture window as a client click. WPF
+  menus (SynthEdit 1.5) take the mouse that way, so an open menu stayed open and stayed
+  behind at its old screen position while the window was dragged away. Win32 drop-down
+  lists lose their capture the same way but have no handler for it, so they still stay
+  until the next click. WineHQ bug 12027.
+- **winex11**: the driver reports the pointer position when the pointer leaves one of its
+  windows (`LeaveNotify`), the way it already does when the pointer enters one. Without it
+  the position the server holds stays where the pointer was last seen inside the window
+  while it sits on the frame the window manager draws, and the `WM_MOUSEMOVE` the server
+  synthesizes after every window move to resync hover state lands at that stale point. It
+  falls on a different part of the window after each step of a window manager drag; in
+  SynthEdit 1.5 the menu bar items lit up one after another while the window was dragged
+  by its title bar.
+- **winex11**: the window manager is offered no close function (`MWM_FUNC_CLOSE`) while the
+  window's `SC_CLOSE` is grayed, disabled or missing in its system menu or the class carries
+  `CS_NOCLOSE`. That is the test `WM_DELETE_WINDOW` is already discarded under, and the
+  state the caption close button is drawn grayed in on Windows; the hints offered the
+  function for every enabled window, so KWin drew an active close button whose click went
+  nowhere. Qt 6 grays `SC_CLOSE` for a window created without `Qt::WindowCloseButtonHint`:
+  the preferences and view options dialogs of Dorico 6 could not be closed from the title
+  bar, while `Esc` and the dialog's own button worked. The button is now drawn disabled.
+- **win32u**: a window that loses its window surface for direct drawing no longer gets the
+  surface's pixels copied over its client area when a pixel format is set on it. The switch
+  happens in the first window position change after the client surface was attached, the
+  window DC draws over the attached client window, and the copy landed on top of a frame
+  the application had already presented; Dorico 6's Qt toolbar popups (top levels drawn
+  through a composition swapchain) came up black in one of four openings when the first
+  GL swap won that race. Upstream has the same copy;
+- **win32u**: the menu bar of a captioned window is measured and drawn through the
+  undocumented non-client theming messages, as on Windows: `WM_UAHMEASUREMENUITEM`
+  (0x0094) per item with an item size of 0x16, `WM_UAHINITMENU` (0x0093) before measuring
+  and painting, `WM_UAHDRAWMENU` (0x0091) for the bar background and `WM_UAHDRAWMENUITEM`
+  (0x0092) per item with a `DRAWITEMSTRUCT` in window coordinates and the states
+  `ODS_SELECTED`, `ODS_GRAYED|ODS_DISABLED` and `ODS_INACTIVE`. `DefWindowProc` measures
+  and draws the default, so an application that does not handle the messages gets the
+  previous result; one that does can override the size and paint the bar itself (the line
+  below the bar stays, as on Windows). A single owner-drawn item takes the whole bar back
+  to the classic path, again as measured on Windows 10 (32-bit processes included).
+  The bar is laid out as on Windows: the items start at the top of the bar and are
+  `SM_CYMENU - 1` tall, the extra row of `SM_CYMENU` is the line below the bar, and
+  `GetMenuBarInfo` reports the bar as ending where the items end. Wine kept that row as
+  a border above the items and drew the line on the first client row, where the
+  non-client clip cut it off: the last row of a bar an application paints itself was
+  never painted (a light line under Live's dark bar) and the line below the bar never
+  visible. Same client area as before, the `todo_wine` on `rcBar` in the user32 menu
+  test from 2012 passes.
+  Ableton Live 12 makes its menu bar 4 px taller this way and adds the same 4 px when
+  sizing its main window; without the measure message the window grew until it hit the
+  maximum height and lost its frame (Wine bug 57955), and without the draw messages its
+  bar stayed light instead of the dark bar Live paints on Windows. This replaces two
+  earlier workarounds for the same bug (suppressed reentrant size-only
+  `WM_WINDOWPOSCHANGED`, lifted `window == visible` decoration gate in winex11), both
+  removed; transparent (0x00) surface init for ARGB popups; the system arrow is shown
+  again when an application hides the cursor and sets none; cursors are process-local in
+  Wine, so a `WM_WINE_SETCURSOR` for an out-of-process child window (WebView2, bridged
+  plug-ins) arrived with a handle the receiving process rejected and the previous cursor
+  stayed — the owner now publishes each cursor's first frame in a named section and the
+  receiver builds a proxy from it; the owned DC of a window hosted below a window of
+  another process refreshes its visible region on every `GetDC`, since the move of that
+  foreign ancestor never marks it dirty in this process (a composition blit through the
+  stale DC landed where the pane had been, over the area the host had just erased);
+  `DisplayConfigGetDeviceInfo` answers `DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL`
+  with the nominal 1000 (80 nits) instead of failing — SynthEdit 1.5 asks for it about
+  twice a second while idle; `WM_ACTIVATEAPP` carries the thread of the previous
+  foreground window when the activation comes from another process instead of 0 — with
+  0, Dorico 5's audio engine process and Dorico blocked on each other as soon as a
+  plug-in editor opened; the CBT hook and the activation messages go out once per
+  activation, as on Windows — a window that activates itself again from its `WM_ACTIVATE`
+  handler got a second round and recursed until the stack was gone (Wine bug 46274; the
+  fix wine-staging carries as `user32-recursive-activation`, with the mark cleared on
+  every exit and only by the call that set it). The drawing messages go out only while a visual style is active, as on Windows,
+  where they come from the themed non-client painting: Cubase 15 paints its bar through
+  them with the theme's MENU class (`OpenThemeData( NULL, L"MENU" )`, `DrawThemeTextEx()`),
+  and without an active style that handle is NULL and the bar came up without text. The
+  measure message is sent either way, because the size the owner answers with is what the
+  window's geometry is built on (Live's main window grows to the maximal height without
+  it). Ableton Live's dark bar therefore needs a visual style enabled in winecfg; its
+  window geometry does not.
+- **wineserver**: a top-level's surface flush no longer overwrites child windows that
+  belong to a *different process*. Such a child draws straight into the top-level's
+  drawable while the owner flushes its own surface over it with a delay — a black
+  one-frame flash over embedded panels whenever the two overlap. Its client rect is now
+  subtracted from the surface region, the treatment GL and Vulkan children already
+  receive. Affects any application that embeds out-of-process content: FL Studio's hub,
+  Ableton Live 12 (WebView2), CEF-based plugin GUIs. Trade-off: a foreign child that stops
+  painting without a geometry change leaves its last frame on screen until something
+  moves. `WINE_DISABLE_FOREIGN_CHILD_CLIP=1` restores the previous behaviour
+- **ole32**: RevokeDragDrop no longer touches drop targets owned by other processes
+  (fixes a crash when closing plugin windows)
+- **crypt32**: verifying a signature hashes the signed attributes as they are stored in
+  the message instead of re-encoding them. The encoder sorts a SET OF into DER order, but a
+  signer may emit the attributes unsorted and the signature covers the order it used, so
+  re-encoding produced a different hash and verification failed with
+  TRUST_E_CERT_SIGNATURE. Affects any application that checks its own Authenticode
+  signature at startup; FL Studio 2026 reported that the program could not be verified and
+  exited
+- **ws2_32**: `SIO_ADDRESS_LIST_SORT` was undefined and every call got WSAEOPNOTSUPP;
+  Chromium issues it for every resolution that returns an IPv6 address and discards the
+  result on failure (FL Studio 2026's WebView2 hit it 35 times in 18 minutes). Addresses
+  are sorted per RFC 6724 §6 with the default policy table
+- **msvcp**: the stream classes' move constructors and move assignment were exported as
+  stubs, so a C++ application calling one aborted with "Call to unimplemented function" —
+  Ableton Live's indexer did, on startup in a fresh prefix, so Live restarted it in a loop
+  and its browser stayed empty. Implemented for msvcp110, msvcp120, msvcp140 and msvcp_win;
+  Live no longer needs a native VC runtime in the prefix
+- **Virtual-desktop compositor (winex11)**: windows inside a Wine virtual desktop get
+  real per-pixel alpha, which the plain desktop drawable cannot provide. A small
+  XDamage-driven compositor assembles frames off screen and composites them through an
+  ARGB overlay onto an opaque child window, so translucent plugin popups and drop shadows
+  blend correctly instead of showing black or leftover pixels
+- **msvcrt (ucrtbase)**: the tmpnam() family returns names in the temporary directory as
+  the UCRT does (`<temp>\u<pid>.<n>`, one prefix letter per function, base 36), instead
+  of the `\s<pid>.<n>` form in the drive root that only the classic msvcrt.dll uses.
+  Measured on Windows 10. libzmq builds its signaller socket pair from `_wtmpnam_s()` and
+  `_wmkdir()`; with the root form a process whose current drive is `Z:` cannot create
+  the directory and Native Instruments Kontakt 7 aborted at start-up when launched from
+  a Unix working directory. Upstream since wine-11.19 (`d8e85ca62a5`, MR 12102)
+- **AF_UNIX sockets (ws2_32, wineserver, ntdll)**: Unix-domain socket support, based on
+  the long-standing wine-staging patch set plus hardening and five conformance fixes of
+  our own — a socket is given its family before bind, a bound socket is reported as a
+  reparse point by GetFileAttributes and can be opened and queried through CreateFile with
+  FSCTL_GET_REPARSE_POINT, and an address carrying only the family (namelen 2) is accepted
+  and leaves the socket unnamed, as measured on Windows. With these the ws2_32 AF_UNIX
+  conformance tests run at all (upstream they skip) and pass. Needed by applications that talk to a local helper over a Unix socket;
+  FL Studio's Cloud plugins install normally instead of spinning on a socket that never
+  appears
+- **Keyboard input into out-of-process content (wineserver, winex11)**: a process that
+  translates keys for a window owned by *another* process now has the whole thread input
+  family attached, derives the AltGr modifier from the passed key state rather than from a
+  process-global cache of the last X11 event, and posts a finished IME result string as
+  WM_CHAR as well. Together these make typing work in embedded WebView2 fields, including
+  AltGr characters such as `@`, `\` and `€` on non-US layouts
+- **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
+  video on a DAW timeline exercises paths a straight play-to-the-end never reaches. The
+  session asked for a new sample on *every* call of its delivery routine instead of one at
+  a time, so a topology rebuild produced 5155 requests in one second and the samples piled
+  up on a transform input that was not consuming yet, until the picture stopped; sample
+  requests now run on a work queue of their own per stream. The renderer accepts samples
+  that arrive while paused, the presenter reinstalls its allocator notification after an
+  output type renegotiation and no longer pulls mixer output through a NULL mixer pointer
+  during teardown, and the session is told when a scrub has been carried out. Together
+  these fix seeking, looping, timeline jumps, playback stalling after 20-35 seconds,
+  stuttering after a large seek, and a black picture after a window toggle in Fender
+  Studio Pro 8. A presentation clock whose time source is replaced while it runs starts
+  the new source at its current time, as Windows does (measured on Windows 10): Studio
+  Pro installs its own time source right after each session start, and the video stayed
+  black from the clip start on and after a loop wrap because that source was never started
+- **Video players that drive the H.264 decoder themselves (wined3d, d3d11, d2d1,
+  winegstreamer)**: Cubase 15 does not render video through the EVR. It drives the H.264
+  decoder MFT directly: it enumerates it, hands it a DXGI device manager, receives NV12
+  Direct3D 11 textures, reads each frame back and draws it through a Direct2D effect of
+  its own with a YCbCr-to-RGB pixel shader. Four things were missing for that: wined3d
+  could allocate planar NV12 textures only in its Vulkan renderer (the OpenGL renderer now
+  keeps one texture per plane and creates plane views on them); `CheckFormatSupport`
+  never reported `D3D11_FORMAT_SUPPORT_CPU_LOCKABLE`, and the application polls that bit
+  and does not upload a frame without it; `ID2D1DeviceContext::DrawImage` dropped every
+  custom effect with "Unhandled effect" (effects with a single draw transform and bitmap
+  inputs are now drawn through the application's pixel shader); and the decoder's pool of
+  ten D3D samples ran empty, because the player decodes about twelve frames ahead and
+  holds the sample of every frame in that window until it has been shown — thirteen at a
+  time, fifteen around a restart (the pool now grows to 32 on demand). The decoder also
+  returned every frame four inputs late: one held by `h264parse` until the next access
+  unit starts, two kept by `nvh264dec` to pipeline decoding against display because the
+  transform answered the latency query as not live, one by the DPB bookkeeping of
+  GStreamer's H.264 decoder base class. The transform now reports itself as live, which
+  drops the two pipelining frames and with them the decoder restart the player performed
+  at every keyframe, where the picture went black for 0.7 s. Where neither NVDEC nor
+  VA-API serves the H.264 MFT and gst-libav's `avdec_h264` decodes instead, the live
+  answer also makes libav choose slice threading over frame threading, which returned the
+  first frame seventeen inputs late with the sixteen threads Wine allows it; a single-slice
+  stream then decodes on one thread (11 ms per 4K frame on a 16-thread desktop, still real
+  time at 30 fps). The video window shows the picture in stop and play
+- **windows.security.authentication.web.core**: WebAuthenticationCoreManager
+  implementation, for applications that probe the WinRT web-account API on startup
+- **windows.globalization**: `Windows.Globalization.Calendar` for the Gregorian calendar —
+  every `ICalendar` field, `Add*` and `*AsString` method with 12- and 24-hour clocks, both
+  factory interfaces and `ITimeZoneOnCalendar` with IANA time zone ids, mapped through the
+  CLDR table onto the Windows time zone rules. The conformance test holds the behaviour
+  measured on Windows 10: range 0001–9999 in local time, the day clamped when a month or
+  year changes, daylight-saving gaps rejected by `put_Hour()` but skipped by `AddDays()`,
+  and the current offset kept in a repeated hour. Other calendar systems return
+  `E_NOTIMPL`, and time zone names come from the Windows time zone data instead of ICU
+  ("W. Europe Daylight Time", "GMT+2"). Cubase 13 and 15 construct one in `headtracking.dll`
+  at load time
+- **No visual style by default (wine.inf)**: upstream activates the Light theme in every
+  new prefix. This branch creates new prefixes with `ThemeActive=0`: the classic look with
+  the win32u default colours (button face, menu and scroll bar 212 208 200), which is what
+  Reaper's own dialogs look like on Linux. The theme stays installed and can be switched on
+  in winecfg — see the note on the visual style below
+- **Direct2D for JUCE 8.0.13+ (ntdll, wine.inf)**: JUCE 8.0.13 and later pick their
+  renderer with `GetProcAddress(GetModuleHandleA("ntdll"), "wine_get_version") != nullptr`
+  and fall back to GDI whenever that succeeds, which bypasses this entire stack — a JUCE
+  plugin then never creates a device context and never gets a composition swapchain. This
+  branch hides that one export inside the plug-in hosts, so those plugins take the Direct2D
+  path again. **On by default for the DAWs listed in `wine.inf`**, off elsewhere — see the
+  note below
+
+### Note: JUCE 8.0.13+ and the hidden `wine_get_version` export
+
+Since JUCE 8.0.13 (upstream commit `5179690ff7`, "Restore Wine functionality") every JUCE
+plugin falls back to the GDI renderer as soon as it detects Wine. That fallback exists
+because stock Wine does not implement the Direct2D 1.3 / DirectComposition surface JUCE
+needs — but this branch does, so the fallback only costs functionality here. Measured with
+one plugin: 23 d2d1 calls with the fallback, 2.6 million without it. What the GDI path
+loses is bitmaps: background artwork, icons and keyboard graphics vanish while text and
+vector shapes survive, which is the fingerprint to look for.
+
+This branch therefore hides `wine_get_version` from `GetProcAddress`. Doing so restored
+the complete UI of a WebView2-based JUCE plugin whose artwork, icons and content had been
+missing, and removed flicker that had been chased for weeks in the wrong place.
+
+The switch is a per-process registry value. `wine.inf` (section `[JuceHosts]`) sets it for
+the plug-in hosts that have been checked here, so a prefix created or updated with this
+branch has it without further setup:
+
+```
+reaper.exe · FL64.exe · Studio Pro.exe · Studio One.exe · Ableton Live 12 {Intro,Lite,Standard,Suite,Trial}.exe
+yabridge-host.exe · yabridge-host-32.exe
+BitwigAudioEngine-X64-{AVX2,SSE41}.exe · BitwigPluginHost-{X64-AVX2,X64-SSE41,X86-SSE41}.exe
+Cubase{12,13,14,15}.exe
+```
+
+The entries use the INF "do not overwrite" flag, so a value you set yourself — including
+`"N"` to turn the switch off for one of these hosts — survives every prefix update.
+Existing prefixes pick the defaults up on their next start after the branch is installed
+(the usual `wineboot` update). For any other host, or for a single run:
+
+```bash
+# single run
+WINE_HIDE_WINE_VERSION=1 wine your-host.exe
+```
+
+```
+# per application
+HKCU\Software\Wine\AppDefaults\your-host.exe\HideWineVersion = "Y"
+# globally, if you know what runs in this prefix (not recommended, see below)
+HKCU\Software\Wine\HideWineVersion = "Y"
+```
+
+The per-application value wins over the global one, so `"N"` can carve out an exception
+where the global switch is on. **It keys on the process name, not on the plug-in**: a
+plug-in that renders correctly in one host and loses its artwork in another has simply
+landed in a host without the value. Bridged hosting runs the plug-in in a different
+process, which needs its own entry: yabridge's hosts are in the list (checked with JUCE
+8.0.13 plug-ins in a Linux DAW), FL Studio's `ilbridge.exe` is not. The Bitwig entries
+name the processes Bitwig runs plug-ins in; they were added by name and have not been
+exercised here yet.
+
+**Why not system-wide:** the switch applies to the whole process, so anything else probing
+for Wine stops finding it — and some software depends on the answer. PACE/iLok protected
+*standalone* applications fail to start with *"Error 2000: An iLok background component
+required to validate the license for this product is not running"*; PACE-protected
+plug-ins inside a host are not affected (checked with UVI Workstation as a plug-in under
+yabridge). Ableton Live's embedded Splice view stopped loading with the global switch,
+which also hides Wine from the `msedgewebview2.exe` child processes Splice renders in —
+with the per-host entry that `wine.inf` now sets, Live runs and Splice loads. Standalone
+JUCE applications are deliberately not in the list; add them per application.
+
+An upstream fix is proposed as [juce-framework/JUCE#1701](https://github.com/juce-framework/JUCE/pull/1701),
+which would add the same opt-in inside JUCE and make this workaround unnecessary.
+
+### Building
+
+```bash
+git clone https://github.com/giang17/wine.git
+cd wine
+git checkout d2d1-dcomp-11.0
+./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64
+make -j$(nproc)
+sudo make install
+```
+
+**Build both architectures.** `--enable-archs=i386,x86_64` builds the 64-bit and the
+32-bit PE side (new WoW64, the Unix side stays 64-bit) and needs the `i686-w64-mingw32`
+cross compiler next to the x86_64 one. It is what this branch is built and tested with,
+and it matters for plug-ins: 32-bit hosts and plug-ins load `d2d1`, `dcomp` and `dxgi`
+directly, and a 32-bit half left over from an older build keeps running old code without
+anything failing. `--enable-win64` still works and gives a 64-bit-only build. Use a
+separate `--prefix` to avoid overwriting your distro's Wine installation. (Thanks to
+@jibeape for working out the `--enable-archs` form for Bottles.)
+
+**`wine.inf` is part of the install.** `make install` also puts `loader/wine.inf` into
+`<prefix>/share/wine/`; it carries this branch's registry defaults — the `HideWineVersion`
+entries for the plug-in hosts, see the JUCE note above. New prefixes get them at creation,
+existing ones at their next start. If you update an installation by copying DLLs rather
+than running `make install`, copy `loader/wine.inf` as well: nothing fails when it is
+missing, the plug-in hosts simply keep rendering with GDI.
+
+**Visual style.** Upstream `wine.inf` activates the Light theme in a new prefix. This
+branch sets `ThemeActive` to `0` instead; the `DllName`, `ColorName` and `SizeName` entries
+stay, so winecfg still offers the theme under Desktop Integration. Existing prefixes are not
+changed, the entries carry the no-clobber flag. The reason, seen in Reaper 7.80: with the Light
+theme active, Win32 dialogs lose their 3D edges, and the first activation replaces the system
+colours with the theme's (white windows, menus and tree controls, button face 245 245 245);
+setting the classic colours again while the theme is active did not bring the grey dialog
+background back. The *WinRT theme* selector next to it only writes `Themes\Personalize\AppsUseLightTheme`,
+which `windows.ui` UISettings and uxtheme's `ShouldAppsUseDarkMode()` report to applications
+that ask; the Win32 drawing reads neither, so light and dark look the same.
+
+When switching the theme on in winecfg, two things follow. The first activation also writes
+the theme's `[SysMetrics]` fonts (Tahoma 8 and 10pt) into `WindowMetrics`, so run
+`wine-font-setup.sh` again afterwards to get Segoe UI 9pt back. And Ableton Live 12's dark
+menu bar is only drawn with an active theme, as on Windows. Switch the theme off in winecfg,
+not by deleting the registry value: only uxtheme restores the system colours and fonts it
+saved when the theme was first activated.
+
+**ntsync** (recommended, upstream Wine feature): with a kernel that provides the
+`ntsync` driver (`/dev/ntsync`), make sure `/usr/include/linux/ntsync.h` exists before
+running `./configure`; check with `grep HAVE_LINUX_NTSYNC_H include/config.h` afterwards.
+NT synchronisation then runs in the kernel instead of through the wineserver, and the
+audio thread keeps up at 64 samples / 48 kHz without xruns (measured here with Serum 2 and
+FL Studio).
+
+**DXVK**: not a hard conflict, but the two do not combine inside one application — in a
+prefix DXVK replaces `dxgi.dll` and `d3d11.dll`, while this branch's composition-swapchain
+and DComp popup handling live in `dxgi` (the GL present in `wined3d`). The simplest setup
+is to leave DXVK out of the prefix; the package alone changes nothing, it takes effect
+once `setup_dxvk.sh` has run there. If it is needed for something else on the same
+machine, select per application rather than per prefix. The switch is
+`WINEDLLOVERRIDES="d3d11,dxgi,d3d10core=n"` (the prefix copies, DXVK) against `=b` (the
+builtins of this branch); a setup that survives desktop-icon launches and keeps `system32`
+untouched puts DXVK's three DLLs next to the host's executable (Wine looks there first
+for native DLLs), sets the same three overrides under
+`HKCU\Software\Wine\AppDefaults\<host>.exe\DllOverrides`, and points
+`DXVK_CONFIG_FILE` in `HKCU\Environment` at a `dxvk.conf` — DXVK reads that file from the
+working directory otherwise, and hosts like REAPER change theirs before the first D3D
+call. Moving the trio together is the predictable choice, since a partial override runs
+one implementation's D3D11 against the other's DXGI; single overrides have worked here
+(EZ Keys 2 with `d3d10core=n`, Korg Modwave and Opsix with `d3d11=n`), but that
+combination is not something this branch tests. Two things not to read as "DXVK is not
+active": DXVK's HUD appears only in an image DXVK presents itself, and none of the
+plug-ins measured here let it — EZ Keys 2 draws through a Direct2D DC render target and a
+GDI blit, Serum 2 through a DComp surface and this branch's blit, JUCE 8 plug-ins through
+a composition swapchain that `dcomp` reads back — so a missing HUD says nothing, while
+`WINEDEBUG=+loaddll` (the DLL next to the host as `native`) and `DXVK_LOG_LEVEL=info` do.
+
+**DXVK and DComp plug-ins**: `DxgiFactory::CreateSwapChainForComposition` returns
+`E_NOTIMPL` unless `dxgi.enableDummyCompositionSwapchain` is set, and DXVK's own
+`dxvk.conf` still calls that option *not a valid implementation of DirectComposition
+swapchains*. The code has moved past its own description — since the fix for DXVK issue
+5053 the present path also runs for a swap chain with no window at all, which is the
+composition case. What is missing on that route is the other half: something has to
+composite the result, and upstream Wine's `dcomp` does not. This branch's `dcomp` does: a
+swapchain that publishes no composition window of this `dxgi` is read back through public
+D3D11 (buffer 0 into a staging texture, fetched per readback and never held) and composited
+like a composition texture, with `WM_PAINT` passed on to the application, which draws into
+its swapchain from there. Measured with the option set: a reproducer shows the swapchain
+colour over the whole client area where it showed the window's own before, and a JUCE 8
+test window comes out pixel-identical to the builtin run. Plug-ins that draw into a DComp
+surface instead of a swapchain (Serum 2) do not need the option: their Direct2D runs on
+DXVK's D3D11 and the surface reaches the window through this branch's blit as before —
+measured complete and stable. What decides whether a swapchain plug-in is usable is DXVK
+itself: two things in DXVK 3.1.1 get in the way, both found with an app-free reproducer
+and both fixed in DXVK master the same day (issue 5919). The first `Present1` with dirty
+rects after a single full `Present` composed over black — a deferred-clear regression for
+shared images, `8438318`. And the back buffers stayed incomplete across `Present1` with
+dirty rects, which is how JUCE 8 paints, so a readback alternated between two partial
+frames (KORG Trinity flickered at 60 Hz) — `ba62c42` writes the composed frame back into
+the last back buffer, as native D3D does, measured against Windows 10. With a DXVK build
+from master at or past `ba62c42`, Trinity through this branch's readback is stable; with
+3.1.1 the per-application switch above remains the answer for JUCE plug-ins. The readback
+path costs nothing while no foreign swapchain is set as content.
+
+**GL present for top-level windows** (default ON): D3D11 swapchains on top-level windows
+present through the driver's SwapBuffers (EGL by default in Wine 11) directly from the GPU
+instead of the GDI readback path — this removes a large per-frame GPU→CPU copy (order of
+650 MB/s display-server traffic during continuous UI activity in Ableton Live) and fixes
+main-window flicker when an app hosts WebView2 content (Ableton Live's Learn View).
+`WS_CHILD` and `WS_POPUP` windows keep the GDI path, unless their flip-model or sequential
+swapchain has a back buffer the GDI path cannot hand to a DC (any format other than the BGR
+ones, e.g. `R8G8B8A8_UNORM`): those present through GL as well, because the GDI path drew
+nothing for them — VirtualDJ 2026 showed only black windows. Adopted from shibco/ableton-linux
+patch 0055 (diagnosis: ClickSentinel). If you see misplaced frames, set
+`WINE_DISABLE_GL_PRESENT=1` to restore the GDI path for every window.
+
+**One wined3d per process in dxgi**: every `CreateDXGIFactory*()` call created a new wined3d
+object, and with it a full adapter initialisation — a window, a GL context, the extension
+strings, the card guess. Measured with VirtualDJ 2026, which creates a factory before every
+frame: 36 ms per call on llvmpipe, 60–480 ms on an NVIDIA card, and a render loop throttled
+to 20 frames per second by it. The factories now share the first wined3d of the process
+(0.03 ms per call); on Windows and under DXVK the call is trivial.
+
+**Serum2 settings** (recommended — DComp gives the best performance):
+- `"Disable DirectComposition": false`
+- `"Disable Partial Redraw": false`
+
+The GDI fallback (`"Disable DirectComposition": true`) is supported as well: the plugin's
+HWND is marked so `needs_offscreen_rendering()` returns FALSE and its X11 child is attached
+directly to the host's toplevel, instead of an offscreen-redirected child that wined3d's
+GDI present never composited.
+
+**SynthEdit / GMPI plugins**: plugins built with SynthEdit — recognisable by the `.sem`
+modules inside the bundle — render through GMPI's DirectX backend, which maps straight
+onto the modern, colour-space aware D2D1 interfaces (`ID2D1GradientStopCollection1`, the
+Color Management effect, sRGB bitmaps). Without those patches such a plugin crashes on
+load or draws its GUI far too dark. No configuration is required. VProm3 is the plugin
+these were developed against, but they are not specific to it.
+
+## Tested Applications
+
+| Application | Framework | Status |
+|-------------|-----------|--------|
+| Serum2 (VST3 in Reaper) | VSTGUI + DComp | Fully functional, all waveform views + envelopes + presets; dragging the envelope, LFO and macro handles shows the drag bitmap with per-pixel alpha and no flicker |
+| VProm3 (VST3 in Reaper) | SynthEdit/GMPI + D2D1 | Fully functional, correct colours (needs the Color Management effect patches) |
+| Korg Trinity (VST3 in Reaper) | JUCE 8.0.13 + DComp | Fully functional on the DComp path — with the `HideWineVersion` entry, which `wine.inf` sets for Reaper; the standalone needs its own entry |
+| Korg Prophecy (VST3 in Reaper) | JUCE 8.0.12 + DComp | Fully functional |
+| Pianoteq 9 (standalone + VST3) | JUCE 8.0.10 + DComp | Fully functional |
+| FL Studio 2026 (Wine + ntsync) | Custom | Runs without xruns at 64 samples / 48 kHz; Cloud plugins install (needs the AF_UNIX patches) and stream |
+| UVI Portal | WebView2 | Installs and signs in, including special characters typed into the login fields |
+| Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing, Splice view; the content indexer (`Ableton Index.exe`) runs on the built-in VC runtime |
+| VirtualDJ 2026 (build 9583) | Custom skin engine (D3D11, FLIP_SEQUENTIAL swapchains with an R8G8B8A8 back buffer) | Runs — decks, browser, and the skin re-lays out while the window is being resized (4–5 relayouts per second during a corner drag). Needs two patches from this branch: the wined3d GL present for flip-model swapchains without a BGR back buffer, without which both windows stay black, and the wined3d shared between all DXGI factories of the process — the application calls `CreateDXGIFactory1()` before every frame and several times per relayout, and at 60–480 ms per call on an NVIDIA card the skin followed a resize only seconds after the drag |
+| Native Access 3.25.2 | Electron/Chromium (D3D11 + DComp) | Installs, signs in and installs products (verified with a Kontakt 7 update, Supercharger and the bundled NTKDaemon). Needs the `powershell` patch from this branch: without it the installer loops forever on "Native Access is running" and the bundled NTKDaemon is never installed, leaving the app stuck at "grant permission to install dependencies". Kontakt 8's own installer aborts under Wine for unrelated reasons (InstallAware) |
+| Kontakt 8 Player 8.12.1 | Custom; installer: InstallAware/MSI | Installs and runs. The official installer needs the `msi` string-pool patch from this branch — without it it aborts after 77 s with "Setup has failed: FALSE", writes no installer log and leaves the product missing (WineHQ bug 59056). Both routes verified with the patch: running the setup executable directly, and a reinstall through Native Access 3; each produces the desktop shortcut and registry entries. Both the standalone and the VST3 in Reaper run: the Player browser lists its 1940 presets and instruments load and play, alongside Kontakt 6 and 7 |
+| SynthEdit 1.5 | Custom engine (D2D1 + winex11 client surfaces) | Fully functional — the MDI canvas draws completely and stays stable: no permanently black regions after a menu closes, no caption flicker while resizing or moving the top-level window, and canvas children no longer vanish mid-resize. Needs the winex11 client-surface and d2d1 bitmap-brush fixes from this branch |
+| EPROM - Memory Rites (VST3 in Reaper) | JUCE 8.0.13; splash/login via WebView2 | Fully functional — the splash and login window render through WebView2, and once signed in the GUI is entirely JUCE. Requires the `HideWineVersion` entry (`wine.inf` sets it for the plug-in hosts); without it JUCE 8.0.13 detects Wine, falls back from Direct2D to GDI and the plug-in comes up with a black background and missing GUI elements |
+| Minimal Audio Current / Evoke / Lucid (VST3 in Reaper) | JUCE 8.0.13 | Fully functional, same `HideWineVersion` requirement as above — without it the GDI fallback leaves the background black and parts of the interface missing |
+| Minimal Hub | Tauri v2 + SvelteKit + WebView2 | Starts, signs in and installs products (an 11.8 MB update completed). Needs the `secur32`/schannel `DecryptMessage` fix from this branch: without it the `oauth/token` request stops after a partial response and the app waits indefinitely, because reqwest has no response timeout. Its installer step also shells out to `powershell Start-Process`, but in a form the `powershell` patch does not recognise — it ran both with and without that patch |
+| Fender Studio Pro 8 | CCL (DXGI + DWrite + DComp) | Fully functional — the song view draws completely and stays stable, no stale tool bar or transport and no flicker; the transport playhead and the selection rectangle no longer flicker while the transport runs, and video on the timeline plays, seeks, loops and jumps without stalling or going black. Starting at all needs the `UIAnimationManager2` and `UIAnimationTransitionLibrary2` implementation from this branch; without it the CCL framework aborts with "requires Windows 10 or later" |
+| Steinberg Cubase Pro 15.0.30 | Custom (DComp + D2D1 + DirectWrite) + WebView2 | Installs through Steinberg's own bootstrapper and runs: project window, MixConsole with live meters, Hub. Installing needs the `msi` feature-cost fix (the setup crashed before its first dialog) and the Script SIP for signed PowerShell — without `pwrshsip`/`wintrust` the installer stops at "preinstall.ps1 … not trusted". Starting needs the `Windows.Globalization.Calendar` runtime class, without which `headtracking.dll` aborts behind the licence splash, and the `comdlg32` folder-dialog fix, without which the Hub reports the project folder as read-only. The window itself needs the dcomp virtual-surface resize and child-surface readback work — and the d2d1 WIC target fix, without which the MixConsole level meters stay empty. The video player needs the planar NV12 textures in the OpenGL renderer, the `CPU_LOCKABLE` format bit, custom Direct2D effects and the larger decoder sample pool (see the video-player entry above) |
+
+## Font Setup
+
+The DWrite patches fix font rendering in VSTGUI-based plugins, but some applications
+also require system fonts to be configured correctly (Unicode symbols, GDI menus).
+
+**[scripts/wine-font-setup.sh](scripts/wine-font-setup.sh)** does the
+host part for you:
+
+```bash
+scripts/wine-font-setup.sh --prefix ~/.wine
+scripts/wine-font-setup.sh --prefix ~/.wine --check   # report only
+```
+
+It locates the fonts through fontconfig (so distribution paths do not matter),
+copies them into the prefix, registers the MS Core Fonts for GDI, writes the
+`FontLink` fallback chain and switches on this branch's text rendering. It is
+idempotent, and `--check` shows whether everything is still in place — worth running
+after a prefix update. Wine rewrites the FontLink chain with its own defaults whenever
+its stored codepage record does not match the running process, and one process
+started under `LC_ALL=C` already triggers that; since 2026-09-02 this branch therefore
+carries the two fallback entries in win32u's own defaults, so the rewrite no longer
+loses them. The fonts themselves still have to be in the prefix, which is this
+script's job.
+
+Three of those steps matter more than they look:
+
+- **MS Core Fonts** are not cosmetic. Some plugins check for font *files* during DLL
+  initialisation — FL Studio's "Fruity Delay 3" looks for `C:\windows\Fonts\Arialbd.ttf`
+  and Verdana — and crash with an access violation and no usable error message when
+  they are missing.
+- **FontLink** is what makes symbol glyphs resolve; without it Serum 2's star
+  ratings render as tofu boxes.
+- **The text rendering switches live in the prefix, not in the build.** Enhanced
+  contrast, linear blending and outline rasterisation are all read from the
+  registry once at startup, and each falls back to stock behaviour when its value
+  is absent. A prefix that never saw this script therefore renders text the way
+  stock Wine does, however carefully the branch was built — and nothing in the
+  log says so. If text looks unchanged after installing this branch, check here
+  before suspecting the build:
+
+  ```bash
+  scripts/wine-font-setup.sh --prefix ~/.wine --check
+  ```
+
+  The values themselves are `text_enhanced_contrast` and `text_linear_blend`
+  under `HKCU\Software\Wine\Direct2D`, and `outline_in_natural_modes` under
+  `HKCU\Software\Wine\DirectWrite`. Enhanced contrast is also in winecfg's
+  graphics tab (*Off* / *Medium (50)* / *Strong (70)*). winecfg stores *Off* as
+  the absence of the value, so the script writes a contrast only on its first run
+  (when no switch is set yet) or when `--contrast N` is given; a choice made
+  there, *Off* included, survives a re-run, and `--check` does not count a
+  missing contrast as a gap.
+
+See **[documentation/wine-font-setup-guide.md](documentation/wine-font-setup-guide.md)**
+for the full guide, including working around the missing `BitPDisp-10` tooltip font in
+Serum 2, which the script deliberately leaves out.
+
+Not every application needs any of this. Some ship their typefaces as binary
+resources and load them with `AddFontMemResourceEx` into a private DirectWrite
+collection, never touching the prefix' font directory for their own UI — Fender
+Studio Pro 8 loads 25 faces that way, from its "Nimbus Sans Novus" interface
+family to the notation fonts. Running the setup script changes nothing for those,
+and text that looks wrong in such an application is not a missing system font.
+The guide's *Which font is the application actually using?* section tells the two
+cases apart from a single `WINEDEBUG=+font,+dwrite` log.
+
+Since 2026-09-17 the branch also keeps such embedded fonts. A font that an
+application registers with `AddFontMemResourceEx` is visible to GDI in that process
+only; DirectWrite builds its system collection from the registry font list and
+never sees it, so an application that embeds its GUI font and then asks DirectWrite
+for it *by family name* gets whatever DirectWrite falls back to — JUCE 5 to 7 take
+family 0 of the collection, which under Wine is the first installed font in
+alphabetical order (the Kurzweil KM88 Editor rendered its whole interface in
+Dorico's serif *Academico* that way). `win32u` therefore writes each memory font
+to `C:\windows\fonts\wine-embedded\<hash>.<otf|ttf>` and registers it in the
+`Fonts` key the way an installer would, and `dwrite` rebuilds a cached system
+collection when that key changes. The first start of such an application still
+shows the fallback (it asks for the font before it registers it); every later
+start finds it. Font collections, bitmap fonts, PDF-style subset fonts and fonts
+whose OS/2 `fsType` forbids embedding altogether are left alone;
+`HKCU\Software\Wine\Fonts` → `PersistMemoryFonts` = `"0"` switches the feature
+off, `"installable"` limits it to fonts whose `fsType` allows installable
+embedding. `HKCU\Software\Wine\Fonts\Embedded Fonts` lists what has been kept.
+
+The other half of that fallback are families that every Windows ships and no Wine
+prefix has: KORG Legacy Cell asks DirectWrite for *Meiryo UI* for its menus and
+dialogs and ended up in the same serif. DirectWrite on Windows knows no
+substitution, but since 2026-09-17 this branch's `dwrite` resolves a family that
+`FindFamilyName` cannot find through the GDI `FontSubstitutes` key (up to three
+steps; if the chain ends at a missing family too, the system message font stands
+in), and `wine.inf` and the setup script point *Meiryo UI*, *Meiryo*, *Yu Gothic
+UI*, *Microsoft YaHei UI*, *Microsoft JhengHei UI* and *Malgun Gothic* at Segoe UI.
+Families without an entry still report "not found", so applications that probe
+for a font before bundling their own keep working. `--check` reports the entries.
+
+### Subpixel (ClearType-style) text
+
+The subpixel text patches are inert until the prefix says it wants them. A fresh
+prefix carries no `FontSmoothingType`, and its absence means "follow the host", so
+these three values are what turns the feature on:
+
+```bash
+wine reg add 'HKCU\Control Panel\Desktop' /v FontSmoothing            /t REG_SZ    /d 2 /f
+wine reg add 'HKCU\Control Panel\Desktop' /v FontSmoothingType        /t REG_DWORD /d 2 /f
+wine reg add 'HKCU\Control Panel\Desktop' /v FontSmoothingOrientation /t REG_DWORD /d 1 /f
+```
+
+`FontSmoothingType` is the switch: 2 is ClearType, 1 is greyscale. Orientation is
+1 for an RGB panel and 0 for BGR — a BGR panel driven as RGB fringes the wrong way.
+Match it to the host (`XftSubPixel` in `kdeglobals`, or
+`gsettings get org.gnome.desktop.interface font-rgba-order`).
+
+What to expect: DirectWrite text is rendered with three coverage samples per pixel
+and reaches the screen that way. Measured on Fender Studio Pro 8, counting pixels
+whose channels differ by more than 15 of 255 — that is, pixels carrying a visible
+colour fringe: 0.00 % without the patches, 29.05 % (body text) and 8.47 % (file
+list) with them; in a test program the GRAYSCALE and ALIASED lines stay at exactly
+0.00 %, which is what makes the measurement trustworthy. FL Studio's Sounds tab is
+a good place to see the difference by eye.
+
+A font's embedded bitmap strikes used to defeat this: where a face carries one,
+FreeType returns the strike, which has a single coverage sample per pixel. Wine's
+bundled Tahoma carries strikes for 8 to 16 ppem and `MS Shell Dlg` resolves to Tahoma,
+so the default interface font lost its subpixel resolution across the whole size range
+interface text uses. DWrite now asks for the outline when the caller wants a ClearType
+texture; a face with no outline for a glyph keeps its strike.
+
+### Greyscale text and embedded strikes
+
+Greyscale text still takes the strike, and Tahoma does not carry one for *every* size
+in its range, so at 96 dpi the character of the text flips between neighbouring sizes —
+12, 15 and 16 px come out as hard 1-bpp bitmaps while 14 px and everything from 17 px
+up is antialiased. Windows selects by **rendering mode** instead: the GDI-compatible
+modes take the strike, the NATURAL modes take the outline — and applications measured
+here request NATURAL exclusively (Fender Studio Pro 8 in 1625 of 1625 glyph-run
+analyses).
+
+```bash
+wine reg add 'HKCU\Software\Wine\DirectWrite' /v outline_in_natural_modes /t REG_DWORD /d 1 /f
+wineserver -k
+```
+
+With the key set, greyscale follows the same rule as Windows and the size-to-size
+inconsistency disappears; unset, rendering is unchanged. It is opt-in because the
+strike is hand-tuned and crisp: switching to the outline makes small greyscale text
+softer, which is a matter of taste. With `FontSmoothingType=2` it barely matters,
+since almost everything then goes through the ClearType path anyway.
+
+### Linear-space text blending
+
+Coverage is a geometric area, so a correct composite linearises source and
+destination, mixes there, and encodes the result back. Direct2D's text path mixes
+in the target's *encoded* space instead, which makes the same text carry a
+different amount of ink depending on its polarity — light text on dark comes out
+thinner than dark text on light, from the arithmetic alone.
+
+```bash
+wine reg add 'HKCU\Software\Wine\Direct2D' /v text_linear_blend /t REG_DWORD /d 1 /f
+wineserver -k
+```
+
+Measured against identical text drawn in both polarities, the polarity bias goes
+from up to -0.57 (half coverage) to 8-bit quantisation noise. On a dark audio
+interface black-on-white becomes more restrained, white-on-black slightly heavier —
+the expected direction. **It costs about 500 µs per `DrawText`** (+12 to +13 % of
+the call), which is why it is off by default; with the key unset rendering is
+bit-identical. Two things worth knowing: it deliberately departs from Direct2D on a
+plain UNORM target, where Windows blends in encoded values; and the cheaper route —
+an `_SRGB` render target view — does not work in Wine, because wined3d honours the
+sRGB cast only for swapchains with a single back buffer, so the blend is finished in
+the shader instead.
+
+### Enhanced contrast — worth setting on a dark interface
+
+DirectWrite reports an *enhanced contrast* value alongside gamma and ClearType
+level; Wine hardcodes it to zero, so nothing is applied. This branch honours it and
+lets the prefix override it — in winecfg (*Graphics* tab, *Direct2D text*, three named
+settings) or by hand:
+
+```bash
+wine reg add 'HKCU\Software\Wine\Direct2D' /v text_enhanced_contrast /t REG_DWORD /d 70 /f
+wineserver -k    # the value is read when d2d1 loads, so restart the application
+```
+
+The value is in hundredths; deleting it restores the default. It raises partial
+coverage while leaving fully covered and empty samples alone, so at 0 — the default
+— rendering is bit-identical to not having the feature at all. `AppDefaults` works
+as for the other keys, so it can be set for a single application.
+
+| value | when |
+|---|---|
+| `0` | default. Clean as it stands; leave it unless you have a reason |
+| `50` | what Windows runs. A safe middle if you want a little more weight |
+| `70` | dark interfaces with dense body text — light text on dark looks thinner than it geometrically is, and this puts the weight back |
+
+On a **light** background the effect works against you — there the same setting makes
+text look heavy. Watch small sizes if you go high: at 11px a strong setting can start
+closing the counters in `e`, `a` and `g`.
+
+Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
+flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
+fallback through `GetGlyphIndices`. That one has its own project:
+[giang17/flstudio-wine-font-fix](https://github.com/giang17/flstudio-wine-font-fix).
+
+## Steinberg installers: PowerShell hosting in Wine-Mono
+
+Steinberg's `Setup.exe` (the bootstrapper behind every Download Assistant package) runs
+the `preinstall.ps1` scripts from `setup.xml` by hosting PowerShell in-process through
+`System.Management.Automation`, an assembly Wine-Mono does not ship. The load fails,
+Setup.exe swallows the exception, logs "Finished Installation" and exits with 0 —
+without installing a single MSI. Nothing in the setup log says so. The Script SIP from
+this branch (`pwrshsip`/`wintrust`) gets such scripts past the "not trusted" check;
+this is the step after it.
+
+**[scripts/mono-sma-shim](scripts/mono-sma-shim/README.md)** is a
+`System.Management.Automation.dll` with the identity Setup.exe asks for (version
+3.0.0.0, delay-signed with Microsoft's public key; Mono does not verify strong-name
+signatures) that implements the hosting API the installer uses and runs the script
+with a small interpreter for the PowerShell subset those preruns are written in.
+Constructs outside that subset raise an error, so a script the shim cannot run is
+reported as failed rather than as done. It is a prefix-side component, not part of
+the Wine build: Wine-Mono ships the C# compiler it needs, and it goes into the
+prefix' Wine-Mono GAC.
+
+```bash
+scripts/mono-sma-shim/build.sh
+scripts/mono-sma-shim/install.sh --prefix ~/.wine          # then a probe through the GAC
+scripts/mono-sma-shim/install.sh --prefix ~/.wine --status # after a Wine-Mono update
+```
+
+A `wineboot -u` with a newer Wine replaces Wine-Mono and the shim with it; `--status`
+reports that (exit 3). Verified with MediaBay 1.3.100: removed with `msiexec /x`, then
+installed again through `Setup.exe --silent`, the setup log showing the prerun's
+`Write-Host` output and `preinstall.ps1 executed successfully`.
+
+## D2D1 Patches Only (Branch: `d2d1-v6`) — DEPRECATED
+
+Deprecated since 2026-05-03; last update 2026-02-14, 15 patches against vanilla Wine 11.0
+(`git format-patch wine-11.0..d2d1-v6`). It was the upstream-targeted D2D1-only series
+and no longer reflects the current D2D1 work, all of which lives in `d2d1-dcomp-11.0`.
+No bundled successor series is planned: small targeted fixes go upstream as ordinary
+merge requests on gitlab.winehq.org, the fork itself stays a rolling devel-tracking
+distribution.
+
+## Related
+
+- Discussion: [yabridge#413](https://github.com/robbert-vdh/yabridge/issues/413)
+- Upstream: [wine-mirror/wine](https://github.com/wine-mirror/wine)
+- Subpixel text: [shibco/ableton-linux](https://github.com/shibco/ableton-linux),
+  pull request 155 by Cade (@shibco), who wrote the nine patches and wants to take
+  them to WineHQ. Reviewed there by @ClickSentinel, whose measurements are worth
+  reading before touching this code
+
+## License
+
+Same as Wine -- GNU LGPL. See [LICENSE](LICENSE) for details.

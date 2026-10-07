@@ -68,6 +68,8 @@
 # define HAS_IRDA
 #endif
 
+#include <sys/un.h>
+
 #include "ntstatus.h"
 #include "windef.h"
 #include "winioctl.h"
@@ -78,6 +80,7 @@
 #include "ws2tcpip.h"
 #include "wsipx.h"
 #include "af_irda.h"
+#include "afunix.h"
 #include "wine/afd.h"
 
 #include "unix_private.h"
@@ -106,6 +109,7 @@ union unix_sockaddr
 #ifdef HAS_IRDA
     struct sockaddr_irda irda;
 #endif
+    struct sockaddr_un un;
 };
 
 struct async_recv_ioctl

@@ -234,6 +234,96 @@ static HRESULT STDMETHODCALLTYPE dxgi_surface_GetDC(IDXGISurface2 *iface, BOOL d
     return hr;
 }
 
+/* Surface-to-window blit for standalone DXGI surfaces.
+ * On Windows, DirectComposition composites DXGI surface content into
+ * associated windows automatically. Wine lacks this compositing, so
+ * after an app draws via GetDC/ReleaseDC on a standalone surface (not
+ * a swapchain back buffer), we manually blit to matching popup windows.
+ *
+ * The targeting below is a size-match heuristic (visible WS_POPUP/owned
+ * window whose client area equals the surface) rather than a real
+ * surface->window binding, and it can blit to more than one same-size
+ * popup at once.  This is deliberate and, in practice, the only option:
+ * a proper binding would need the surface to be associated with a window
+ * through the DComp visual tree (IDCompositionVisual::SetContent on a
+ * visual whose target is the popup), but apps that actually hit this path
+ * do not do that.  Investigated for issue 10 (2026-06-19) with KORG Trinity,
+ * standalone and embedded: its popups are composition-swapchain targets and
+ * the GetDC/ReleaseDC surfaces (from IDCompositionSurface::BeginDraw with
+ * IID_IDXGISurface) are never set as visual content, so dcomp has no HWND to
+ * hand us — there is nothing to bind to.  A prototype binding (stamp the
+ * owning HWND onto the surface via SetPrivateData, read it here) was built
+ * and verified to never engage for any tested plugin, so it was dropped in
+ * favour of this documented heuristic.
+ *
+ * Blitting to every same-size popup is safe in the observed cases because
+ * such sibling popups carry identical content (e.g. symmetric scrollbar
+ * troughs).  The over-blit would only be visibly wrong for two same-size
+ * popups holding *different* content drawn from the same surface API; not
+ * observed in practice.  Tightening to a single window is NOT done: the
+ * correct target is always among the matches today, so picking one risks
+ * leaving the right window with stale content. */
+
+struct surface_blit_data
+{
+    HDC src_dc;
+    unsigned int width;
+    unsigned int height;
+    unsigned int blit_count;
+};
+
+static BOOL CALLBACK surface_blit_enum_proc(HWND hwnd, LPARAM lparam)
+{
+    struct surface_blit_data *data = (struct surface_blit_data *)lparam;
+    unsigned int w, h;
+    RECT client;
+    LONG style;
+    HDC dst_dc;
+
+    if (!IsWindowVisible(hwnd))
+        return TRUE;
+
+    /* Only consider popup windows or owned windows — skip main app windows. */
+    style = GetWindowLongW(hwnd, GWL_STYLE);
+    if (!(style & WS_POPUP) && !GetWindow(hwnd, GW_OWNER))
+        return TRUE;
+
+    GetClientRect(hwnd, &client);
+    w = client.right - client.left;
+    h = client.bottom - client.top;
+
+    if (w != data->width || h != data->height || w == 0 || h == 0)
+        return TRUE;
+
+    dst_dc = GetDC(hwnd);
+    if (dst_dc)
+    {
+        BitBlt(dst_dc, 0, 0, w, h, data->src_dc, 0, 0, SRCCOPY);
+        ReleaseDC(hwnd, dst_dc);
+        data->blit_count++;
+        TRACE("Blit DXGI surface %ux%u to popup hwnd %p.\n", w, h, hwnd);
+    }
+
+    return TRUE;
+}
+
+static void dxgi_surface_blit_to_popup_windows(HDC src_dc,
+        unsigned int width, unsigned int height)
+{
+    struct surface_blit_data data;
+
+    data.src_dc = src_dc;
+    data.width = width;
+    data.height = height;
+    data.blit_count = 0;
+
+    EnumWindows(surface_blit_enum_proc, (LPARAM)&data);
+
+    if (data.blit_count)
+        TRACE("Blit DXGI surface %ux%u to %u popup window(s).\n",
+                width, height, data.blit_count);
+}
+
 static HRESULT STDMETHODCALLTYPE dxgi_surface_ReleaseDC(IDXGISurface2 *iface, RECT *dirty_rect)
 {
     struct dxgi_resource *resource = impl_from_IDXGISurface2(iface);
@@ -241,7 +331,35 @@ static HRESULT STDMETHODCALLTYPE dxgi_surface_ReleaseDC(IDXGISurface2 *iface, RE
 
     TRACE("iface %p, rect %s\n", iface, wine_dbgstr_rect(dirty_rect));
 
-    if (!IsRectEmpty(dirty_rect))
+    /* Blit standalone surface content to matching popup windows before
+     * releasing the DC. On Windows, DirectComposition would composite
+     * DXGI surface content into associated windows automatically. */
+    if (resource->dc)
+    {
+        struct wined3d_sub_resource_desc desc;
+        struct wined3d_texture *texture;
+        struct wined3d_swapchain *swapchain;
+
+        wined3d_mutex_lock();
+        texture = wined3d_texture_from_resource(resource->wined3d_resource);
+        swapchain = wined3d_texture_get_swapchain(texture);
+
+        if (!swapchain)
+        {
+            wined3d_resource_get_sub_resource_desc(resource->wined3d_resource,
+                    resource->subresource_idx, &desc);
+            wined3d_mutex_unlock();
+
+            if (desc.width > 1 && desc.height > 1)
+                dxgi_surface_blit_to_popup_windows(resource->dc, desc.width, desc.height);
+        }
+        else
+        {
+            wined3d_mutex_unlock();
+        }
+    }
+
+    if (dirty_rect && !IsRectEmpty(dirty_rect))
         FIXME("dirty rectangle is ignored.\n");
 
     wined3d_mutex_lock();
