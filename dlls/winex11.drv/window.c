@@ -103,6 +103,9 @@ static const WCHAR whole_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','w','h','o','l','e','_','w','i','n','d','o','w',0};
 static const WCHAR clip_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
+/* visual id of whole_window, published next to it for X11DRV_GetDC in other processes */
+static const WCHAR visual_id_prop[] =
+    {'_','_','w','i','n','e','_','x','1','1','_','v','i','s','u','a','l','_','i','d',0};
 static const WCHAR focus_time_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','f','o','c','u','s','_','t','i','m','e',0};
 static const WCHAR dcomp_swapchain_propW[] =
@@ -2963,6 +2966,7 @@ static void create_whole_window( struct x11drv_win_data *data )
 
     XSaveContext( data->display, data->whole_window, winContext, (char *)data->hwnd );
     NtUserSetProp( data->hwnd, whole_window_prop, (HANDLE)data->whole_window );
+    NtUserSetProp( data->hwnd, visual_id_prop, (HANDLE)(ULONG_PTR)data->vis.visualid );
 
     /* set the window text */
     if (!NtUserInternalGetWindowText( data->hwnd, text, ARRAY_SIZE( text ))) text[0] = 0;
@@ -3040,6 +3044,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     /* Outlook stops processing messages after destroying a dialog, so we need an explicit flush */
     XFlush( data->display );
     NtUserRemoveProp( data->hwnd, whole_window_prop );
+    NtUserRemoveProp( data->hwnd, visual_id_prop );
 
     /* It's possible that we are in a different thread, when called from
      * set_window_visual, and about to recreate the window. In this case
@@ -3604,8 +3609,35 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     }
     else
     {
+        /* The top level belongs to another process; its X window was published
+         * on whole_window_prop together with the id of the visual it was created
+         * with.  Resolve that id instead of assuming the default visual: the
+         * xrender picture format follows the DC's visual, and a format whose
+         * depth differs from the drawable's makes XRenderCreatePicture fail with
+         * BadMatch, a fatal X error.  WebView2's GPU process presents a
+         * DirectComposition swapchain into its "Intermediate D3D Window", a
+         * child of the browser process's tooltip top level, and that top level
+         * carries a depth-32 ARGB visual (WS_EX_NOREDIRECTIONBITMAP); with the
+         * depth-24 default format the GDI present's StretchBlt killed the GPU
+         * process on the first tooltip.  XGetVisualInfo on a visual id is a
+         * client-side lookup, no round trip. */
+        VisualID visualid = (VisualID)(ULONG_PTR)NtUserGetProp( top, visual_id_prop );
+
         escape.drawable = X11DRV_get_whole_window( top );
-        escape.visual = default_visual; /* FIXME: use the right visual for other process window */
+        escape.visual = default_visual;
+        if (visualid && visualid != default_visual.visualid)
+        {
+            XVisualInfo template = { .visualid = visualid };
+            XVisualInfo *info;
+            int count;
+
+            if ((info = XGetVisualInfo( gdi_display, VisualIDMask, &template, &count )))
+            {
+                escape.visual = *info;
+                XFree( info );
+            }
+            else WARN( "visual %lx of foreign top level %p not found, using the default\n", visualid, top );
+        }
     }
 
     if (!escape.drawable) return; /* don't create a GC for foreign windows */
