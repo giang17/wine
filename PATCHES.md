@@ -221,6 +221,16 @@ This is the recommended branch. What it changes, by subsystem:
   frame or undefined pixmap content, and SynthEdit 1.5's menus came up as a copy of the
   screen below them or black once the empty-region flush above was disabled. WineHQ bug
   60173 reports the same for every WPF menu, tooltip and `AllowsTransparency` window.
+- **winex11**: a DC on a window whose top-level belongs to another process takes the
+  visual that top-level was created with instead of the default one. The xrender picture
+  format follows the DC's visual, and a format whose depth differs from the drawable's makes
+  `XRenderCreatePicture` fail with BadMatch, a fatal X error. WebView2's GPU process
+  presents a DirectComposition swap chain into its intermediate D3D child window under the
+  browser process's tooltip top-level, which carries a depth-32 ARGB visual
+  (`WS_EX_NOREDIRECTIONBITMAP`); the GDI present of the first tooltip killed the GPU process
+  (Splice INSTRUMENT with WebView2 runtime 154). The visual id is published on the window as
+  a property next to the X window id, so the lookup is a client-side `XGetVisualInfo`
+  without a round trip.
 - **win32u**: a mouse capture taken without a menu or move/size loop ends with
   `WM_CANCELMODE` when the window manager moves, resizes or changes the state of a window
   of that thread, unless a mouse button is held. The press on the window manager frame
