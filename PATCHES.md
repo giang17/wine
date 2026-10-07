@@ -396,6 +396,18 @@ This is the recommended branch. What it changes, by subsystem:
   first frame seventeen inputs late with the sixteen threads Wine allows it; a single-slice
   stream then decodes on one thread (11 ms per 4K frame on a 16-thread desktop, still real
   time at 30 fps). The video window shows the picture in stop and play
+- **winegstreamer**: GStreamer plugins are loaded through its plugin scanner helper again
+  instead of inside the application. Initialization has passed `--gst-disable-registry-fork`
+  since 2010. The helper is a separate `gst-plugin-scanner` process started with fork and
+  exec; with it disabled, every plugin whose file changed since the registry cache was
+  written is loaded in-process by the first GStreamer user after a package update. Loading a plugin runs its class
+  registration, and that is not free: the `openni2` plugin from gst-plugins-bad calls
+  `openni::OpenNI::initialize()`, whose PrimeSense driver starts a thread that waits with
+  `select()`. A process holding more than 1024 descriptors — Cubase 15 does once its video
+  engine runs on `nvcodec` — then dies in glibc's `FD_SET` check with
+  `bit out of range 0 - FD_SETSIZE`. With the helper, the plugin loads in the scanner, a
+  crash there blacklists the plugin, and the application never sees it (measured with a
+  forced full rescan: media source created, two streams, where the same run aborted before)
 - **windows.security.authentication.web.core**: WebAuthenticationCoreManager
   implementation, for applications that probe the WinRT web-account API on startup
 - **windows.globalization**: `Windows.Globalization.Calendar` for the Gregorian calendar —
