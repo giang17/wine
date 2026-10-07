@@ -1642,6 +1642,7 @@ static void window_set_net_wm_state( struct x11drv_win_data *data, UINT new_stat
 
             data->pending_state.net_wm_state ^= (1 << i);
             data->wm_frame_changed = TRUE;
+            if (i == NET_WM_STATE_MAXIMIZED) data->unmaximize_retry = !(new_state & (1 << i));
             data->net_wm_state_serial = NextRequest( data->display );
             TRACE( "window %p/%lx, requesting _NET_WM_STATE %#x serial %lu\n", data->hwnd, data->whole_window,
                    data->pending_state.net_wm_state, data->net_wm_state_serial );
@@ -1716,6 +1717,7 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     data->configure_serial = NextRequest( data->display );
     data->configure_retry = data->wm_frame_changed;
     data->wm_frame_changed = FALSE;
+    data->unmaximize_retry = FALSE;
     TRACE( "window %p/%lx, requesting config %s mask %#x above %u, serial %lu\n", data->hwnd, data->whole_window,
            wine_dbgstr_rect(new_rect), mask, above, data->configure_serial );
     XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen, mask, &changes );
@@ -2239,6 +2241,7 @@ void window_wm_state_notify( struct x11drv_win_data *data, unsigned long serial,
         return;
     data->current_state.activate = data->pending_state.activate;
     data->reparenting = 0;
+    data->unmaximize_retry = FALSE;
 
     /* send any pending changes from the desired state */
     window_request_desired_state( data );
@@ -2260,6 +2263,7 @@ void window_net_wm_state_notify( struct x11drv_win_data *data, unsigned long ser
     if (!handle_state_change( serial, expect_serial, sizeof(value), &value, desired, pending,
                               current, expected, prefix, received, NULL ))
         return;
+    if (value & (1 << NET_WM_STATE_MAXIMIZED)) data->unmaximize_retry = FALSE;
 
     /* send any pending changes from the desired state */
     window_request_desired_state( data );
@@ -2336,6 +2340,29 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
         *expect_serial = 0;
         window_set_config( data, rect, FALSE );
         return;
+    }
+
+    /* An application that leaves the maximized state but keeps its window rect leaves nothing to
+     * request, and the window manager then restores the size it remembers from before the
+     * maximize (Dorico 5 re-applies a geometry it captured while maximized on every switch to
+     * Engrave mode). Windows keeps the rect the application set. Ask for it once instead of
+     * adopting the window manager's; the next config is adopted as before. A config that only
+     * moves the window is the user dragging it, not the window manager restoring a size. */
+    if (data->unmaximize_retry)
+    {
+        data->unmaximize_retry = FALSE;
+        if (!*expect_serial && !data->is_fullscreen &&
+            (value->right - value->left != desired->right - desired->left ||
+             value->bottom - value->top != desired->bottom - desired->top))
+        {
+            RECT rect = *desired;
+
+            WARN( "%sconfig %s/%lu follows an unmaximize, requesting %s again\n", prefix,
+                  wine_dbgstr_rect(value), serial, wine_dbgstr_rect(&rect) );
+            *current = *pending = *value;
+            window_set_config( data, rect, FALSE );
+            return;
+        }
     }
 
     /* if we've delayed some config we want to continue with it, make sure handle_state_change doesn't overwrite it */

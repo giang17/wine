@@ -735,6 +735,7 @@ struct x11drv_win_data
     unsigned long configure_serial;    /* serial of last pending configure request */
     BOOL          wm_frame_changed;    /* decorations or _NET_WM_STATE were requested since the last configure request */
     BOOL          configure_retry;     /* the pending configure request follows such a change and may be re-issued once */
+    BOOL          unmaximize_retry;    /* _NET_WM_STATE_MAXIMIZED was cleared at our request, the first config the window manager sends on its own may be answered once */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
     unsigned long state_locks;         /* X11 state requests lock while updating win32 state */
 };
