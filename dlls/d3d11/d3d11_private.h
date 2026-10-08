@@ -563,7 +563,7 @@ struct d3d11_device_context
 {
     ID3D11DeviceContext4 ID3D11DeviceContext4_iface;
     ID3D11Multithread ID3D11Multithread_iface;
-    ID3D11VideoContext ID3D11VideoContext_iface;
+    ID3D11VideoContext1 ID3D11VideoContext1_iface;
     ID3DUserDefinedAnnotation ID3DUserDefinedAnnotation_iface;
     LONG refcount;
 
