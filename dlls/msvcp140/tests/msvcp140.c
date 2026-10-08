@@ -2770,7 +2770,8 @@ static void check_gcount(unsigned line, void *istream, int expect)
 static void test_stream_move(void)
 {
     /* large enough for any basic_*stream<char> on either architecture */
-    union { char buf[256]; void *align; } sb, is1, is2, os1, os2, ios1, ios2;
+    union { char buf[256]; void *align; } is1, is2, os1, os2, ios1, ios2;
+    basic_streambuf_char sb;
     char data[] = "abc";
     void *ret;
     int c;
