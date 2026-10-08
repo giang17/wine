@@ -231,6 +231,12 @@ This is the recommended branch. What it changes, by subsystem:
   (Splice INSTRUMENT with WebView2 runtime 154). The visual id is published on the window as
   a property next to the X window id, so the lookup is a client-side `XGetVisualInfo`
   without a round trip.
+- **d3d11**: the immediate context exposes `ID3D11VideoContext1` (the methods beyond
+  `ID3D11VideoContext` are stubs). WebView2 runtime 154's GPU process queries it right after
+  `ID3D11VideoDevice1` while initializing DirectComposition and aborts with a CHECK when the
+  query fails; it crashed six times at startup until Chromium fell back to a software
+  compositor, which is also the configuration the tooltip crash above surfaced in. With the
+  interface the first GPU process survives and composites normally.
 - **win32u**: a mouse capture taken without a menu or move/size loop ends with
   `WM_CANCELMODE` when the window manager moves, resizes or changes the state of a window
   of that thread, unless a mouse button is held. The press on the window manager frame
