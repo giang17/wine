@@ -304,6 +304,29 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
 }
 
 
+/*******************************************************************
+ *		log_ignored_callback_exception
+ *
+ * The application keeps running after an exception that ends a user
+ * callback, so report where it happened, not only its code.
+ */
+static void log_ignored_callback_exception( const EXCEPTION_RECORD *rec )
+{
+    const char *where = "", *access = "";
+    LDR_DATA_TABLE_ENTRY *mod;
+
+    if (!LdrFindEntryForAddress( rec->ExceptionAddress, &mod ))
+        where = wine_dbg_sprintf( " (%s+%#Ix)", debugstr_us( &mod->BaseDllName ),
+                                  (ULONG_PTR)rec->ExceptionAddress - (ULONG_PTR)mod->DllBase );
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
+        access = wine_dbg_sprintf( ", %s of %p",
+                                   rec->ExceptionInformation[0] == EXCEPTION_WRITE_FAULT ? "write" :
+                                   rec->ExceptionInformation[0] == EXCEPTION_EXECUTE_FAULT ? "execute" : "read",
+                                   (void *)rec->ExceptionInformation[1] );
+    ERR( "ignoring exception %lx at %p%s%s\n", rec->ExceptionCode, rec->ExceptionAddress, where, access );
+}
+
+
 #if defined(__WINE_PE_BUILD) && !defined(__i386__)
 
 /*******************************************************************
@@ -316,13 +339,19 @@ EXCEPTION_DISPOSITION WINAPI user_callback_handler( EXCEPTION_RECORD *record, vo
 {
     if (!(record->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)))
     {
-        ERR( "ignoring exception %lx\n", record->ExceptionCode );
+        log_ignored_callback_exception( record );
         RtlUnwind( frame, KiUserCallbackDispatcherReturn, record, ULongToPtr(record->ExceptionCode) );
     }
     return ExceptionContinueSearch;
 }
 
 #else
+
+static LONG CALLBACK user_callback_filter( EXCEPTION_POINTERS *ptrs )
+{
+    log_ignored_callback_exception( ptrs->ExceptionRecord );
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 
 /*******************************************************************
  *		dispatch_user_callback
@@ -338,10 +367,9 @@ NTSTATUS WINAPI dispatch_user_callback( void *args, ULONG len, ULONG id )
         KERNEL_CALLBACK_PROC func = NtCurrentTeb()->Peb->KernelCallbackTable[id];
         status = func( args, len );
     }
-    __EXCEPT_ALL
+    __EXCEPT( user_callback_filter )
     {
         status = GetExceptionCode();
-        ERR( "ignoring exception %lx\n", status );
     }
     __ENDTRY
     return status;
