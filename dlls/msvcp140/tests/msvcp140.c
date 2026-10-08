@@ -2737,6 +2737,8 @@ static void test_time_put(void)
         call_func1(p_basic_streambuf_char_dtor, &strbuf);
         call_func1(p_time_put_char_dtor, &time_put);
     }
+}
+
 /* basic_istream & co. inherit basic_ios virtually: the vbtable pointer is the
  * first member, vbtable[1] the displacement of the basic_ios subobject. */
 #define GET_BASIC_IOS(obj) ((void*)((char*)(obj) + (*(const int**)(obj))[1]))
