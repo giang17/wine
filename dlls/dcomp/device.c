@@ -3543,6 +3543,11 @@ struct dcomp_target
     BOOL comp_needs_full_present;         /* force a full BitBlt on first present after DIB (re)create */
     UINT64 children_sig;                  /* fingerprint of the surface children the last present composited (issue 334) */
     BOOL comp_backdrop_valid;             /* comp_bits holds a backdrop captured successfully at the current size (issue 116) */
+    DWORD *backdrop_bits;                 /* what lies under our composition at the current size -- never our own delivery (issue 421) */
+    DWORD *prev_capture_bits;             /* the previous capture while the backdrop settles (issue 421) */
+    BOOL prev_capture_valid;
+    BOOL backdrop_settled;                /* backdrop_bits is final; captures no longer feed it (issue 421) */
+    UINT comp_dc_generation;              /* how many comp DIBs this target has had (1 = the first) */
     LONGLONG last_present_qpc;            /* QPC of last actual present — drives ~60 Hz coalescing (issue 56) */
     BOOL foreign;                         /* target hwnd belongs to another process — no subclass, hook-driven compositing (issue 88) */
     DWORD last_tree_composite_tick;       /* GetTickCount of last hook-driven tree composite (~60 Hz rate limit) */
@@ -3766,6 +3771,8 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
             SelectObject(target->comp_dc, NULL);
             DeleteObject(target->comp_bitmap);
             target->comp_bits = NULL;
+            free(target->backdrop_bits); target->backdrop_bits = NULL;
+            free(target->prev_capture_bits); target->prev_capture_bits = NULL;
         }
         if (target->comp_dc)
             DeleteDC(target->comp_dc);
@@ -4425,6 +4432,8 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
         DeleteObject(target->comp_bitmap);
         target->comp_bitmap = NULL;
         target->comp_bits = NULL;
+        free(target->backdrop_bits); target->backdrop_bits = NULL;
+        free(target->prev_capture_bits); target->prev_capture_bits = NULL;
     }
     if (target->comp_dc)
     {
@@ -4464,6 +4473,15 @@ static void dcomp_target_ensure_comp_dc(struct dcomp_target *target, UINT width,
     /* Fresh DIB section: zero-initialised, so it holds no usable backdrop yet
      * and must not be kept as one when the next capture fails (issue 116). */
     target->comp_backdrop_valid = FALSE;
+    /* The backdrop under a transparent page (issue 421): black like the DIB.
+     * Only a target's first DIB takes it from the window; after a size change
+     * nobody has painted the window under us at the new size, so it stays black
+     * and is final at once. */
+    target->comp_dc_generation++;
+    target->backdrop_bits = calloc((SIZE_T)width * height, sizeof(DWORD));
+    target->prev_capture_bits = calloc((SIZE_T)width * height, sizeof(DWORD));
+    target->prev_capture_valid = FALSE;
+    target->backdrop_settled = target->comp_dc_generation > 1;
     LeaveCriticalSection(&dcomp_all_targets_cs);
 
     FIXME("Created comp DC %p with %ux%u DIB for target hwnd %p.\n",
@@ -4552,6 +4570,75 @@ static BOOL dcomp_skip_unchanged(void)
         dcomp_skip_unchanged_enabled = (!e || atoi(e)) ? 1 : 0;
     }
     return dcomp_skip_unchanged_enabled > 0;
+}
+
+/* WINE_DCOMP_SETTLED_BACKDROP=0 restores the read-back of the window before
+ * every composite (the behaviour before issue 421), for A/B measurements. */
+static int dcomp_settled_backdrop_enabled = -1;
+static BOOL dcomp_settled_backdrop(void)
+{
+    if (dcomp_settled_backdrop_enabled < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_SETTLED_BACKDROP");
+        dcomp_settled_backdrop_enabled = (!e || atoi(e)) ? 1 : 0;
+    }
+    return dcomp_settled_backdrop_enabled > 0;
+}
+
+/* The backdrop of the rootless composite is what lies under our composition:
+ * on Windows the host's surface, which DWM composites the visual tree over.
+ * Reading it back from the window before every composite (the model this path
+ * had: "the backdrop is the window itself") breaks in two ways for a page
+ * that is mostly transparent (FL Studio's Sounds tab when started offline:
+ * 91 % of the leaf at alpha 0, only the card opaque -- issue 421):
+ *
+ *  - After a resize nobody has painted the window under us at the new size
+ *    (the Chromium child clips its host), and the read-back is undefined pixmap
+ *    memory: nested frames of the window at earlier sizes on NVIDIA/KWin.
+ *  - What the window shows otherwise is our own last delivery, and X GetImage on
+ *    NVIDIA/KWin answers every other pass with a stale buffer of it (measured
+ *    08.10.2026: black, or the card at its position before the last resize,
+ *    strictly alternating over hundreds of passes, and two stale buffers
+ *    agreeing on the same old card).  Composited under a transparent leaf that
+ *    accumulates forever -- the card of the narrower layout stayed as a ghost.
+ *
+ * So the backdrop comes from the window only for a target's first DIB, where
+ * two captures in a row agree (host content painted before we existed, issue
+ * 88 -- the stale-buffer alternation never agrees with itself), and is final
+ * from then on; after a size change it is black.  A host painting under a
+ * child it does not clip is the rare case and cannot be told from the stale
+ * buffers here, so it is not taken.  comp_bits leaves this function holding
+ * the backdrop; the raw capture stays available to the caller only through
+ * the hash it took before. */
+static void dcomp_target_settle_backdrop(struct dcomp_target *target, BOOL captured, UINT w, UINT h)
+{
+    SIZE_T n = (SIZE_T)w * h, i;
+    DWORD *prev = target->prev_capture_bits;
+
+    if (!target->backdrop_bits || !prev)
+    {
+        if (!captured && !target->comp_backdrop_valid)
+            memset(target->comp_bits, 0, n * sizeof(DWORD));
+        return;
+    }
+    if (!captured || target->backdrop_settled)
+    {
+        memcpy(target->comp_bits, target->backdrop_bits, n * sizeof(DWORD));
+        return;
+    }
+    for (i = 0; i < n; i++)
+    {
+        DWORD cap = target->comp_bits[i], was = prev[i];
+
+        prev[i] = cap;
+        if (target->prev_capture_valid && !((cap ^ was) & 0x00ffffff))
+            target->backdrop_bits[i] = cap;
+        else
+            target->comp_bits[i] = target->backdrop_bits[i];
+    }
+    if (target->prev_capture_valid)
+        target->backdrop_settled = TRUE;
+    target->prev_capture_valid = TRUE;
 }
 
 /* Sparse FNV-1a over a composition buffer, RGB only (alpha carries noise).
@@ -6132,6 +6219,8 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
     {
         static unsigned int comp_tree_log;
         HDC hdc_win = GetDC(target->hwnd);
+        BOOL captured, capture_hash_valid = FALSE;
+        DWORD capture_hash = 0;
 
         /* Unchanged-content gate: seed the walk hash (FNV-1a) with the
          * composition size so a window resize always forces a fresh blit. */
@@ -6154,15 +6243,23 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
          * better filler than opaque black.  Only clear when no valid backdrop
          * was ever captured at this size, so a freshly allocated DIB still
          * shows black rather than uninitialised memory. */
-        if (!hdc_win || !BitBlt(target->comp_dc, 0, 0, rc.right, rc.bottom,
-                hdc_win, 0, 0, SRCCOPY))
-        {
-            if (!target->comp_backdrop_valid)
-                memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
-        }
-        else target->comp_backdrop_valid = TRUE;
+        captured = hdc_win && BitBlt(target->comp_dc, 0, 0, rc.right, rc.bottom,
+                hdc_win, 0, 0, SRCCOPY);
+        if (captured)
+            target->comp_backdrop_valid = TRUE;
         if (hdc_win)
             ReleaseDC(target->hwnd, hdc_win);
+        /* The repair below compares the window against our last delivery; take
+         * the hash of the raw capture before the backdrop replaces it. */
+        if (captured && target->last_delivered_valid && from_timer)
+        {
+            capture_hash = dcomp_surface_hash(target->comp_bits, (unsigned int)(rc.right * rc.bottom));
+            capture_hash_valid = TRUE;
+        }
+        if (dcomp_settled_backdrop())
+            dcomp_target_settle_backdrop(target, captured, rc.right, rc.bottom);
+        else if (!captured && !target->comp_backdrop_valid)
+            memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
 
         /* The backdrop we just read back IS the window's current content, so it
          * also answers the question the leaf hash cannot: does the target still
@@ -6174,12 +6271,11 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
          * Re-deliver only once the mismatch has persisted past
          * DCOMP_TARGET_REPAIR_MS, so the tab-switch repaint from issue 99 --
          * which resolves within a few hundred ms -- never triggers it. */
-        if (target->last_delivered_valid && from_timer)
+        if (capture_hash_valid)
         {
             DWORD now = GetTickCount();
 
-            if (dcomp_surface_hash(target->comp_bits,
-                    (unsigned int)(rc.right * rc.bottom)) == target->last_delivered_hash)
+            if (capture_hash == target->last_delivered_hash)
                 target->target_diverged_tick = 0;
             else if (!target->target_diverged_tick)
                 target->target_diverged_tick = now | 1;

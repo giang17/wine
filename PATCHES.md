@@ -65,7 +65,12 @@ This is the recommended branch. What it changes, by subsystem:
   dirty-rect clipping and DIB+BitBlt presentation; IDCompositionDevice3/4/5, composition
   and dynamic textures, D3D11 BeginDraw and surface handle export; rootless visual trees
   composited onto the target window at ~60 Hz, cross-process targets, backdrop capture;
-  when a hosted target moves, the area it leaves is handed back to the host only after a
+  the backdrop under a transparent page is taken from the window only for a target's
+  first composition buffer (where two captures in a row agree) and is final from then on,
+  black after a size change — reading it back before every composite composited the
+  window's own stale pixmap memory and our own earlier frames under the page (FL Studio's
+  Sounds tab started offline: nested old frames after a resize, a ghost of the offline
+  card after a tab switch); when a hosted target moves, the area it leaves is handed back to the host only after a
   round trip on our X connection, so the host's repaint cannot overtake the blit that is
   still on its way (a docked WebView2 pane dragged in FL Studio left 3 px strips of the
   plugin image behind, 30-70 px on a fast drag)
