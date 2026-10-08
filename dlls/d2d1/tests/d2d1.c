@@ -13977,7 +13977,7 @@ static void test_effect_grayscale(BOOL d3d11)
     release_test_context(&ctx);
 }
 
-static void test_effect_color_management(BOOL d3d11)
+static void test_effect_color_management_output(BOOL d3d11)
 {
     D2D1_BITMAP_PROPERTIES1 bitmap_desc;
     DWORD colour, expected_colour;
@@ -19317,7 +19317,7 @@ START_TEST(d2d1)
     queue_test(test_effect_2d_affine);
     queue_test(test_effect_crop);
     queue_test(test_effect_grayscale);
-    queue_test(test_effect_color_management);
+    queue_test(test_effect_color_management_output);
     queue_d3d10_test(test_registered_effects);
     queue_d3d10_test(test_effect_gaussian_blur);
     queue_d3d10_test(test_effect_point_specular);
