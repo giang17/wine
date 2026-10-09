@@ -2870,6 +2870,77 @@ static float d2d_apply_enhanced_contrast(float coverage, float contrast)
     return a * 255.0f;
 }
 
+/* DirectWrite's alpha correction ratios for gamma 1.0 to 2.2 in steps of 0.1,
+ * in the form Windows Terminal reproduces DirectWrite's own greyscale blend
+ * (src/renderer/atlas/dwrite_helpers.cpp and .hlsl, MIT licence). */
+static const float d2d_text_gamma_ratios[13][4] =
+{
+    {0.0000f,  0.0000f, 0.0000f,  0.0000f}, /* 1.0 */
+    {0.0166f, -0.0807f, 0.2227f, -0.0751f},
+    {0.0350f, -0.1760f, 0.4325f, -0.1370f},
+    {0.0543f, -0.2821f, 0.6302f, -0.1876f},
+    {0.0739f, -0.3963f, 0.8167f, -0.2287f},
+    {0.0933f, -0.5161f, 0.9926f, -0.2616f}, /* 1.5 */
+    {0.1121f, -0.6395f, 1.1588f, -0.2877f},
+    {0.1300f, -0.7649f, 1.3159f, -0.3080f},
+    {0.1469f, -0.8911f, 1.4644f, -0.3234f}, /* 1.8, Windows' default */
+    {0.1627f, -1.0170f, 1.6051f, -0.3347f},
+    {0.1773f, -1.1420f, 1.7385f, -0.3426f}, /* 2.0 */
+    {0.1908f, -1.2652f, 1.8650f, -0.3476f},
+    {0.2031f, -1.3864f, 1.9851f, -0.3501f}, /* 2.2 */
+};
+
+/* Coverage mapping for one greyscale run in a solid colour. DirectWrite scales
+ * the greyscale enhanced contrast down to nothing for light text, applies it,
+ * and then corrects the result for the gamma of a blend in encoded space:
+ * light text gains weight, dark text gives back most of what the contrast
+ * added. Both steps depend on the text colour, so the mapping is built per
+ * run. Measured against Windows 10 with the same Segoe UI runs and its
+ * parameters (gamma 1.8, greyscale contrast 1.0), the ink this adds agrees
+ * with Direct2D's to about one percentage point at 12 px in both polarities;
+ * bold and larger text stay a few points above, which comes from FreeType's
+ * coverage rather than from the blend. */
+static void d2d_text_grayscale_ramp(IDWriteRenderingParams *params, const D2D1_COLOR_F *colour, BYTE *ramp)
+{
+    float r, g, b, gamma, contrast = 1.0f, lightness, intensity, k, ratios[4];
+    IDWriteRenderingParams1 *params1;
+    unsigned int i, index;
+
+    gamma = IDWriteRenderingParams_GetGamma(params);
+    if (SUCCEEDED(IDWriteRenderingParams_QueryInterface(params, &IID_IDWriteRenderingParams1, (void **)&params1)))
+    {
+        contrast = IDWriteRenderingParams1_GetGrayscaleEnhancedContrast(params1);
+        IDWriteRenderingParams1_Release(params1);
+    }
+    if (!(contrast >= 0.0f))
+        contrast = 0.0f;
+    if (!(gamma >= 1.0f))
+        gamma = 1.0f;
+    else if (gamma > 2.2f)
+        gamma = 2.2f;
+    index = (unsigned int)(gamma * 10.0f + 0.5f) - 10;
+    ratios[0] = d2d_text_gamma_ratios[index][0] * 65536.0f / (255.0f * 255.0f);
+    ratios[1] = d2d_text_gamma_ratios[index][1] * 256.0f / 255.0f;
+    ratios[2] = d2d_text_gamma_ratios[index][2] * 65536.0f / (255.0f * 255.0f);
+    ratios[3] = d2d_text_gamma_ratios[index][3] * 256.0f / 255.0f;
+
+    r = min(max(colour->r, 0.0f), 1.0f);
+    g = min(max(colour->g, 0.0f), 1.0f);
+    b = min(max(colour->b, 0.0f), 1.0f);
+    lightness = 0.30f * r + 0.59f * g + 0.11f * b;
+    intensity = 0.25f * r + 0.50f * g + 0.25f * b;
+    k = contrast * min(max(4.0f * (0.75f - lightness), 0.0f), 1.0f);
+
+    for (i = 0; i < 256; ++i)
+    {
+        float a = i / 255.0f;
+
+        a = a * (k + 1.0f) / (a * k + 1.0f);
+        a += a * (1.0f - a) * ((ratios[0] * intensity + ratios[1]) * a + (ratios[2] * intensity + ratios[3]));
+        ramp[i] = min(max((int)(a * 255.0f + 0.5f), 0), 255);
+    }
+}
+
 /* One coverage mask for all the glyph runs a device context draws.
  *
  * A run used to get a texture of its own: a D3D texture with an upload, a
@@ -3155,7 +3226,7 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
     IDWriteGlyphRunAnalysis *analysis;
     DWRITE_TEXTURE_TYPE texture_type;
     D2D1_MATRIX_3X2_F *transform, m;
-    struct d2d_brush *mask_brush;
+    struct d2d_brush *mask_brush, *brush_impl;
     float scale_x, scale_y;
     size_t coverage_size;
     D2D1_RECT_F run_rect;
@@ -3255,17 +3326,15 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
         goto done;
     }
 
-    /* The same curve the ClearType path applies per channel, here on the one
-     * greyscale sample. Empty and fully covered pixels keep their value, so
-     * the run does not grow; only the edges gain weight. */
-    if (d2d_settings.text_grayscale_enhanced_contrast_set && d2d_settings.text_grayscale_enhanced_contrast)
+    /* The mapping needs the text colour; a gradient or bitmap brush has no
+     * single one and keeps the plain coverage. */
+    brush_impl = unsafe_impl_from_ID2D1Brush(brush);
+    if (d2d_settings.text_grayscale_blend && brush_impl->type == D2D_BRUSH_TYPE_SOLID)
     {
-        float contrast = min(d2d_settings.text_grayscale_enhanced_contrast, 100) / 100.0f;
-        unsigned int i, x;
+        unsigned int x;
         BYTE ramp[256];
 
-        for (i = 0; i < ARRAY_SIZE(ramp); ++i)
-            ramp[i] = min(max((int)(d2d_apply_enhanced_contrast(i, contrast) + 0.5f), 0), 255);
+        d2d_text_grayscale_ramp(rendering_params, &brush_impl->u.solid.color, ramp);
 
         for (y = 0; y < height; ++y)
         {

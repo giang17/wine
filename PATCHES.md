@@ -880,20 +880,29 @@ All of the above reaches ClearType text only. Direct2D draws ClearType on opaque
 targets alone, so text on a target with an alpha channel is greyscale, and that covers
 whole interfaces: Cubase 15's Hub draws everything into premultiplied DirectComposition
 surfaces, and its light-on-dark sidebar looked thin however the ClearType settings
-were tuned. Greyscale text has a value of its own:
+were tuned. Wine handed greyscale coverage through unchanged; DirectWrite does not. It
+applies its greyscale enhanced contrast only to dark text (scaled down to nothing as the
+text colour gets light) and then corrects the coverage for the gamma of a blend in
+encoded space, which gives light text weight and takes most of the contrast back from
+dark text. The branch does the same when asked to:
 
 ```bash
-wine reg add 'HKCU\Software\Wine\Direct2D' /v text_grayscale_enhanced_contrast /t REG_DWORD /d 100 /f
+wine reg add 'HKCU\Software\Wine\Direct2D' /v text_grayscale_blend /t REG_DWORD /d 1 /f
 # or for one application only:
-wine reg add 'HKCU\Software\Wine\AppDefaults\Cubase15.exe\Direct2D' /v text_grayscale_enhanced_contrast /t REG_DWORD /d 100 /f
+wine reg add 'HKCU\Software\Wine\AppDefaults\Cubase15.exe\Direct2D' /v text_grayscale_blend /t REG_DWORD /d 1 /f
 ```
 
-Same scale and curve, capped at 100; with the value unset greyscale text is
-bit-identical. DirectWrite's default for its greyscale enhanced contrast is 1.0, so 100
-is the value closest to Windows — Wine's dwrite reports that 1.0 as well, which is why
-the branch does not apply it unasked. Measured with Segoe UI at 12 px on a premultiplied
-target: +12 % ink at 50, +17 % at 70, +24 % at 100, the same in both polarities, and
-transparent backgrounds stay valid premultiplied. Linear blending remains ClearType-only.
+Gamma and greyscale contrast come from the DirectWrite rendering parameters, as on
+Windows; text in a gradient or bitmap brush keeps the plain coverage. Measured against
+Windows 10 with Segoe UI at 12 px on a premultiplied target, as extra ink over the bare
+coverage: light-on-dark text +12.8 % on Windows and +13.5 % here, dark-on-light +2.7 %
+and +3.9 %, black on white -2.7 % and -2.3 % — with Windows' parameters (gamma 1.8). Wine's
+dwrite reports gamma 2.0, which makes light text about three points heavier than that.
+Bold and larger text stay a few points above Windows, from FreeType's coverage rather
+than the blend. With the value unset, greyscale text is bit-identical. An earlier
+`text_grayscale_enhanced_contrast` applied the ClearType curve above to every greyscale
+pixel regardless of colour; it made dark text on light backgrounds blotchy and was
+replaced by this.
 
 Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
