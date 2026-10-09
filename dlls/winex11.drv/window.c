@@ -1753,6 +1753,13 @@ static void update_net_wm_states( struct x11drv_win_data *data )
     else if (style & WS_MAXIMIZE)
         new_state |= (1 << NET_WM_STATE_MAXIMIZED);
 
+    /* A fullscreen state the window manager set on its own (KWin's fullscreen action on a
+     * maximized window) has no win32 counterpart: the window stays maximized with its caption,
+     * and the request above would ask for MAXIMIZED alone as soon as the fullscreen config is
+     * applied, taking the window out of fullscreen again. Keep it while the window is maximized. */
+    if (data->wm_fullscreen && (style & (WS_MAXIMIZE | WS_MINIMIZE)) == WS_MAXIMIZE && (style & WS_CAPTION) == WS_CAPTION)
+        new_state |= (1 << NET_WM_STATE_FULLSCREEN);
+
     ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
     if (ex_style & WS_EX_TOPMOST)
         new_state |= (1 << NET_WM_STATE_ABOVE);
@@ -2257,6 +2264,7 @@ void window_net_wm_state_notify( struct x11drv_win_data *data, unsigned long ser
 {
     UINT *desired = &data->desired_state.net_wm_state, *pending = &data->pending_state.net_wm_state, *current = &data->current_state.net_wm_state;
     unsigned long *expect_serial = &data->net_wm_state_serial;
+    UINT requested = *expect_serial ? *pending : *current;
     const char *expected, *received, *prefix;
 
     prefix = wine_dbg_sprintf( "window %p/%lx ", data->hwnd, data->whole_window );
@@ -2267,6 +2275,13 @@ void window_net_wm_state_notify( struct x11drv_win_data *data, unsigned long ser
                               current, expected, prefix, received, NULL ))
         return;
     if (value & (1 << NET_WM_STATE_MAXIMIZED)) data->unmaximize_retry = FALSE;
+    /* a fullscreen state we did not ask for is the window manager's own, remember it until it is gone */
+    if (!(value & (1 << NET_WM_STATE_FULLSCREEN))) data->wm_fullscreen = FALSE;
+    else if (!(requested & (1 << NET_WM_STATE_FULLSCREEN)))
+    {
+        TRACE( "window %p/%lx fullscreen set by the window manager\n", data->hwnd, data->whole_window );
+        data->wm_fullscreen = TRUE;
+    }
 
     /* send any pending changes from the desired state */
     window_request_desired_state( data );
@@ -3048,6 +3063,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     data->wm_normal_hints_serial = 0;
     data->configure_serial = 0;
     data->net_wm_icon_serial = 0;
+    data->wm_fullscreen = FALSE;
     data->reparenting = 0;
 
     if (data->xic)
