@@ -1383,8 +1383,10 @@ static HRESULT WINAPI dwritefactory_CreateMonitorRenderingParams(IDWriteFactory7
         }
     }
 
-    /* FIXME: use actual per-monitor gamma factor */
-    hr = IDWriteFactory7_CreateCustomRenderingParams(iface, 2.0f, 0.0f, 1.0f, cleartype_level, geometry,
+    /* FIXME: use actual per-monitor gamma factor. Until then report what Windows 10
+     * does for a display nobody has tuned: 1.8. Direct2D's greyscale text blend
+     * picks its gamma correction from this value. */
+    hr = IDWriteFactory7_CreateCustomRenderingParams(iface, 1.8f, 0.0f, 1.0f, cleartype_level, geometry,
         DWRITE_RENDERING_MODE1_DEFAULT, DWRITE_GRID_FIT_MODE_DEFAULT, &params3);
     *params = (IDWriteRenderingParams*)params3;
     return hr;
