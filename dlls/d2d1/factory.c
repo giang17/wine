@@ -1696,12 +1696,10 @@ static void d2d_settings_init(void)
                 d2d_settings.text_enhanced_contrast);
     }
 
-    if (get_config_key_u32(default_key, application_key, "text_grayscale_enhanced_contrast",
-            &d2d_settings.text_grayscale_enhanced_contrast))
+    if (get_config_key_u32(default_key, application_key, "text_grayscale_blend", &value) && value)
     {
-        d2d_settings.text_grayscale_enhanced_contrast_set = TRUE;
-        ERR_(winediag)("Overriding greyscale enhanced contrast with %u/100.\n",
-                d2d_settings.text_grayscale_enhanced_contrast);
+        d2d_settings.text_grayscale_blend = TRUE;
+        ERR_(winediag)("Blending greyscale text with DirectWrite's contrast and gamma correction.\n");
     }
 
     if (get_config_key_u32(default_key, application_key, "text_linear_blend", &value) && value)
