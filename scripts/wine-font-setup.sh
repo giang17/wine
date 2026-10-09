@@ -687,17 +687,25 @@ printf '%s\n' "$(fontlink_block)" | grep -q '^"DejaVu Sans"=.*NotoSansSymbols2' 
     echo "       Is '$WINE' the right binary for this prefix?" >&2
     ok=0; }
 if [ "$DO_RENDERING" -eq 1 ]; then
-    for _ in $(seq 1 15); do
-        [ -n "$(reg_value "$USERREG" 'Software\\Wine\\DirectWrite' outline_in_natural_modes)" ] && break
-        sleep 1
-    done
     # Single quotes: in double quotes the shell would collapse the doubled
     # backslashes of a registry path into single ones and nothing would match.
-    for kv in 'Software\\Wine\\Direct2D:text_linear_blend' \
-              'Software\\Wine\\Direct2D:text_grayscale_blend' \
-              'Software\\Wine\\Direct2D:text_cleartype_blend' \
-              'Software\\Wine\\DirectWrite:outline_in_natural_modes' \
-              'Control Panel\\Desktop:FontSmoothingType'; do
+    switches=('Software\\Wine\\Direct2D:text_linear_blend'
+              'Software\\Wine\\Direct2D:text_grayscale_blend'
+              'Software\\Wine\\Direct2D:text_cleartype_blend'
+              'Software\\Wine\\DirectWrite:outline_in_natural_modes'
+              'Control Panel\\Desktop:FontSmoothingType')
+    # The wineserver writes user.reg a moment after the last reg add returns,
+    # so wait for every value, not for one of them: on a prefix that already
+    # had the others, a check right away misses the value added last.
+    for _ in $(seq 1 15); do
+        missing=0
+        for kv in "${switches[@]}"; do
+            [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || missing=1
+        done
+        [ "$missing" -eq 0 ] && break
+        sleep 1
+    done
+    for kv in "${switches[@]}"; do
         [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {
             echo "ERROR: ${kv##*:} did not appear in $USERREG." >&2; ok=0; }
     done
