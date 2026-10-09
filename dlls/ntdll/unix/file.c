@@ -1706,19 +1706,27 @@ static NTSTATUS get_handle_link_unix_name( HANDLE handle, char **unix_name )
 }
 
 
-/* is the handle a symlink to a directory?  Those are reported as IO_REPARSE_TAG_SYMLINK
- * reparse points (see get_file_info); fstat() follows the link, so handle-based queries
- * have to look at the name. */
-static BOOL handle_is_unix_dir_symlink( HANDLE handle )
+/* <config_dir>/dosdevices/x:[/]: a drive root is a plain directory on Windows, even
+ * though the dosdevices entry is a symlink and the directory it points to may be a
+ * mount point (Z: -> /, WineHQ bug 54903) */
+static BOOL is_drive_root_unix_name( const char *path )
 {
-    char *unix_name;
-    struct stat st;
-    BOOL ret;
+    size_t len = strlen( config_dir ), path_len = strlen( path );
 
-    if (get_handle_link_unix_name( handle, &unix_name )) return FALSE;
-    ret = !lstat( unix_name, &st ) && S_ISLNK( st.st_mode ) && !stat( unix_name, &st ) && S_ISDIR( st.st_mode );
-    free( unix_name );
-    return ret;
+    if (path_len && path[path_len - 1] == '/') path_len--;
+    return path_len == len + 14 && !strncmp( path, config_dir, len )
+           && !strncmp( path + len, "/dosdevices/", 12 ) && path[len + 13] == ':';
+}
+
+
+/* a symlink to a directory is reported as an IO_REPARSE_TAG_SYMLINK reparse point
+ * (see get_file_info); fstat() follows the link, so handle-based queries have to
+ * look at the name */
+static BOOL is_unix_dir_symlink( const char *unix_name )
+{
+    struct stat st;
+
+    return !lstat( unix_name, &st ) && S_ISLNK( st.st_mode ) && !stat( unix_name, &st ) && S_ISDIR( st.st_mode );
 }
 
 
@@ -1741,19 +1749,25 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
         *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
         if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
     }
-    /* consider mount points to be reparse points (IO_REPARSE_TAG_MOUNT_POINT) */
+    /* consider mount points and directory symlinks to be reparse points, except for
+     * drive roots (the server keeps the resolved unix name, so look at the NT name) */
     if (options & FILE_OPEN_REPARSE_POINT)
     {
-        if (fd_is_mount_point( fd, st ))
+        char *unix_name = NULL;
+
+        if (get_handle_link_unix_name( handle, &unix_name )) unix_name = NULL;
+        if (unix_name && is_drive_root_unix_name( unix_name )) ;
+        else if (fd_is_mount_point( fd, st ))
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_MOUNT_POINT;
         }
-        else if (handle_is_unix_dir_symlink( handle ))
+        else if (unix_name && is_unix_dir_symlink( unix_name ))
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_SYMLINK;
         }
+        free( unix_name );
     }
 
     attr_len = xattr_fget( fd, XATTR_REPARSE, buffer, sizeof(buffer) );
@@ -1850,8 +1864,8 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
         /* is a symbolic link and a directory, consider these "reparse points";
          * reported as a Windows symlink, whose reparse data FSCTL_GET_REPARSE_POINT
          * can serve (IO_REPARSE_TAG_LX_SYMLINK carries no data applications can
-         * resolve, see get_unix_symlink_reparse_data) */
-        if (S_ISDIR( st->st_mode ))
+         * resolve, see get_unix_symlink_reparse_data); a drive root is not one */
+        if (S_ISDIR( st->st_mode ) && !is_drive_root_unix_name( path ))
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_SYMLINK;
@@ -1863,7 +1877,7 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
         *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
         if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
     }
-    else if (S_ISDIR( st->st_mode ) && (parent_path = malloc( len + 4 )))
+    else if (S_ISDIR( st->st_mode ) && !is_drive_root_unix_name( path ) && (parent_path = malloc( len + 4 )))
     {
         struct stat parent_st;
 
@@ -6729,12 +6743,10 @@ static NTSTATUS get_unix_symlink_reparse_data( HANDLE handle, void *out_buffer, 
     REPARSE_DATA_BUFFER *data;
     unsigned int nt_len, print_len, total, copy;
     NTSTATUS status = STATUS_NOT_A_REPARSE_POINT;
-    struct stat st;
     ssize_t len;
 
     if (get_handle_link_unix_name( handle, &unix_name )) return STATUS_NOT_A_REPARSE_POINT;
-    if (lstat( unix_name, &st ) || !S_ISLNK( st.st_mode ) || stat( unix_name, &st ) || !S_ISDIR( st.st_mode ))
-        goto done;
+    if (is_drive_root_unix_name( unix_name ) || !is_unix_dir_symlink( unix_name )) goto done;
     if ((len = readlink( unix_name, link, PATH_MAX )) < 0) goto done;
     link[len] = 0;
 
