@@ -3254,8 +3254,33 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
         ERR("Failed to allocate glyph mask plane.\n");
         goto done;
     }
-    for (y = 0; y < height; ++y)
-        memcpy(&plane[y * pitch], &mask->coverage[(size_t)y * width], width);
+
+    /* The same curve the ClearType path applies per channel, here on the one
+     * greyscale sample. Empty and fully covered pixels keep their value, so
+     * the run does not grow; only the edges gain weight. */
+    if (d2d_settings.text_grayscale_enhanced_contrast_set && d2d_settings.text_grayscale_enhanced_contrast)
+    {
+        float contrast = min(d2d_settings.text_grayscale_enhanced_contrast, 100) / 100.0f;
+        unsigned int i, x;
+        BYTE ramp[256];
+
+        for (i = 0; i < ARRAY_SIZE(ramp); ++i)
+            ramp[i] = min(max((int)(d2d_apply_enhanced_contrast(i, contrast) + 0.5f), 0), 255);
+
+        for (y = 0; y < height; ++y)
+        {
+            const BYTE *src = &mask->coverage[(size_t)y * width];
+            BYTE *dst = &plane[y * pitch];
+
+            for (x = 0; x < width; ++x)
+                dst[x] = ramp[src[x]];
+        }
+    }
+    else
+    {
+        for (y = 0; y < height; ++y)
+            memcpy(&plane[y * pitch], &mask->coverage[(size_t)y * width], width);
+    }
 
     scale_x = context->desc.dpiX / 96.0f;
     scale_y = context->desc.dpiY / 96.0f;

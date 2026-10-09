@@ -113,6 +113,16 @@ struct d2d_settings
      * which keeps the default behaviour bit-identical. */
     unsigned int text_enhanced_contrast;
     BOOL text_enhanced_contrast_set;
+    /* Enhanced contrast for greyscale text, in hundredths. Greyscale is what
+     * every target with an alpha channel gets, since ClearType needs an
+     * opaque one. DirectWrite keeps a separate value for it
+     * (IDWriteRenderingParams1::GetGrayscaleEnhancedContrast, 1.0 by default
+     * on Windows), but the greyscale path takes the coverage as dwrite
+     * produced it. Honouring the reported 1.0 would change every greyscale
+     * run, so only this override applies it; absent keeps the coverage
+     * unchanged, bit-identical to not having the setting at all. */
+    unsigned int text_grayscale_enhanced_contrast;
+    BOOL text_grayscale_enhanced_contrast_set;
     /* Blend ClearType text in linear space instead of in the target's encoded
      * space. Off by default: it needs a copy of the destination per glyph run,
      * and it deliberately departs from what Direct2D does on a plain UNORM

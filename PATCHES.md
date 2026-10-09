@@ -876,6 +876,25 @@ On a **light** background the effect works against you — there the same settin
 text look heavy. Watch small sizes if you go high: at 11px a strong setting can start
 closing the counters in `e`, `a` and `g`.
 
+All of the above reaches ClearType text only. Direct2D draws ClearType on opaque
+targets alone, so text on a target with an alpha channel is greyscale, and that covers
+whole interfaces: Cubase 15's Hub draws everything into premultiplied DirectComposition
+surfaces, and its light-on-dark sidebar looked thin however the ClearType settings
+were tuned. Greyscale text has a value of its own:
+
+```bash
+wine reg add 'HKCU\Software\Wine\Direct2D' /v text_grayscale_enhanced_contrast /t REG_DWORD /d 100 /f
+# or for one application only:
+wine reg add 'HKCU\Software\Wine\AppDefaults\Cubase15.exe\Direct2D' /v text_grayscale_enhanced_contrast /t REG_DWORD /d 100 /f
+```
+
+Same scale and curve, capped at 100; with the value unset greyscale text is
+bit-identical. DirectWrite's default for its greyscale enhanced contrast is 1.0, so 100
+is the value closest to Windows — Wine's dwrite reports that 1.0 as well, which is why
+the branch does not apply it unasked. Measured with Segoe UI at 12 px on a premultiplied
+target: +12 % ink at 50, +17 % at 70, +24 % at 100, the same in both polarities, and
+transparent backgrounds stay valid premultiplied. Linear blending remains ClearType-only.
+
 Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
 fallback through `GetGlyphIndices`. That one has its own project:
