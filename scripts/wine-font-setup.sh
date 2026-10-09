@@ -242,7 +242,7 @@ have_link=0
 mangled_links=$(printf '%s\n' "$blk" \
     | grep -cE '^"[^"]+"=str\(7\):"([^\\]\\0){3}' 2>/dev/null) || mangled_links=0
 
-# The rendering switches sit in HKCU, so they are in user.reg.  All three are
+# The rendering switches sit in HKCU, so they are in user.reg.  All of them are
 # read once when d2d1/dwrite load, so a running application does not pick up a
 # change — it has to be restarted.
 reg_value() {  # <file> <section> <value>
@@ -261,6 +261,7 @@ have_rendering=0
 {
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_linear_blend)" ] &&
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_grayscale_blend)" ] &&
+    [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_cleartype_blend)" ] &&
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\DirectWrite' outline_in_natural_modes)" ] &&
     [ "$(reg_value "$USERREG" 'Control Panel\\Desktop' FontSmoothingType)" \
         = '"FontSmoothingType"=dword:00000002' ] &&
@@ -594,19 +595,28 @@ fi
 #   text_grayscale_blend      greyscale text (every target with an alpha channel,
 #                             e.g. DirectComposition surfaces) with DirectWrite's
 #                             contrast and gamma correction, as Windows draws it
+#   text_cleartype_blend      the same for ClearType text, per subpixel channel;
+#                             takes precedence over text_linear_blend for text in
+#                             a solid colour, and needs the contrast: Wine's dwrite
+#                             reports 0 where Windows reports 0.5
 #   outline_in_natural_modes  rasterise from the outline instead of an embedded
 #                             bitmap strike, so hinted fonts keep their shape
 if [ "$DO_RENDERING" -eq 1 ]; then
     echo "  setting the text rendering switches..."
     # Contrast is a matter of taste — winecfg offers Off/50/70 in the graphics
     # tab, and stores Off as the absence of the value, which looks exactly like
-    # a prefix this script has never seen.  The other switch tells the two
+    # a prefix this script has never seen.  The other switches tell the two
     # apart: with text_linear_blend already set this script has run before, and
     # an absent contrast is somebody's choice.  Never overwrite that silently;
     # write the contrast on the first run or when --contrast says so explicitly.
+    # The one exception is the first run that sets text_cleartype_blend: a
+    # choice of Off was made under the old curve, where the contrast reached
+    # every text colour, and the new blend without a contrast takes a quarter of
+    # the ink from black text on white.
     cur_contrast=$(reg_value "$USERREG" 'Software\\Wine\\Direct2D' text_enhanced_contrast)
     cur_blend=$(reg_value "$USERREG" 'Software\\Wine\\Direct2D' text_linear_blend)
-    if [ "$CONTRAST_EXPLICIT" -eq 1 ] || { [ -z "$cur_contrast" ] && [ -z "$cur_blend" ]; }; then
+    cur_ctblend=$(reg_value "$USERREG" 'Software\\Wine\\Direct2D' text_cleartype_blend)
+    if [ "$CONTRAST_EXPLICIT" -eq 1 ] || { [ -z "$cur_contrast" ] && { [ -z "$cur_blend" ] || [ -z "$cur_ctblend" ]; }; }; then
         echo "    enhanced contrast: $CONTRAST"
         WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
             /v text_enhanced_contrast /t REG_DWORD /d "$CONTRAST" /f </dev/null >/dev/null 2>&1
@@ -619,6 +629,8 @@ if [ "$DO_RENDERING" -eq 1 ]; then
         /v text_linear_blend /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
     WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
         /v text_grayscale_blend /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
+    WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
+        /v text_cleartype_blend /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
     WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\DirectWrite' \
         /v outline_in_natural_modes /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
     # Everything above builds on the system font smoothing type.  Wine defaults
@@ -683,6 +695,7 @@ if [ "$DO_RENDERING" -eq 1 ]; then
     # backslashes of a registry path into single ones and nothing would match.
     for kv in 'Software\\Wine\\Direct2D:text_linear_blend' \
               'Software\\Wine\\Direct2D:text_grayscale_blend' \
+              'Software\\Wine\\Direct2D:text_cleartype_blend' \
               'Software\\Wine\\DirectWrite:outline_in_natural_modes' \
               'Control Panel\\Desktop:FontSmoothingType'; do
         [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {
