@@ -260,6 +260,7 @@ reg_value() {  # <file> <section> <value>
 have_rendering=0
 {
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_linear_blend)" ] &&
+    [ -n "$(reg_value "$USERREG" 'Software\\Wine\\Direct2D'    text_grayscale_blend)" ] &&
     [ -n "$(reg_value "$USERREG" 'Software\\Wine\\DirectWrite' outline_in_natural_modes)" ] &&
     [ "$(reg_value "$USERREG" 'Control Panel\\Desktop' FontSmoothingType)" \
         = '"FontSmoothingType"=dword:00000002' ] &&
@@ -583,12 +584,16 @@ if [ "$have_subst" -eq 0 ]; then
 fi
 
 # --- 4b. text rendering switches ---------------------------------------------
-# This branch renders ClearType text closer to what Windows does, but every part
-# of it is opt-in: the code reads these values once at startup and falls back to
-# stock behaviour when they are absent.  Without them a plug-in GUI looks like
-# the fix was never built, which is indistinguishable from a broken build.
+# This branch renders ClearType and greyscale text closer to what Windows does,
+# but every part of it is opt-in: the code reads these values once at startup
+# and falls back to stock behaviour when they are absent.  Without them a plug-in
+# GUI looks like the fix was never built, which is indistinguishable from a
+# broken build.
 #   text_enhanced_contrast    stem darkening, in hundredths.  Windows uses 50.
 #   text_linear_blend         blend subpixel coverage in linear space
+#   text_grayscale_blend      greyscale text (every target with an alpha channel,
+#                             e.g. DirectComposition surfaces) with DirectWrite's
+#                             contrast and gamma correction, as Windows draws it
 #   outline_in_natural_modes  rasterise from the outline instead of an embedded
 #                             bitmap strike, so hinted fonts keep their shape
 if [ "$DO_RENDERING" -eq 1 ]; then
@@ -612,6 +617,8 @@ if [ "$DO_RENDERING" -eq 1 ]; then
     fi
     WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
         /v text_linear_blend /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
+    WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\Direct2D' \
+        /v text_grayscale_blend /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
     WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE" reg add 'HKCU\Software\Wine\DirectWrite' \
         /v outline_in_natural_modes /t REG_DWORD /d 1 /f </dev/null >/dev/null 2>&1
     # Everything above builds on the system font smoothing type.  Wine defaults
@@ -675,6 +682,7 @@ if [ "$DO_RENDERING" -eq 1 ]; then
     # Single quotes: in double quotes the shell would collapse the doubled
     # backslashes of a registry path into single ones and nothing would match.
     for kv in 'Software\\Wine\\Direct2D:text_linear_blend' \
+              'Software\\Wine\\Direct2D:text_grayscale_blend' \
               'Software\\Wine\\DirectWrite:outline_in_natural_modes' \
               'Control Panel\\Desktop:FontSmoothingType'; do
         [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {

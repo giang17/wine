@@ -721,9 +721,10 @@ Three of those steps matter more than they look:
   scripts/wine-font-setup.sh --prefix ~/.wine --check
   ```
 
-  The values themselves are `text_enhanced_contrast` and `text_linear_blend`
-  under `HKCU\Software\Wine\Direct2D`, and `outline_in_natural_modes` under
-  `HKCU\Software\Wine\DirectWrite`. Enhanced contrast is also in winecfg's
+  The values themselves are `text_enhanced_contrast`, `text_linear_blend` and
+  `text_grayscale_blend` under `HKCU\Software\Wine\Direct2D`, and
+  `outline_in_natural_modes` under `HKCU\Software\Wine\DirectWrite`. Enhanced
+  contrast is also in winecfg's
   graphics tab (*Off* / *Medium (50)* / *Strong (70)*). winecfg stores *Off* as
   the absence of the value, so the script writes a contrast only on its first run
   (when no switch is set yet) or when `--contrast N` is given; a choice made
@@ -884,7 +885,8 @@ were tuned. Wine handed greyscale coverage through unchanged; DirectWrite does n
 applies its greyscale enhanced contrast only to dark text (scaled down to nothing as the
 text colour gets light) and then corrects the coverage for the gamma of a blend in
 encoded space, which gives light text weight and takes most of the contrast back from
-dark text. The branch does the same when asked to:
+dark text. The branch does the same when asked to; `scripts/wine-font-setup.sh` sets it
+with the other text switches:
 
 ```bash
 wine reg add 'HKCU\Software\Wine\Direct2D' /v text_grayscale_blend /t REG_DWORD /d 1 /f
