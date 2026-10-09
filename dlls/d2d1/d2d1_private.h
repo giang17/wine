@@ -119,6 +119,13 @@ struct d2d_settings
      * gets, since ClearType needs an opaque one. Off by default, which keeps
      * the coverage exactly as dwrite produced it. */
     BOOL text_grayscale_blend;
+    /* Blend ClearType text the way DirectWrite does: the enhanced contrast
+     * scaled down for light text, then the gamma alpha correction per channel
+     * with that channel of the text colour as its intensity, blended in the
+     * target's encoded space. Takes precedence over text_linear_blend for a
+     * run in a solid colour. Off by default, which keeps the subpixel path
+     * exactly as it was. */
+    BOOL text_cleartype_blend;
     /* Blend ClearType text in linear space instead of in the target's encoded
      * space. Off by default: it needs a copy of the destination per glyph run,
      * and it deliberately departs from what Direct2D does on a plain UNORM
