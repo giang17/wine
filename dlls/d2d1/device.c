@@ -2890,30 +2890,31 @@ static const float d2d_text_gamma_ratios[13][4] =
     {0.2031f, -1.3864f, 1.9851f, -0.3501f}, /* 2.2 */
 };
 
-/* Coverage mapping for one greyscale run in a solid colour. DirectWrite scales
- * the greyscale enhanced contrast down to nothing for light text, applies it,
- * and then corrects the result for the gamma of a blend in encoded space:
- * light text gains weight, dark text gives back most of what the contrast
- * added. Both steps depend on the text colour, so the mapping is built per
- * run. Measured against Windows 10 with the same Segoe UI runs and its
- * parameters (gamma 1.8, greyscale contrast 1.0), the ink this adds agrees
- * with Direct2D's to about one percentage point at 12 px in both polarities;
- * bold and larger text stay a few points above, which comes from FreeType's
- * coverage rather than from the blend. */
-static void d2d_text_grayscale_ramp(IDWriteRenderingParams *params, const D2D1_COLOR_F *colour, BYTE *ramp)
+/* DirectWrite's enhanced contrast depends on the text colour: the full value
+ * for dark text, scaled down to nothing as the colour gets light. */
+static float d2d_text_contrast_for_colour(float contrast, const D2D1_COLOR_F *colour)
 {
-    float r, g, b, gamma, contrast = 1.0f, lightness, intensity, k, ratios[4];
-    IDWriteRenderingParams1 *params1;
-    unsigned int i, index;
+    float r, g, b, lightness;
 
-    gamma = IDWriteRenderingParams_GetGamma(params);
-    if (SUCCEEDED(IDWriteRenderingParams_QueryInterface(params, &IID_IDWriteRenderingParams1, (void **)&params1)))
-    {
-        contrast = IDWriteRenderingParams1_GetGrayscaleEnhancedContrast(params1);
-        IDWriteRenderingParams1_Release(params1);
-    }
-    if (!(contrast >= 0.0f))
-        contrast = 0.0f;
+    r = min(max(colour->r, 0.0f), 1.0f);
+    g = min(max(colour->g, 0.0f), 1.0f);
+    b = min(max(colour->b, 0.0f), 1.0f);
+    lightness = 0.30f * r + 0.59f * g + 0.11f * b;
+
+    return contrast * min(max(4.0f * (0.75f - lightness), 0.0f), 1.0f);
+}
+
+/* Coverage mapping for one text channel. DirectWrite applies the enhanced
+ * contrast k, and then corrects the result for the gamma of a blend in encoded
+ * space with the intensity of the text colour in that channel: light text
+ * gains weight, dark text gives back most of what the contrast added. */
+static void d2d_text_blend_ramp(float gamma, float k, float intensity, BYTE *ramp)
+{
+    unsigned int i, index;
+    float ratios[4];
+
+    if (!(k >= 0.0f))
+        k = 0.0f;
     if (!(gamma >= 1.0f))
         gamma = 1.0f;
     else if (gamma > 2.2f)
@@ -2924,13 +2925,6 @@ static void d2d_text_grayscale_ramp(IDWriteRenderingParams *params, const D2D1_C
     ratios[2] = d2d_text_gamma_ratios[index][2] * 65536.0f / (255.0f * 255.0f);
     ratios[3] = d2d_text_gamma_ratios[index][3] * 256.0f / 255.0f;
 
-    r = min(max(colour->r, 0.0f), 1.0f);
-    g = min(max(colour->g, 0.0f), 1.0f);
-    b = min(max(colour->b, 0.0f), 1.0f);
-    lightness = 0.30f * r + 0.59f * g + 0.11f * b;
-    intensity = 0.25f * r + 0.50f * g + 0.25f * b;
-    k = contrast * min(max(4.0f * (0.75f - lightness), 0.0f), 1.0f);
-
     for (i = 0; i < 256; ++i)
     {
         float a = i / 255.0f;
@@ -2939,6 +2933,35 @@ static void d2d_text_grayscale_ramp(IDWriteRenderingParams *params, const D2D1_C
         a += a * (1.0f - a) * ((ratios[0] * intensity + ratios[1]) * a + (ratios[2] * intensity + ratios[3]));
         ramp[i] = min(max((int)(a * 255.0f + 0.5f), 0), 255);
     }
+}
+
+/* Coverage mapping for one greyscale run in a solid colour, from the
+ * rendering parameters' gamma and greyscale enhanced contrast and the
+ * luminance of the text colour. Measured against Windows 10 with the same
+ * Segoe UI runs and its parameters (gamma 1.8, greyscale contrast 1.0), the
+ * ink this adds agrees with Direct2D's to about one percentage point at 12 px
+ * in both polarities; bold and larger text stay a few points above, which
+ * comes from FreeType's coverage rather than from the blend. */
+static void d2d_text_grayscale_ramp(IDWriteRenderingParams *params, const D2D1_COLOR_F *colour, BYTE *ramp)
+{
+    float r, g, b, contrast = 1.0f, intensity;
+    IDWriteRenderingParams1 *params1;
+
+    if (SUCCEEDED(IDWriteRenderingParams_QueryInterface(params, &IID_IDWriteRenderingParams1, (void **)&params1)))
+    {
+        contrast = IDWriteRenderingParams1_GetGrayscaleEnhancedContrast(params1);
+        IDWriteRenderingParams1_Release(params1);
+    }
+    if (!(contrast >= 0.0f))
+        contrast = 0.0f;
+
+    r = min(max(colour->r, 0.0f), 1.0f);
+    g = min(max(colour->g, 0.0f), 1.0f);
+    b = min(max(colour->b, 0.0f), 1.0f);
+    intensity = 0.25f * r + 0.50f * g + 0.25f * b;
+
+    d2d_text_blend_ramp(IDWriteRenderingParams_GetGamma(params),
+            d2d_text_contrast_for_colour(contrast, colour), intensity, ramp);
 }
 
 /* One coverage mask for all the glyph runs a device context draws.
@@ -3124,7 +3147,7 @@ static void d2d_device_context_fill_glyph_rect(struct d2d_device_context *contex
 
 static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_context *context,
         struct d2d_glyph_mask *mask, ID2D1Brush *brush, unsigned int width, unsigned int height,
-        const RECT *bounds, DWRITE_PIXEL_GEOMETRY pixel_geometry, float cleartype_level,
+        const RECT *bounds, DWRITE_PIXEL_GEOMETRY pixel_geometry, float gamma, float cleartype_level,
         float enhanced_contrast)
 {
     D2D1_ANTIALIAS_MODE antialias_mode = context->drawing_state.antialiasMode;
@@ -3135,10 +3158,12 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
     D2D1_MATRIX_3X2_F *transform, m;
     struct d2d_brush *mask_brush;
     unsigned int c, x, y, pitch;
+    BOOL linear, temporary;
+    BOOL dwrite_blend = FALSE;
     float scale_x, scale_y;
     D2D1_RECT_F run_rect;
-    BOOL linear, temporary;
     HRESULT hr = S_OK;
+    BYTE ramps[3][256];
     BYTE *plane;
 
     if (!width || !height)
@@ -3152,10 +3177,27 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
     d2d_rect_set(&run_rect, bounds->left / scale_x, bounds->top / scale_y,
             bounds->right / scale_x, bounds->bottom / scale_y);
 
+    /* DirectWrite's own blend: the contrast scaled for the text colour, then
+     * the gamma alpha correction per channel with that channel of the colour
+     * as its intensity, and the result blended in encoded space — the
+     * correction already accounts for that, so a linear blend on top would
+     * correct twice. The mapping needs the text colour; a gradient or bitmap
+     * brush has no single one and keeps the path below. */
+    if (d2d_settings.text_cleartype_blend && brush_impl->type == D2D_BRUSH_TYPE_SOLID)
+    {
+        const D2D1_COLOR_F *colour = &brush_impl->u.solid.color;
+        float k = d2d_text_contrast_for_colour(enhanced_contrast, colour);
+
+        d2d_text_blend_ramp(gamma, k, min(max(colour->r, 0.0f), 1.0f), ramps[0]);
+        d2d_text_blend_ramp(gamma, k, min(max(colour->g, 0.0f), 1.0f), ramps[1]);
+        d2d_text_blend_ramp(gamma, k, min(max(colour->b, 0.0f), 1.0f), ramps[2]);
+        dwrite_blend = TRUE;
+    }
+
     /* Linear blending needs the destination, which the output merger cannot
      * supply through a transfer function. Take a copy of it and let the shader
      * finish the blend; if that is not available, stay on the ordinary path. */
-    linear = d2d_settings.text_linear_blend
+    linear = !dwrite_blend && d2d_settings.text_linear_blend
             && d2d_device_context_capture_text_dst(context, bounds, width, height);
 
     for (c = 0; c < 3; ++c)
@@ -3190,6 +3232,12 @@ static HRESULT d2d_device_context_draw_glyph_run_subpixel(struct d2d_device_cont
                 const BYTE *pixel = &coverage[((size_t)y * width + x) * 3];
                 int gray = (pixel[0] + pixel[1] + pixel[2] + 1) / 3;
                 float value = gray + cleartype_level * (pixel[sample] - gray);
+
+                if (dwrite_blend)
+                {
+                    plane[y * pitch + x] = ramps[c][min(max((int)(value + 0.5f), 0), 255)];
+                    continue;
+                }
 
                 value = d2d_apply_enhanced_contrast(value, enhanced_contrast);
 
@@ -3314,7 +3362,7 @@ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *
         TRACE("ClearType blend parameters: gamma %.3f, contrast %.3f, level %.3f, geometry %u.\n",
                 gamma, contrast, cleartype_level, pixel_geometry);
         hr = d2d_device_context_draw_glyph_run_subpixel(context, mask, brush,
-                width, height, &bounds, pixel_geometry, cleartype_level, contrast);
+                width, height, &bounds, pixel_geometry, gamma, cleartype_level, contrast);
         if (FAILED(hr))
             d2d_device_context_set_error(context, hr);
         goto done;

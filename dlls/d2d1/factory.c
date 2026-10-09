@@ -1702,6 +1702,12 @@ static void d2d_settings_init(void)
         ERR_(winediag)("Blending greyscale text with DirectWrite's contrast and gamma correction.\n");
     }
 
+    if (get_config_key_u32(default_key, application_key, "text_cleartype_blend", &value) && value)
+    {
+        d2d_settings.text_cleartype_blend = TRUE;
+        ERR_(winediag)("Blending ClearType text with DirectWrite's contrast and gamma correction.\n");
+    }
+
     if (get_config_key_u32(default_key, application_key, "text_linear_blend", &value) && value)
     {
         d2d_settings.text_linear_blend = TRUE;

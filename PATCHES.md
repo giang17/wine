@@ -721,8 +721,8 @@ Three of those steps matter more than they look:
   scripts/wine-font-setup.sh --prefix ~/.wine --check
   ```
 
-  The values themselves are `text_enhanced_contrast`, `text_linear_blend` and
-  `text_grayscale_blend` under `HKCU\Software\Wine\Direct2D`, and
+  The values themselves are `text_enhanced_contrast`, `text_linear_blend`,
+  `text_grayscale_blend` and `text_cleartype_blend` under `HKCU\Software\Wine\Direct2D`, and
   `outline_in_natural_modes` under `HKCU\Software\Wine\DirectWrite`. Enhanced
   contrast is also in winecfg's
   graphics tab (*Off* / *Medium (50)* / *Strong (70)*). winecfg stores *Off* as
@@ -848,7 +848,9 @@ bit-identical. Two things worth knowing: it deliberately departs from Direct2D o
 plain UNORM target, where Windows blends in encoded values; and the cheaper route —
 an `_SRGB` render target view — does not work in Wine, because wined3d honours the
 sRGB cast only for swapchains with a single back buffer, so the blend is finished in
-the shader instead.
+the shader instead. `text_cleartype_blend` (see *Enhanced contrast*) reproduces what
+Windows does instead and takes precedence for text in a solid colour; the linear blend
+then only reaches gradient and bitmap brushes.
 
 ### Enhanced contrast — worth setting on a dark interface
 
@@ -862,10 +864,12 @@ wine reg add 'HKCU\Software\Wine\Direct2D' /v text_enhanced_contrast /t REG_DWOR
 wineserver -k    # the value is read when d2d1 loads, so restart the application
 ```
 
-The value is in hundredths; deleting it restores the default. It raises partial
-coverage while leaving fully covered and empty samples alone, so at 0 — the default
-— rendering is bit-identical to not having the feature at all. `AppDefaults` works
-as for the other keys, so it can be set for a single application.
+The value is in hundredths; deleting it restores the default. On its own it raises
+partial coverage while leaving fully covered and empty samples alone, so at 0 — the
+default — rendering is bit-identical to not having the feature at all. `AppDefaults`
+works as for the other keys, so it can be set for a single application. With
+`text_cleartype_blend` (below) the value feeds DirectWrite's own curve instead, where
+it only reaches dark text.
 
 | value | when |
 |---|---|
@@ -905,6 +909,28 @@ than the blend. With the value unset, greyscale text is bit-identical. An earlie
 `text_grayscale_enhanced_contrast` applied the ClearType curve above to every greyscale
 pixel regardless of colour; it made dark text on light backgrounds blotchy and was
 replaced by this.
+
+ClearType text gets the same treatment on request. DirectWrite scales the enhanced
+contrast for the text colour as above, applies it per subpixel channel, corrects each
+channel for the gamma of an encoded-space blend with that channel of the text colour as
+its intensity, and blends in encoded space. The branch's own curve ignored the colour,
+and `text_linear_blend` on top of it corrected the gamma a second time: with Windows'
+parameters black on white lost 22 % of its ink against 10 % on Windows, and without
+the contrast 35 %.
+
+```bash
+wine reg add 'HKCU\Software\Wine\Direct2D' /v text_cleartype_blend /t REG_DWORD /d 1 /f
+wine reg add 'HKCU\Software\Wine\Direct2D' /v text_enhanced_contrast /t REG_DWORD /d 50 /f
+```
+
+The contrast belongs with it: Wine's dwrite reports 0 where Windows reports 0.5, and
+at 0 the blend takes 23 % of the ink from black text on white (Windows: 10 %). With
+both set, Segoe UI at 12 px on an opaque target measures against Windows 10 as
+light-on-dark +17.0 % here and +11.5 % there, black on white -11.5 % and -9.7 %; the
+light-on-dark rest comes from FreeType spreading subpixel coverage over more partial
+pixels than Windows' rasteriser, not from the blend. For a run in a solid colour this
+takes precedence over `text_linear_blend`; gradient and bitmap brushes keep the
+previous path. Unset, ClearType text is bit-identical.
 
 Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
 flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
