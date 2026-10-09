@@ -1671,6 +1671,57 @@ static BOOL fd_is_mount_point( int fd, const struct stat *st )
 static unsigned int server_get_unix_name( HANDLE handle, char **unix_name );
 
 
+/* unix name of a handle with the last path element left unresolved.  The server keeps
+ * the realpath()'d name, in which a symlink has already been followed, so rebuild the
+ * name from the handle's NT name instead. */
+static NTSTATUS get_handle_link_unix_name( HANDLE handle, char **unix_name )
+{
+    OBJECT_NAME_INFORMATION *info;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING nt_name;
+    ULONG size = 1024;
+    NTSTATUS status;
+
+    *unix_name = NULL;
+    for (;;)
+    {
+        if (!(info = malloc( size ))) return STATUS_NO_MEMORY;
+        status = NtQueryObject( handle, ObjectNameInformation, info, size, &size );
+        if (status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_OVERFLOW) break;
+        free( info );
+    }
+    if (!status)
+    {
+        InitializeObjectAttributes( &attr, &info->Name, OBJ_CASE_INSENSITIVE, 0, NULL );
+        status = get_nt_and_unix_names( &attr, &nt_name, unix_name, FILE_OPEN, TRUE );
+        free( nt_name.Buffer );
+        if (status)
+        {
+            free( *unix_name );
+            *unix_name = NULL;
+        }
+    }
+    free( info );
+    return status;
+}
+
+
+/* is the handle a symlink to a directory?  Those are reported as IO_REPARSE_TAG_SYMLINK
+ * reparse points (see get_file_info); fstat() follows the link, so handle-based queries
+ * have to look at the name. */
+static BOOL handle_is_unix_dir_symlink( HANDLE handle )
+{
+    char *unix_name;
+    struct stat st;
+    BOOL ret;
+
+    if (get_handle_link_unix_name( handle, &unix_name )) return FALSE;
+    ret = !lstat( unix_name, &st ) && S_ISLNK( st.st_mode ) && !stat( unix_name, &st ) && S_ISDIR( st.st_mode );
+    free( unix_name );
+    return ret;
+}
+
+
 /* get the stat info and file attributes for a file (by file descriptor) */
 static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
                              struct stat *st, ULONG *attr, ULONG *reparse_tag )
@@ -1697,6 +1748,11 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_MOUNT_POINT;
+        }
+        else if (handle_is_unix_dir_symlink( handle ))
+        {
+            *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+            if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_SYMLINK;
         }
     }
 
@@ -1791,11 +1847,14 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     {
         ret = stat( path, st );
         if (ret == -1) return ret;
-        /* is a symbolic link and a directory, consider these "reparse points" */
+        /* is a symbolic link and a directory, consider these "reparse points";
+         * reported as a Windows symlink, whose reparse data FSCTL_GET_REPARSE_POINT
+         * can serve (IO_REPARSE_TAG_LX_SYMLINK carries no data applications can
+         * resolve, see get_unix_symlink_reparse_data) */
         if (S_ISDIR( st->st_mode ))
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
-            if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
+            if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_SYMLINK;
         }
     }
     /* a bound AF_UNIX socket is a reparse point on Windows */
@@ -6657,6 +6716,92 @@ static void ignore_server_ioctl_struct_holes( ULONG code, const void *in_buffer,
 }
 
 
+/* FSCTL_GET_REPARSE_POINT on a Unix symlink to a directory.  The server only knows the
+ * xattr-based reparse points created through FSCTL_SET_REPARSE_POINT; a native symlink is
+ * reported as IO_REPARSE_TAG_SYMLINK (get_file_info), so build the matching buffer here,
+ * where the link target can be mapped to an NT path. */
+static NTSTATUS get_unix_symlink_reparse_data( HANDLE handle, void *out_buffer, ULONG out_size,
+                                               ULONG_PTR *ret_size )
+{
+    const unsigned int header = FIELD_OFFSET( REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer );
+    char link[PATH_MAX + 1], *unix_name = NULL, *target = NULL;
+    WCHAR *nt_name = NULL, *print_name;
+    REPARSE_DATA_BUFFER *data;
+    unsigned int nt_len, print_len, total, copy;
+    NTSTATUS status = STATUS_NOT_A_REPARSE_POINT;
+    struct stat st;
+    ssize_t len;
+
+    if (get_handle_link_unix_name( handle, &unix_name )) return STATUS_NOT_A_REPARSE_POINT;
+    if (lstat( unix_name, &st ) || !S_ISLNK( st.st_mode ) || stat( unix_name, &st ) || !S_ISDIR( st.st_mode ))
+        goto done;
+    if ((len = readlink( unix_name, link, PATH_MAX )) < 0) goto done;
+    link[len] = 0;
+
+    if (link[0] == '/') target = strdup( link );
+    else  /* relative to the link's directory */
+    {
+        const char *slash = strrchr( unix_name, '/' );
+        size_t dir_len = slash ? slash - unix_name + 1 : 0;
+
+        if ((target = malloc( dir_len + len + 1 )))
+        {
+            memcpy( target, unix_name, dir_len );
+            strcpy( target + dir_len, link );
+        }
+    }
+    if (!target)
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+
+    status = unix_to_nt_file_name( target, &nt_name, FILE_OPEN );
+    if (!nt_name)
+    {
+        if (!status) status = STATUS_NOT_A_REPARSE_POINT;
+        goto done;
+    }
+    nt_len = wcslen( nt_name );
+    print_name = (nt_name[5] == ':') ? nt_name + 4 : nt_name;   /* \??\C:\dir -> C:\dir */
+    print_len = wcslen( print_name );
+    total = header + (nt_len + print_len) * sizeof(WCHAR);
+
+    if (out_size < header)
+    {
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto done;
+    }
+    if (!(data = calloc( 1, total )))
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+    data->ReparseTag = IO_REPARSE_TAG_SYMLINK;
+    data->ReparseDataLength = total - FIELD_OFFSET( REPARSE_DATA_BUFFER, GenericReparseBuffer );
+    data->SymbolicLinkReparseBuffer.SubstituteNameOffset = 0;
+    data->SymbolicLinkReparseBuffer.SubstituteNameLength = nt_len * sizeof(WCHAR);
+    data->SymbolicLinkReparseBuffer.PrintNameOffset = nt_len * sizeof(WCHAR);
+    data->SymbolicLinkReparseBuffer.PrintNameLength = print_len * sizeof(WCHAR);
+    data->SymbolicLinkReparseBuffer.Flags = 0;
+    memcpy( data->SymbolicLinkReparseBuffer.PathBuffer, nt_name, nt_len * sizeof(WCHAR) );
+    memcpy( data->SymbolicLinkReparseBuffer.PathBuffer + nt_len, print_name, print_len * sizeof(WCHAR) );
+
+    copy = total < out_size ? total : out_size;
+    memcpy( out_buffer, data, copy );
+    *ret_size = copy;
+    status = (copy < total) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+    free( data );
+    TRACE( "%s -> %s\n", debugstr_a(unix_name), debugstr_w(nt_name) );
+
+done:
+    free( nt_name );
+    free( target );
+    free( unix_name );
+    return status;
+}
+
+
 /******************************************************************************
  *              NtFsControlFile   (NTDLL.@)
  */
@@ -6749,6 +6894,12 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
     case FSCTL_SET_SPARSE:
         TRACE("FSCTL_SET_SPARSE: Ignoring request\n");
         status = STATUS_SUCCESS;
+        break;
+    case FSCTL_GET_REPARSE_POINT:
+        status = get_unix_symlink_reparse_data( handle, out_buffer, out_size, &size );
+        if (status == STATUS_NOT_A_REPARSE_POINT)  /* xattr-based reparse points live in the server */
+            return server_ioctl_file( handle, event, apc, apc_context, io, code,
+                                      in_buffer, in_size, out_buffer, out_size );
         break;
     default:
         return server_ioctl_file( handle, event, apc, apc_context, io, code,
