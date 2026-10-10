@@ -646,6 +646,10 @@ enum wine_internal_message
     WM_WINE_LAST_DRIVER_MSG = 0x80001fff
 };
 
+/* Wine-internal SetWindowPos flag: the window manager raised the window, re-apply the win32
+ * Z-order to the native stacking even if win32u sees no Z-order change (winex11) */
+#define SWP_WINE_ZORDER_SYNC 0x00100000
+
 /* internal IME message */
 #define WM_IME_INTERNAL 0x287
 #define IME_INTERNAL_ACTIVATE   0x17

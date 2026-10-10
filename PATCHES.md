@@ -277,6 +277,24 @@ This is the recommended branch. What it changes, by subsystem:
   their own frame and are unchanged. Setting `DecorateToolWindows` to `N` under
   `HKCU\Software\Wine\X11 Driver`, or per application under
   `HKCU\Software\Wine\AppDefaults\<app.exe>\X11 Driver`, restores the previous behaviour.
+- **win32u / winex11**: a top-level window the window manager raised on its own (a click
+  under X11) is brought to the top of the win32 Z-order as well, as Windows does on
+  activation, and the win32 order that results is applied back to the X stacking. An
+  application may keep another of its windows above the activated one from
+  `WM_WINDOWPOSCHANGING` — Cubase 15 implements *Always on Top* for its tool windows that
+  way (the Audio Performance monitor carries neither `WS_EX_TOPMOST` nor an owner) — and
+  Wine then saw no Z-order change at all: `set_active_window` never touched the Z-order,
+  so the project window already sat below the monitor in win32 terms while KWin had just
+  raised it over the monitor. `winex11` had no way to express a sibling-relative order
+  either: `XConfigureWindow` with `CWSibling` is refused with `BadMatch` under a
+  reparenting window manager, and a pure raise is dropped for managed windows (upstream
+  `69e3a51b3dc`). The driver now sends the EWMH `_NET_RESTACK_WINDOW` message for a
+  window the win32 order puts below a visible sibling, on every Z-order change and, flagged
+  by win32u, after a window-manager raise; a change of `_NET_CLIENT_LIST_STACKING` is
+  checked for the active window too, since a click on the frame never reaches Wine.
+  Verified with Cubase's monitor against clicks into the inactive and the active project
+  window, the monitor and the KWin title bar (12/12 keep the monitor above); the user32
+  window tests are unchanged.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
