@@ -515,6 +515,8 @@ enum x11drv_atoms
     XATOM__KDE_NET_WM_STATE_SKIP_SWITCHER,
     XATOM__MOTIF_WM_HINTS,
     XATOM__NET_ACTIVE_WINDOW,
+    XATOM__NET_CLIENT_LIST_STACKING,
+    XATOM__NET_RESTACK_WINDOW,
     XATOM__NET_STARTUP_INFO_BEGIN,
     XATOM__NET_STARTUP_INFO,
     XATOM__NET_SUPPORTED,
@@ -732,6 +734,7 @@ extern void window_configure_notify( struct x11drv_win_data *data, unsigned long
 
 extern void set_net_active_window( HWND hwnd, HWND previous );
 extern Window get_net_active_window( Display *display );
+extern void net_client_list_stacking_notify(void);
 extern void net_active_window_notify( unsigned long serial, Window window, Time time );
 extern void net_active_window_init( struct x11drv_thread_data *data );
 extern void net_supported_init( struct x11drv_thread_data *data );

@@ -277,6 +277,7 @@ extern HWND is_current_process_window( HWND hwnd );
 extern HWND is_current_thread_window( HWND hwnd );
 extern BOOL is_desktop_window( HWND hwnd );
 extern BOOL is_iconic( HWND hwnd );
+extern void sync_zorder_after_wm_raise( HWND hwnd, BOOL activated );
 extern BOOL is_window_drawable( HWND hwnd, BOOL icon );
 extern BOOL is_window_enabled( HWND hwnd );
 extern BOOL is_window_unicode( HWND hwnd );

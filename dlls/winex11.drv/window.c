@@ -2425,6 +2425,65 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
     NtUserPostMessage( foreground, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
 }
 
+static void window_restack_below( struct x11drv_win_data *data, Window sibling );
+
+/***********************************************************************
+ *     net_client_list_stacking_notify
+ *
+ * The window manager restacked something.  Clicking an already active window
+ * raises it under KWin without any activation Wine would hear about, so check
+ * the foreground window of this thread against the win32 Z-order: if win32 keeps
+ * it below a visible sibling (an application doing so from WM_WINDOWPOSCHANGING
+ * never produces a Z-order change win32u could forward), ask for that order back.
+ */
+void net_client_list_stacking_notify(void)
+{
+    struct x11drv_win_data *data;
+    unsigned long i, count, remaining, idx_window = ~0ul, idx_sibling = ~0ul;
+    Window sibling, *list = NULL;
+    HWND foreground, prev;
+    Display *display;
+    int format;
+    Atom type;
+
+    if (is_virtual_desktop()) return;
+    if (!(foreground = NtUserGetForegroundWindow())) return;
+    if (NtUserGetWindowThread( foreground, NULL ) != GetCurrentThreadId()) return;
+
+    prev = NtUserGetWindowRelative( foreground, GW_HWNDPREV );
+    while (prev && !(NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE))
+        prev = NtUserGetWindowRelative( prev, GW_HWNDPREV );
+    if (!prev || !(sibling = X11DRV_get_whole_window( prev ))) return;
+
+    if (!(data = get_win_data( foreground ))) return;
+    if (!data->whole_window || !data->managed || data->embedded || sibling == data->whole_window) goto done;
+    /* only when X and win32 agree on the active window: right after a click the win32
+     * foreground still lags behind, the activation path takes care of that case */
+    if (x11drv_thread_data()->current_state.net_active_window != data->whole_window) goto done;
+
+    display = data->display;
+    if (XGetWindowProperty( display, DefaultRootWindow( display ), x11drv_atom(_NET_CLIENT_LIST_STACKING), 0,
+                            65536 / sizeof(Window), False, XA_WINDOW, &type, &format, &count,
+                            &remaining, (unsigned char **)&list ))
+        goto done;
+    if (type == XA_WINDOW && format == 32)
+    {
+        for (i = 0; i < count; i++) /* bottom-to-top */
+        {
+            if (list[i] == data->whole_window) idx_window = i;
+            else if (list[i] == sibling) idx_sibling = i;
+        }
+    }
+    XFree( list );
+    if (idx_window == ~0ul || idx_sibling == ~0ul || idx_window < idx_sibling) goto done;
+
+    TRACE( "window %p/%lx stacked above win32 predecessor %p/%lx, restacking\n", foreground, data->whole_window, prev, sibling );
+    window_restack_below( data, sibling );
+
+done:
+    release_win_data( data );
+}
+
 Window get_net_active_window( Display *display )
 {
     unsigned long count, remaining;
@@ -2564,6 +2623,40 @@ void make_window_embedded( struct x11drv_win_data *data )
 
 
 /***********************************************************************
+ *     window_restack_below
+ *
+ * Ask the window manager to stack a managed window directly below one of its
+ * siblings.  A ConfigureWindow request with CWSibling is refused with BadMatch
+ * once the window manager has reparented both windows into their own frames,
+ * so the only way to express a sibling-relative Z-order is the EWMH
+ * _NET_RESTACK_WINDOW client message.  Nothing is tracked here: the window
+ * manager may or may not restack, and it does not have to answer.
+ */
+static void window_restack_below( struct x11drv_win_data *data, Window sibling )
+{
+    XEvent xev = {0};
+
+    if (!data->whole_window || !data->managed || data->embedded) return;
+    if (data->pending_state.wm_state == WithdrawnState) return; /* the window manager doesn't know the window yet */
+    if (sibling == data->whole_window) return;
+
+    xev.xclient.type = ClientMessage;
+    xev.xclient.window = data->whole_window;
+    xev.xclient.message_type = x11drv_atom(_NET_RESTACK_WINDOW);
+    xev.xclient.serial = 0;
+    xev.xclient.display = data->display;
+    xev.xclient.send_event = True;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = 1; /* source indication: normal application */
+    xev.xclient.data.l[1] = sibling;
+    xev.xclient.data.l[2] = Below;
+
+    TRACE( "window %p/%lx, requesting restack below %lx\n", data->hwnd, data->whole_window, sibling );
+    XSendEvent( data->display, root_window, False, SubstructureRedirectMask | SubstructureNotifyMask, &xev );
+}
+
+
+/***********************************************************************
  *		sync_window_position
  *
  * Synchronize the X window position with the Windows one
@@ -2574,10 +2667,11 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
     DWORD ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
     RECT new_rect, window_rect;
     BOOL above = FALSE;
+    Window sibling = 0;
 
     if (data->managed && ((style & WS_MINIMIZE) || data->desired_state.wm_state == IconicState)) return;
 
-    if (!(swp_flags & SWP_NOZORDER) || (swp_flags & SWP_SHOWWINDOW))
+    if (!(swp_flags & SWP_NOZORDER) || (swp_flags & (SWP_SHOWWINDOW | SWP_WINE_ZORDER_SYNC)))
     {
         /* find window that this one must be after */
         HWND prev = NtUserGetWindowRelative( data->hwnd, GW_HWNDPREV );
@@ -2586,6 +2680,8 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
         if (!prev) above = TRUE;  /* top child */
         /* should use stack_mode Below but most window managers don't get it right */
         /* and Above with a sibling doesn't work so well either, so we ignore it */
+        /* for managed windows the sibling-relative order goes out as _NET_RESTACK_WINDOW instead */
+        else if (data->managed) sibling = X11DRV_get_whole_window( prev );
     }
 
     set_size_hints( data, style );
@@ -2612,6 +2708,7 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
                                         window_rect.top - old_rects->window.top );
 
     window_set_config( data, new_rect, above );
+    if (sibling) window_restack_below( data, sibling );
 }
 
 

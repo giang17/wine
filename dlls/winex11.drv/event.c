@@ -1386,6 +1386,7 @@ static BOOL X11DRV_PropertyNotify( HWND hwnd, XEvent *xev )
     if (event->atom == x11drv_atom(WM_NORMAL_HINTS)) handle_wm_normal_hints_notify( hwnd, event );
     if (event->atom == x11drv_atom(_NET_SUPPORTED)) handle_net_supported_notify( event );
     if (event->atom == x11drv_atom(_NET_ACTIVE_WINDOW)) handle_net_active_window( event );
+    if (event->atom == x11drv_atom(_NET_CLIENT_LIST_STACKING)) net_client_list_stacking_notify();
 
     return TRUE;
 }

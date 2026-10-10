@@ -2246,7 +2246,11 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
 
         if (state_cmd || swp_flags) cancel_capture_for_wm_change( hwnd );
 
-        if (foreground) set_foreground_window( foreground, FALSE, TRUE );
+        if (foreground)
+        {
+            sync_zorder_after_wm_raise( foreground, TRUE );
+            set_foreground_window( foreground, FALSE, TRUE );
+        }
         switch (state_cmd)
         {
         case SC_RESTORE:
@@ -2752,7 +2756,13 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
 
         /* Activate the window if needed */
 
-        if (msg->hwnd != info.hwndActive)
+        if (msg->hwnd == info.hwndActive)
+        {
+            /* already active: a window manager still raises it on the click,
+             * re-apply the win32 Z-order the application may be maintaining */
+            sync_zorder_after_wm_raise( NtUserGetAncestor( msg->hwnd, GA_ROOT ), FALSE );
+        }
+        else
         {
             HWND hwndTop = NtUserGetAncestor( msg->hwnd, GA_ROOT );
 
@@ -2773,6 +2783,7 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
                 case MA_ACTIVATE:
                 case 0:
                     if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
+                    else sync_zorder_after_wm_raise( hwndTop, TRUE );
                     break;
                 default:
                     WARN( "unknown WM_MOUSEACTIVATE code %d\n", ret );

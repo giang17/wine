@@ -3923,6 +3923,40 @@ done:
     return after;
 }
 
+/***********************************************************************
+ *           sync_zorder_after_wm_raise
+ *
+ * The window manager raised and activated a top-level window on its own (a
+ * click under X11).  Windows brings an activated window to the top of its
+ * band, so request that here, letting the application rewrite the insert
+ * position from WM_WINDOWPOSCHANGING as it would on Windows.  The flag tells
+ * the driver to re-apply whatever win32 Z-order results to the native
+ * stacking, since the native side moved without any win32 change.
+ */
+void sync_zorder_after_wm_raise( HWND hwnd, BOOL activated )
+{
+    HWND prev;
+
+    if (!hwnd || hwnd == get_desktop_window() || is_iconic( hwnd )) return;
+    if ((get_window_long( hwnd, GWL_STYLE ) & (WS_CHILD | WS_POPUP)) == WS_CHILD) return;
+    /* only for windows of this thread: a SetWindowPos on another thread's window sends
+     * WM_WINDOWPOSCHANGING synchronously to a thread that may not be pumping messages */
+    if (!is_current_thread_window( hwnd )) return;
+
+    prev = get_window_relative( hwnd, GW_HWNDPREV );
+    while (prev && !(get_window_long( prev, GWL_STYLE ) & WS_VISIBLE))
+        prev = get_window_relative( prev, GW_HWNDPREV );
+    if (!prev) return; /* already on top, nothing the native side could disagree with */
+
+    TRACE( "hwnd %p raised by the window manager, win32 predecessor %p, activated %u\n", hwnd, prev, activated );
+    if (activated) /* Windows brings an activated window to the top of its band */
+        NtUserSetWindowPos( hwnd, HWND_TOP, 0, 0, 0, 0,
+                            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_WINE_ZORDER_SYNC );
+    else /* an already active window keeps its win32 place: no-op for win32, the driver re-applies it */
+        NtUserSetWindowPos( hwnd, prev, 0, 0, 0, 0,
+                            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_WINE_ZORDER_SYNC );
+}
+
 /* NtUserSetWindowPos implementation */
 BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
 {
