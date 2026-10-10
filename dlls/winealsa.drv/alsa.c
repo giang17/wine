@@ -26,6 +26,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <sched.h>
+#include <errno.h>
+#include <stdlib.h>
 
 #include <alsa/asoundlib.h>
 
@@ -1526,12 +1529,33 @@ static int alsa_rewind_best_effort(struct alsa_stream *stream)
     return len;
 }
 
+/* The timer thread is the last stage before the device.  On wine-11.0 mmdevapi
+ * owns this thread and registers it with MMCSS ("Pro Audio" at
+ * AVRT_PRIORITY_CRITICAL); since 4c3dd4e1d0e it is a unix thread, so the same
+ * policy is applied here directly: SCHED_FIFO at the level avrt gives an
+ * application's critical audio threads (5; WINE_AVRT_RTPRIO overrides it,
+ * 0 disables). */
+static void set_timer_thread_priority(void)
+{
+    static int warned;
+    struct sched_param sp = {0};
+    const char *env = getenv("WINE_AVRT_RTPRIO");
+    int prio = env ? atoi(env) : 5, max = sched_get_priority_max(SCHED_FIFO);
+
+    if (prio <= 0) return;
+    if (max > 0 && prio > max) prio = max;
+    sp.sched_priority = prio;
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) && !warned++)
+        WARN("cannot raise the timer thread to SCHED_FIFO %d (errno %d)\n", prio, errno);
+}
+
 static void alsa_timer_loop(void *args)
 {
     struct alsa_stream *stream = args;
     LARGE_INTEGER delay, next;
     int adjust;
 
+    set_timer_thread_priority();
     alsa_lock(stream);
 
     delay.QuadPart = -stream->mmdev_period_rt;
