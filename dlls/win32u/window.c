@@ -2436,7 +2436,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
          * above cannot reach a surface window of another process -- so the owner
          * never learns that a foreign child was shown, moved or resized after its
          * surface region was taken.  Creation and destruction already prod the
-         * top-level (NtUserCreateWindowEx, free_window_handle); do the same here.
+         * top-level (NtUserCreateWindowEx, destroy_window); do the same here.
          * Seen in FL Studio 2026: the Browser window is open at start, Chromium's
          * WebView2 child grows into it later, and FL's repaint storm after an
          * activation change then flushed its untouched (black) surface over the
