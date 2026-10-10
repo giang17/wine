@@ -367,6 +367,19 @@ This is the recommended branch. What it changes, by subsystem:
   Ableton Live's indexer did, on startup in a fresh prefix, so Live restarted it in a loop
   and its browser stayed empty. Implemented for msvcp110, msvcp120, msvcp140 and msvcp_win;
   Live no longer needs a native VC runtime in the prefix
+- **avrt (MMCSS)**: `AvSetMmThreadCharacteristics`, `AvSetMmThreadPriority` and
+  `AvRevertMmThreadCharacteristics` were stubs. A thread that registers for the `Pro Audio`,
+  `Audio`, `Capture` or `Playback` task is now scheduled `SCHED_FIFO` (priority 3 at
+  `AVRT_PRIORITY_NORMAL`, 5 at `AVRT_PRIORITY_CRITICAL`, the level of a JACK client thread),
+  and the revert puts it back to `SCHED_OTHER`. Ableton Live 12 registers its audio workers
+  this way (26 on a 20-core machine) and waits in every audio cycle for the slowest of them;
+  as ordinary threads they lost the race against the GUI often enough that Live's CPU meter
+  showed 140–4900 % on an empty set and jackdbus logged hundreds of xruns per minute, with
+  the fix 6–8 % and none after the engine start. Needs a non-zero `RLIMIT_RTPRIO` in the
+  Wine process (the `audio` group's `rtprio` limit); otherwise, and with
+  `WINE_AVRT_RTPRIO=0`, the threads keep their previous priority. `WINE_AVRT_RTPRIO=<n>`
+  sets the CRITICAL level. Other MMCSS tasks (`Games`, `Window Manager`, …) are left alone:
+  Windows caps MMCSS threads through `SystemResponsiveness`, Linux has no such limit.
 - **Virtual-desktop compositor (winex11)**: windows inside a Wine virtual desktop get
   real per-pixel alpha, which the plain desktop drawable cannot provide. A small
   XDamage-driven compositor assembles frames off screen and composites them through an

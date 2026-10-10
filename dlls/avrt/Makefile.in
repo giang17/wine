@@ -1,8 +1,8 @@
 MODULE    = avrt.dll
+UNIXLIB   = avrt.so
 IMPORTLIB = avrt
 IMPORTS   = user32
 
-EXTRADLLFLAGS = -Wb,--prefer-native
-
 SOURCES = \
-	main.c
+	main.c \
+	unixlib.c
