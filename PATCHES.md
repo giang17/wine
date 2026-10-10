@@ -266,6 +266,17 @@ This is the recommended branch. What it changes, by subsystem:
   nowhere. Qt 6 grays `SC_CLOSE` for a window created without `Qt::WindowCloseButtonHint`:
   the preferences and view options dialogs of Dorico 6 could not be closed from the title
   bar, while `Esc` and the dialog's own button worked. The button is now drawn disabled.
+- **winex11**: a tool window (`WS_EX_TOOLWINDOW`) with a full caption gets its frame from
+  the window manager like any other titled window. Since 2007 Wine has left every tool
+  window undecorated and drawn the caption itself, so REAPER's floating FX chain windows,
+  captioned `WS_EX_TOOLWINDOW` popups, showed Wine's own title bar inside the
+  desktop theme. Tool windows without a caption (menus, tooltips, shadows) and windows
+  that draw their own non-client area stay undecorated, and the window keeps its Windows
+  geometry: the smaller tool window caption is what the window manager's frame replaces.
+  Checked in REAPER, Cubase and Ableton Live 12; FL Studio and Fender Studio Pro 8 draw
+  their own frame and are unchanged. Setting `DecorateToolWindows` to `N` under
+  `HKCU\Software\Wine\X11 Driver`, or per application under
+  `HKCU\Software\Wine\AppDefaults\<app.exe>\X11 Driver`, restores the previous behaviour.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
