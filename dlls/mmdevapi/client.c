@@ -28,6 +28,7 @@
 
 #include <audiopolicy.h>
 #include <mmdeviceapi.h>
+#include <avrt.h>
 #include <winternl.h>
 
 #include <wine/debug.h>
@@ -245,13 +246,24 @@ static DWORD CALLBACK timer_loop_func(void *user)
 {
     struct timer_loop_params params;
     struct audio_client *This = user;
+    DWORD task_index = 0;
+    HANDLE mmcss;
 
     SetThreadDescription(GetCurrentThread(), L"audio_client_timer");
+
+    /* This thread is the last stage before the hardware; on Windows the engine's
+     * pump runs in the real-time priority band.  THREAD_PRIORITY_TIME_CRITICAL
+     * only maps to niceness here, so register with MMCSS like an application's
+     * audio thread would: avrt gives the thread SCHED_FIFO at the level of the
+     * application's critical audio threads (dlls/avrt). */
+    if ((mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &task_index)))
+        AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL);
 
     params.stream = This->stream;
 
     wine_unix_call(timer_loop, &params);
 
+    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     return 0;
 }
 
