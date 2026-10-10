@@ -2288,6 +2288,28 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     if (ret)
     {
         update_surface_region( surface_win );
+        /* A child drawn by another process is subtracted from its top-level's
+         * surface region (server, clip_pixel_format_children), so the owner's
+         * flush keeps off the pixels the child paints into the shared drawable.
+         * That region is only recomputed by the owner, and update_surface_region()
+         * above cannot reach a surface window of another process -- so the owner
+         * never learns that a foreign child was shown, moved or resized after its
+         * surface region was taken.  Creation and destruction already prod the
+         * top-level (NtUserCreateWindowEx, free_window_handle); do the same here.
+         * Seen in FL Studio 2026: the Browser window is open at start, Chromium's
+         * WebView2 child grows into it later, and FL's repaint storm after an
+         * activation change then flushed its untouched (black) surface over the
+         * page for ~0.5 s -- until the window was hidden and shown again, which
+         * made FL recompute the region with the child in it. */
+        if (is_child && surface_win && surface_win != hwnd
+            && ((swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW))
+                || !EqualRect( &old_rects.client, &new_rects->client )))
+        {
+            WND *top = get_win_ptr( surface_win );
+
+            if (top == WND_OTHER_PROCESS) update_window_state( surface_win );
+            else if (top && top != WND_DESKTOP) release_win_ptr( top );
+        }
         if (((swp_flags & SWP_AGG_NOPOSCHANGE) != SWP_AGG_NOPOSCHANGE) ||
             (swp_flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW | SWP_STATECHANGED | SWP_FRAMECHANGED)))
             invalidate_dce( win, &old_rects.window );
