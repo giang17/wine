@@ -380,6 +380,10 @@ This is the recommended branch. What it changes, by subsystem:
   `WINE_AVRT_RTPRIO=0`, the threads keep their previous priority. `WINE_AVRT_RTPRIO=<n>`
   sets the CRITICAL level. Other MMCSS tasks (`Games`, `Window Manager`, …) are left alone:
   Windows caps MMCSS threads through `SystemResponsiveness`, Linux has no such limit.
+  `mmdevapi` registers its own pump thread (`audio_client_timer`, the last stage before the
+  device) the same way, so a WASAPI client's mix is not handed to the hardware by a thread
+  that ranks below the client's audio threads; Cubase 15 through its built-in ASIO driver had
+  six `Audio Realtime` threads at SCHED_FIFO 4 and the pump at nice -19 before.
 - **Virtual-desktop compositor (winex11)**: windows inside a Wine virtual desktop get
   real per-pixel alpha, which the plain desktop drawable cannot provide. A small
   XDamage-driven compositor assembles frames off screen and composites them through an
