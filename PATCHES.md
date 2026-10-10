@@ -342,7 +342,13 @@ This is the recommended branch. What it changes, by subsystem:
   receive. Affects any application that embeds out-of-process content: FL Studio's hub,
   Ableton Live 12 (WebView2), CEF-based plugin GUIs. Trade-off: a foreign child that stops
   painting without a geometry change leaves its last frame on screen until something
-  moves. `WINE_DISABLE_FOREIGN_CHILD_CLIP=1` restores the previous behaviour
+  moves. `WINE_DISABLE_FOREIGN_CHILD_CLIP=1` restores the previous behaviour. The owner
+  recomputes that region only itself, so a foreign child that is shown, moved or resized
+  after the region was taken now prods the owner's top-level (win32u, the same
+  `update_window_state` that window creation already uses) — FL Studio's Browser window,
+  open at start with the Sounds tab, went black for ~0.5 s after every activation change
+  until it was hidden and shown once, because Chromium's child grew into it after FL had
+  taken the region
 - **ole32**: RevokeDragDrop no longer touches drop targets owned by other processes
   (fixes a crash when closing plugin windows)
 - **crypt32**: verifying a signature hashes the signed attributes as they are stored in
