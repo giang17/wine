@@ -527,8 +527,21 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
 {
     unsigned long ret = 0;
 
-    if (ex_style & WS_EX_TOOLWINDOW) return 0;
     if (ex_style & WS_EX_LAYERED) return 0;
+
+    if (ex_style & WS_EX_TOOLWINDOW)
+    {
+        /* A titled tool window (REAPER's floating FX chains) gets its frame from
+         * the window manager like any other titled window; untitled tool popups
+         * (menus, tooltips, shadows) stay undecorated, and windows drawing their
+         * own non-client area are caught by the window == visible check in
+         * get_mwm_decorations().  Tool window captions have no minimize or
+         * maximize button on Windows. */
+        if (!decorate_tool_windows || (style & WS_CAPTION) != WS_CAPTION) return 0;
+        ret = MWM_DECOR_TITLE | MWM_DECOR_BORDER;
+        if (style & WS_SYSMENU) ret |= MWM_DECOR_MENU;
+        return ret;
+    }
 
     if ((style & WS_CAPTION) == WS_CAPTION)
     {
@@ -3841,7 +3854,12 @@ BOOL X11DRV_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *sty
     }
 
     *style_mask = *ex_style_mask = 0;
-    if (decor & MWM_DECOR_TITLE) *style_mask |= WS_CAPTION;
+    if (decor & MWM_DECOR_TITLE)
+    {
+        *style_mask |= WS_CAPTION;
+        /* tool windows have the smaller caption, strip that one */
+        *ex_style_mask |= WS_EX_TOOLWINDOW;
+    }
     if (decor & MWM_DECOR_BORDER)
     {
         *style_mask |= WS_DLGFRAME | WS_THICKFRAME;
