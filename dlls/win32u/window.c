@@ -2855,6 +2855,13 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         window_surface_unlock( surface );
 
         if (!(flags & ULW_COLORKEY)) key = CLR_INVALID;
+        /* Windows keys nothing with a PALETTEINDEX key here.  Measured on
+         * Windows 10 with an 8 bpp source whose logical palette and colour
+         * table both name the key colour, only one of them, or neither: the
+         * colour stays, and so do black pixels.  get_color_key() would turn the
+         * key into black and cut those away instead (issue 434; Microsoft
+         * Agent 2.0 passes PALETTEINDEX keys, WineHQ bug 60180). */
+        else if ((key & 0xff000000) == 0x01000000) key = CLR_INVALID;
         window_surface_set_layered( surface, key, -1, 0xff000000 );
 
         user_driver->pUpdateLayeredWindow( hwnd, source_alpha, flags );

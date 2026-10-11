@@ -220,7 +220,8 @@ This is the recommended branch. What it changes, by subsystem:
   image itself — they stay opaque in the surface, and with the bounding shape gone an
   `UpdateLayeredWindow()` colour key had no visible effect at all (Microsoft Agent's
   characters on a solid box; a 128×128 probe now keeps exactly its unkeyed 64×64 square,
-  like vanilla Wine)
+  like vanilla Wine); a colour key given as `PALETTEINDEX` keys nothing, as measured on
+  Windows 10, where Wine used to turn it into black and cut away the black pixels
 - **Window-surface repaints (win32u, winex11)**: a series of erase-and-repaint races in
   the window-surface path. Flushes are held back while an erase waits for its repaint,
   `XShmPutImage` is waited for before the surface is painted into again, a new surface
