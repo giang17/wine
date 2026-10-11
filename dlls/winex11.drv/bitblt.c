@@ -1859,6 +1859,25 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
                 ptr[x] |= alpha_bits;
     }
 
+    /* A per-pixel-alpha surface on a 32-bit visual gets its mask as the input
+     * shape only (see below), so whatever the mask cuts away has to be
+     * transparent in the image itself.  For the alpha part it already is; a
+     * colour key is not: UpdateLayeredWindow blends without a source alpha and
+     * leaves the keyed pixels opaque, and they stayed on screen (issue 434 -
+     * Microsoft Agent's characters on a solid box).  Clear them to 0, which on
+     * a premultiplied visual is fully transparent.  Surfaces without a colour
+     * key are left exactly as they were. */
+    if (alpha_mask && ximage->depth == 32 && window_surface->color_key != CLR_INVALID && shape_bits)
+    {
+        int x, y, stride = ximage->bytes_per_line / sizeof(ULONG);
+        UINT shape_stride = shape_info->bmiHeader.biSizeImage / abs( shape_info->bmiHeader.biHeight );
+        const BYTE *shape = (const BYTE *)shape_bits + dirty->top * shape_stride;
+        ULONG *ptr = (ULONG *)ximage->data + dirty->top * stride;
+
+        for (y = dirty->top; y < dirty->bottom; y++, ptr += stride, shape += shape_stride)
+            for (x = dirty->left; x < dirty->right; x++)
+                if (!(shape[x / 8] & (0x80 >> (x % 8)))) ptr[x] = 0;
+    }
 
     if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,

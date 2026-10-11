@@ -215,7 +215,12 @@ This is the recommended branch. What it changes, by subsystem:
   animated popup, which showed a strip of it or nothing for single frames (FL Studio's
   About fruit, 16 flickers in 36 test cycles against 0); the mask is kept as the input
   shape, so clicks on transparent pixels still pass through, set after the image is in
-  place and at most once a second during an animation
+  place and at most once a second during an animation; since the mask no longer cuts the
+  window, the pixels a `ULW_COLORKEY` colour key removes are cleared to transparent in the
+  image itself — they stay opaque in the surface, and with the bounding shape gone an
+  `UpdateLayeredWindow()` colour key had no visible effect at all (Microsoft Agent's
+  characters on a solid box; a 128×128 probe now keeps exactly its unkeyed 64×64 square,
+  like vanilla Wine)
 - **Window-surface repaints (win32u, winex11)**: a series of erase-and-repaint races in
   the window-surface path. Flushes are held back while an erase waits for its repaint,
   `XShmPutImage` is waited for before the surface is painted into again, a new surface
