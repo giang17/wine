@@ -74,6 +74,18 @@ This is the recommended branch. What it changes, by subsystem:
   round trip on our X connection, so the host's repaint cannot overtake the blit that is
   still on its way (a docked WebView2 pane dragged in FL Studio left 3 px strips of the
   plugin image behind, 30-70 px on a fast drag)
+- **DComp on a layered top-level without attributes**: a rootless visual tree whose target
+  is a top-level window with `WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP` and no layered
+  attributes is presented with `UpdateLayeredWindow()`, composited over a transparent
+  backdrop and with its per-pixel alpha. Windows shows such a window only through the DWM;
+  winex11 does not map a layered window before it has attributes, so the GDI blit of the
+  rootless path left it unmapped for good (NinjaTrader 8's embedded WebView2 chat, WineHQ
+  bug 58921). The dxgi swapchain bind already gave this window class an opaque
+  `LWA_ALPHA`, but only for a swapchain bound as root content. Measured app-free over 16
+  combinations of top-level/child target, four extended styles and root/rootless content:
+  the two that failed (top-level, layered without attributes, rootless tree) now render,
+  the other 14 are unchanged, and a tree covering half the window leaves exactly the
+  uncovered half transparent
 - **DComp leaves in the presented frame**: a visual tree that covers only a sliver of its
   window — a transport playhead, a selection rectangle — used to be delivered *after* the
   application's present by reading back the window and blitting, a race no CPU-side blit

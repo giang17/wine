@@ -3550,6 +3550,7 @@ struct dcomp_target
     UINT comp_dc_generation;              /* how many comp DIBs this target has had (1 = the first) */
     LONGLONG last_present_qpc;            /* QPC of last actual present — drives ~60 Hz coalescing (issue 56) */
     BOOL foreign;                         /* target hwnd belongs to another process — no subclass, hook-driven compositing (issue 88) */
+    BOOL present_layered;                 /* layered top-level without attributes: the rootless tree goes out through UpdateLayeredWindow (issue 433) */
     DWORD last_tree_composite_tick;       /* GetTickCount of last hook-driven tree composite (~60 Hz rate limit) */
     /* Sticky: this target's tree has carried at least one content leaf at some
      * point (issue 184).  Latched, never cleared — a rootless tree may be
@@ -6189,8 +6190,11 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
      * MEASURED on Fender Studio Pro 8: three one-pixel leaves, 0.03% of the
      * window; running this path at all left vertical strips of stale pixels
      * across the arranger that nothing ever repaired, while the same build with
-     * the path skipped drew the window exactly like the unpatched one. */
-    if (!target->covers_window)
+     * the path skipped drew the window exactly like the unpatched one.
+     *
+     * A layered target without attributes has nothing of the application's
+     * to protect: its whole content is our composition (issue 433). */
+    if (!target->covers_window && !target->present_layered)
     {
         /* Deliver the covered region all the same, without claiming the window
          * (issue 190): those leaves are content nobody else draws -- Studio
@@ -6218,7 +6222,7 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
     if (target->comp_bits)
     {
         static unsigned int comp_tree_log;
-        HDC hdc_win = GetDC(target->hwnd);
+        HDC hdc_win = target->present_layered ? NULL : GetDC(target->hwnd);
         BOOL captured, capture_hash_valid = FALSE;
         DWORD capture_hash = 0;
 
@@ -6256,7 +6260,12 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
             capture_hash = dcomp_surface_hash(target->comp_bits, (unsigned int)(rc.right * rc.bottom));
             capture_hash_valid = TRUE;
         }
-        if (dcomp_settled_backdrop())
+        /* A layered target's backdrop is the desktop, which the window manager
+         * composes under the alpha we hand it: start every frame transparent
+         * instead of from our own last delivery (issue 433). */
+        if (target->present_layered)
+            memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
+        else if (dcomp_settled_backdrop())
             dcomp_target_settle_backdrop(target, captured, rc.right, rc.bottom);
         else if (!captured && !target->comp_backdrop_valid)
             memset(target->comp_bits, 0, (SIZE_T)rc.right * rc.bottom * sizeof(DWORD));
@@ -6311,7 +6320,7 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
         int clip_out = -1;
         RECT clip_out_rc = {0};
 
-        hdc = GetDC(target->hwnd);
+        hdc = target->present_layered ? NULL : GetDC(target->hwnd);
         if (hdc)
         {
             /* Paint only as far as the tree reaches (issue 187).  Everything
@@ -6383,6 +6392,38 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
                 TRACE("issue-99 skip-unchanged: target %p hwnd %p %ux%u clip %d.\n",
                         target, target->hwnd, target->comp_width, target->comp_height, clip_out);
             ReleaseDC(target->hwnd, hdc);
+        }
+        else if (target->present_layered)
+        {
+            /* See dcomp_target_wants_layered_present() (issue 433).  Nothing
+             * else draws into this window, so an unchanged tree may skip
+             * without the foreground and clip checks of the GDI path. */
+            BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            POINT src = {0, 0};
+
+            if (!IsWindowVisible(target->hwnd))
+                target->last_blit_leaf_valid = FALSE;
+            else if (from_timer && dcomp_skip_unchanged()
+                    && target->walk_leaf_hash_valid && target->last_blit_leaf_valid
+                    && target->walk_leaf_hash == target->last_blit_leaf_hash)
+                skip_same = TRUE;
+            else if (UpdateLayeredWindow(target->hwnd, NULL, NULL, NULL,
+                    target->comp_dc, &src, 0, &blend, ULW_ALPHA))
+                blt_out = TRUE;
+            else
+            {
+                /* The application gave the window attributes after the bind,
+                 * so it has a GDI display path now: take the ordinary one. */
+                WARN("UpdateLayeredWindow failed on hwnd %p, error %lu, presenting through GDI.\n",
+                        target->hwnd, GetLastError());
+                target->present_layered = FALSE;
+                target->last_blit_leaf_valid = FALSE;
+            }
+            if (skip_same || blt_out)
+            {
+                clip_out = SIMPLEREGION;
+                clip_out_rc = rc;
+            }
         }
 
         /* Record delivery only when pixels could actually reach the window. */
@@ -7467,6 +7508,43 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_GetFrameStatistics(IDCompositionDe
     return S_OK;
 }
 
+/* A top-level with WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP and no layered
+ * attributes has no GDI content on Windows at all: the DWM shows its visual
+ * tree over the desktop, and nothing else ever reaches the screen there.  Here
+ * winex11 does not map a layered top-level before it has attributes, so the
+ * GetDC/BitBlt delivery of the rootless path leaves it unmapped for good --
+ * measured app-free: 400+ tree composites, X window IsUnMapped (issue 433).
+ * NinjaTrader 8's embedded WebView2 chat is such a window (WineHQ 58921).
+ *
+ * dxgi gives the same window class an opaque LWA_ALPHA when a swapchain is
+ * bound as root content (17b8be1671f), but a rootless tree never passes
+ * there.  Present it with UpdateLayeredWindow instead, which both maps the
+ * window and keeps the per-pixel alpha the DWM would compose.
+ *
+ * Decided once, here: child targets are not affected (their pixels land in
+ * the top-level's surface -- measured delivered for all four styles), a
+ * foreign window cannot be updated from this process, and a window with a
+ * non-client area would take the client-sized frame at the wrong offset. */
+static BOOL dcomp_target_wants_layered_present(HWND hwnd)
+{
+    LONG ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    HWND parent = GetAncestor(hwnd, GA_PARENT);
+    RECT client, window;
+
+    if ((ex_style & (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP))
+            != (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP))
+        return FALSE;
+    if (parent && parent != GetDesktopWindow())
+        return FALSE;
+    if (GetLayeredWindowAttributes(hwnd, NULL, NULL, NULL))
+        return FALSE;
+    if (!GetClientRect(hwnd, &client) || !GetWindowRect(hwnd, &window)
+            || client.right != window.right - window.left
+            || client.bottom != window.bottom - window.top)
+        return FALSE;
+    return TRUE;
+}
+
 static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionDevice *iface,
         HWND hwnd, BOOL topmost, IDCompositionTarget **target)
 {
@@ -7531,6 +7609,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
             return S_OK;
         }
     }
+
+    if ((object->present_layered = dcomp_target_wants_layered_present(hwnd)))
+        FIXME("Target %p hwnd %p is a layered top-level without attributes, "
+                "presenting its tree with UpdateLayeredWindow.\n", object, hwnd);
 
     /* In-process from here: our wndproc will handle WM_WINE_DCOMP_PRESENT_FLUSH
      * for this window.  Foreign targets never get the property, so dxgi never
