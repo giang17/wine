@@ -6501,6 +6501,89 @@ failed:
     CoUninitialize();
 }
 
+static void test_audio_convert_dmo_input_status(void)
+{
+    struct media_buffer *input_media_buffer = NULL, *output_media_buffer = NULL;
+    DMO_OUTPUT_DATA_BUFFER output_data_buffer;
+    IMediaObject *media_object;
+    DMO_MEDIA_TYPE *type;
+    char buffer[2048];
+    DWORD status;
+    HRESULT hr;
+    ULONG ret;
+
+    hr = CoInitialize(NULL);
+    ok(hr == S_OK, "Failed to initialize, hr %#lx.\n", hr);
+
+    winetest_push_context("resampler");
+
+    if (FAILED(hr = CoCreateInstance(&CLSID_CResamplerMediaObject, NULL, CLSCTX_INPROC_SERVER,
+            &IID_IMediaObject, (void **)&media_object)))
+    {
+        win_skip("Failed to create the resampler DMO, hr %#lx.\n", hr);
+        goto failed;
+    }
+
+    status = 0xdeadbeef;
+    hr = IMediaObject_GetInputStatus(media_object, 1, &status);
+    ok(hr == DMO_E_INVALIDSTREAMINDEX, "GetInputStatus returned %#lx.\n", hr);
+    ok(status == 0xdeadbeef, "Unexpected status %#lx.\n", status);
+
+    /* no input is accepted before the types are set */
+    status = 0xdeadbeef;
+    hr = IMediaObject_GetInputStatus(media_object, 0, &status);
+    ok(hr == S_OK, "GetInputStatus returned %#lx.\n", hr);
+    ok(!status, "Unexpected status %#lx.\n", status);
+
+    type = (DMO_MEDIA_TYPE *)buffer;
+    init_dmo_media_type_audio(type, &MEDIASUBTYPE_PCM, 1, 44100, 16);
+    hr = IMediaObject_SetInputType(media_object, 0, type, 0);
+    ok(hr == S_OK, "SetInputType returned %#lx.\n", hr);
+    init_dmo_media_type_audio(type, &MEDIASUBTYPE_PCM, 2, 48000, 16);
+    hr = IMediaObject_SetOutputType(media_object, 0, type, 0);
+    ok(hr == S_OK, "SetOutputType returned %#lx.\n", hr);
+
+    status = 0xdeadbeef;
+    hr = IMediaObject_GetInputStatus(media_object, 0, &status);
+    ok(hr == S_OK, "GetInputStatus returned %#lx.\n", hr);
+    ok(status == DMO_INPUT_STATUSF_ACCEPT_DATA, "Unexpected status %#lx.\n", status);
+
+    /* 10 ms of input; the resampler holds it until ProcessOutput() consumes it. */
+    hr = media_buffer_create(441 * 2, &input_media_buffer);
+    ok(hr == S_OK, "Failed to create input media buffer, hr %#lx.\n", hr);
+    input_media_buffer->length = 441 * 2;
+    hr = IMediaObject_ProcessInput(media_object, 0, &input_media_buffer->IMediaBuffer_iface, 0, 0, 0);
+    ok(hr == S_OK, "ProcessInput returned %#lx.\n", hr);
+
+    status = 0xdeadbeef;
+    hr = IMediaObject_GetInputStatus(media_object, 0, &status);
+    ok(hr == S_OK, "GetInputStatus returned %#lx.\n", hr);
+    ok(!status, "Unexpected status %#lx.\n", status);
+    hr = IMediaObject_ProcessInput(media_object, 0, &input_media_buffer->IMediaBuffer_iface, 0, 0, 0);
+    ok(hr == DMO_E_NOTACCEPTING, "ProcessInput returned %#lx.\n", hr);
+
+    hr = media_buffer_create(480 * 4 * 2, &output_media_buffer);
+    ok(hr == S_OK, "Failed to create output media buffer, hr %#lx.\n", hr);
+    memset(&output_data_buffer, 0, sizeof(output_data_buffer));
+    output_data_buffer.pBuffer = &output_media_buffer->IMediaBuffer_iface;
+    hr = IMediaObject_ProcessOutput(media_object, 0, 1, &output_data_buffer, &status);
+    ok(hr == S_OK, "ProcessOutput returned %#lx.\n", hr);
+
+    status = 0xdeadbeef;
+    hr = IMediaObject_GetInputStatus(media_object, 0, &status);
+    ok(hr == S_OK, "GetInputStatus returned %#lx.\n", hr);
+    ok(status == DMO_INPUT_STATUSF_ACCEPT_DATA, "Unexpected status %#lx.\n", status);
+
+    IMediaBuffer_Release(&output_media_buffer->IMediaBuffer_iface);
+    IMediaBuffer_Release(&input_media_buffer->IMediaBuffer_iface);
+    ret = IMediaObject_Release(media_object);
+    ok(ret == 0, "Release returned %lu\n", ret);
+
+failed:
+    winetest_pop_context();
+    CoUninitialize();
+}
+
 const GUID *wmv_decoder_output_subtypes[] =
 {
     &MEDIASUBTYPE_NV12,
@@ -12845,6 +12928,7 @@ START_TEST(transform)
     test_wmv_decoder_dmo_get_size_info();
     test_wmv_decoder_media_object();
     test_audio_convert();
+    test_audio_convert_dmo_input_status();
     test_color_convert(FALSE);
     test_color_convert(TRUE);
     test_resizer(FALSE);

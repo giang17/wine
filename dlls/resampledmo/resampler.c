@@ -1068,8 +1068,20 @@ static HRESULT WINAPI media_object_FreeStreamingResources(IMediaObject *iface)
 
 static HRESULT WINAPI media_object_GetInputStatus(IMediaObject *iface, DWORD index, DWORD *flags)
 {
-    FIXME("iface %p, index %lu, flags %p stub!\n", iface, index, flags);
-    return E_NOTIMPL;
+    struct resampler *impl = impl_from_IMediaObject(iface);
+
+    TRACE("iface %p, index %lu, flags %p.\n", iface, index, flags);
+
+    if (index > 0)
+        return DMO_E_INVALIDSTREAMINDEX;
+    if (!flags)
+        return E_POINTER;
+
+    /* No input is accepted before both types are set, and ProcessInput() holds one buffer
+     * until ProcessOutput() has consumed it. */
+    *flags = impl->context && !impl->current_frame.nb_samples ? DMO_INPUT_STATUSF_ACCEPT_DATA : 0;
+
+    return S_OK;
 }
 
 static HRESULT WINAPI media_object_ProcessInput(IMediaObject *iface, DWORD index,
