@@ -1275,29 +1275,17 @@ BOOL X11DRV_KeymapNotify( HWND hwnd, XEvent *event )
     return TRUE;
 }
 
-static void adjust_lock_state( BYTE *keystate, HWND hwnd, WORD vkey, WORD scan, DWORD flags, DWORD time )
-{
-    BYTE prev_state = keystate[vkey] & 0x01;
-
-    X11DRV_send_keyboard_input( hwnd, vkey, scan, flags, time );
-    X11DRV_send_keyboard_input( hwnd, vkey, scan, flags ^ KEYEVENTF_KEYUP, time );
-
-    /* Keyboard hooks may have blocked processing lock keys causing our state
-     * to be different than state on X server side. Although Windows allows hooks
-     * to block changing state, we can't prevent it on X server side. Having
-     * different states would cause us to try to adjust it again on the next
-     * key event. We prevent that by overriding hooks and setting key states here. */
-    if (NtUserGetAsyncKeyboardState( keystate ) && (keystate[vkey] & 0x01) == prev_state)
-    {
-        WARN("keystate %x not changed (%#.2x), probably blocked by hooks\n", vkey, keystate[vkey]);
-        keystate[vkey] ^= 0x01;
-        set_async_key_state( keystate );
-    }
-}
-
-static void update_lock_state( HWND hwnd, WORD vkey, UINT state, UINT time )
+/* Set the lock key toggle states directly instead of sending lock key events.
+ * Windows never generates a lock key event for a state that changed outside of
+ * it, and synthetic events reach low-level hooks, raw input and the window:
+ * DirectInput reported a NumLock press before the first key of an application
+ * started with NumLock on. With a low-level hook installed, the server also
+ * commits the state of such an event only after the hook returns, so checking
+ * it right after sending could not tell a blocked event from a delayed one. */
+static void update_lock_state( WORD vkey, UINT state )
 {
     BYTE keystate[256];
+    BOOL changed = FALSE;
 
     /* Note: X sets the below states on key down and clears them on key up.
        Windows triggers them on key down. */
@@ -1307,29 +1295,28 @@ static void update_lock_state( HWND hwnd, WORD vkey, UINT state, UINT time )
     /* Adjust the CAPSLOCK state if it has been changed outside wine */
     if (!(keystate[VK_CAPITAL] & 0x01) != !(state & LockMask) && vkey != VK_CAPITAL)
     {
-        DWORD flags = 0;
-        if (keystate[VK_CAPITAL] & 0x80) flags ^= KEYEVENTF_KEYUP;
         TRACE("Adjusting CapsLock state (%#.2x)\n", keystate[VK_CAPITAL]);
-        adjust_lock_state( keystate, hwnd, VK_CAPITAL, 0x3a, flags, time );
+        keystate[VK_CAPITAL] ^= 0x01;
+        changed = TRUE;
     }
 
     /* Adjust the NUMLOCK state if it has been changed outside wine */
     if (!(keystate[VK_NUMLOCK] & 0x01) != !(state & NumLockMask) && (vkey & 0xff) != VK_NUMLOCK)
     {
-        DWORD flags = KEYEVENTF_EXTENDEDKEY;
-        if (keystate[VK_NUMLOCK] & 0x80) flags ^= KEYEVENTF_KEYUP;
         TRACE("Adjusting NumLock state (%#.2x)\n", keystate[VK_NUMLOCK]);
-        adjust_lock_state( keystate, hwnd, VK_NUMLOCK, 0x45, flags, time );
+        keystate[VK_NUMLOCK] ^= 0x01;
+        changed = TRUE;
     }
 
     /* Adjust the SCROLLLOCK state if it has been changed outside wine */
     if (!(keystate[VK_SCROLL] & 0x01) != !(state & ScrollLockMask) && vkey != VK_SCROLL)
     {
-        DWORD flags = 0;
-        if (keystate[VK_SCROLL] & 0x80) flags ^= KEYEVENTF_KEYUP;
         TRACE("Adjusting ScrLock state (%#.2x)\n", keystate[VK_SCROLL]);
-        adjust_lock_state( keystate, hwnd, VK_SCROLL, 0x46, flags, time );
+        keystate[VK_SCROLL] ^= 0x01;
+        changed = TRUE;
     }
+
+    if (changed) set_async_key_state( keystate );
 }
 
 /***********************************************************************
@@ -1432,7 +1419,7 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
     if ( event->type == KeyRelease ) dwFlags |= KEYEVENTF_KEYUP;
     if ( vkey & 0x100 )              dwFlags |= KEYEVENTF_EXTENDEDKEY;
 
-    update_lock_state( hwnd, vkey, event->state, event_time );
+    update_lock_state( vkey, event->state );
 
     X11DRV_send_keyboard_input( hwnd, vkey & 0xff, bScan, dwFlags, event_time );
     return TRUE;
