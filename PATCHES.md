@@ -403,6 +403,17 @@ This is the recommended branch. What it changes, by subsystem:
   page script reports its size; the jQuery UI focus search read `textarea.disabled`, the
   exception aborted the script, and the invisible modal dialog locked the main window. The
   dialog now opens at its size and can be closed
+- **mshtml**: a document in IE10 or IE11 mode gets an agent style sheet that sets
+  `min-width` and `min-height` to 0, the minimum size IE 10 and 11 give flex items. Gecko
+  implements the automatic minimum size of the flexbox spec, the item's content size, and a
+  page written for IE that sizes a flex item to its container and lets a child scroll had that
+  item run out of the container instead. Power BI Desktop's options dialog: the options pane
+  grew to 1052 px in a 668 px dialog body and ran over the footer, where the transparent box
+  took every click meant for OK and Cancel (a hit-test probe found the click on the pane's
+  `SECTION`, not on the button); now the pane scrolls and the buttons work. The sheet changes
+  nothing for other elements, whose automatic minimum is zero already, and any rule of the
+  page overrides it; the mshtml `style`, `dom` and `events` tests give the same results with
+  and without it
 - **winemenubuilder**: a shortcut without arguments no longer produces a desktop entry whose
   `Exec` line ends in an empty `""` argument (backport of 1977760e374 from Wine 11.19). vatSys,
   which registers the `vatsys://` URL protocol, exited silently during its .NET start-up when
