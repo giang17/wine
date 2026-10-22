@@ -1022,6 +1022,18 @@ This is the recommended branch. What it changes, by subsystem:
   under Xwayland, as reported), while its map, a Vulkan child without the mark, rendered.
   Now they render offscreen like the map. OpenGL surfaces, wined3d's default renderer,
   keep the attached path
+- **Minimised windows under the Wayland driver (winewayland)**: backport of 7310a48e3d1,
+  3972b7b5337 and 8d64701d80b from Wine 11.8 (WineHQ bug 59577). Minimising sets
+  `WS_MINIMIZE` and moves the window to (-32000,-32000); the driver did not tell the
+  compositor and kept a 160x24 surface that stayed so on every configure, so a window
+  minimised from its title bar remained a bar that could be neither clicked nor restored
+  (Notepad on KWin 5.27, Plasma Wayland). Now the driver minimises through
+  `xdg_toplevel_set_minimized`, sends no `unset_maximized`/`unset_fullscreen` for a minimised
+  window, and restores it with `SC_RESTORE` when the compositor sends a configure;
+  3972b7b5337 fixes a use-after-release of the window rects in the configure handler. On
+  KWin 5.27 the window comes back through Alt+Tab, a click on its task bar entry does not
+  restore it (the same with Wine 11.20, which has the three commits). Only the Wayland driver
+  is affected; the fork default is winex11 through Xwayland
 - **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
   video on a DAW timeline exercises paths a straight play-to-the-end never reaches. The
   session asked for a new sample on *every* call of its delivery routine instead of one at
