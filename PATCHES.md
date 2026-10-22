@@ -980,6 +980,20 @@ This is the recommended branch. What it changes, by subsystem:
   a 32-bit DirectInput 8 test, ten keys, NumLock on: before 1 fake `DIK_NUMLOCK` without a
   hook and 20 with one, the toggle left off; now 0 and the toggle on, as on Windows 11. A
   lock key changed while no Wine window had the focus is no longer replayed to hooks
+- **Application compatibility layers (win32u)**: an entry under
+  `Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers` (HKCU or HKLM) named
+  after the full path of the executable applies, as on Windows. Wine looked up only the
+  file name, which Windows 10 22H2 ignores (measured with a test program); the file name
+  and the default value stay as Wine extensions. The vatSys plugins OzStrips and Maestro
+  write `DPIUNAWARE` under the full path of `vatSys.exe`. Without it vatSys became system
+  aware later in its run, and from wine-11.16 on its strip bays stayed empty: their
+  panels, created under the WinForms parking window while the process was still unaware,
+  could not be moved into the system-aware bay forms, because `SetParent()` refuses
+  windows of different DPI awareness. With only the full-path entry, vatSys on 11.20 now
+  creates the four strip bay devices again (six `DXGID3D10CreateDevice` instead of two)
+  and leaves no panel in the parking window. Still different from Windows: there, windows
+  created before the process awareness is set follow it once it is set, so the
+  reparenting succeeds without a layer as well
 - **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
   video on a DAW timeline exercises paths a straight play-to-the-end never reaches. The
   session asked for a new sample on *every* call of its delivery routine instead of one at
