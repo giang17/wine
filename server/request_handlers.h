@@ -313,6 +313,7 @@ DECL_HANDLER(d3dkmt_share_objects);
 DECL_HANDLER(d3dkmt_object_open_name);
 DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
+DECL_HANDLER(set_process_dpi_awareness);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -623,6 +624,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_object_open_name,
     (req_handler)req_d3dkmt_mutex_acquire,
     (req_handler)req_d3dkmt_mutex_release,
+    (req_handler)req_set_process_dpi_awareness,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2373,3 +2375,5 @@ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, key_value) == 20 );
 C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, fence_value) == 24 );
 C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, runtime_size) == 32 );
 C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
+C_ASSERT( offsetof(struct set_process_dpi_awareness_request, dpi_context) == 12 );
+C_ASSERT( sizeof(struct set_process_dpi_awareness_request) == 16 );

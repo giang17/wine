@@ -83,6 +83,7 @@ struct window
     unsigned int     is_layered : 1;  /* has layered info been set? */
     unsigned int     is_orphan : 1;   /* is window orphaned */
     unsigned int     set_foreground : 1;/* has window been foreground once */
+    unsigned int     dpi_unset : 1;   /* created before the process DPI awareness was set */
     unsigned int     color_key;       /* color key for a layered window */
     unsigned int     alpha;           /* alpha value for a layered window */
     unsigned int     layered_flags;   /* flags for a layered window */
@@ -430,6 +431,7 @@ static int set_parent_window( struct window *win, struct window *parent )
                 shared->dpi_context = parent->shared->dpi_context;
             }
             SHARED_WRITE_END;
+            win->dpi_unset = parent->dpi_unset;
         }
 
         /* if parent belongs to a different thread and the window is a child
@@ -678,6 +680,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->is_layered     = 0;
     win->is_orphan      = 0;
     win->set_foreground = 0;
+    win->dpi_unset      = 0;
     win->monitor_dpi    = USER_DEFAULT_SCREEN_DPI;
     win->user_data      = 0;
     win->text           = NULL;
@@ -2419,7 +2422,7 @@ DECL_HANDLER(create_window)
     if (parent && !is_desktop_window( parent ))
         dpi_context = parent->shared->dpi_context;
     else if (!parent || !NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( req->dpi_context ))
-        dpi_context = req->dpi_context;
+        dpi_context = req->dpi_context & ~NTUSER_DPI_CONTEXT_FLAG_PROCESS;
     else
         dpi_context = win->shared->dpi_context;
 
@@ -2428,6 +2431,11 @@ DECL_HANDLER(create_window)
         shared->dpi_context = dpi_context;
     }
     SHARED_WRITE_END;
+
+    /* a window created while the process DPI awareness is unset takes the awareness once it is set
+     * (set_process_dpi_awareness); a child follows its parent */
+    win->dpi_unset = (parent && !is_desktop_window( parent )) ? parent->dpi_unset
+                                                             : !!(req->dpi_context & NTUSER_DPI_CONTEXT_FLAG_PROCESS);
 
     win->style = req->style;
     win->ex_style = req->ex_style;
@@ -2456,6 +2464,37 @@ DECL_HANDLER(set_parent)
     reply->old_parent  = win->parent->handle;
     reply->full_parent = parent ? parent->handle : 0;
     set_parent_window( win, parent );
+}
+
+
+/* set the process DPI awareness context: windows created while it was unset take it now, as on Windows
+ * (Windows 10 22H2, measured: every window of the process created before the call, whatever the thread
+ * context it was created under, reports the process awareness afterwards; a window that already had a
+ * higher awareness keeps it) */
+DECL_HANDLER(set_process_dpi_awareness)
+{
+    unsigned int context = req->dpi_context, awareness = NTUSER_DPI_CONTEXT_GET_AWARENESS( context );
+    struct process *process = current->process;
+    user_handle_t handle = 0;
+    struct window *win, *top;
+
+    /* a per-monitor context is stored as version 1, as for a new window */
+    if (NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( context )) context = NTUSER_DPI_PER_MONITOR_AWARE;
+
+    while ((win = next_user_handle( &handle, NTUSER_OBJ_WINDOW )))
+    {
+        if (!win->dpi_unset) continue;
+        /* the awareness of a child is that of its top-level window, including one of another process */
+        for (top = win; top->parent && !is_desktop_window( top->parent ); top = top->parent) ;
+        if (!top->thread || top->thread->process != process) continue;
+        win->dpi_unset = 0;
+        if (NTUSER_DPI_CONTEXT_GET_AWARENESS( win->shared->dpi_context ) >= awareness) continue;
+        SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+        {
+            shared->dpi_context = context;
+        }
+        SHARED_WRITE_END;
+    }
 }
 
 

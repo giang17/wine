@@ -5638,6 +5638,9 @@ static WND *create_window_handle( HWND parent, HWND owner, UNICODE_STRING *name,
     int extra_bytes = 0;
     WND *win;
 
+    /* while the process DPI awareness is unset, the window takes the awareness once it is set */
+    if (process_dpi_awareness_unset()) dpi_context |= NTUSER_DPI_CONTEXT_FLAG_PROCESS;
+
     SERVER_START_REQ( create_window )
     {
         req->parent          = wine_server_user_handle( parent );

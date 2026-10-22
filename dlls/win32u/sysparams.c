@@ -3146,6 +3146,12 @@ UINT get_thread_dpi_awareness_context(void)
     return context ? context : NTUSER_DPI_UNAWARE;
 }
 
+/* whether the process DPI awareness is still unset: a window created now takes it once it is set */
+BOOL process_dpi_awareness_unset(void)
+{
+    return !ReadNoFence( &dpi_context );
+}
+
 DWORD get_process_layout(void)
 {
     return process_layout == ~0u ? 0 : process_layout;
@@ -7363,6 +7369,14 @@ BOOL WINAPI NtUserSetProcessDpiAwarenessContext( ULONG context, ULONG unknown )
         RtlSetLastWin32Error( ERROR_ACCESS_DENIED );
         return FALSE;
     }
+
+    /* windows created while the awareness was unset take it now, as on Windows */
+    SERVER_START_REQ( set_process_dpi_awareness )
+    {
+        req->dpi_context = context;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
 
     TRACE( "set to %#x\n", context );
     return TRUE;
