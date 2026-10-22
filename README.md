@@ -142,7 +142,7 @@ architectures: 32-bit hosts and plugins load `d2d1`, `dcomp` and `dxgi` directly
 stale 32-bit half keeps running old code without anything visibly failing. This needs the
 `i686-w64-mingw32` cross compiler next to the x86_64 one.
 
-Two things are worth knowing before the first run, both explained in
+Three things are worth knowing before the first run, the first two explained in
 [PATCHES.md](PATCHES.md):
 
 - **`wine.inf` is part of the install.** It carries this fork's registry defaults,
@@ -155,6 +155,15 @@ Two things are worth knowing before the first run, both explained in
   no speed-up in the setup this fork is developed on. If DXVK is needed for something else
   on the same machine, PATCHES.md has the per-application switch; the whole trio
   `d3d11,dxgi,d3d10core` has to move together.
+- **On a Wayland desktop, keep Wine on Xwayland.** That is Wine's default as long as
+  `DISPLAY` is set (driver order `mac,x11,wayland`). Together with the previous point this
+  is the configuration the fork is developed and tested in: winex11 with Wine's own
+  Direct3D. Every display-driver change of the fork is in `winex11.drv`, while
+  `winewayland.drv` is unmodified. Starting with `DISPLAY` unset selects Wine's own Wayland
+  driver, on Plasma recognisable by Wine-drawn blue title bars, and the fork's driver-level
+  fixes do not apply there. In a short test on Plasma 6, Serum 2's drag image came out
+  black, WebView2 content embedded from another process (FL Cloud) stayed black, and
+  rendering was noticeably slower.
 
 Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**. Steinberg Cubase 15,
 Nuendo 15 and Dorico 6, from the Download Assistant to a running project:
