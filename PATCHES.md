@@ -994,6 +994,14 @@ This is the recommended branch. What it changes, by subsystem:
   and leaves no panel in the parking window. Still different from Windows: there, windows
   created before the process awareness is set follow it once it is set, so the
   reparenting succeeds without a layer as well
+- **Direct2D window targets with DXVK (winex11)**: the window of an `ID2D1HwndRenderTarget`
+  renders offscreen when its swap chain is a Vulkan one. d2d1 marks such a window so that a
+  child is attached to its top-level instead, because wined3d presents it through GDI and
+  the blit of an offscreen window never comes. DXVK presents through the Vulkan swap chain,
+  and attached, the window stayed black: vatSys's strip bays and its VSCS panel on X11 (and
+  under Xwayland, as reported), while its map, a Vulkan child without the mark, rendered.
+  Now they render offscreen like the map. OpenGL surfaces, wined3d's default renderer,
+  keep the attached path
 - **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
   video on a DAW timeline exercises paths a straight play-to-the-end never reaches. The
   session asked for a new sample on *every* call of its delivery routine instead of one at
