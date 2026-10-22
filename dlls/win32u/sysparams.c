@@ -5821,7 +5821,18 @@ static DWORD get_config_key( HKEY defkey, HKEY appkey, const char *name,
     return ERROR_FILE_NOT_FOUND;
 }
 
-static char *get_app_compat_flags( const WCHAR *appname )
+static BOOL query_app_compat_layers( HKEY hkey, const WCHAR *path, const WCHAR *appname,
+                                     KEY_VALUE_PARTIAL_INFORMATION *value, ULONG size )
+{
+    /* Windows names the entry after the full path of the executable */
+    return (query_reg_value( hkey, path, value, size ) && value->Type == REG_SZ) ||
+           /* Wine extension: also accept the file name alone */
+           (query_reg_value( hkey, appname, value, size ) && value->Type == REG_SZ) ||
+           /* Wine extension: set default application flag using the default key value */
+           (query_reg_value( hkey, NULL, value, size ) && value->Type == REG_SZ);
+}
+
+static char *get_app_compat_flags( const WCHAR *path, const WCHAR *appname )
 {
     char buffer[4096];
     KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
@@ -5832,18 +5843,14 @@ static char *get_app_compat_flags( const WCHAR *appname )
 
     if ((hkey = reg_open_hkcu_key( "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers" )))
     {
-        if ((query_reg_value( hkey, appname, value, sizeof(buffer) ) && value->Type == REG_SZ) ||
-            /* Wine extension: set default application flag using the default key value */
-            (query_reg_value( hkey, NULL, value, sizeof(buffer) ) && value->Type == REG_SZ))
+        if (query_app_compat_layers( hkey, path, appname, value, sizeof(buffer) ))
             value_str = (WCHAR *)value->Data;
         NtClose( hkey );
     }
 
     if (!value_str && (hkey = reg_open_ascii_key( NULL, "Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers" )))
     {
-        if ((query_reg_value( hkey, appname, value, sizeof(buffer) ) && value->Type == REG_SZ) ||
-            /* Wine extension: set default application flag using the default key value */
-            (query_reg_value( hkey, NULL, value, sizeof(buffer) ) && value->Type == REG_SZ))
+        if (query_app_compat_layers( hkey, path, appname, value, sizeof(buffer) ))
             value_str = (WCHAR *)value->Data;
         NtClose( hkey );
     }
@@ -5856,7 +5863,7 @@ static char *get_app_compat_flags( const WCHAR *appname )
 
 void sysparams_init(void)
 {
-    WCHAR buffer[MAX_PATH+16], *p, *appname;
+    WCHAR buffer[MAX_PATH+16], *p, *path, *appname;
     char *app_compat_flags = NULL;
     DWORD i, dispos, dpi_scaling;
     WCHAR layout[KL_NAMELENGTH];
@@ -5924,7 +5931,7 @@ void sysparams_init(void)
 
     /* open the app-specific key */
 
-    appname = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+    appname = path = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
     if ((p = wcsrchr( appname, '/' ))) appname = p + 1;
     if ((p = wcsrchr( appname, '\\' ))) appname = p + 1;
     len = lstrlenW( appname );
@@ -5938,8 +5945,8 @@ void sysparams_init(void)
         buffer[i] = 0;
         appname = buffer;
 
-        app_compat_flags = get_app_compat_flags( appname );
-        if (app_compat_flags) TRACE( "Found %s AppCompatFlags %s\n", debugstr_w(appname), debugstr_a(app_compat_flags) );
+        app_compat_flags = get_app_compat_flags( path, appname );
+        if (app_compat_flags) TRACE( "Found %s AppCompatFlags %s\n", debugstr_w(path), debugstr_a(app_compat_flags) );
 
         /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe\X11 Driver */
         if ((tmpkey = reg_open_hkcu_key( "Software\\Wine\\AppDefaults" )))
