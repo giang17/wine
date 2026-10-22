@@ -991,9 +991,29 @@ This is the recommended branch. What it changes, by subsystem:
   could not be moved into the system-aware bay forms, because `SetParent()` refuses
   windows of different DPI awareness. With only the full-path entry, vatSys on 11.20 now
   creates the four strip bay devices again (six `DXGID3D10CreateDevice` instead of two)
-  and leaves no panel in the parking window. Still different from Windows: there, windows
-  created before the process awareness is set follow it once it is set, so the
-  reparenting succeeds without a layer as well
+  and leaves no panel in the parking window. Windows created before the process awareness
+  is set follow it once it is set since the next entry, so the reparenting succeeds
+  without a layer as well
+- **DPI awareness of windows created before the process sets it (win32u, server)**: a
+  window created while the process DPI awareness is still unset takes the awareness once
+  the process sets it, as on Windows. Measured on Windows 10 22H2
+  (`projects/dpi-process-503-probe`): every window of the process created before
+  `SetProcessDPIAware()` or `SetProcessDpiAwarenessContext()` reports the process
+  awareness afterwards, whatever thread context it was created under and on whichever
+  thread, children included; a window whose awareness is already higher keeps it (a
+  system-aware window stays system aware when the process declares itself unaware). Wine
+  fixed the awareness at creation. WinForms applications that load WPF late (vatSys)
+  create their first forms unaware, WPF then calls `SetProcessDPIAware()`, and from
+  wine-11.16 on `SetParent()` refuses to move the earlier, unaware panels into the later,
+  system-aware forms (`ERROR_INVALID_STATE`), which left the vatSys strip bays empty
+  without a `DPIUNAWARE` layer. Now the `create_window` request carries
+  `NTUSER_DPI_CONTEXT_FLAG_PROCESS` while the process awareness is unset, the server
+  marks the window (children and reparented windows take the mark of their parent), and
+  the new request `set_process_dpi_awareness` raises the marked windows of the process
+  when it sets its awareness. Window rectangles are not rescaled (not measured on
+  Windows; at 96 dpi there is nothing to rescale). Covered by `user32/tests/sysparams.c`
+  (`test_dpi_context`, `test_SetProcessDpiAwarenessContext`); the test program's
+  results for Windows 10, Wine before and after lie next to it in the project
 - **Direct2D window targets with DXVK (winex11)**: the window of an `ID2D1HwndRenderTarget`
   renders offscreen when its swap chain is a Vulkan one. d2d1 marks such a window so that a
   child is attached to its top-level instead, because wined3d presents it through GDI and
