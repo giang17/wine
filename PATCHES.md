@@ -969,6 +969,17 @@ This is the recommended branch. What it changes, by subsystem:
   process-global cache of the last X11 event, and posts a finished IME result string as
   WM_CHAR as well. Together these make typing work in embedded WebView2 fields, including
   AltGr characters such as `@`, `\` and `€` on non-US layouts
+- **Lock keys (winex11)**: when the CapsLock, NumLock or ScrollLock state of X differs from
+  Wine's, the driver sets the toggle bit directly instead of sending a lock key press and
+  release before the next key. Wine starts with every toggle off, so with NumLock on at
+  login (Plasma's default) every application saw a NumLock press nobody made, in its window
+  messages, low-level hooks and raw input; DirectInput 8 reads raw input, and vatSys's key
+  binding dialog captured NumLock instead of the key pressed. With any `WH_KEYBOARD_LL` hook
+  on the desktop the mismatch never settled (WineHQ bug 60059): the pair came before every
+  key press and release, and with CapsLock typed text changed case at random. Measured with
+  a 32-bit DirectInput 8 test, ten keys, NumLock on: before 1 fake `DIK_NUMLOCK` without a
+  hook and 20 with one, the toggle left off; now 0 and the toggle on, as on Windows 11. A
+  lock key changed while no Wine window had the focus is no longer replayed to hooks
 - **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
   video on a DAW timeline exercises paths a straight play-to-the-end never reaches. The
   session asked for a new sample on *every* call of its delivery routine instead of one at
