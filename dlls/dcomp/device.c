@@ -9247,22 +9247,18 @@ static HRESULT STDMETHODCALLTYPE dcomp_device4_CreateCompositionTexture(
 static HRESULT STDMETHODCALLTYPE dcomp_device5_CreateDynamicTexture(
         IDCompositionDevice5 *iface, IDCompositionDynamicTexture **texture)
 {
-    struct dcomp_dynamic_texture *object;
-
     TRACE("iface %p, texture %p.\n", iface, texture);
 
     if (!texture)
         return E_POINTER;
     *texture = NULL;
 
-    if (!(object = calloc(1, sizeof(*object))))
-        return E_OUTOFMEMORY;
-
-    object->IDCompositionDynamicTexture_iface.lpVtbl = &dcomp_dynamic_texture_vtbl;
-    object->refcount = 1;
-
-    *texture = &object->IDCompositionDynamicTexture_iface;
-    return S_OK;
+    /* SetTexture's damage rectangles describe an incremental update, not a
+     * complete replacement frame. The current indirection drops them and its
+     * always-available fence also permits reuse before our deferred readback.
+     * Do not advertise that implementation as a working presentation surface.
+     * Callers can still bind ordinary composition textures to their visuals. */
+    return E_NOTIMPL;
 }
 
 static const IDCompositionDevice5Vtbl dcomp_device5_vtbl =
