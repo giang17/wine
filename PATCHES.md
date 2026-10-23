@@ -1092,6 +1092,28 @@ This is the recommended branch. What it changes, by subsystem:
   blank with 11.0 (WineHQ bug 60548 reports the same menus with the same font). Windows
   draws nothing for the glyph and advances 8 px at 16 px (measured on Windows 10); so does
   Wine now
+- **Embedded bitmap strikes in GDI metrics (win32u)**: `GetGlyphOutline(GGO_METRICS)`,
+  `GetCharWidth32()`, `GetCharABCWidths()`, `GetTextExtentPoint32()` and the `DrawText()`
+  measurement take the advance of a font's embedded bitmap strike when the face has one at
+  the current ppem, and the ClearType rasterisation draws the strike's pixels as the mono
+  one already did; the grey formats keep the outline. Before, every glyph was loaded with
+  `FT_LOAD_NO_BITMAP` for everything but `GGO_BITMAP`, so a face whose strike is wider than
+  its hinted outline was measured narrower than it was drawn. Windows 10 reports the
+  strike's advance for `GGO_METRICS`, the ABC widths and `DrawText(DT_CALCRECT)` under every
+  quality and font smoothing setting and draws the strike for NONANTIALIASED, DEFAULT and
+  CLEARTYPE quality (reference VM; `GetCharWidth32()` and `GetTextExtentPoint32()` on that
+  build still report the outline, on the reporter's Windows the strike — Wine now gives the
+  strike throughout). TerminusTTF-Bold 4.39, shipped with vatSys, has strikes at 12 to
+  28 ppem, and those at 14 and 18 ppem are one pixel wider than the hinted outline: vatSys
+  sizes its strip fields from `TextRenderer.MeasureText("_")` on the 18 px font (reporter's
+  reading of the IL) and draws them with DirectWrite, whose GDI-compatible layout already
+  took the strike (10 px per glyph), so every field was one pixel per character too narrow
+  and the callsign ran past its box. Wine's own Tahoma and Tahoma Bold carry strikes at 8 to
+  16 ppem that Microsoft's Tahoma does not have, with advances that differ from Windows
+  (11 ppem: `i` 2 px against 3, `g` 6 against 7); faces from the Wine data directory keep
+  their strike for the mono rasterisation only, as before. Remaining difference: Windows
+  trims the strike to its ink for the ABC split and the black box (`_` at 18 px: 1/8/1 and
+  8x1 against 0/10/0 and 10x18 here)
 - **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
   video on a DAW timeline exercises paths a straight play-to-the-end never reaches. The
   session asked for a new sample on *every* call of its delivery routine instead of one at
