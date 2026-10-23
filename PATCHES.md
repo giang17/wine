@@ -1045,6 +1045,41 @@ This is the recommended branch. What it changes, by subsystem:
   KWin 5.27 the window comes back through Alt+Tab, a click on its task bar entry does not
   restore it (the same with Wine 11.20, which has the three commits). Only the Wayland driver
   is affected; the fork default is winex11 through Xwayland
+- **Scroll bar size (win32u)**: the default `ScrollHeight` and `ScrollWidth` are 17 px
+  (-255 twips) as on Windows — measured on Windows 10 22H2, where
+  `HKCU\Control Panel\Desktop\WindowMetrics` carries -255 and
+  `GetSystemMetrics(SM_CYHSCROLL)` returns 17 — instead of 16 px (-240), unchanged since the
+  metrics became scalable (a657e5f6efa, 2013). WinForms sizes an auto-sized horizontal
+  `TrackBar` to `SM_CYHSCROLL * 8 / 3`: 42 px instead of 45, and the sliders of vatSys's
+  Display Settings, which paint their value from row `Height / 2 + 10`, cut the digits. The
+  default goes into a new prefix; an existing prefix keeps the value in its registry
+  (`reg add "HKCU\Control Panel\Desktop\WindowMetrics" /v ScrollHeight /d -255 /f`, the
+  same for `ScrollWidth`, brings it in line)
+- **GDI+ font metrics and text baseline (gdiplus)**: three things, measured against Windows
+  10 with Terminus (TTF) Bold 4.39, the font vatSys ships. `GdipCreateFontFamilyFromName()`
+  finds a family whose only face is bold (backport of e6e9d7627c0 from Wine 11.17): the
+  lookup compared the face's full name "Terminus (TTF) Bold" with the family name and
+  failed, and .NET fell back to GenericSansSerif, Tahoma here. A font that sets
+  `USE_TYPO_METRICS` (OS/2 `fsSelection` bit 7) reports its typographic metrics as cell
+  ascent, descent and line spacing — 833/167/1090 for Terminus, as Windows reports them,
+  where hhea says 849/183/1122. `GdipDrawString()` places the baseline where Windows GDI+
+  does: at the cell ascent scaled to the em size and rounded, or at GDI's hinted ascent
+  (`tmAscent`) when the font has a VDMX table and that is larger — not at `tmAscent`
+  unconditionally (94 of 94 family and size pairs on Windows 10, 69 of 70 under Wine
+  afterwards; before, the digits of 16 px Terminus sat one row lower than on Windows). With
+  the three and the 45 px slider, the digits under vatSys's brightness sliders are complete,
+  as on Windows
+- **Glyphs FreeType refuses (win32u)**: a glyph `FT_Load_Glyph()` rejects is drawn empty
+  with the advance from `hmtx` instead of failing, and the ABC widths of a glyph that still
+  fails are zero: `GetTextExtentPoint32()`, `GetCharABCWidths()` and the `DrawText()`
+  measurement left them uninitialised, and whatever the stack held became the width.
+  TerminusTTF-Bold 4.39 has a `.notdef` whose instruction count exceeds
+  `maxp.maxSizeOfInstructions` (`FT_Err_Too_Many_Hints`), every control character maps to
+  it, and WinForms measures a tab for the shortcut column of every drop-down menu: vatSys's
+  menus opened across the screen, 30 849 px wide with Wine 11.20 and 32 475 217 px wide and
+  blank with 11.0 (WineHQ bug 60548 reports the same menus with the same font). Windows
+  draws nothing for the glyph and advances 8 px at 16 px (measured on Windows 10); so does
+  Wine now
 - **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
   video on a DAW timeline exercises paths a straight play-to-the-end never reaches. The
   session asked for a new sample on *every* call of its delivery routine instead of one at
