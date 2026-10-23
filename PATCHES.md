@@ -557,6 +557,18 @@ This is the recommended branch. What it changes, by subsystem:
   stale frame or undefined pixmap content, and SynthEdit 1.5's menus came up as a copy of
   the screen below them or black once the empty-region flush above was disabled. WineHQ
   bug 60173 reports the same for every WPF menu, tooltip and `AllowsTransparency` window.
+- **winex11**: the present blit that `x11drv_client_surface_reblit()` repeats on a
+  `VisibilityNotify` is dropped for a window's own swap chain once the window shows
+  `UpdateLayeredWindow()` content. WPF creates a Direct3D 9 swap chain for an
+  `AllowsTransparency` window, presents it once at start-up and from then on only hands
+  frames to `UpdateLayeredWindow()`; the pending blit was replayed on the `VisibilityNotify`
+  that follows a resize, over the window surface flushed a moment before, and only the parts
+  a later flush covered came back. NinjaTrader 8's welcome window grows from 378×550 to
+  902×502 for its trading-mode page and kept an L-shaped hole at its top-left corner (376×127
+  plus a 56 px column, 68 744 pixels with alpha 0 in the two measured starts, showing stripes
+  or a cyan tint from the undefined pixmap of the resized offscreen client window).
+  `scripts/repro-513-ulw-reblit.sh` shows 188 752 magenta pixels of a 902×502 window before
+  and 0 after. A child's swap chain inside such a window is still repeated.
 - **wineserver, winex11**: a child window of another process with
   `WS_EX_NOREDIRECTIONBITMAP` shows its DirectComposition content over a top-level painted
   through `UpdateLayeredWindow()`, as the DWM composes it on Windows. Such a top-level
