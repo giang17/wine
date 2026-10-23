@@ -7981,6 +7981,469 @@ static const struct ID2D1DeviceContext6Vtbl d2d_device_context_vtbl =
     d2d_device_context_BlendImage,
 };
 
+/* A multi-threaded factory serialises every call on the objects it creates
+ * (D2D1_FACTORY_TYPE_MULTI_THREADED); applications rely on it, e.g. vatSys draws
+ * the runways of a map with Parallel.ForEach onto one bitmap render target.
+ * Taking the factory lock only around the D3D11 submission leaves the constant
+ * buffer maps, the scratch buffers and the line and fill batches open to a
+ * second thread. Contexts of such a factory therefore get this table, whose
+ * entries hold the lock for the whole call; the lock is recursive, so a method
+ * calling another one through the interface is fine. */
+#define D2D_DEVICE_CONTEXT_MT_VOID(name, params, args) \
+static void STDMETHODCALLTYPE d2d_device_context_mt_##name params \
+{ \
+    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface); \
+\
+    EnterCriticalSection(context->cs); \
+    d2d_device_context_##name args; \
+    LeaveCriticalSection(context->cs); \
+}
+
+#define D2D_DEVICE_CONTEXT_MT(type, name, params, args) \
+static type STDMETHODCALLTYPE d2d_device_context_mt_##name params \
+{ \
+    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface); \
+    type ret; \
+\
+    EnterCriticalSection(context->cs); \
+    ret = d2d_device_context_##name args; \
+    LeaveCriticalSection(context->cs); \
+    return ret; \
+}
+
+D2D_DEVICE_CONTEXT_MT_VOID(GetFactory, (ID2D1DeviceContext6 *iface, ID2D1Factory **factory), (iface, factory))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateBitmap, (ID2D1DeviceContext6 *iface, D2D1_SIZE_U size,
+        const void *src_data, UINT32 pitch, const D2D1_BITMAP_PROPERTIES *desc, ID2D1Bitmap **bitmap), (iface,
+        size, src_data, pitch, desc, bitmap))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateBitmapFromWicBitmap, (ID2D1DeviceContext6 *iface,
+        IWICBitmapSource *bitmap_source, const D2D1_BITMAP_PROPERTIES *desc, ID2D1Bitmap **bitmap), (iface,
+        bitmap_source, desc, bitmap))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateSharedBitmap, (ID2D1DeviceContext6 *iface, REFIID iid, void *data,
+        const D2D1_BITMAP_PROPERTIES *desc, ID2D1Bitmap **bitmap), (iface, iid, data, desc, bitmap))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateBitmapBrush, (ID2D1DeviceContext6 *iface, ID2D1Bitmap *bitmap,
+        const D2D1_BITMAP_BRUSH_PROPERTIES *bitmap_brush_desc, const D2D1_BRUSH_PROPERTIES *brush_desc,
+        ID2D1BitmapBrush **brush), (iface, bitmap, bitmap_brush_desc, brush_desc, brush))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateSolidColorBrush, (ID2D1DeviceContext6 *iface, const D2D1_COLOR_F *color,
+        const D2D1_BRUSH_PROPERTIES *desc, ID2D1SolidColorBrush **brush), (iface, color, desc, brush))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateGradientStopCollection, (ID2D1DeviceContext6 *iface,
+        const D2D1_GRADIENT_STOP *stops, UINT32 stop_count, D2D1_GAMMA gamma, D2D1_EXTEND_MODE extend_mode,
+        ID2D1GradientStopCollection **gradient), (iface, stops, stop_count, gamma, extend_mode, gradient))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateLinearGradientBrush, (ID2D1DeviceContext6 *iface,
+        const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES *gradient_brush_desc,
+        const D2D1_BRUSH_PROPERTIES *brush_desc, ID2D1GradientStopCollection *gradient,
+        ID2D1LinearGradientBrush **brush), (iface, gradient_brush_desc, brush_desc, gradient, brush))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateRadialGradientBrush, (ID2D1DeviceContext6 *iface,
+        const D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES *gradient_brush_desc,
+        const D2D1_BRUSH_PROPERTIES *brush_desc, ID2D1GradientStopCollection *gradient,
+        ID2D1RadialGradientBrush **brush), (iface, gradient_brush_desc, brush_desc, gradient, brush))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateCompatibleRenderTarget, (ID2D1DeviceContext6 *iface,
+        const D2D1_SIZE_F *size, const D2D1_SIZE_U *pixel_size, const D2D1_PIXEL_FORMAT *format,
+        D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS options, ID2D1BitmapRenderTarget **rt), (iface, size,
+        pixel_size, format, options, rt))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateLayer, (ID2D1DeviceContext6 *iface, const D2D1_SIZE_F *size,
+        ID2D1Layer **layer), (iface, size, layer))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateMesh, (ID2D1DeviceContext6 *iface, ID2D1Mesh **mesh), (iface, mesh))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawLine, (ID2D1DeviceContext6 *iface, D2D1_POINT_2F p0, D2D1_POINT_2F p1,
+        ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style), (iface, p0, p1, brush,
+        stroke_width, stroke_style))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawRectangle, (ID2D1DeviceContext6 *iface, const D2D1_RECT_F *rect,
+        ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style), (iface, rect, brush,
+        stroke_width, stroke_style))
+D2D_DEVICE_CONTEXT_MT_VOID(FillRectangle, (ID2D1DeviceContext6 *iface, const D2D1_RECT_F *rect,
+        ID2D1Brush *brush), (iface, rect, brush))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawRoundedRectangle, (ID2D1DeviceContext6 *iface, const D2D1_ROUNDED_RECT *rect,
+        ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style), (iface, rect, brush,
+        stroke_width, stroke_style))
+D2D_DEVICE_CONTEXT_MT_VOID(FillRoundedRectangle, (ID2D1DeviceContext6 *iface, const D2D1_ROUNDED_RECT *rect,
+        ID2D1Brush *brush), (iface, rect, brush))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawEllipse, (ID2D1DeviceContext6 *iface, const D2D1_ELLIPSE *ellipse,
+        ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style), (iface, ellipse, brush,
+        stroke_width, stroke_style))
+D2D_DEVICE_CONTEXT_MT_VOID(FillEllipse, (ID2D1DeviceContext6 *iface, const D2D1_ELLIPSE *ellipse,
+        ID2D1Brush *brush), (iface, ellipse, brush))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawGeometry, (ID2D1DeviceContext6 *iface, ID2D1Geometry *geometry,
+        ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style), (iface, geometry, brush,
+        stroke_width, stroke_style))
+D2D_DEVICE_CONTEXT_MT_VOID(FillGeometry, (ID2D1DeviceContext6 *iface, ID2D1Geometry *geometry,
+        ID2D1Brush *brush, ID2D1Brush *opacity_brush), (iface, geometry, brush, opacity_brush))
+D2D_DEVICE_CONTEXT_MT_VOID(FillMesh, (ID2D1DeviceContext6 *iface, ID2D1Mesh *mesh, ID2D1Brush *brush), (iface,
+        mesh, brush))
+D2D_DEVICE_CONTEXT_MT_VOID(FillOpacityMask, (ID2D1DeviceContext6 *iface, ID2D1Bitmap *mask, ID2D1Brush *brush,
+        D2D1_OPACITY_MASK_CONTENT content, const D2D1_RECT_F *dst_rect, const D2D1_RECT_F *src_rect), (iface,
+        mask, brush, content, dst_rect, src_rect))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawBitmap, (ID2D1DeviceContext6 *iface, ID2D1Bitmap *bitmap,
+        const D2D1_RECT_F *dst_rect, float opacity, D2D1_BITMAP_INTERPOLATION_MODE interpolation_mode,
+        const D2D1_RECT_F *src_rect), (iface, bitmap, dst_rect, opacity, interpolation_mode, src_rect))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawText, (ID2D1DeviceContext6 *iface, const WCHAR *string, UINT32 string_len,
+        IDWriteTextFormat *text_format, const D2D1_RECT_F *layout_rect, ID2D1Brush *brush,
+        D2D1_DRAW_TEXT_OPTIONS options, DWRITE_MEASURING_MODE measuring_mode), (iface, string, string_len,
+        text_format, layout_rect, brush, options, measuring_mode))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawTextLayout, (ID2D1DeviceContext6 *iface, D2D1_POINT_2F origin,
+        IDWriteTextLayout *layout, ID2D1Brush *brush, D2D1_DRAW_TEXT_OPTIONS options), (iface, origin, layout,
+        brush, options))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawGlyphRun, (ID2D1DeviceContext6 *iface, D2D1_POINT_2F baseline_origin,
+        const DWRITE_GLYPH_RUN *glyph_run, ID2D1Brush *brush, DWRITE_MEASURING_MODE measuring_mode), (iface,
+        baseline_origin, glyph_run, brush, measuring_mode))
+D2D_DEVICE_CONTEXT_MT_VOID(SetTransform, (ID2D1DeviceContext6 *iface, const D2D1_MATRIX_3X2_F *transform),
+        (iface, transform))
+D2D_DEVICE_CONTEXT_MT_VOID(GetTransform, (ID2D1DeviceContext6 *iface, D2D1_MATRIX_3X2_F *transform), (iface,
+        transform))
+D2D_DEVICE_CONTEXT_MT_VOID(SetAntialiasMode, (ID2D1DeviceContext6 *iface, D2D1_ANTIALIAS_MODE antialias_mode),
+        (iface, antialias_mode))
+D2D_DEVICE_CONTEXT_MT(D2D1_ANTIALIAS_MODE, GetAntialiasMode, (ID2D1DeviceContext6 *iface), (iface))
+D2D_DEVICE_CONTEXT_MT_VOID(SetTextAntialiasMode, (ID2D1DeviceContext6 *iface,
+        D2D1_TEXT_ANTIALIAS_MODE antialias_mode), (iface, antialias_mode))
+D2D_DEVICE_CONTEXT_MT(D2D1_TEXT_ANTIALIAS_MODE, GetTextAntialiasMode, (ID2D1DeviceContext6 *iface), (iface))
+D2D_DEVICE_CONTEXT_MT_VOID(SetTextRenderingParams, (ID2D1DeviceContext6 *iface,
+        IDWriteRenderingParams *text_rendering_params), (iface, text_rendering_params))
+D2D_DEVICE_CONTEXT_MT_VOID(GetTextRenderingParams, (ID2D1DeviceContext6 *iface,
+        IDWriteRenderingParams **text_rendering_params), (iface, text_rendering_params))
+D2D_DEVICE_CONTEXT_MT_VOID(SetTags, (ID2D1DeviceContext6 *iface, D2D1_TAG tag1, D2D1_TAG tag2), (iface, tag1,
+        tag2))
+D2D_DEVICE_CONTEXT_MT_VOID(GetTags, (ID2D1DeviceContext6 *iface, D2D1_TAG *tag1, D2D1_TAG *tag2), (iface,
+        tag1, tag2))
+D2D_DEVICE_CONTEXT_MT_VOID(PushLayer, (ID2D1DeviceContext6 *iface,
+        const D2D1_LAYER_PARAMETERS *layer_parameters, ID2D1Layer *layer), (iface, layer_parameters, layer))
+D2D_DEVICE_CONTEXT_MT_VOID(PopLayer, (ID2D1DeviceContext6 *iface), (iface))
+D2D_DEVICE_CONTEXT_MT(HRESULT, Flush, (ID2D1DeviceContext6 *iface, D2D1_TAG *tag1, D2D1_TAG *tag2), (iface,
+        tag1, tag2))
+D2D_DEVICE_CONTEXT_MT_VOID(SaveDrawingState, (ID2D1DeviceContext6 *iface,
+        ID2D1DrawingStateBlock *state_block), (iface, state_block))
+D2D_DEVICE_CONTEXT_MT_VOID(RestoreDrawingState, (ID2D1DeviceContext6 *iface,
+        ID2D1DrawingStateBlock *state_block), (iface, state_block))
+D2D_DEVICE_CONTEXT_MT_VOID(PushAxisAlignedClip, (ID2D1DeviceContext6 *iface, const D2D1_RECT_F *clip_rect,
+        D2D1_ANTIALIAS_MODE antialias_mode), (iface, clip_rect, antialias_mode))
+D2D_DEVICE_CONTEXT_MT_VOID(PopAxisAlignedClip, (ID2D1DeviceContext6 *iface), (iface))
+D2D_DEVICE_CONTEXT_MT_VOID(Clear, (ID2D1DeviceContext6 *iface, const D2D1_COLOR_F *colour), (iface, colour))
+D2D_DEVICE_CONTEXT_MT_VOID(BeginDraw, (ID2D1DeviceContext6 *iface), (iface))
+D2D_DEVICE_CONTEXT_MT(HRESULT, EndDraw, (ID2D1DeviceContext6 *iface, D2D1_TAG *tag1, D2D1_TAG *tag2), (iface,
+        tag1, tag2))
+D2D_DEVICE_CONTEXT_MT(D2D1_PIXEL_FORMAT *, GetPixelFormat, (ID2D1DeviceContext6 *iface,
+        D2D1_PIXEL_FORMAT *format), (iface, format))
+D2D_DEVICE_CONTEXT_MT_VOID(SetDpi, (ID2D1DeviceContext6 *iface, float dpi_x, float dpi_y), (iface, dpi_x,
+        dpi_y))
+D2D_DEVICE_CONTEXT_MT_VOID(GetDpi, (ID2D1DeviceContext6 *iface, float *dpi_x, float *dpi_y), (iface, dpi_x,
+        dpi_y))
+D2D_DEVICE_CONTEXT_MT(D2D1_SIZE_F *, GetSize, (ID2D1DeviceContext6 *iface, D2D1_SIZE_F *size), (iface, size))
+D2D_DEVICE_CONTEXT_MT(D2D1_SIZE_U *, GetPixelSize, (ID2D1DeviceContext6 *iface, D2D1_SIZE_U *pixel_size),
+        (iface, pixel_size))
+D2D_DEVICE_CONTEXT_MT(UINT32, GetMaximumBitmapSize, (ID2D1DeviceContext6 *iface), (iface))
+D2D_DEVICE_CONTEXT_MT(BOOL, IsSupported, (ID2D1DeviceContext6 *iface,
+        const D2D1_RENDER_TARGET_PROPERTIES *desc), (iface, desc))
+D2D_DEVICE_CONTEXT_MT(HRESULT, ID2D1DeviceContext_CreateBitmap, (ID2D1DeviceContext6 *iface, D2D1_SIZE_U size,
+        const void *src_data, UINT32 pitch, const D2D1_BITMAP_PROPERTIES1 *desc, ID2D1Bitmap1 **bitmap),
+        (iface, size, src_data, pitch, desc, bitmap))
+D2D_DEVICE_CONTEXT_MT(HRESULT, ID2D1DeviceContext_CreateBitmapFromWicBitmap, (ID2D1DeviceContext6 *iface,
+        IWICBitmapSource *bitmap_source, const D2D1_BITMAP_PROPERTIES1 *desc, ID2D1Bitmap1 **bitmap), (iface,
+        bitmap_source, desc, bitmap))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateColorContext, (ID2D1DeviceContext6 *iface, D2D1_COLOR_SPACE space,
+        const BYTE *profile, UINT32 profile_size, ID2D1ColorContext **color_context), (iface, space, profile,
+        profile_size, color_context))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateColorContextFromFilename, (ID2D1DeviceContext6 *iface,
+        const WCHAR *filename, ID2D1ColorContext **color_context), (iface, filename, color_context))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateColorContextFromWicColorContext, (ID2D1DeviceContext6 *iface,
+        IWICColorContext *wic_color_context, ID2D1ColorContext **color_context), (iface, wic_color_context,
+        color_context))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateBitmapFromDxgiSurface, (ID2D1DeviceContext6 *iface,
+        IDXGISurface *surface, const D2D1_BITMAP_PROPERTIES1 *desc, ID2D1Bitmap1 **bitmap), (iface, surface,
+        desc, bitmap))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateEffect, (ID2D1DeviceContext6 *iface, REFCLSID effect_id,
+        ID2D1Effect **effect), (iface, effect_id, effect))
+D2D_DEVICE_CONTEXT_MT(HRESULT, ID2D1DeviceContext_CreateGradientStopCollection, (ID2D1DeviceContext6 *iface,
+        const D2D1_GRADIENT_STOP *stops, UINT32 stop_count, D2D1_COLOR_SPACE preinterpolation_space,
+        D2D1_COLOR_SPACE postinterpolation_space, D2D1_BUFFER_PRECISION buffer_precision,
+        D2D1_EXTEND_MODE extend_mode, D2D1_COLOR_INTERPOLATION_MODE color_interpolation_mode,
+        ID2D1GradientStopCollection1 **gradient), (iface, stops, stop_count, preinterpolation_space,
+        postinterpolation_space, buffer_precision, extend_mode, color_interpolation_mode, gradient))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateImageBrush, (ID2D1DeviceContext6 *iface, ID2D1Image *image,
+        const D2D1_IMAGE_BRUSH_PROPERTIES *image_brush_desc, const D2D1_BRUSH_PROPERTIES *brush_desc,
+        ID2D1ImageBrush **brush), (iface, image, image_brush_desc, brush_desc, brush))
+D2D_DEVICE_CONTEXT_MT(HRESULT, ID2D1DeviceContext_CreateBitmapBrush, (ID2D1DeviceContext6 *iface,
+        ID2D1Bitmap *bitmap, const D2D1_BITMAP_BRUSH_PROPERTIES1 *bitmap_brush_desc,
+        const D2D1_BRUSH_PROPERTIES *brush_desc, ID2D1BitmapBrush1 **brush), (iface, bitmap,
+        bitmap_brush_desc, brush_desc, brush))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateCommandList, (ID2D1DeviceContext6 *iface,
+        ID2D1CommandList **command_list), (iface, command_list))
+D2D_DEVICE_CONTEXT_MT(BOOL, IsDxgiFormatSupported, (ID2D1DeviceContext6 *iface, DXGI_FORMAT format), (iface,
+        format))
+D2D_DEVICE_CONTEXT_MT(BOOL, IsBufferPrecisionSupported, (ID2D1DeviceContext6 *iface,
+        D2D1_BUFFER_PRECISION buffer_precision), (iface, buffer_precision))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetImageLocalBounds, (ID2D1DeviceContext6 *iface, ID2D1Image *image,
+        D2D1_RECT_F *local_bounds), (iface, image, local_bounds))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetImageWorldBounds, (ID2D1DeviceContext6 *iface, ID2D1Image *image,
+        D2D1_RECT_F *world_bounds), (iface, image, world_bounds))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetGlyphRunWorldBounds, (ID2D1DeviceContext6 *iface,
+        D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run,
+        DWRITE_MEASURING_MODE measuring_mode, D2D1_RECT_F *bounds), (iface, baseline_origin, glyph_run,
+        measuring_mode, bounds))
+D2D_DEVICE_CONTEXT_MT_VOID(GetDevice, (ID2D1DeviceContext6 *iface, ID2D1Device **device), (iface, device))
+D2D_DEVICE_CONTEXT_MT_VOID(SetTarget, (ID2D1DeviceContext6 *iface, ID2D1Image *target), (iface, target))
+D2D_DEVICE_CONTEXT_MT_VOID(GetTarget, (ID2D1DeviceContext6 *iface, ID2D1Image **target), (iface, target))
+D2D_DEVICE_CONTEXT_MT_VOID(SetRenderingControls, (ID2D1DeviceContext6 *iface,
+        const D2D1_RENDERING_CONTROLS *rendering_controls), (iface, rendering_controls))
+D2D_DEVICE_CONTEXT_MT_VOID(GetRenderingControls, (ID2D1DeviceContext6 *iface,
+        D2D1_RENDERING_CONTROLS *rendering_controls), (iface, rendering_controls))
+D2D_DEVICE_CONTEXT_MT_VOID(SetPrimitiveBlend, (ID2D1DeviceContext6 *iface,
+        D2D1_PRIMITIVE_BLEND primitive_blend), (iface, primitive_blend))
+D2D_DEVICE_CONTEXT_MT(D2D1_PRIMITIVE_BLEND, GetPrimitiveBlend, (ID2D1DeviceContext6 *iface), (iface))
+D2D_DEVICE_CONTEXT_MT_VOID(SetUnitMode, (ID2D1DeviceContext6 *iface, D2D1_UNIT_MODE unit_mode), (iface,
+        unit_mode))
+D2D_DEVICE_CONTEXT_MT(D2D1_UNIT_MODE, GetUnitMode, (ID2D1DeviceContext6 *iface), (iface))
+D2D_DEVICE_CONTEXT_MT_VOID(ID2D1DeviceContext_DrawGlyphRun, (ID2D1DeviceContext6 *iface,
+        D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run,
+        const DWRITE_GLYPH_RUN_DESCRIPTION *glyph_run_desc, ID2D1Brush *brush,
+        DWRITE_MEASURING_MODE measuring_mode), (iface, baseline_origin, glyph_run, glyph_run_desc, brush,
+        measuring_mode))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawImage, (ID2D1DeviceContext6 *iface, ID2D1Image *image,
+        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
+        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode), (iface, image,
+        target_offset, image_rect, interpolation_mode, composite_mode))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawGdiMetafile, (ID2D1DeviceContext6 *iface, ID2D1GdiMetafile *metafile,
+        const D2D1_POINT_2F *target_offset), (iface, metafile, target_offset))
+D2D_DEVICE_CONTEXT_MT_VOID(ID2D1DeviceContext_DrawBitmap, (ID2D1DeviceContext6 *iface, ID2D1Bitmap *bitmap,
+        const D2D1_RECT_F *dst_rect, float opacity, D2D1_INTERPOLATION_MODE interpolation_mode,
+        const D2D1_RECT_F *src_rect, const D2D1_MATRIX_4X4_F *perspective_transform), (iface, bitmap,
+        dst_rect, opacity, interpolation_mode, src_rect, perspective_transform))
+D2D_DEVICE_CONTEXT_MT_VOID(ID2D1DeviceContext_PushLayer, (ID2D1DeviceContext6 *iface,
+        const D2D1_LAYER_PARAMETERS1 *layer_parameters, ID2D1Layer *layer), (iface, layer_parameters, layer))
+D2D_DEVICE_CONTEXT_MT(HRESULT, InvalidateEffectInputRectangle, (ID2D1DeviceContext6 *iface,
+        ID2D1Effect *effect, UINT32 input, const D2D1_RECT_F *input_rect), (iface, effect, input, input_rect))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetEffectInvalidRectangleCount, (ID2D1DeviceContext6 *iface,
+        ID2D1Effect *effect, UINT32 *rect_count), (iface, effect, rect_count))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetEffectInvalidRectangles, (ID2D1DeviceContext6 *iface, ID2D1Effect *effect,
+        D2D1_RECT_F *rectangles, UINT32 rect_count), (iface, effect, rectangles, rect_count))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetEffectRequiredInputRectangles, (ID2D1DeviceContext6 *iface,
+        ID2D1Effect *effect, const D2D1_RECT_F *image_rect, const D2D1_EFFECT_INPUT_DESCRIPTION *desc,
+        D2D1_RECT_F *input_rect, UINT32 input_count), (iface, effect, image_rect, desc, input_rect,
+        input_count))
+D2D_DEVICE_CONTEXT_MT_VOID(ID2D1DeviceContext_FillOpacityMask, (ID2D1DeviceContext6 *iface, ID2D1Bitmap *mask,
+        ID2D1Brush *brush, const D2D1_RECT_F *dst_rect, const D2D1_RECT_F *src_rect), (iface, mask, brush,
+        dst_rect, src_rect))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateFilledGeometryRealization, (ID2D1DeviceContext6 *iface,
+        ID2D1Geometry *geometry, float tolerance, ID2D1GeometryRealization **realization), (iface, geometry,
+        tolerance, realization))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateStrokedGeometryRealization, (ID2D1DeviceContext6 *iface,
+        ID2D1Geometry *geometry, float tolerance, float stroke_width, ID2D1StrokeStyle *stroke_style,
+        ID2D1GeometryRealization **realization), (iface, geometry, tolerance, stroke_width, stroke_style,
+        realization))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawGeometryRealization, (ID2D1DeviceContext6 *iface,
+        ID2D1GeometryRealization *realization, ID2D1Brush *brush), (iface, realization, brush))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateInk, (ID2D1DeviceContext6 *iface, const D2D1_INK_POINT *start_point,
+        ID2D1Ink **ink), (iface, start_point, ink))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateInkStyle, (ID2D1DeviceContext6 *iface,
+        const D2D1_INK_STYLE_PROPERTIES *ink_style_properties, ID2D1InkStyle **ink_style), (iface,
+        ink_style_properties, ink_style))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateGradientMesh, (ID2D1DeviceContext6 *iface,
+        const D2D1_GRADIENT_MESH_PATCH *patches, UINT32 patches_count, ID2D1GradientMesh **gradient_mesh),
+        (iface, patches, patches_count, gradient_mesh))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateImageSourceFromWic, (ID2D1DeviceContext6 *iface,
+        IWICBitmapSource *wic_bitmap_source, D2D1_IMAGE_SOURCE_LOADING_OPTIONS loading_options,
+        D2D1_ALPHA_MODE alpha_mode, ID2D1ImageSourceFromWic **image_source), (iface, wic_bitmap_source,
+        loading_options, alpha_mode, image_source))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateLookupTable3D, (ID2D1DeviceContext6 *iface,
+        D2D1_BUFFER_PRECISION precision, const UINT32 *extents, const BYTE *data, UINT32 data_count,
+        const UINT32 *strides, ID2D1LookupTable3D **lookup_table), (iface, precision, extents, data,
+        data_count, strides, lookup_table))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateImageSourceFromDxgi, (ID2D1DeviceContext6 *iface,
+        IDXGISurface **surfaces, UINT32 surface_count, DXGI_COLOR_SPACE_TYPE color_space,
+        D2D1_IMAGE_SOURCE_FROM_DXGI_OPTIONS options, ID2D1ImageSource **image_source), (iface, surfaces,
+        surface_count, color_space, options, image_source))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetGradientMeshWorldBounds, (ID2D1DeviceContext6 *iface,
+        ID2D1GradientMesh *gradient_mesh, D2D1_RECT_F *bounds), (iface, gradient_mesh, bounds))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawInk, (ID2D1DeviceContext6 *iface, ID2D1Ink *ink, ID2D1Brush *brush,
+        ID2D1InkStyle *ink_style), (iface, ink, brush, ink_style))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawGradientMesh, (ID2D1DeviceContext6 *iface, ID2D1GradientMesh *gradient_mesh),
+        (iface, gradient_mesh))
+D2D_DEVICE_CONTEXT_MT_VOID(ID2D1DeviceContext2_DrawGdiMetafile, (ID2D1DeviceContext6 *iface,
+        ID2D1GdiMetafile *gdi_metafile, const D2D1_RECT_F *dst_rect, const D2D1_RECT_F *src_rect), (iface,
+        gdi_metafile, dst_rect, src_rect))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateTransformedImageSource, (ID2D1DeviceContext6 *iface,
+        ID2D1ImageSource *source, const D2D1_TRANSFORMED_IMAGE_SOURCE_PROPERTIES *props,
+        ID2D1TransformedImageSource **transformed), (iface, source, props, transformed))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateSpriteBatch, (ID2D1DeviceContext6 *iface,
+        ID2D1SpriteBatch **sprite_batch), (iface, sprite_batch))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawSpriteBatch, (ID2D1DeviceContext6 *iface, ID2D1SpriteBatch *sprite_batch,
+        UINT32 start_index, UINT32 sprite_count, ID2D1Bitmap *bitmap,
+        D2D1_BITMAP_INTERPOLATION_MODE interpolation_mode, D2D1_SPRITE_OPTIONS sprite_options), (iface,
+        sprite_batch, start_index, sprite_count, bitmap, interpolation_mode, sprite_options))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateSvgGlyphStyle, (ID2D1DeviceContext6 *iface,
+        ID2D1SvgGlyphStyle **svg_glyph_style), (iface, svg_glyph_style))
+D2D_DEVICE_CONTEXT_MT_VOID(ID2D1DeviceContext4_DrawText, (ID2D1DeviceContext6 *iface, const WCHAR *string,
+        UINT32 string_length, IDWriteTextFormat *text_format, const D2D1_RECT_F *layout_rect,
+        ID2D1Brush *default_fill_brush, ID2D1SvgGlyphStyle *svg_glyph_style, UINT32 color_palette_index,
+        D2D1_DRAW_TEXT_OPTIONS options, DWRITE_MEASURING_MODE measuring_mode), (iface, string, string_length,
+        text_format, layout_rect, default_fill_brush, svg_glyph_style, color_palette_index, options,
+        measuring_mode))
+D2D_DEVICE_CONTEXT_MT_VOID(ID2D1DeviceContext4_DrawTextLayout, (ID2D1DeviceContext6 *iface,
+        D2D1_POINT_2F origin, IDWriteTextLayout *text_layout, ID2D1Brush *default_fill_brush,
+        ID2D1SvgGlyphStyle *svg_glyph_style, UINT32 color_palette_index, D2D1_DRAW_TEXT_OPTIONS options),
+        (iface, origin, text_layout, default_fill_brush, svg_glyph_style, color_palette_index, options))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawColorBitmapGlyphRun, (ID2D1DeviceContext6 *iface,
+        DWRITE_GLYPH_IMAGE_FORMATS glyph_image_format, D2D1_POINT_2F baseline_origin,
+        const DWRITE_GLYPH_RUN *glyph_run, DWRITE_MEASURING_MODE measuring_mode,
+        D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION bitmap_snap_option), (iface, glyph_image_format, baseline_origin,
+        glyph_run, measuring_mode, bitmap_snap_option))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawSvgGlyphRun, (ID2D1DeviceContext6 *iface, D2D1_POINT_2F baseline_origin,
+        const DWRITE_GLYPH_RUN *glyph_run, ID2D1Brush *default_fill_brush,
+        ID2D1SvgGlyphStyle *svg_glyph_style, UINT32 color_palette_index,
+        DWRITE_MEASURING_MODE measuring_mode), (iface, baseline_origin, glyph_run, default_fill_brush,
+        svg_glyph_style, color_palette_index, measuring_mode))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetColorBitmapGlyphImage, (ID2D1DeviceContext6 *iface,
+        DWRITE_GLYPH_IMAGE_FORMATS glyph_image_format, D2D1_POINT_2F glyph_origin, IDWriteFontFace *font_face,
+        FLOAT font_em_size, UINT16 glyph_index, BOOL is_sideways, const D2D1_MATRIX_3X2_F *world_transform,
+        FLOAT dpi_x, FLOAT dpi_y, D2D1_MATRIX_3X2_F *glyph_transform, ID2D1Image **glyph_image), (iface,
+        glyph_image_format, glyph_origin, font_face, font_em_size, glyph_index, is_sideways, world_transform,
+        dpi_x, dpi_y, glyph_transform, glyph_image))
+D2D_DEVICE_CONTEXT_MT(HRESULT, GetSvgGlyphImage, (ID2D1DeviceContext6 *iface, D2D1_POINT_2F glyph_origin,
+        IDWriteFontFace *font_face, FLOAT font_em_size, UINT16 glyph_index, BOOL is_sideways,
+        const D2D1_MATRIX_3X2_F *world_transform, ID2D1Brush *default_fill_brush,
+        ID2D1SvgGlyphStyle *svg_glyph_style, UINT32 color_palette_index, D2D1_MATRIX_3X2_F *glyph_transform,
+        ID2D1CommandList **glyph_image), (iface, glyph_origin, font_face, font_em_size, glyph_index,
+        is_sideways, world_transform, default_fill_brush, svg_glyph_style, color_palette_index,
+        glyph_transform, glyph_image))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateSvgDocument, (ID2D1DeviceContext6 *iface, IStream *input_xml_stream,
+        D2D1_SIZE_F viewport_size, ID2D1SvgDocument **svg_document), (iface, input_xml_stream, viewport_size,
+        svg_document))
+D2D_DEVICE_CONTEXT_MT_VOID(DrawSvgDocument, (ID2D1DeviceContext6 *iface, ID2D1SvgDocument *svg_document),
+        (iface, svg_document))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateColorContextFromDxgiColorSpace, (ID2D1DeviceContext6 *iface,
+        DXGI_COLOR_SPACE_TYPE color_space, ID2D1ColorContext1 **color_context), (iface, color_space,
+        color_context))
+D2D_DEVICE_CONTEXT_MT(HRESULT, CreateColorContextFromSimpleColorProfile, (ID2D1DeviceContext6 *iface,
+        const D2D1_SIMPLE_COLOR_PROFILE *simple_profile, ID2D1ColorContext1 **color_context), (iface,
+        simple_profile, color_context))
+D2D_DEVICE_CONTEXT_MT_VOID(BlendImage, (ID2D1DeviceContext6 *iface, ID2D1Image *image,
+        D2D1_BLEND_MODE blend_mode, const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
+        D2D1_INTERPOLATION_MODE interpolation_mode), (iface, image, blend_mode, target_offset, image_rect,
+        interpolation_mode))
+
+#undef D2D_DEVICE_CONTEXT_MT_VOID
+#undef D2D_DEVICE_CONTEXT_MT
+
+static const struct ID2D1DeviceContext6Vtbl d2d_device_context_mt_vtbl =
+{
+    d2d_device_context_QueryInterface,
+    d2d_device_context_AddRef,
+    d2d_device_context_Release,
+    d2d_device_context_mt_GetFactory,
+    d2d_device_context_mt_CreateBitmap,
+    d2d_device_context_mt_CreateBitmapFromWicBitmap,
+    d2d_device_context_mt_CreateSharedBitmap,
+    d2d_device_context_mt_CreateBitmapBrush,
+    d2d_device_context_mt_CreateSolidColorBrush,
+    d2d_device_context_mt_CreateGradientStopCollection,
+    d2d_device_context_mt_CreateLinearGradientBrush,
+    d2d_device_context_mt_CreateRadialGradientBrush,
+    d2d_device_context_mt_CreateCompatibleRenderTarget,
+    d2d_device_context_mt_CreateLayer,
+    d2d_device_context_mt_CreateMesh,
+    d2d_device_context_mt_DrawLine,
+    d2d_device_context_mt_DrawRectangle,
+    d2d_device_context_mt_FillRectangle,
+    d2d_device_context_mt_DrawRoundedRectangle,
+    d2d_device_context_mt_FillRoundedRectangle,
+    d2d_device_context_mt_DrawEllipse,
+    d2d_device_context_mt_FillEllipse,
+    d2d_device_context_mt_DrawGeometry,
+    d2d_device_context_mt_FillGeometry,
+    d2d_device_context_mt_FillMesh,
+    d2d_device_context_mt_FillOpacityMask,
+    d2d_device_context_mt_DrawBitmap,
+    d2d_device_context_mt_DrawText,
+    d2d_device_context_mt_DrawTextLayout,
+    d2d_device_context_mt_DrawGlyphRun,
+    d2d_device_context_mt_SetTransform,
+    d2d_device_context_mt_GetTransform,
+    d2d_device_context_mt_SetAntialiasMode,
+    d2d_device_context_mt_GetAntialiasMode,
+    d2d_device_context_mt_SetTextAntialiasMode,
+    d2d_device_context_mt_GetTextAntialiasMode,
+    d2d_device_context_mt_SetTextRenderingParams,
+    d2d_device_context_mt_GetTextRenderingParams,
+    d2d_device_context_mt_SetTags,
+    d2d_device_context_mt_GetTags,
+    d2d_device_context_mt_PushLayer,
+    d2d_device_context_mt_PopLayer,
+    d2d_device_context_mt_Flush,
+    d2d_device_context_mt_SaveDrawingState,
+    d2d_device_context_mt_RestoreDrawingState,
+    d2d_device_context_mt_PushAxisAlignedClip,
+    d2d_device_context_mt_PopAxisAlignedClip,
+    d2d_device_context_mt_Clear,
+    d2d_device_context_mt_BeginDraw,
+    d2d_device_context_mt_EndDraw,
+    d2d_device_context_mt_GetPixelFormat,
+    d2d_device_context_mt_SetDpi,
+    d2d_device_context_mt_GetDpi,
+    d2d_device_context_mt_GetSize,
+    d2d_device_context_mt_GetPixelSize,
+    d2d_device_context_mt_GetMaximumBitmapSize,
+    d2d_device_context_mt_IsSupported,
+    d2d_device_context_mt_ID2D1DeviceContext_CreateBitmap,
+    d2d_device_context_mt_ID2D1DeviceContext_CreateBitmapFromWicBitmap,
+    d2d_device_context_mt_CreateColorContext,
+    d2d_device_context_mt_CreateColorContextFromFilename,
+    d2d_device_context_mt_CreateColorContextFromWicColorContext,
+    d2d_device_context_mt_CreateBitmapFromDxgiSurface,
+    d2d_device_context_mt_CreateEffect,
+    d2d_device_context_mt_ID2D1DeviceContext_CreateGradientStopCollection,
+    d2d_device_context_mt_CreateImageBrush,
+    d2d_device_context_mt_ID2D1DeviceContext_CreateBitmapBrush,
+    d2d_device_context_mt_CreateCommandList,
+    d2d_device_context_mt_IsDxgiFormatSupported,
+    d2d_device_context_mt_IsBufferPrecisionSupported,
+    d2d_device_context_mt_GetImageLocalBounds,
+    d2d_device_context_mt_GetImageWorldBounds,
+    d2d_device_context_mt_GetGlyphRunWorldBounds,
+    d2d_device_context_mt_GetDevice,
+    d2d_device_context_mt_SetTarget,
+    d2d_device_context_mt_GetTarget,
+    d2d_device_context_mt_SetRenderingControls,
+    d2d_device_context_mt_GetRenderingControls,
+    d2d_device_context_mt_SetPrimitiveBlend,
+    d2d_device_context_mt_GetPrimitiveBlend,
+    d2d_device_context_mt_SetUnitMode,
+    d2d_device_context_mt_GetUnitMode,
+    d2d_device_context_mt_ID2D1DeviceContext_DrawGlyphRun,
+    d2d_device_context_mt_DrawImage,
+    d2d_device_context_mt_DrawGdiMetafile,
+    d2d_device_context_mt_ID2D1DeviceContext_DrawBitmap,
+    d2d_device_context_mt_ID2D1DeviceContext_PushLayer,
+    d2d_device_context_mt_InvalidateEffectInputRectangle,
+    d2d_device_context_mt_GetEffectInvalidRectangleCount,
+    d2d_device_context_mt_GetEffectInvalidRectangles,
+    d2d_device_context_mt_GetEffectRequiredInputRectangles,
+    d2d_device_context_mt_ID2D1DeviceContext_FillOpacityMask,
+    d2d_device_context_mt_CreateFilledGeometryRealization,
+    d2d_device_context_mt_CreateStrokedGeometryRealization,
+    d2d_device_context_mt_DrawGeometryRealization,
+    d2d_device_context_mt_CreateInk,
+    d2d_device_context_mt_CreateInkStyle,
+    d2d_device_context_mt_CreateGradientMesh,
+    d2d_device_context_mt_CreateImageSourceFromWic,
+    d2d_device_context_mt_CreateLookupTable3D,
+    d2d_device_context_mt_CreateImageSourceFromDxgi,
+    d2d_device_context_mt_GetGradientMeshWorldBounds,
+    d2d_device_context_mt_DrawInk,
+    d2d_device_context_mt_DrawGradientMesh,
+    d2d_device_context_mt_ID2D1DeviceContext2_DrawGdiMetafile,
+    d2d_device_context_mt_CreateTransformedImageSource,
+    d2d_device_context_mt_CreateSpriteBatch,
+    d2d_device_context_mt_DrawSpriteBatch,
+    d2d_device_context_mt_CreateSvgGlyphStyle,
+    d2d_device_context_mt_ID2D1DeviceContext4_DrawText,
+    d2d_device_context_mt_ID2D1DeviceContext4_DrawTextLayout,
+    d2d_device_context_mt_DrawColorBitmapGlyphRun,
+    d2d_device_context_mt_DrawSvgGlyphRun,
+    d2d_device_context_mt_GetColorBitmapGlyphImage,
+    d2d_device_context_mt_GetSvgGlyphImage,
+    d2d_device_context_mt_CreateSvgDocument,
+    d2d_device_context_mt_DrawSvgDocument,
+    d2d_device_context_mt_CreateColorContextFromDxgiColorSpace,
+    d2d_device_context_mt_CreateColorContextFromSimpleColorProfile,
+    d2d_device_context_mt_BlendImage,
+};
+
 static inline struct d2d_device_context *impl_from_IDWriteTextRenderer(IDWriteTextRenderer *iface)
 {
     return CONTAINING_RECORD(iface, struct d2d_device_context, IDWriteTextRenderer_iface);
@@ -8337,14 +8800,11 @@ static HRESULT d2d_gdi_interop_get_surface(struct d2d_device_context *context, I
     return hr;
 }
 
-static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_GetDC(ID2D1GdiInteropRenderTarget *iface,
+static HRESULT d2d_gdi_interop_get_dc(struct d2d_device_context *render_target,
         D2D1_DC_INITIALIZE_MODE mode, HDC *dc)
 {
-    struct d2d_device_context *render_target = impl_from_ID2D1GdiInteropRenderTarget(iface);
     IDXGISurface1 *surface;
     HRESULT hr;
-
-    TRACE("iface %p, mode %d, dc %p.\n", iface, mode, dc);
 
     d2d_device_context_flush_batches(render_target);
 
@@ -8365,15 +8825,11 @@ static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_GetDC(ID2D1GdiInt
     return hr;
 }
 
-static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_ReleaseDC(ID2D1GdiInteropRenderTarget *iface,
-        const RECT *update)
+static HRESULT d2d_gdi_interop_release_dc(struct d2d_device_context *render_target, const RECT *update)
 {
-    struct d2d_device_context *render_target = impl_from_ID2D1GdiInteropRenderTarget(iface);
     IDXGISurface1 *surface;
     RECT update_rect;
     HRESULT hr;
-
-    TRACE("iface %p, update rect %s.\n", iface, wine_dbgstr_rect(update));
 
     if (!render_target->target.hdc)
         return D2DERR_WRONG_STATE;
@@ -8386,6 +8842,40 @@ static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_ReleaseDC(ID2D1Gd
         update_rect = *update;
     hr = IDXGISurface1_ReleaseDC(surface, update ? &update_rect : NULL);
     IDXGISurface1_Release(surface);
+
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_GetDC(ID2D1GdiInteropRenderTarget *iface,
+        D2D1_DC_INITIALIZE_MODE mode, HDC *dc)
+{
+    struct d2d_device_context *render_target = impl_from_ID2D1GdiInteropRenderTarget(iface);
+    HRESULT hr;
+
+    TRACE("iface %p, mode %d, dc %p.\n", iface, mode, dc);
+
+    if (render_target->cs)
+        EnterCriticalSection(render_target->cs);
+    hr = d2d_gdi_interop_get_dc(render_target, mode, dc);
+    if (render_target->cs)
+        LeaveCriticalSection(render_target->cs);
+
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_gdi_interop_render_target_ReleaseDC(ID2D1GdiInteropRenderTarget *iface,
+        const RECT *update)
+{
+    struct d2d_device_context *render_target = impl_from_ID2D1GdiInteropRenderTarget(iface);
+    HRESULT hr;
+
+    TRACE("iface %p, update rect %s.\n", iface, wine_dbgstr_rect(update));
+
+    if (render_target->cs)
+        EnterCriticalSection(render_target->cs);
+    hr = d2d_gdi_interop_release_dc(render_target, update);
+    if (render_target->cs)
+        LeaveCriticalSection(render_target->cs);
 
     return hr;
 }
@@ -9574,7 +10064,10 @@ static HRESULT d2d_device_context_init(struct d2d_device_context *render_target,
 
     factory = unsafe_impl_from_ID2D1Factory(render_target->factory);
     if (factory->factory_type == D2D1_FACTORY_TYPE_MULTI_THREADED)
+    {
         render_target->cs = &factory->cs;
+        render_target->ID2D1DeviceContext6_iface.lpVtbl = &d2d_device_context_mt_vtbl;
+    }
 
     render_target->outer_unknown = outer_unknown ? outer_unknown : &render_target->IUnknown_iface;
     render_target->ops = ops;
