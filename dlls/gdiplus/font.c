@@ -109,12 +109,6 @@ typedef struct
 #define GET_BE_DWORD(x) MAKELONG(GET_BE_WORD(HIWORD(x)), GET_BE_WORD(LOWORD(x)))
 #endif
 
-#define MS_MAKE_TAG(ch0, ch1, ch2, ch3) \
-                    ((DWORD)(BYTE)(ch0) | ((DWORD)(BYTE)(ch1) << 8) | \
-                    ((DWORD)(BYTE)(ch2) << 16) | ((DWORD)(BYTE)(ch3) << 24))
-#define MS_OS2_TAG MS_MAKE_TAG('O','S','/','2')
-#define MS_HHEA_TAG MS_MAKE_TAG('h','h','e','a')
-
 static GpFontCollection installedFontCollection = {0};
 
 static CRITICAL_SECTION font_cs;
@@ -633,12 +627,33 @@ static BOOL get_font_metrics(HDC hdc, struct font_metrics *fm)
     TT_HHEA tt_hori;
     LONG size;
     UINT16 line_gap;
+    BOOL have_os2;
 
     otm.otmSize = sizeof(otm);
     if (!GetOutlineTextMetricsW(hdc, otm.otmSize, &otm)) return FALSE;
 
     fm->em_height = otm.otmEMSquare;
     fm->dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+
+    memset(&tt_os2, 0, sizeof(tt_os2));
+    size = GetFontData(hdc, MS_OS2_TAG, 0, NULL, 0);
+    if (size != GDI_ERROR && size > sizeof(tt_os2)) size = sizeof(tt_os2);
+    have_os2 = size != GDI_ERROR && GetFontData(hdc, MS_OS2_TAG, 0, &tt_os2, size) == size;
+
+    /* USE_TYPO_METRICS (OS/2 version 4, fsSelection bit 7) asks for the typographic metrics, and Windows
+     * GDI+ honours it: Terminus (TTF) Bold 4.39 carries the bit and reports cell ascent 833, descent 167
+     * and line spacing 1090 on Windows 10 (sTypoAscender, -sTypoDescender, their sum plus sTypoLineGap),
+     * while its hhea and usWin* metrics say 849/183/1122; Tahoma, without the bit, is reported with its
+     * usWin and hhea values. */
+    if (have_os2 && GET_BE_WORD(tt_os2.version) >= 4 && (GET_BE_WORD(tt_os2.fsSelection) & 0x80))
+    {
+        fm->ascent = (SHORT)GET_BE_WORD(tt_os2.sTypoAscender);
+        fm->descent = -(SHORT)GET_BE_WORD(tt_os2.sTypoDescender);
+        line_gap = (SHORT)GET_BE_WORD(tt_os2.sTypoLineGap);
+        fm->line_spacing = fm->ascent + fm->descent + line_gap;
+        TRACE("typo: ascent %u, descent %u, line_gap %u\n", fm->ascent, fm->descent, line_gap);
+        if (fm->ascent + fm->descent != 0) return TRUE;
+    }
 
     memset(&tt_hori, 0, sizeof(tt_hori));
     if (GetFontData(hdc, MS_HHEA_TAG, 0, &tt_hori, sizeof(tt_hori)) != GDI_ERROR)
@@ -652,13 +667,7 @@ static BOOL get_font_metrics(HDC hdc, struct font_metrics *fm)
         if (fm->ascent + fm->descent != 0) return TRUE;
     }
 
-    size = GetFontData(hdc, MS_OS2_TAG, 0, NULL, 0);
-    if (size == GDI_ERROR) return FALSE;
-
-    if (size > sizeof(tt_os2)) size = sizeof(tt_os2);
-
-    memset(&tt_os2, 0, sizeof(tt_os2));
-    if (GetFontData(hdc, MS_OS2_TAG, 0, &tt_os2, size) != size) return FALSE;
+    if (!have_os2) return FALSE;
 
     fm->ascent = GET_BE_WORD(tt_os2.usWinAscent);
     fm->descent = GET_BE_WORD(tt_os2.usWinDescent);
