@@ -843,12 +843,34 @@ void x11drv_client_surface_reblit( HWND toplevel )
         surface = pending[i];
         if (surface->client.hwnd && NtUserGetAncestor( surface->client.hwnd, GA_ROOT ) == toplevel)
         {
-            TRACE( "repeating the present blit of %s for top-level %p\n",
-                   debugstr_client_surface( &surface->client ), toplevel );
-            InterlockedExchange( &surface->reblitting, TRUE );
-            InterlockedExchange( &surface->blit_pending, FALSE );
-            client_surface_present( &surface->client );
-            InterlockedExchange( &surface->reblitting, FALSE );
+            /* A window painted through UpdateLayeredWindow() shows its window
+             * surface, and its own swap chain's client window holds the frame
+             * from before the switch - or, once the window has been resized,
+             * the undefined content of a reallocated redirected pixmap.  WPF
+             * presents that swap chain once at start-up and then only hands
+             * frames to UpdateLayeredWindow(); the blit it left pending was
+             * repeated on the VisibilityNotify that follows a resize, over the
+             * surface flushed a moment before, and the parts no later flush
+             * covered stayed that way (NinjaTrader's welcome window with its
+             * top-left corner cut away, issue 513).  Drop the pending blit:
+             * the surface flush, not a replay of that frame, is what repaints
+             * the window.  A child's swap chain inside such a window is real
+             * content and is repeated as before. */
+            if (surface->client.hwnd == toplevel && has_ulw_surface( toplevel ))
+            {
+                TRACE( "not repeating the present blit of %s: top-level %p shows UpdateLayeredWindow() content\n",
+                       debugstr_client_surface( &surface->client ), toplevel );
+                InterlockedExchange( &surface->blit_pending, FALSE );
+            }
+            else
+            {
+                TRACE( "repeating the present blit of %s for top-level %p\n",
+                       debugstr_client_surface( &surface->client ), toplevel );
+                InterlockedExchange( &surface->reblitting, TRUE );
+                InterlockedExchange( &surface->blit_pending, FALSE );
+                client_surface_present( &surface->client );
+                InterlockedExchange( &surface->reblitting, FALSE );
+            }
         }
         client_surface_release( &surface->client );
     }
