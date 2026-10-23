@@ -2507,6 +2507,7 @@ static struct gdi_font *create_gdi_font( const struct gdi_font_face *face, const
     font->face_index = face->face_index;
     font->ntmFlags = face->ntmFlags;
     font->aa_flags = HIWORD( face->flags );
+    font->wine_font = !!(face->flags & ADDFONT_WINE_FONT);
     if (!family_name) family_name = face->family->family_name;
     font->otm.otmpFamilyName = (char *)wcsdup( family_name );
     font->otm.otmpStyleName = (char *)wcsdup( face->style_name );
@@ -6640,7 +6641,7 @@ static void load_file_system_fonts(void)
 
     /* Wine data directory */
     get_fonts_data_dir_path( NULL, path );
-    load_directory_fonts( path, ADDFONT_EXTERNAL_FONT );
+    load_directory_fonts( path, ADDFONT_EXTERNAL_FONT | ADDFONT_WINE_FONT );
 
     /* custom paths */
     /* @@ Wine registry key: HKCU\Software\Wine\Fonts */
