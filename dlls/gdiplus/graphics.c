@@ -6074,6 +6074,26 @@ struct draw_string_args {
     REAL x, y, rel_width, rel_height, ascent;
 };
 
+/* Baseline of the first line of a string drawn with the font selected into hdc, in device pixels above the
+ * line top. Windows GDI+ places it at the font's cell ascent scaled to the em height and rounded, not at
+ * GDI's tmAscent; a font with a VDMX table gets the hinted ascent (which is what tmAscent is for it) when
+ * that is larger. Measured on Windows 10 with "88H" over eight families and twelve sizes each (94 pairs,
+ * issue 512): Terminus (TTF) Bold 16 px has no VDMX and sits at round(833 * 16 / 1000) = 13 while GDI
+ * reports tmAscent 14; Verdana Bold 16 px sits at round(2059 * 16 / 2048) = 16 over its VDMX 15; Segoe UI
+ * Bold 20 px sits at its VDMX 23 over round(2210 * 20 / 2048) = 22. */
+static REAL get_text_ascent(HDC hdc, GDIPCONST GpFont *font, const TEXTMETRICW *tm)
+{
+    LOGFONTW lf;
+    REAL ascent;
+
+    if (!font->family->em_height || !GetObjectW(GetCurrentObject(hdc, OBJ_FONT), sizeof(lf), &lf) || !lf.lfHeight)
+        return tm->tmAscent;
+    ascent = gdip_round((REAL)font->family->ascent * abs(lf.lfHeight) / font->family->em_height);
+    if (tm->tmAscent > ascent && GetFontData(hdc, MS_VDMX_TAG, 0, NULL, 0) != GDI_ERROR)
+        ascent = tm->tmAscent;
+    return ascent;
+}
+
 static GpStatus draw_string_callback(struct gdip_format_string_info *info)
 {
     struct draw_string_args *args = info->user_data;
@@ -6242,7 +6262,7 @@ GpStatus WINGDIPAPI GdipDrawString(GpGraphics *graphics, GDIPCONST WCHAR *string
     gdi_transform_acquire(graphics);
 
     GetTextMetricsW(hdc, &textmetric);
-    args.ascent = textmetric.tmAscent / rel_height;
+    args.ascent = get_text_ascent(hdc, font, &textmetric) / rel_height;
 
     gdip_format_string(graphics, hdc, string, length, font, &scaled_rect, format, TRUE,
         draw_string_callback, &args);
