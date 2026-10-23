@@ -175,6 +175,17 @@ This is the recommended branch. What it changes, by subsystem:
   bits the enumeration does not define. Cymatics Hotline with its editor open, 25 s with
   `+fixme`: 661 of 815 log lines were that message, 0 of 154 now. Under `+d2d` the
   contexts remain visible as one `Created device context` line per call (561 in 10 s)
+- **D2D1 multi-threaded factories**: a device context of a `D2D1_FACTORY_TYPE_MULTI_THREADED`
+  factory holds the factory lock for the whole of every call, as Windows serialises the
+  calls on the objects such a factory creates. The lock used to cover only the D3D11
+  submission; the constant buffer maps, the scratch buffers and the line and fill batches
+  ran unprotected, and two threads drawing onto one render target corrupted them. vatSys
+  draws the runways of its map with `Parallel.ForEach` onto one bitmap render target and
+  crashed in `ID3D11DeviceContext::Map()`, with DXVK and with wined3d. Eight threads
+  calling `DrawLine()`/`DrawGeometry()` on one bitmap render target crashed every run in
+  both architectures (wined3d assertion in 32-bit, heap corruption in 64-bit) and complete
+  8 of 8 runs now; vanilla Wine 11.0 crashed 3 of 3 32-bit runs. JUCE 8 creates its
+  factory multi-threaded as well. Single-threaded factories are unchanged
 - **DComp**: IDCompositionDesktopDevice implementation with a D2D1 bitmap rendering path,
   dirty-rect clipping and DIB+BitBlt presentation; IDCompositionDevice3/4/5, composition
   and dynamic textures, D3D11 BeginDraw and surface handle export; rootless visual trees
