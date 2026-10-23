@@ -53,6 +53,7 @@
 #include FT_SFNT_NAMES_H
 #include FT_TRUETYPE_IDS_H
 #include FT_OUTLINE_H
+#include FT_ADVANCES_H
 #include FT_TRIGONOMETRY_H
 #include FT_MODULE_H
 #include FT_WINFONTS_H
@@ -90,6 +91,7 @@ static void *ft_handle = NULL;
 
 #define MAKE_FUNCPTR(f) static typeof(f) * p##f = NULL
 MAKE_FUNCPTR(FT_Done_Face);
+MAKE_FUNCPTR(FT_Get_Advance);
 MAKE_FUNCPTR(FT_Get_Char_Index);
 MAKE_FUNCPTR(FT_Get_First_Char);
 MAKE_FUNCPTR(FT_Get_Next_Char);
@@ -1468,6 +1470,7 @@ static BOOL init_freetype(void)
 #define LOAD_FUNCPTR(f) if((p##f = dlsym(ft_handle, #f)) == NULL){WARN("Can't find symbol %s\n", #f); goto sym_not_found;}
 
     LOAD_FUNCPTR(FT_Done_Face)
+    LOAD_FUNCPTR(FT_Get_Advance)
     LOAD_FUNCPTR(FT_Get_Char_Index)
     LOAD_FUNCPTR(FT_Get_First_Char)
     LOAD_FUNCPTR(FT_Get_Next_Char)
@@ -3131,9 +3134,25 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
         err = pFT_Load_Glyph(ft_face, glyph, load_flags);
     }
 
-    if(err) {
-        WARN("Failed to load glyph %#x, error %#x.\n", glyph, err);
-        return GDI_ERROR;
+    if (err)
+    {
+        /* FreeType refuses the glyph itself. TerminusTTF-Bold 4.39, shipped with vatSys, has a .notdef whose
+         * instruction count exceeds maxp.maxSizeOfInstructions (FT_Err_Too_Many_Hints), and every control
+         * character maps to it. Windows draws nothing for the outline and advances by the hmtx width (a tab
+         * is 8 px wide at 16 px, measured on Windows 10). Without this the callers read whatever ABC widths
+         * the stack held: a WinForms menu measured its shortcut tab 32 475 217 px wide and opened across the
+         * screen. Load the space glyph as the empty stand-in and give it the advance of the glyph asked for. */
+        FT_UInt space = pFT_Get_Char_Index( ft_face, ' ' );
+        FT_Fixed advance;
+
+        if (!space || space == glyph || pFT_Load_Glyph( ft_face, space, load_flags ))
+        {
+            WARN("Failed to load glyph %#x, error %#x.\n", glyph, err);
+            return GDI_ERROR;
+        }
+        WARN("Failed to load glyph %#x, error %#x; drawing it empty with its advance.\n", glyph, err);
+        if (!pFT_Get_Advance( ft_face, glyph, load_flags | FT_LOAD_NO_HINTING, &advance ))
+            ft_face->glyph->metrics.horiAdvance = (load_flags & FT_LOAD_NO_SCALE) ? advance : advance >> 10;
     }
 
     metrics = ft_face->glyph->metrics;
