@@ -3104,7 +3104,13 @@ static FT_Int get_load_flags( UINT format )
  * the outline. Wine's own Tahoma and Tahoma Bold carry strikes at 8 to 16 ppem that Microsoft's
  * Tahoma does not have, with advances that differ from Windows (11 ppem: 'i' 2 px against 3, 'g' 6
  * against 7), so a face from the Wine data directory keeps its strike for the mono rasterisation
- * only, as before. */
+ * only, as before. A font selected with ANTIALIASED_QUALITY asks for the outline rasterisation and
+ * keeps the outline's metrics too: the reporter's Windows reports 9 px and ABC 0/8/1 for it where
+ * DEFAULT and CLEARTYPE quality report the strike's 10 px (Windows 10 reports the strike for
+ * DrawText() and the outline for GetTextExtentPoint32() under every quality), and gdiplus, which
+ * rasterises the outline through GGO_GRAY8_BITMAP, selects its fonts with that quality so that its
+ * measurements match what it draws and what GDI+ on Windows measures (wine-dev issue 515, vatSys
+ * "Disconnect" button wrapping after nine characters). */
 static BOOL format_uses_strike( const struct gdi_font *font, UINT format )
 {
     switch (format)
@@ -3116,7 +3122,7 @@ static BOOL format_uses_strike( const struct gdi_font *font, UINT format )
     case WINE_GGO_HBGR_BITMAP:
     case WINE_GGO_VRGB_BITMAP:
     case WINE_GGO_VBGR_BITMAP:
-        return !font->wine_font;
+        return !font->wine_font && font->lf.lfQuality != ANTIALIASED_QUALITY;
     }
     return FALSE;
 }
