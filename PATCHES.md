@@ -1130,6 +1130,20 @@ This is the recommended branch. What it changes, by subsystem:
   their strike for the mono rasterisation only, as before. Remaining difference: Windows
   trims the strike to its ink for the ABC split and the black box (`_` at 18 px: 1/8/1 and
   8x1 against 0/10/0 and 10x18 here)
+- **GDI+ text metrics from the outline (gdiplus, win32u)**: gdiplus selects its fonts with
+  `ANTIALIASED_QUALITY`, and a font selected with that quality keeps the outline's advances
+  for `GGO_METRICS` and the measurements built on it where the strike metrics above would
+  take the embedded bitmap strike. GDI+ on Windows measures the outline's advances
+  regardless of a strike (Windows 10: 9.0 px per character for Terminus (TTF) Bold at 18 px
+  and 7.0 at 14 px, where the strikes are 10 and 8 px wide; the reporter's Windows: 180.00
+  for 20 characters at 18 px) and rasterises the outline, as Wine's gdiplus does through
+  `GGO_GRAY8_BITMAP`; with the strike's advance in the measurement and the outline in the
+  rasterisation, vatSys's connection window wrapped its "Disconnect" button — a 100 × 30 px
+  `Graphics.DrawString()` with a default `StringFormat` in the application's own button
+  class — after nine characters, "Disconnec" / "t", once connected. For GDI itself the
+  reporter's Windows reports the outline for ANTIALIASED quality (9 px and ABC 0/8/1 at
+  18 px against 10 px for DEFAULT and CLEARTYPE), which Wine gives now; DEFAULT quality,
+  the `TextRenderer` measurement of the strip fields, keeps the strike
 - **Media Foundation video playback (mf, evr, winegstreamer)**: playing and scrubbing
   video on a DAW timeline exercises paths a straight play-to-the-end never reaches. The
   session asked for a new sample on *every* call of its delivery routine instead of one at
