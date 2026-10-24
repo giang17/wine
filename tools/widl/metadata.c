@@ -1779,8 +1779,9 @@ static UINT make_property_sig( const var_t *method, BYTE *buf, BOOL is_static )
     {
         const type_t *type;
 
-        if (!is_retval( arg )) continue;
-        type = type_pointer_get_ref_type( arg->declspec.type ); /* retval must be a pointer */
+        if (is_retval( arg )) type = type_pointer_get_ref_type( arg->declspec.type ); /* retval must be a pointer */
+        else if (is_attr( method->attrs, ATTR_PROPPUT )) type = arg->declspec.type; /* write-only property: the setter's value */
+        else continue;
         len = make_type_sig( type, buf + 2 ) + 2;
     }
 
@@ -2474,7 +2475,7 @@ static void add_propput_method( const type_t *class, const type_t *iface, const 
     const var_t *propget = find_propget_method( iface, method->name );
     UINT sig_size, paramlist, property, flags, attrs = get_method_attrs( class, iface, method, &flags );
     char *name = get_method_name( method );
-    type_t *type = method->declspec.type;
+    type_t *type = method->declspec.type, *prop = propget ? propget->declspec.type : type; /* write-only: the setter */
     BYTE sig[256];
 
     paramlist = add_method_params_step2( type_function_get_args(method->declspec.type) );
@@ -2486,13 +2487,13 @@ static void add_propput_method( const type_t *class, const type_t *iface, const 
     /* add propget method first if not already added */
     if (class)
     {
-        if (!propget->declspec.type->md.class_property) add_propget_method( class, iface, propget );
-        property = type->md.class_property = propget->declspec.type->md.class_property;
+        if (propget && !prop->md.class_property) add_propget_method( class, iface, propget );
+        property = type->md.class_property = prop->md.class_property;
     }
     else
     {
-        if (!propget->declspec.type->md.iface_property) add_propget_method( class, iface, propget );
-        property = type->md.iface_property = propget->declspec.type->md.iface_property;
+        if (propget && !prop->md.iface_property) add_propget_method( class, iface, propget );
+        property = type->md.iface_property = prop->md.iface_property;
     }
 
     add_methodsemantics_row( METHOD_SEM_SETTER, type->md.def, has_semantics(TABLE_PROPERTY, property) );
@@ -2572,13 +2573,19 @@ static void add_regular_method( const type_t *class, const type_t *iface, const 
     free( name );
 }
 
+static const var_t *find_propget_method( const type_t *iface, const char *name );
+
 static void add_property( type_t *class, type_t *iface, const var_t *method )
 {
     UINT sig_size;
     type_t *type = method->declspec.type;
     BYTE sig[256];
 
-    if (!is_attr( method->attrs, ATTR_PROPGET )) return;
+    if (!is_attr( method->attrs, ATTR_PROPGET ))
+    {
+        /* a property with a setter only (ICoreWindow2.PointerPosition) is registered on the setter */
+        if (!is_attr( method->attrs, ATTR_PROPPUT ) || find_propget_method( iface, method->name )) return;
+    }
 
     sig_size = make_property_sig( method, sig, is_static_iface(class, iface) );
     if (class)
