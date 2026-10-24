@@ -551,6 +551,7 @@ struct d2d_hwnd_render_target
     ID2D1RenderTarget *dxgi_target;
     IUnknown *dxgi_inner;
     IDXGISwapChain *swapchain;
+    IDXGISurface1 *gdi_surface;    /* GDI present path (no swapchain): the target bitmap's surface */
     UINT sync_interval;
     HWND hwnd;
 

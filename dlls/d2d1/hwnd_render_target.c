@@ -19,6 +19,9 @@
 
 #include "d2d1_private.h"
 
+/* wine/winedxgi.idl: the private interface wined3d's dxgi device implements and DXVK's does not. */
+static const GUID IID_IWineDXGIDevice_private = {0x3e1ff30b, 0xc951, 0x48c3, {0xb0,0x10, 0x0f,0xb4,0x9f,0x3d,0xca,0x71}};
+
 WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 
 static inline struct d2d_hwnd_render_target *impl_from_IUnknown(IUnknown *iface)
@@ -26,15 +29,127 @@ static inline struct d2d_hwnd_render_target *impl_from_IUnknown(IUnknown *iface)
     return CONTAINING_RECORD(iface, struct d2d_hwnd_render_target, ID2D1HwndRenderTarget_iface);
 }
 
+/* Present through GDI: the target is a GDI-compatible texture instead of a swap chain back buffer,
+ * and its DC is blitted to the window DC.  A window DC taken with DCX_USESTYLE clips the children of
+ * a WS_CLIPCHILDREN window, so GDI child windows stay visible over the Direct2D content whatever the
+ * display driver and the D3D implementation do with a swap chain (wine-dev issue 505). */
+static HRESULT d2d_hwnd_render_target_present_gdi(struct d2d_hwnd_render_target *render_target)
+{
+    D2D1_SIZE_U size;
+    RECT empty_rect;
+    HDC src_hdc, dst_hdc;
+    HRESULT hr;
+
+    if (FAILED(hr = IDXGISurface1_GetDC(render_target->gdi_surface, FALSE, &src_hdc)))
+    {
+        WARN("GetDC() failed, %#lx.\n", hr);
+        return S_OK;
+    }
+
+    if ((dst_hdc = GetDCEx(render_target->hwnd, NULL, DCX_CACHE | DCX_USESTYLE)))
+    {
+        size = ID2D1RenderTarget_GetPixelSize(render_target->dxgi_target);
+        BitBlt(dst_hdc, 0, 0, size.width, size.height, src_hdc, 0, 0, SRCCOPY);
+        ReleaseDC(render_target->hwnd, dst_hdc);
+    }
+
+    SetRectEmpty(&empty_rect);
+    IDXGISurface1_ReleaseDC(render_target->gdi_surface, &empty_rect);
+
+    return S_OK;
+}
+
 static HRESULT d2d_hwnd_render_target_present(IUnknown *outer_unknown)
 {
     struct d2d_hwnd_render_target *render_target = impl_from_IUnknown(outer_unknown);
     HRESULT hr;
 
+    if (render_target->gdi_surface)
+        return d2d_hwnd_render_target_present_gdi(render_target);
+
     if (FAILED(hr = IDXGISwapChain_Present(render_target->swapchain, render_target->sync_interval, 0)))
         WARN("Present failed, %#lx.\n", hr);
 
     return S_OK;
+}
+
+/* Create (or replace, on Resize()) the GDI-compatible target bitmap of the GDI present path. */
+static HRESULT d2d_hwnd_render_target_create_gdi_target(struct d2d_hwnd_render_target *render_target,
+        D2D1_SIZE_U size)
+{
+    D2D1_BITMAP_PROPERTIES1 bitmap_desc;
+    struct d2d_bitmap *bitmap_impl;
+    IDXGISurface1 *dxgi_surface;
+    ID2D1DeviceContext *context;
+    ID2D1Bitmap1 *bitmap;
+    RECT client_rect;
+    HRESULT hr;
+
+    if (!size.width || !size.height)
+    {
+        /* As DXGI does for a swap chain of size 0: take the window's client size. */
+        GetClientRect(render_target->hwnd, &client_rect);
+        if (!size.width) size.width = max(client_rect.right - client_rect.left, 1);
+        if (!size.height) size.height = max(client_rect.bottom - client_rect.top, 1);
+    }
+
+    ID2D1RenderTarget_QueryInterface(render_target->dxgi_target, &IID_ID2D1DeviceContext, (void **)&context);
+    ID2D1DeviceContext_SetTarget(context, NULL);
+
+    memset(&bitmap_desc, 0, sizeof(bitmap_desc));
+    bitmap_desc.pixelFormat = render_target->desc.pixelFormat;
+    ID2D1DeviceContext_GetDpi(context, &bitmap_desc.dpiX, &bitmap_desc.dpiY);
+    bitmap_desc.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW
+            | D2D1_BITMAP_OPTIONS_GDI_COMPATIBLE;
+    if (FAILED(hr = ID2D1DeviceContext_CreateBitmap(context, size, NULL, 0, &bitmap_desc, &bitmap)))
+    {
+        WARN("Failed to create GDI-compatible target bitmap, hr %#lx.\n", hr);
+        ID2D1DeviceContext_Release(context);
+        return hr;
+    }
+
+    bitmap_impl = unsafe_impl_from_ID2D1Bitmap((ID2D1Bitmap *)bitmap);
+    ID3D11Resource_QueryInterface(bitmap_impl->resource, &IID_IDXGISurface1, (void **)&dxgi_surface);
+
+    ID2D1DeviceContext_SetTarget(context, (ID2D1Image *)bitmap);
+    ID2D1Bitmap1_Release(bitmap);
+    ID2D1DeviceContext_Release(context);
+
+    if (render_target->gdi_surface)
+        IDXGISurface1_Release(render_target->gdi_surface);
+    render_target->gdi_surface = dxgi_surface;
+
+    return S_OK;
+}
+
+/* Whether this HWND target presents through GDI (wine-dev issue 505).
+ *
+ * vatSys's VSCS window is a WS_CLIPCHILDREN child filled by an ID2D1HwndRenderTarget, with WinForms
+ * children (the Add Freq panel, the Text page) on top of it.  wined3d presents the swap chain of a
+ * child window through GDI and winex11 blits an offscreen Vulkan surface, so the children stay
+ * visible there; winewayland attaches a Vulkan client surface as a wl_subsurface above the top-level
+ * surface that holds the GDI children, and with DXVK they were covered (measured 22.10.2026, Plasma
+ * Wayland, issue 504).  A window that has child windows when the target is created therefore gets
+ * no swap chain on a device that is not wined3d.  A GDI-compatible texture needs B8G8R8A8.
+ * WINE_D2D1_HWND_GDI_PRESENT=0 switches the path off, =1 takes it for every window with children
+ * (wined3d too), =2 for every HWND target. */
+static BOOL d2d_hwnd_render_target_use_gdi_present(HWND hwnd, ID3D10Device1 *d3d_device,
+        const D2D1_RENDER_TARGET_PROPERTIES *desc)
+{
+    const char *env = getenv("WINE_D2D1_HWND_GDI_PRESENT");
+    IUnknown *wine_device;
+
+    if (env && *env == '0') return FALSE;
+    if (desc->pixelFormat.format != DXGI_FORMAT_B8G8R8A8_UNORM) return FALSE;
+    if (env && *env == '2') return TRUE;
+    if (!GetWindow(hwnd, GW_CHILD)) return FALSE;
+    if (env && *env == '1') return TRUE;
+    if (SUCCEEDED(ID3D10Device1_QueryInterface(d3d_device, &IID_IWineDXGIDevice_private, (void **)&wine_device)))
+    {
+        IUnknown_Release(wine_device);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static inline struct d2d_hwnd_render_target *impl_from_ID2D1HwndRenderTarget(ID2D1HwndRenderTarget *iface)
@@ -82,7 +197,10 @@ static ULONG STDMETHODCALLTYPE d2d_hwnd_render_target_Release(ID2D1HwndRenderTar
     if (!refcount)
     {
         IUnknown_Release(render_target->dxgi_inner);
-        IDXGISwapChain_Release(render_target->swapchain);
+        if (render_target->swapchain)
+            IDXGISwapChain_Release(render_target->swapchain);
+        if (render_target->gdi_surface)
+            IDXGISurface1_Release(render_target->gdi_surface);
         free(render_target);
     }
 
@@ -686,6 +804,9 @@ static D2D1_WINDOW_STATE STDMETHODCALLTYPE d2d_hwnd_render_target_CheckWindowSta
 
     TRACE("iface %p.\n", iface);
 
+    if (render_target->gdi_surface)
+        return IsIconic(render_target->hwnd) ? D2D1_WINDOW_STATE_OCCLUDED : D2D1_WINDOW_STATE_NONE;
+
     return IDXGISwapChain_Present(render_target->swapchain, render_target->sync_interval, DXGI_PRESENT_TEST) ==
             DXGI_STATUS_OCCLUDED ? D2D1_WINDOW_STATE_OCCLUDED : D2D1_WINDOW_STATE_NONE;
 }
@@ -699,6 +820,9 @@ static HRESULT STDMETHODCALLTYPE d2d_hwnd_render_target_Resize(ID2D1HwndRenderTa
     HRESULT hr;
 
     TRACE("iface %p, width %u, height %u.\n", iface, size->width, size->height);
+
+    if (render_target->gdi_surface)
+        return d2d_hwnd_render_target_create_gdi_target(render_target, *size);
 
     ID2D1RenderTarget_QueryInterface(render_target->dxgi_target, &IID_ID2D1DeviceContext, (void **)&context);
     ID2D1DeviceContext_SetTarget(context, NULL);
@@ -828,6 +952,8 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
 
     render_target->ID2D1HwndRenderTarget_iface.lpVtbl = &d2d_hwnd_render_target_vtbl;
     render_target->hwnd = hwnd_rt_desc->hwnd;
+    render_target->swapchain = NULL;
+    render_target->gdi_surface = NULL;
     render_target->sync_interval = hwnd_rt_desc->presentOptions & D2D1_PRESENT_OPTIONS_IMMEDIATELY ? 0 : 1;
 
     if (FAILED(hr = ID3D10Device1_QueryInterface(d3d_device, &IID_IDXGIDevice, (void **)&dxgi_device)))
@@ -873,6 +999,49 @@ HRESULT d2d_hwnd_render_target_init(struct d2d_hwnd_render_target *render_target
     /* FIXME: should be resolved to either HW or SW type. */
     if (render_target->desc.type == D2D1_RENDER_TARGET_TYPE_DEFAULT)
         render_target->desc.type = D2D1_RENDER_TARGET_TYPE_HARDWARE;
+
+    if (d2d_hwnd_render_target_use_gdi_present(hwnd_rt_desc->hwnd, d3d_device, &dxgi_rt_desc))
+    {
+        TRACE("Presenting the target of window %p through GDI, the window has child windows.\n",
+                hwnd_rt_desc->hwnd);
+        IDXGIFactory_Release(dxgi_factory);
+
+        if (FAILED(hr = ID3D10Device1_QueryInterface(d3d_device, &IID_IDXGIDevice, (void **)&dxgi_device)))
+        {
+            WARN("Failed to get IDXGIDevice interface, hr %#lx.\n", hr);
+            return hr;
+        }
+        hr = d2d_factory_create_device(factory, dxgi_device, false, &IID_ID2D1Device, (void **)&device);
+        IDXGIDevice_Release(dxgi_device);
+        if (FAILED(hr))
+        {
+            WARN("Failed to create D2D device, hr %#lx.\n", hr);
+            return hr;
+        }
+        hr = d2d_d3d_create_render_target(unsafe_impl_from_ID2D1Device((ID2D1Device1 *)device), NULL,
+                (IUnknown *)&render_target->ID2D1HwndRenderTarget_iface, &d2d_hwnd_render_target_ops,
+                &dxgi_rt_desc, (void **)&render_target->dxgi_inner);
+        ID2D1Device_Release(device);
+        if (FAILED(hr))
+        {
+            WARN("Failed to create DXGI surface render target, hr %#lx.\n", hr);
+            return hr;
+        }
+        if (FAILED(hr = IUnknown_QueryInterface(render_target->dxgi_inner,
+                &IID_ID2D1RenderTarget, (void **)&render_target->dxgi_target)))
+        {
+            WARN("Failed to retrieve ID2D1RenderTarget interface, hr %#lx.\n", hr);
+            IUnknown_Release(render_target->dxgi_inner);
+            return hr;
+        }
+        if (FAILED(hr = d2d_hwnd_render_target_create_gdi_target(render_target, hwnd_rt_desc->pixelSize)))
+        {
+            ID2D1RenderTarget_Release(render_target->dxgi_target);
+            IUnknown_Release(render_target->dxgi_inner);
+            return hr;
+        }
+        return S_OK;
+    }
 
     /* Mark this HWND so winex11.drv's needs_offscreen_rendering() returns FALSE
      * BEFORE the swapchain is created.  Otherwise the swapchain wires itself
