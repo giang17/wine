@@ -1045,6 +1045,22 @@ This is the recommended branch. What it changes, by subsystem:
   under Xwayland, as reported), while its map, a Vulkan child without the mark, rendered.
   Now they render offscreen like the map. OpenGL surfaces, wined3d's default renderer,
   keep the attached path
+- **GDI present for a Direct2D window target with child windows (d2d1)**: an
+  `ID2D1HwndRenderTarget` whose window has child windows when it is created gets no DXGI
+  swap chain on a device that is not wined3d. It renders into a GDI-compatible texture, and
+  `EndDraw()` blits the texture's DC to a window DC taken with `DCX_USESTYLE`, which clips
+  the children of a `WS_CLIPCHILDREN` window — the way the DC render target presents.
+  vatSys's VSCS window is such a child, with WinForms children (the Add Freq panel, the
+  Text page) on top of it. wined3d presents a child window's swap chain through GDI and
+  winex11 blits an offscreen Vulkan surface, so the children stay visible there; winewayland
+  attaches DXVK's Vulkan client surface as a `wl_subsurface` above the top-level surface
+  that holds the GDI children, and they were covered (reported with 11.20 + DXVK +
+  winewayland; measured in a Plasma Wayland login and reproduced with a test program in a
+  nested weston: 0 of the 12 800 pixels of a red GDI grandchild visible, all of them with
+  this change, the wined3d and winex11 runs unchanged). The path costs one GPU-to-CPU copy
+  per present (VSCS repaints every 500 ms); only windows with children at creation time and
+  only `B8G8R8A8` targets take it. `WINE_D2D1_HWND_GDI_PRESENT=0` disables it, `=1` takes it
+  on wined3d too, `=2` for every window target
 - **Minimised windows under the Wayland driver (winewayland)**: backport of 7310a48e3d1,
   3972b7b5337 and 8d64701d80b from Wine 11.8 (WineHQ bug 59577). Minimising sets
   `WS_MINIMIZE` and moves the window to (-32000,-32000); the driver did not tell the
