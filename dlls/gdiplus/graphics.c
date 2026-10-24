@@ -2482,6 +2482,11 @@ void get_font_hfont(GpGraphics *graphics, GDIPCONST GpFont *font, BOOL vertical,
 
     get_log_fontW(font, vertical, graphics, &lfw);
     lfw.lfHeight = -gdip_round(font_height * rel_height);
+    /* The text is rasterised from the outline (GGO_GRAY8_BITMAP in draw_driver_string()), and GDI+
+     * on Windows measures the outline's advances too, 9.0 px per character for Terminus (TTF) Bold at
+     * 18 px whose embedded strike is 10 px wide; ANTIALIASED_QUALITY keeps GDI's metrics on the
+     * outline for a face with a strike (wine-dev issue 515, vatSys "Disconnect" button). */
+    lfw.lfQuality = ANTIALIASED_QUALITY;
     unscaled_font = CreateFontIndirectW(&lfw);
 
     SelectObject(hdc, unscaled_font);
