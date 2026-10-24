@@ -1377,6 +1377,7 @@ sortdefault.nls
 [WinmdFiles]
 windows.applicationmodel.winmd
 windows.foundation.collections.winmd
+windows.foundation.metadata.winmd
 windows.foundation.winmd
 windows.globalization.winmd
 windows.graphics.winmd
