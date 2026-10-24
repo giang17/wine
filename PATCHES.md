@@ -986,6 +986,25 @@ This is the recommended branch. What it changes, by subsystem:
   conformance tests run at all (upstream they skip) and pass. Needed by applications that talk to a local helper over a Unix socket;
   FL Studio's Cloud plugins install normally instead of spinning on a socket that never
   appears
+- **WebSocket Protocol Component (websocket)**: `websocket.dll` implements the client and
+  server side of the WebSocket Protocol Component API, whose exports upstream are stubs:
+  handle creation and property validation, the client and server handshakes (random
+  `Sec-WebSocket-Key`, SHA-1/base64 `Sec-WebSocket-Accept`, subprotocol and extension
+  selection), the `WebSocketGetAction()`/`WebSocketCompleteAction()` send and receive action
+  queues, masking (with the zero-key form used when masking is disabled), fragmentation by
+  send and receive buffer size, streaming UTF-8 validation, ping/pong with an automatic pong
+  on a received ping, and the close handshake. Buffers follow the layout the .NET Framework
+  `WebSocketProtocolComponent` expects — a receive area at the start of the allocated buffer,
+  a send area after it, received payloads unmasked in place — so
+  `System.Net.WebSockets.ClientWebSocket` works. The conformance test in
+  `dlls/websocket/tests` was first run with the native `websocket.dll`; the builtin
+  reproduces that trace line by line (200 checks, no structural difference once addresses,
+  keys and masks are normalised). Not mirrored: a fragmented message whose first frame
+  carries a reserved bit without a negotiated extension, which native delivers as a custom
+  message and the builtin rejects as a protocol error. NinjaTrader 8 logged on and then
+  stopped with "The type initializer for 'System.Net.WebSockets.WebSocketProtocolComponent'
+  threw an exception" at `fixme:websocket:WebSocketCreateClientHandle … stub`; its
+  simulation data connection now comes up
 - **Keyboard input into out-of-process content (wineserver, winex11)**: a process that
   translates keys for a window owned by *another* process now has the whole thread input
   family attached, derives the AltGr modifier from the passed key state rather than from a
