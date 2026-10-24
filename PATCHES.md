@@ -387,10 +387,32 @@ This is the recommended branch. What it changes, by subsystem:
   returned `RO_E_METADATA_NAME_NOT_FOUND` for every namespace, and the .NET Framework resolves
   a Windows Runtime type through this call: Power BI Desktop 2.158 stopped at start-up with
   `Could not find Windows Runtime type 'Windows.Storage.StorageFile'` (WineHQ bug 57410, an
-  empty main window and a 2x2 "Something went wrong" dialog). `StorageFile` now resolves; the
-  start still fails on `Windows.Storage.Streams.IInputStreamReference`, which is in no `.winmd`
-  Wine installs (widl puts only the types of one IDL file into its `.winmd`, and
-  `windows.storage.streams.idl` gets none)
+  empty main window and a 2x2 "Something went wrong" dialog). `StorageFile` resolves; the
+  start then failed on `Windows.Storage.Streams.IInputStreamReference`, which no installed
+  `.winmd` defined — the next entry
+- **windows.*.winmd (widl, include)**: eight more Windows Runtime metadata files are generated
+  and installed — Windows.Foundation, Windows.Foundation.Collections,
+  Windows.Foundation.Metadata, Windows.Storage.Streams, Windows.Storage.FileProperties,
+  Windows.Networking.Connectivity, Windows.UI.Core and Windows.UI.Xaml.Interop — and
+  `windows.storage.fileproperties.idl` carries the content property classes (backport of
+  13289668fd1 from Wine 11.11). widl writes only the types of one IDL into its `.winmd`, so of
+  the Windows.* types the ten installed files refer to, 37 were defined in none of them; with
+  eighteen files the set holds 381 type definitions instead of 202, and 31 references stay
+  open (parameterized interfaces, which widl does not write, the Windows.Foundation.Metadata
+  attribute classes, `EventRegistrationToken`, `AsyncStatus`, `Windows.UI.Input.PointerPoint`).
+  widl itself needed three fixes to produce the files: the class column of the MethodImpl
+  table was written with the index width of the table that the class index happened to name
+  (backport of 8b963e98fe4 from Wine 11.17; `windows.networking.connectivity.winmd` had four
+  rows 8 bytes wide and every table after them shifted), the contract attribute of a method
+  is taken from the class (an interface without one crashed widl on `windows.foundation.idl`;
+  from Tao Wen's change for Power BI Desktop, taowen/wine f2ca524b98f), and a property with a
+  setter only is registered on the setter, as midlrt does (`ICoreWindow2.PointerPosition`
+  crashed widl on `windows.ui.core.idl`). Power BI Desktop 2.158 resolves
+  `Windows.Storage.StorageFile`, `Windows.Storage.FileProperties.StorageItemContentProperties`
+  and `Windows.Foundation.Metadata.ApiInformation` from these files and starts without the
+  `.winmd` of a Windows installation (measured on the devel branch, whose local NTLM sign-in
+  it also needs); `Windows.System.Launcher` and `IStorageItemProperties` are still defined in
+  no IDL
 - **msxml3**: the SAX writer (`MXXMLWriter`) accepts `putDocumentLocator()`, and with indentation
   enabled it no longer writes a newline before the first element or indents the end tag of an
   element with text, which changed the text content (backport of 7981b37f728 from Wine 11.4 and
