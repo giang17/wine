@@ -740,6 +740,22 @@ This is the recommended branch. What it changes, by subsystem:
   now names the tool window instead of the popup. The reporter's build with the equivalent
   win32u change: 0 resyncs in 26 map clicks against 9 of 13 before, no flicker. user32 `win`
   tests: the same five failures before and after.
+- **win32u**: the palette messages of an activation are sent only on a palettized display.
+  `set_active_window()` sent `WM_QUERYNEWPALETTE` to every newly active window and, when the
+  window answered, broadcast `WM_PALETTEISCHANGING`. Windows sends them only when the display
+  is palettized: Wine's own user32 message tests carry `WM_QUERYNEWPALETTE` as `optional` in
+  every activation sequence and as `wine_only` in two of them, and ReactOS sends it only with
+  `PUSIF_PALETTEDISPLAY`, which it derives from `RC_PALETTE` of the display. WinForms answers
+  the message in `Control.WmQueryNewPalette` with `Invalidate(true)`, so under Wine every
+  activation erased and repainted the whole window with its children. vatSys (giang17/wine
+  issue 21) calls `SetFocus` on its map child on every `WM_MOUSEMOVE`; each time the pointer
+  came back onto the map from a popup the main window was activated and the Direct2D map
+  flickered. `is_palette_display()` now checks `RASTERCAPS` of the display DC once per process
+  (winex11 reports `RC_PALETTE` only for a palettized visual) and both messages are skipped
+  otherwise. Measured on a TrueColor display, 11 activations alternating between two windows:
+  11 `WM_QUERYNEWPALETTE` before, 0 after. user32 `msg` tests: the same failure lines before
+  and after; the `test_msg_setpos` steps that expect `WM_ACTIVATEAPP` where Wine sent
+  `WM_QUERYNEWPALETTE` now pass inside their `todo_wine` blocks (9 steps).
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
