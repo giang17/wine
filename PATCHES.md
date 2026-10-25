@@ -896,6 +896,18 @@ This is the recommended branch. What it changes, by subsystem:
   x86_64 and i386. Tests `test_close_zero_length_line` and `test_close_subnormal_coordinates`.
   The fuzzers count failed `Close()` calls (`DONE fail=N`, `scripts/d2d1-fuzz/run.sh` sums them)
   and `scripts/d2d1-fuzz/windows-job.bat` runs them in the reference VM (issue 525).
+- **d2d1**: a fill or text drawn on a device context without a target reports `D2DERR_WRONG_STATE`
+  instead of crashing. `FillRectangle()`, `DrawGlyphRun()`, `DrawText()`, `DrawTextLayout()` and
+  `FillOpacityMask()` reached `d2d_device_context_draw()`, which bound `&target.bitmap->rtv` with
+  `target.bitmap` NULL (address 0x20) and crashed in `d3d11_device_context_OMSetRenderTargets()`;
+  `FillRectangle()` lost its check when it got its own rectangle geometry instead of going
+  through `FillGeometry()`, the text and opacity mask entry points never had one. All of them
+  now set the error with the tags of the first offending call, as `Clear()`, `DrawBitmap()`,
+  `DrawGeometry()` and `FillGeometry()` do and `test_no_target()` expects, and
+  `d2d_device_context_draw()` refuses a context without a bitmap target itself. The d2d1 test
+  binary used to die in `test_no_target()` with exit status 5 and no summary line (the tests
+  queued after it on that thread went unrun); it now ends with 20,701 tests on x86_64 and 20,676
+  on i386 and the same failures as before. 29 paths render hash-identically (issue 527).
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
