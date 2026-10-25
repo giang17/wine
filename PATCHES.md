@@ -813,6 +813,25 @@ This is the recommended branch. What it changes, by subsystem:
   coordinates none before or after, and none of the new checks fires on those paths. Vanilla
   Wine 11.0 crashed on 1,340 and hung on 12 of the same 20,000 paths (not analysed further);
   WineHQ bug 60115 reports stack overflows in the same triangulation code for FL Studio + Serum 2.
+- **d2d1**: the subdivision of overlapping Bézier control triangles is bounded. Splitting a pair
+  separates the triangles only where the curves keep apart; where they cross, or run along each
+  other, the halves overlap again at every level, and `d2d_geometry_resolve_beziers()` went on
+  until a triangle had rounded down to a point, at a depth of about 25 for coordinates in the
+  hundreds. Every split shifts the figure arrays behind it and adds a segment that is tested
+  against all earlier ones; WineHQ bug 60265 reports a figure of Affinity Designer 3 with a
+  cluster of nodes at nearly the same coordinates growing past 900,000 vertices until the process
+  ran out of memory. A pair now stops splitting once either segment has reached depth 8, where a
+  piece covers 1/256 of its curve (the bound of the patch attached to that bug), and the segment
+  count is capped at 16 times the initial count as a backstop. The overlap left at a crossing is
+  at most that piece's control triangle. Measured with the bug's reproducer, a rosette of N
+  curves whose control points all lie near the centre: with vanilla's single quadratic per cubic,
+  the bound holds at depth 8, 162 segments grow to 2,403 instead of further, and `Close()` takes
+  38 ms instead of 51 ms for N = 160 (vanilla Wine 11.0: 23 s); in a 1016x1016 render of the
+  N = 80 rosette 74 pixels change (0.007 %, single pixels at crossings). The cubic reproducer as
+  attached never reaches depth 8 here (maximum 5) and renders identically; the fork closed it in
+  52 ms for N = 320 already before this change, vanilla Wine 11.0 needs 507 s. The fuzzers of
+  issues 522 and 523 run 1,000,000 integer and 120,000 float paths without a new failure, and the
+  d2d1 tests report the same failures as before on x86_64 and i386.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
