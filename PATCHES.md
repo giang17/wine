@@ -771,6 +771,22 @@ This is the recommended branch. What it changes, by subsystem:
   maximum. Measured with `scripts/repro-521-min-track-size.c` (minimum 400x300) on kwin_x11: an
   interactive corner drag left the X window at 92x41 against win32's 400x300 before (19 `mismatch
   config` warnings), and at 392x266 — the minimum less the frame — after, no mismatch.
+- **d2d1**: the bitmap methods that use the D3D11 immediate context take the lock of a
+  multi-threaded factory as well. Since the device-context lock of issue 511,
+  `ID2D1Bitmap::CopyFromMemory()`, `CopyFromBitmap()`/`CopyFromRenderTarget()`, `Map()` and
+  `Unmap()` still ran unlocked on the immediate context of the device, which is not thread-safe.
+  vatSys (giang17/wine issue 21) crashed in DXVK's `d3d11.dll` from its map render thread —
+  `d3d11 + 0x154b1` behind the batch flush of `SetAntialiasMode()`, `+ 0x15529` behind `Map()`
+  in the scratch buffer two days earlier, the same function — while another thread updated a
+  bitmap; wined3d's `d3d11` serialises its entry points itself and hid the race in the smoke
+  tests of issue 511. `D2D1_FACTORY_TYPE_MULTI_THREADED` promises synchronisation of "the
+  factory and the objects it creates", so the four methods now take `factory->cs` (recursive, a
+  bitmap call from inside a locked device-context call stays legal). Measured with
+  `scripts/repro-520-bitmap-update-race.c` (8 drawing threads plus one `CopyFromMemory()`
+  thread, i686, headless): before, DXVK 3 of 3 runs crashed inside DXVK and wined3d crashed in
+  `get_scratch_buffer()` once and hung at the first frame once; after, DXVK 4 of 5 runs of 300
+  frames and wined3d 3 of 3 runs of 100 frames completed (the remaining DXVK run was at frame 200
+  when the 180 s limit hit, no error).
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
