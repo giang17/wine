@@ -3000,6 +3000,26 @@ static BOOL d2d_point_segments_cross(const D2D1_POINT_2F *p0, const D2D1_POINT_2
     return a != 0.0f || b != 0.0f;
 }
 
+/* Whether the segment q0-q1 runs along the line through p0 and p1, within the
+ * rounding of the coordinates: both of its end points lie no further from the
+ * line than a few ULPs of the coordinate magnitude, or p0-p1 is itself that
+ * short. A cubic whose end point coincides with its last control point, or
+ * with its start point, folds back along a straight line, and its pieces run
+ * over each other. The leaf points of two such pieces are rounded onto either
+ * side of the shared line, so d2d_point_segments_cross() found a crossing in
+ * about every other leaf, and one such cubic became 432 segments. */
+static BOOL d2d_point_segment_along(const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1,
+        const D2D1_POINT_2F *q0, const D2D1_POINT_2F *q1)
+{
+    float eps = 1e-6f * fmaxf(1.0f, fmaxf(fabsf(p0->x), fabsf(p0->y)));
+    float len = sqrtf((p1->x - p0->x) * (p1->x - p0->x) + (p1->y - p0->y) * (p1->y - p0->y));
+
+    if (len <= eps)
+        return TRUE;
+
+    return fabsf(d2d_point_ccw(p0, p1, q0)) <= eps * len && fabsf(d2d_point_ccw(p0, p1, q1)) <= eps * len;
+}
+
 static BOOL d2d_geometry_intersect_bezier_bezier(struct d2d_geometry *geometry,
         struct d2d_geometry_intersections *intersections,
         const struct d2d_segment_idx *idx_p, float start_p, float end_p,
@@ -3058,6 +3078,9 @@ static BOOL d2d_geometry_intersect_bezier_bezier(struct d2d_geometry *geometry,
         d2d_point_calculate_bezier(&p_end, p[0], p[1], p[2], end_p);
         d2d_point_calculate_bezier(&q_start, q[0], q[1], q[2], start_q);
         d2d_point_calculate_bezier(&q_end, q[0], q[1], q[2], end_q);
+        if (d2d_point_segment_along(&p_start, &p_end, &q_start, &q_end)
+                || d2d_point_segment_along(&q_start, &q_end, &p_start, &p_end))
+            return TRUE;
         if (!d2d_point_segments_cross(&p_start, &p_end, &q_start, &q_end))
             return TRUE;
 
