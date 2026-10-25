@@ -756,6 +756,21 @@ This is the recommended branch. What it changes, by subsystem:
   11 `WM_QUERYNEWPALETTE` before, 0 after. user32 `msg` tests: the same failure lines before
   and after; the `test_msg_setpos` steps that expect `WM_ACTIVATEAPP` where Wine sent
   `WM_QUERYNEWPALETTE` now pass inside their `todo_wine` blocks (9 steps).
+- **win32u / winex11**: the window manager gets the application's minimum and maximum track
+  size as `PMinSize`/`PMaxSize`. `set_size_hints()` sent them only for windows that are not
+  resizable; a resizable window got position and gravity only, so the window manager shrank it
+  below the `ptMinTrackSize` of `WM_GETMINMAXINFO` during an interactive resize, win32 clamped
+  every step back to the minimum (`DefWindowProc`, `WM_WINDOWPOSCHANGING`) and asked for the
+  clamped size, which the interactive resize overrode — after the release the X window stayed
+  small while win32 kept the minimum, and the edges win32 placed outside the visible window could
+  not be grabbed (vatSys VSCS, 610x318 minimum, X window 430 px wide, giang17/wine issue 21).
+  `get_min_max_info()` now caches the track sizes it obtains in the window structure, and the
+  driver reads them through `NtUserCallHwndParam_GetMinMaxTrack` in raw pixels without sending a
+  message (the hints are updated under the driver's own lock, where application code must not
+  run); `PMinSize` goes out for every resizable window, `PMaxSize` only when the application set a
+  maximum. Measured with `scripts/repro-521-min-track-size.c` (minimum 400x300) on kwin_x11: an
+  interactive corner drag left the X window at 92x41 against win32's 400x300 before (19 `mismatch
+  config` warnings), and at 392x266 — the minimum less the frame — after, no mismatch.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
