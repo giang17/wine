@@ -715,6 +715,31 @@ This is the recommended branch. What it changes, by subsystem:
   Verified with Cubase's monitor against clicks into the inactive and the active project
   window, the monitor and the KWin title bar (12/12 keep the monitor above); the user32
   window tests are unchanged.
+- **win32u / winex11**: the Z-order resync after a window-manager raise no longer counts a
+  window's own owned popups as predecessors. `sync_zorder_after_wm_raise()` looked for the
+  first visible window above the clicked top-level and, if there was one, requested
+  `HWND_TOP` with `SWP_WINE_ZORDER_SYNC`; an owned popup above its owner is the normal
+  win32 order (`swp_owner_popups()` puts it back there on every Z-order change of the
+  owner), so the request changed nothing in win32 and still made the driver send
+  `_NET_RESTACK_WINDOW(Below, popup)` to the window manager — on every click, as long as one
+  visible owned popup sat above the main window. vatSys (giang17/wine issue 21, 32-bit
+  WinForms, the map drawn with Direct2D) flickered on nearly every map click once one of its
+  owned forms (Jurisdiction, Error Window, the OzStrips form) had ended up above the main
+  window; in the clean launches all of them sat below it. The window manager keeps owned
+  windows above their owner anyway (`WM_TRANSIENT_FOR`, set by winex11 for owned windows).
+  The predecessor walk in win32u and the two in winex11 (`sync_window_position()` for the
+  sibling of a managed window, `net_client_list_stacking_notify()`) now skip windows owned by
+  the window, directly or through the owner chain; an unmanaged window still counts them for
+  "top", since it must not be raised over its own popups, and ownerless predecessors keep the
+  behaviour of the entry above. Measured with `scripts/repro-517-owned-popup-resync.c` (main
+  window with a child, 8 clicks into the child on `:99` with kwin_x11): one owned popup above
+  the main window — resync and `_NET_RESTACK_WINDOW` on 8 of 8 clicks before, 0 of 8 after,
+  the popup stays above in `_NET_CLIENT_LIST_STACKING`; the Cubase pattern (ownerless tool
+  window held above from `WM_WINDOWPOSCHANGING`) — 8 resyncs, 15 restack requests and the
+  tool window above after every click, before and after alike; with both windows the restack
+  now names the tool window instead of the popup. The reporter's build with the equivalent
+  win32u change: 0 resyncs in 26 map clicks against 9 of 13 before, no flicker. user32 `win`
+  tests: the same five failures before and after.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
