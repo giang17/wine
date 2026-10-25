@@ -10280,6 +10280,50 @@ static void test_bezier_split_no_progress(BOOL d3d11)
     ok(!refcount, "Factory has %lu references left.\n", refcount);
 }
 
+static void test_bezier_split_depth(BOOL d3d11)
+{
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    ID2D1Factory *factory;
+    D2D1_POINT_2F point;
+    ULONG refcount;
+    unsigned int i;
+    HRESULT hr;
+
+    /* A rosette of 160 quadratic segments whose control points all lie near
+     * the centre, so that every pair of control triangles overlaps and the
+     * curves cross each other many times. Splitting the control triangles
+     * never separates crossing curves; without a bound on the subdivision
+     * depth, closing this path took tens of seconds and a path with a
+     * cluster of nodes at nearly the same coordinates never finished
+     * (WineHQ bug 60265). */
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1Factory_CreatePathGeometry(factory, &geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(geometry, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    set_point(&point, 500.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    for (i = 1; i <= 160; ++i)
+    {
+        float a = 2.0f * M_PI * i / 160.0f, b = 2.0f * M_PI * (i - 1) / 160.0f;
+
+        quadratic_to(sink, -95.0f * (cosf(a) + cosf(b)), -95.0f * (sinf(a) + sinf(b)),
+                500.0f * cosf(a), 500.0f * sinf(a));
+    }
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    ID2D1GeometrySink_Release(sink);
+    ID2D1PathGeometry_Release(geometry);
+    refcount = ID2D1Factory_Release(factory);
+    ok(!refcount, "Factory has %lu references left.\n", refcount);
+}
+
 static void test_triangulation_degenerate(BOOL d3d11)
 {
     ID2D1PathGeometry *geometry;
@@ -19759,6 +19803,7 @@ START_TEST(d2d1)
     queue_test(test_bezier_intersect);
     queue_d3d10_test(test_bezier_non_finite);
     queue_d3d10_test(test_bezier_split_no_progress);
+    queue_d3d10_test(test_bezier_split_depth);
     queue_d3d10_test(test_triangulation_degenerate);
     queue_test(test_create_device);
     queue_test(test_create_device_context);
