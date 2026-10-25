@@ -872,6 +872,30 @@ This is the recommended branch. What it changes, by subsystem:
   polyline of 32,000 points along one line stays at 2.8 s: every face's probe still meets every
   edge there (issue 528; a winding propagation over the triangulation would be linear for that
   case too, not done).
+- **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
+  on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
+  figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
+  Windows closes all of them (reference VM, same binaries). Four causes, traced with probes in
+  the triangulation: a line of zero length (two consecutive identical points) meeting a Bézier
+  made `d2d_geometry_add_bezier_line_intersections()` divide zero by zero, and the check
+  `t < 0 || t > 1` let the NaN through as a vertex that sorted after every other one and left the
+  triangulation contradicting itself (duplicate edges, a vertex connected to itself, a vertex
+  without edges) — every one of the 152 integer failures; the range checks of the bezier-line
+  and line-line intersections now reject NaN. Coordinates below `FLT_MIN` make the exact
+  orientation and incircle predicates contradict each other; `Close()` flushes them to zero
+  (within 1.2e-38 of it). On an inconsistent triangulation the ring walk of
+  `d2d_cdt_insert_segment()` accepted a sector that was not the triangle the segment leaves
+  through, and the cut walk went around the whole outline back to the start vertex, where the
+  caller connected the vertex to itself; the sector is checked against the face and a walk that
+  returns to its start skips the segment without destroying anything. A vertex left without
+  edges by a skipped constraint skips the segments starting there instead of failing the path
+  (the faces are classified by a point inside them, so only the fill along those segments is
+  off). Result: 0 of 200,000 integer, 20,000 float-with-Bézier and 100,000 float paths fail (32,
+  1,176 and 5,102 before; without the sector and walk checks 3 and 6 of the float paths would
+  still); 29 regular paths render hash-identically, the d2d1 tests report the same failures on
+  x86_64 and i386. Tests `test_close_zero_length_line` and `test_close_subnormal_coordinates`.
+  The fuzzers count failed `Close()` calls (`DONE fail=N`, `scripts/d2d1-fuzz/run.sh` sums them)
+  and `scripts/d2d1-fuzz/windows-job.bat` runs them in the reference VM (issue 525).
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
