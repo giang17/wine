@@ -10095,6 +10095,99 @@ static void test_bezier_split_no_progress(BOOL d3d11)
     ok(!refcount, "Factory has %lu references left.\n", refcount);
 }
 
+static void test_triangulation_degenerate(BOOL d3d11)
+{
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    ID2D1Factory *factory;
+    D2D1_POINT_2F point;
+    unsigned int i, j;
+    const float *p;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* Closing these paths used to hang or crash in the triangulation. Each
+     * one has a few points with subnormal coordinates next to points a few
+     * ULPs apart, where the orientation tests the triangulation relies on
+     * contradict each other. The walk that removes the edges a new segment
+     * crosses then went around in a circle and grew without bound, a face
+     * walk never got back to its start, or an edge that was still in use got
+     * destroyed. Found by fuzzing random paths with such coordinates.
+     *
+     * Only termination is tested. When the triangulation gives up on a path
+     * that is this degenerate, Close() returns E_FAIL, as it does for other
+     * degenerate paths; which result depends on the floating-point
+     * environment (x87 on i386 differs).
+     *
+     * Each array lists its figures as a point count followed by the points;
+     * the first point starts the figure, the others are lines. */
+    static const float walk_cycle[] =
+    {
+        10, 1.75f, 3.25f, 2.0f, 1.0f, 1.0f, 2.99999976f, 4.0f, 0.0f, 1.99999905f, 2.0f,
+            1.00000095f, 1.40129846e-45f, 0.0f, 5.0f, 1.0f, 4.0f, 5.0f, 4.0f, 3.0f, 2.0f,
+        7, 3.0f, 3.0f, 0.0f, 2.99999905f, 1.40129846e-45f, 5.0f, 2.0f, 2.0f, 3.0f, 5.0f,
+            2.80259693e-45f, 5.0f, 1.99999988f, 1.75f,
+        0,
+    };
+    static const float face_walk[] =
+    {
+        9, 3.0f, 0.0f, 4.0f, 4.00000095f, 0.0f, 5.0f, 1.99899995f, 0.0f, 1.0f, 5.0f,
+            0.0f, 2.0f, 2.99999976f, 4.0f, 0.0f, 3.0f, 0.0f, 2.99999905f,
+        3, 3.0f, 4.0f, 0.0f, 0.0f, 1.40129846e-45f, 5.0f,
+        0,
+    };
+    static const float freed_edge[] =
+    {
+        7, 5.0f, 1.00100005f, 2.0f, 5.0f, -1.40129846e-45f, 1.0f, 0.0f, 4.99900007f,
+            1.875f, 4.99993753f, 0.0f, 5.0f, 2.80259693e-45f, 1.0f,
+        0,
+    };
+    static const struct
+    {
+        const char *name;
+        const float *figures;
+    }
+    tests[] =
+    {
+        {"walk cycle", walk_cycle},
+        {"face walk", face_walk},
+        {"freed edge", freed_edge},
+    };
+
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        winetest_push_context("%s", tests[i].name);
+
+        hr = ID2D1Factory_CreatePathGeometry(factory, &geometry);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        hr = ID2D1PathGeometry_Open(geometry, &sink);
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+        for (p = tests[i].figures; *p; p += 1 + 2 * (unsigned int)*p)
+        {
+            set_point(&point, p[1], p[2]);
+            ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+            for (j = 1; j < (unsigned int)*p; ++j)
+                line_to(sink, p[1 + 2 * j], p[2 + 2 * j]);
+            ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+        }
+
+        hr = ID2D1GeometrySink_Close(sink);
+        ok(hr == S_OK || hr == E_FAIL, "Got unexpected hr %#lx.\n", hr);
+
+        ID2D1GeometrySink_Release(sink);
+        ID2D1PathGeometry_Release(geometry);
+
+        winetest_pop_context();
+    }
+
+    refcount = ID2D1Factory_Release(factory);
+    ok(!refcount, "Factory has %lu references left.\n", refcount);
+}
+
 static void test_create_device(BOOL d3d11)
 {
     D2D1_CREATION_PROPERTIES properties = {0};
@@ -19764,6 +19857,7 @@ START_TEST(d2d1)
     queue_test(test_bezier_intersect);
     queue_d3d10_test(test_bezier_non_finite);
     queue_d3d10_test(test_bezier_split_no_progress);
+    queue_d3d10_test(test_triangulation_degenerate);
     queue_test(test_create_device);
     queue_test(test_create_device_context);
     queue_test(test_bitmap_surface);

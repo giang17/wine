@@ -25,6 +25,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 #define D2D_FIGURE_FLAG_HOLLOW          0x00000002u
 
 #define D2D_CDT_EDGE_FLAG_FREED         0x80000000u
+#define D2D_CDT_EDGE_FLAG_CUT           0x40000000u
 #define D2D_CDT_EDGE_FLAG_VISITED(r)    (1u << (r))
 
 #define D2D_FP_EPS (1.0f / (1 << FLT_MANT_DIG))
@@ -278,6 +279,7 @@ struct d2d_cdt
     size_t free_edge;
 
     const D2D1_POINT_2F *vertices;
+    size_t vertex_count;
 };
 
 struct d2d_geometry_intersection
@@ -2384,10 +2386,14 @@ fail:
     return FALSE;
 }
 
+/* Both loops below are bounded by the number of vertices: a face cannot have
+ * more edges than there are vertices, and retriangulating the faces next to
+ * one new edge cannot add more edges than that either. On degenerate input a
+ * face walk that never returns to its start was seen to spin forever. */
 static BOOL d2d_cdt_fixup(struct d2d_cdt *cdt, const struct d2d_cdt_edge_ref *base_edge)
 {
     struct d2d_cdt_edge_ref *stack = NULL;
-    size_t stack_count = 0, stack_capacity = 0;
+    size_t stack_count = 0, stack_capacity = 0, connects = 0;
     BOOL result = TRUE;
 
     if (!d2d_array_reserve((void **)&stack, &stack_capacity, 1, sizeof(*stack)))
@@ -2419,11 +2425,28 @@ static BOOL d2d_cdt_fixup(struct d2d_cdt *cdt, const struct d2d_cdt_edge_ref *ba
                     d2d_cdt_edge_destination(cdt, &candidate), d2d_cdt_edge_destination(cdt, &next)))
                 candidate = next;
             d2d_cdt_edge_next_left(cdt, &next, &next);
-            ++count;
+            if (++count > cdt->vertex_count)
+                break;
+        }
+        if (count > cdt->vertex_count)
+        {
+            static int once;
+            if (!once++)
+                FIXME("Face walk does not close.\n");
+            result = FALSE;
+            break;
         }
 
         if (count > 1)
         {
+            if (++connects > cdt->vertex_count)
+            {
+                static int once;
+                if (!once++)
+                    FIXME("Too many edges added while restoring the triangulation.\n");
+                result = FALSE;
+                break;
+            }
             d2d_cdt_edge_next_left(cdt, &next, &candidate);
             if (d2d_cdt_edge_destination(cdt, &next) == d2d_cdt_edge_origin(cdt, &current_base))
                 d2d_cdt_edge_next_left(cdt, &next, &current_base);
@@ -2453,12 +2476,28 @@ static BOOL d2d_cdt_fixup(struct d2d_cdt *cdt, const struct d2d_cdt_edge_ref *ba
     return result;
 }
 
-static void d2d_cdt_cut_edges(struct d2d_cdt *cdt, struct d2d_cdt_edge_ref *end_edge,
-        const struct d2d_cdt_edge_ref *base_edge, size_t start_vertex, size_t end_vertex)
+/* Walks from base_edge towards end_vertex and removes every edge the segment
+ * crosses. On consistent geometry each edge is crossed at most once. With
+ * duplicate and nearly collinear vertices the inexact orientation tests can
+ * send the walk around in a circle instead: it then collected the same edges
+ * again and again until memory ran out, destroyed an edge twice, or destroyed
+ * an edge the caller connects to afterwards, and the triangulation was left
+ * pointing at freed edges. An edge that comes up a second time, and a walk
+ * that would destroy base_edge, keep or the edge it ends on, end the walk
+ * without changing anything, and the caller skips the segment. */
+static BOOL d2d_cdt_cut_edges(struct d2d_cdt *cdt, struct d2d_cdt_edge_ref *end_edge,
+        const struct d2d_cdt_edge_ref *base_edge, const struct d2d_cdt_edge_ref *keep,
+        size_t start_vertex, size_t end_vertex)
 {
     struct d2d_cdt_edge_ref *destroy_stack = NULL;
     size_t destroy_count = 0, destroy_capacity = 0;
     struct d2d_cdt_edge_ref current = *base_edge;
+    BOOL ret = TRUE;
+
+    /* The caller destroys base_edge itself and connects to keep afterwards;
+     * the walk must collect neither. */
+    cdt->edges[base_edge->idx].flags |= D2D_CDT_EDGE_FLAG_CUT;
+    cdt->edges[keep->idx].flags |= D2D_CDT_EDGE_FLAG_CUT;
 
     for (;;)
     {
@@ -2484,20 +2523,49 @@ static void d2d_cdt_cut_edges(struct d2d_cdt *cdt, struct d2d_cdt_edge_ref *end_
 
         d2d_cdt_edge_sym(&next, &next);
 
+        if (cdt->edges[next.idx].flags & D2D_CDT_EDGE_FLAG_CUT)
+        {
+            static int once;
+            if (!once++)
+                FIXME("Segment walk crosses an edge twice, skipping the segment.\n");
+            ret = FALSE;
+            break;
+        }
+
         if (!d2d_array_reserve((void **)&destroy_stack, &destroy_capacity,
                 destroy_count + 1, sizeof(*destroy_stack)))
         {
             ERR("Failed to grow destroy stack.\n");
+            ret = FALSE;
             break;
         }
+        cdt->edges[next.idx].flags |= D2D_CDT_EDGE_FLAG_CUT;
         destroy_stack[destroy_count++] = next;
         current = next;
     }
 
+    /* The edge the walk ends on is connected to by the caller, so it must not
+     * be one that is about to be destroyed. Ending on keep is fine. */
+    if (ret && end_edge->idx != keep->idx && (cdt->edges[end_edge->idx].flags & D2D_CDT_EDGE_FLAG_CUT))
+    {
+        static int once;
+        if (!once++)
+            FIXME("Segment walk ends on a crossed edge, skipping the segment.\n");
+        ret = FALSE;
+    }
+
+    cdt->edges[base_edge->idx].flags &= ~D2D_CDT_EDGE_FLAG_CUT;
+    cdt->edges[keep->idx].flags &= ~D2D_CDT_EDGE_FLAG_CUT;
+    if (!ret)
+    {
+        while (destroy_count > 0)
+            cdt->edges[destroy_stack[--destroy_count].idx].flags &= ~D2D_CDT_EDGE_FLAG_CUT;
+    }
     while (destroy_count > 0)
         d2d_cdt_destroy_edge(cdt, &destroy_stack[--destroy_count]);
 
     free(destroy_stack);
+    return ret;
 }
 
 static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geometry,
@@ -2505,15 +2573,36 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
 {
     struct d2d_cdt_edge_ref current_origin = *origin;
     size_t last_origin_vtx = ~(size_t)0;
-    size_t collinear_steps = 0;
+    size_t collinear_steps = 0, steps = 0;
 
     for (;;)
     {
         struct d2d_cdt_edge_ref base_edge, current, new_origin, next, target;
-        size_t current_destination, current_origin_vtx;
+        size_t current_destination, current_origin_vtx, ring = 0;
+
+        /* Every pass continues from a vertex further along the segment, so
+         * there cannot be more passes than vertices. More means the passes
+         * go around in a circle on degenerate input. */
+        if (++steps > cdt->vertex_count)
+        {
+            static int once;
+            if (!once++)
+                FIXME("Segment insertion does not advance, skipping the segment.\n");
+            return FALSE;
+        }
 
         for (current = current_origin;; current = next)
         {
+            /* The edges around a vertex form a ring of at most edge_count
+             * edges; a walk that does not come back has run into a damaged
+             * triangulation. */
+            if (++ring > cdt->edge_count)
+            {
+                static int once;
+                if (!once++)
+                    FIXME("Edge ring around a vertex does not close.\n");
+                return FALSE;
+            }
             d2d_cdt_edge_next_origin(cdt, &next, &current);
 
             current_destination = d2d_cdt_edge_destination(cdt, &current);
@@ -2558,8 +2647,9 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
                 d2d_cdt_edge_next_left(cdt, &base_edge, &current);
 
                 d2d_cdt_edge_sym(&base_edge, &base_edge);
-                d2d_cdt_cut_edges(cdt, &target, &base_edge,
-                        d2d_cdt_edge_origin(cdt, &current_origin), end_vertex);
+                if (!d2d_cdt_cut_edges(cdt, &target, &base_edge, &current,
+                        d2d_cdt_edge_origin(cdt, &current_origin), end_vertex))
+                    return FALSE;
                 d2d_cdt_destroy_edge(cdt, &base_edge);
 
                 if (!d2d_cdt_connect(cdt, &base_edge, &target, &current))
@@ -3601,6 +3691,7 @@ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
 
     cdt.free_edge = ~0u;
     cdt.vertices = vertices;
+    cdt.vertex_count = vertex_count;
 
 #ifdef __i386__
     control_word_x87 = _controlfp(0, 0);
