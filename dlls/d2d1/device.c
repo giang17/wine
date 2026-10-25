@@ -505,12 +505,25 @@ static void d2d_device_context_draw_finish(struct d2d_device_context *render_tar
         LeaveCriticalSection(render_target->cs);
 }
 
+static void d2d_device_context_set_error(struct d2d_device_context *context, HRESULT code);
+
 static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
         ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
         struct d2d_brush *brush, struct d2d_brush *opacity_brush)
 {
     ID3DDeviceContextState *prev_state;
     ID3D11DeviceContext1 *context;
+
+    /* A context without a target has nothing to draw into; the entry points
+     * report that as D2DERR_WRONG_STATE with the tags of the first call that
+     * tried. Any path that gets here anyway would bind the render target
+     * view of a bitmap that does not exist. */
+    if (render_target->target.type != D2D_TARGET_BITMAP)
+    {
+        if (!FAILED(render_target->error.code))
+            d2d_device_context_set_error(render_target, D2DERR_WRONG_STATE);
+        return;
+    }
 
     /* Lines and fills recorded before this primitive have to land underneath it. */
     d2d_device_context_flush_batches(render_target);
@@ -1154,6 +1167,12 @@ static void STDMETHODCALLTYPE d2d_device_context_FillRectangle(ID2D1DeviceContex
 
     if (FAILED(context->error.code))
         return;
+
+    if (context->target.type == D2D_TARGET_UNKNOWN)
+    {
+        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
+        return;
+    }
 
     if (context->target.type == D2D_TARGET_COMMAND_LIST)
     {
@@ -3177,6 +3196,12 @@ static void STDMETHODCALLTYPE d2d_device_context_FillOpacityMask(ID2D1DeviceCont
     if (FAILED(context->error.code))
         return;
 
+    if (context->target.type == D2D_TARGET_UNKNOWN)
+    {
+        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
+        return;
+    }
+
     if (context->drawing_state.antialiasMode != D2D1_ANTIALIAS_MODE_ALIASED)
     {
         d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
@@ -3323,6 +3348,15 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawText(ID2D1DeviceContext6 *i
 
     d2d_device_context_flush_batches(render_target);
 
+    if (FAILED(render_target->error.code))
+        return;
+
+    if (render_target->target.type == D2D_TARGET_UNKNOWN)
+    {
+        d2d_device_context_set_error(render_target, D2DERR_WRONG_STATE);
+        return;
+    }
+
     if (FAILED(hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
             &IID_IDWriteFactory, (IUnknown **)&dwrite_factory)))
     {
@@ -3363,6 +3397,15 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawTextLayout(ID2D1DeviceConte
             iface, debug_d2d_point_2f(&origin), layout, brush, options);
 
     d2d_device_context_flush_batches(render_target);
+
+    if (FAILED(render_target->error.code))
+        return;
+
+    if (render_target->target.type == D2D_TARGET_UNKNOWN)
+    {
+        d2d_device_context_set_error(render_target, D2DERR_WRONG_STATE);
+        return;
+    }
 
     ctx.brush = brush;
     ctx.options = options;
@@ -4451,6 +4494,15 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGlyphRun(ID2D1DeviceContext
             iface, debug_d2d_point_2f(&baseline_origin), glyph_run, brush, measuring_mode);
 
     d2d_device_context_flush_batches(context);
+
+    if (FAILED(context->error.code))
+        return;
+
+    if (context->target.type == D2D_TARGET_UNKNOWN)
+    {
+        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
+        return;
+    }
 
     d2d_device_context_draw_glyph_run(context, baseline_origin, glyph_run, NULL, brush, measuring_mode);
 }
