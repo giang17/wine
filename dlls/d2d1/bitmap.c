@@ -26,13 +26,29 @@ static inline struct d2d_bitmap *impl_from_ID2D1Bitmap1(ID2D1Bitmap1 *iface)
     return CONTAINING_RECORD(iface, struct d2d_bitmap, ID2D1Bitmap1_iface);
 }
 
+/* A multi-threaded factory serialises the objects it creates, not only its device
+ * contexts: the bitmap methods below use the D3D11 immediate context of the device,
+ * which is not thread-safe (DXVK's is not unless d3d11.enableContextLock), and run
+ * on other threads than the drawing.  The device context calls hold the same lock. */
+static CRITICAL_SECTION *d2d_bitmap_cs(const struct d2d_bitmap *bitmap)
+{
+    struct d2d_factory *factory = unsafe_impl_from_ID2D1Factory(bitmap->factory);
+    return factory->factory_type == D2D1_FACTORY_TYPE_MULTI_THREADED ? &factory->cs : NULL;
+}
+
 static HRESULT d2d_bitmap_unmap(struct d2d_bitmap *bitmap)
 {
     ID3D11DeviceContext *context;
     ID3D11Device *device;
 
+    CRITICAL_SECTION *cs = d2d_bitmap_cs(bitmap);
+
+    if (cs) EnterCriticalSection(cs);
     if (!bitmap->mapped_resource.pData)
+    {
+        if (cs) LeaveCriticalSection(cs);
         return D2DERR_WRONG_STATE;
+    }
 
     ID3D11Resource_GetDevice(bitmap->resource, &device);
     ID3D11Device_GetImmediateContext(device, &context);
@@ -41,6 +57,7 @@ static HRESULT d2d_bitmap_unmap(struct d2d_bitmap *bitmap)
     ID3D11Device_Release(device);
 
     memset(&bitmap->mapped_resource, 0, sizeof(bitmap->mapped_resource));
+    if (cs) LeaveCriticalSection(cs);
 
     return S_OK;
 }
@@ -157,6 +174,7 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromBitmap(ID2D1Bitmap1 *iface,
     struct d2d_bitmap *src_bitmap = unsafe_impl_from_ID2D1Bitmap(bitmap);
     struct d2d_bitmap *dst_bitmap = impl_from_ID2D1Bitmap1(iface);
     ID3D11DeviceContext *context;
+    CRITICAL_SECTION *cs;
     ID3D11Device *device;
     D3D11_BOX box;
 
@@ -173,6 +191,8 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromBitmap(ID2D1Bitmap1 *iface,
         box.back = 1;
     }
 
+    cs = d2d_bitmap_cs(dst_bitmap);
+    if (cs) EnterCriticalSection(cs);
     ID3D11Resource_GetDevice(dst_bitmap->resource, &device);
     ID3D11Device_GetImmediateContext(device, &context);
     ID3D11DeviceContext_CopySubresourceRegion(context, dst_bitmap->resource, 0,
@@ -180,6 +200,7 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromBitmap(ID2D1Bitmap1 *iface,
             src_bitmap->resource, 0, src_rect ? &box : NULL);
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
+    if (cs) LeaveCriticalSection(cs);
 
     return S_OK;
 }
@@ -224,6 +245,7 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromMemory(ID2D1Bitmap1 *iface,
 {
     struct d2d_bitmap *bitmap = impl_from_ID2D1Bitmap1(iface);
     ID3D11DeviceContext *context;
+    CRITICAL_SECTION *cs;
     ID3D11Device *device;
     D3D11_BOX box;
 
@@ -240,11 +262,14 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_CopyFromMemory(ID2D1Bitmap1 *iface,
         box.back = 1;
     }
 
+    cs = d2d_bitmap_cs(bitmap);
+    if (cs) EnterCriticalSection(cs);
     ID3D11Resource_GetDevice(bitmap->resource, &device);
     ID3D11Device_GetImmediateContext(device, &context);
     ID3D11DeviceContext_UpdateSubresource(context, bitmap->resource, 0, dst_rect ? &box : NULL, src_data, pitch, 0);
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
+    if (cs) LeaveCriticalSection(cs);
 
     return S_OK;
 }
@@ -287,6 +312,7 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_Map(ID2D1Bitmap1 *iface, D2D1_MAP_OP
     struct d2d_bitmap *bitmap = impl_from_ID2D1Bitmap1(iface);
     D3D11_MAPPED_SUBRESOURCE mapped_resource;
     ID3D11DeviceContext *context;
+    CRITICAL_SECTION *cs;
     ID3D11Device *device;
     D3D11_MAP map_type;
     HRESULT hr;
@@ -295,9 +321,6 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_Map(ID2D1Bitmap1 *iface, D2D1_MAP_OP
 
     if (!(bitmap->options & D2D1_BITMAP_OPTIONS_CPU_READ))
         return E_INVALIDARG;
-
-    if (bitmap->mapped_resource.pData)
-        return D2DERR_WRONG_STATE;
 
     if (options == D2D1_MAP_OPTIONS_READ)
         map_type = D3D11_MAP_READ;
@@ -313,6 +336,14 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_Map(ID2D1Bitmap1 *iface, D2D1_MAP_OP
         return E_INVALIDARG;
     }
 
+    cs = d2d_bitmap_cs(bitmap);
+    if (cs) EnterCriticalSection(cs);
+    if (bitmap->mapped_resource.pData)
+    {
+        if (cs) LeaveCriticalSection(cs);
+        return D2DERR_WRONG_STATE;
+    }
+
     ID3D11Resource_GetDevice(bitmap->resource, &device);
     ID3D11Device_GetImmediateContext(device, &context);
     if (SUCCEEDED(hr = ID3D11DeviceContext_Map(context, bitmap->resource, 0, map_type,
@@ -322,6 +353,7 @@ static HRESULT STDMETHODCALLTYPE d2d_bitmap_Map(ID2D1Bitmap1 *iface, D2D1_MAP_OP
     }
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
+    if (cs) LeaveCriticalSection(cs);
 
     if (FAILED(hr))
     {
