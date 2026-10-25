@@ -832,6 +832,24 @@ This is the recommended branch. What it changes, by subsystem:
   52 ms for N = 320 already before this change, vanilla Wine 11.0 needs 507 s. The fuzzers of
   issues 522 and 523 run 1,000,000 integer and 120,000 float paths without a new failure, and the
   d2d1 tests report the same failures as before on x86_64 and i386.
+- **d2d1**: the self-intersection pass no longer reports a crossing where two Bézier pieces run
+  along the same line. A cubic whose end point coincides with its last control point, or with
+  its start point, runs out along a straight line and folds back over itself (with p0 = p2 = p3
+  the curve is p0 + 3t(1 - t)² (p1 - p0)); its quadratic pieces lie on that line over each
+  other, and so do those of a second such curve on the same line. In the leaves of
+  `d2d_geometry_intersect_bezier_bezier()` the points of two such pieces are rounded onto either
+  side of the shared line, and `d2d_point_segments_cross()` reported a crossing in about every
+  other leaf: one such cubic became 432 segments, a path of four cubics on one line 2,127, the
+  overlap loop split those into 9,333, and the triangulation needed 20 s to insert a constraint
+  through the cluster (`d2d_cdt_fixup()` with the exact incircle predicate). A leaf is now skipped
+  when either chord runs along the other's line within 1e-6 of the coordinate magnitude, as the
+  pass already skips coincident segments and parallel lines; the path keeps its 7 segments and
+  closes at once. Found with the float path fuzzer of issue 522 (points on the line through two
+  earlier points): the fuzzers run 1,000,000 integer and 120,000 float paths with the same
+  results as before (no hang or crash; 152, 1,176 and 5,102 failed `Close()` calls in the three runs, before and after; the 20,000 float paths with Béziers close in 26 s instead of 89 s), the d2d1 tests report the same failures on x86_64 and i386,
+  and the rosette, crossing-curve and arrow paths of issue 523 render identically except for
+  the join of two petals of the cubic rosette that meet with opposite tangents, which no longer
+  counts as a crossing (296 of 1016x1016 pixels, by up to 78 of 255).
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
