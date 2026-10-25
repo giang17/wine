@@ -2151,6 +2151,24 @@ static HWND set_focus_window( HWND hwnd )
     return previous;
 }
 
+/* Windows sends the palette messages of an activation only on a palettized display
+ * (ReactOS: PUSIF_PALETTEDISPLAY from the display's RC_PALETTE); the user32 message
+ * tests record them as optional or Wine-only.  WinForms answers WM_QUERYNEWPALETTE
+ * with an Invalidate() of the whole window, so sending it on every activation erases
+ * and repaints the window on each focus change. */
+static BOOL is_palette_display(void)
+{
+    static int palette_display = -1;
+
+    if (palette_display < 0)
+    {
+        HDC hdc = NtGdiOpenDCW( NULL, NULL, NULL, 0, TRUE, 0, NULL, NULL );
+        palette_display = hdc && (NtGdiGetDeviceCaps( hdc, RASTERCAPS ) & RC_PALETTE) != 0;
+        if (hdc) NtGdiDeleteObjectApp( hdc );
+    }
+    return palette_display;
+}
+
 /*******************************************************************
  *		set_active_window
  */
@@ -2205,8 +2223,8 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD oth
     {
         NtUserNotifyWinEvent( EVENT_SYSTEM_FOREGROUND, hwnd, 0, 0 );
 
-        /* send palette messages */
-        if (send_message( hwnd, WM_QUERYNEWPALETTE, 0, 0 ))
+        /* send palette messages, like Windows only on a palettized display */
+        if (is_palette_display() && send_message( hwnd, WM_QUERYNEWPALETTE, 0, 0 ))
             send_message_timeout( HWND_BROADCAST, WM_PALETTEISCHANGING, (WPARAM)hwnd, 0,
                                   SMTO_ABORTIFHUNG, 2000, FALSE );
         if (!is_window(hwnd)) goto failed;
