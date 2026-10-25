@@ -4724,9 +4724,58 @@ static BOOL d2d_quadratic_is_degenerate(const D2D1_POINT_2F *p0, const D2D1_POIN
     return cross * cross <= 1e-8f * l2 * l2;
 }
 
+/* Splitting a pair of overlapping control triangles separates them only if
+ * the curves themselves do not cross. Where they do cross, or run along each
+ * other, the halves keep overlapping at every level, and without a bound the
+ * loop below only stops once a triangle has rounded down to a point: at a
+ * depth of about 25 for coordinates in the hundreds. Every split adds a
+ * segment that is tested against all earlier ones and shifts the figure
+ * arrays behind it, so that tail is what makes a path with many crossings
+ * take seconds, and a cluster of nodes at nearly the same coordinates grow
+ * past a million vertices without finishing (WineHQ bug 60265). Stop at a
+ * depth where a piece covers 1/256 of its curve. The pair then keeps an
+ * overlap no larger than that piece's control triangle, the same state the
+ * loop reaches through rounding, only sooner. */
+#define D2D_BEZIER_MAX_SPLIT_DEPTH 8
+
+/* Ceiling on the number of Bézier segments a path may grow to while
+ * splitting, as a multiple of the count it started with. The depth bound
+ * alone still allows every segment to become 256, which a path of a few
+ * thousand near-coincident curves would turn into memory exhaustion. */
+#define D2D_BEZIER_MAX_SEGMENT_FACTOR 16
+#define D2D_BEZIER_MIN_SEGMENT_BUDGET 4096
+
+/* The subdivision depth of every Bézier segment, in the order in which
+ * d2d_geometry_get_next_bezier_segment_idx() visits them. A split leaves the
+ * first half at the segment's position and inserts the second half right
+ * after it, so the array is kept in step with the figure arrays. */
+struct d2d_bezier_depths
+{
+    unsigned char *depth;
+    size_t size;
+    size_t count;
+};
+
+static BOOL d2d_bezier_depths_split(struct d2d_bezier_depths *depths, size_t idx)
+{
+    if (!d2d_array_reserve((void **)&depths->depth, &depths->size, depths->count + 1, sizeof(*depths->depth)))
+    {
+        ERR("Failed to grow Bézier depth array.\n");
+        return FALSE;
+    }
+
+    memmove(&depths->depth[idx + 2], &depths->depth[idx + 1], (depths->count - idx - 1) * sizeof(*depths->depth));
+    depths->depth[idx + 1] = ++depths->depth[idx];
+    ++depths->count;
+
+    return TRUE;
+}
+
 static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
 {
     struct d2d_segment_idx idx_p, idx_q;
+    struct d2d_bezier_depths depths = {0};
+    size_t ord_p, ord_q, budget, initial;
     struct d2d_curve_vertex *b;
     const D2D1_POINT_2F *p[3];
     struct d2d_figure *figure;
@@ -4736,16 +4785,40 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
     if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
         return S_OK;
 
+    depths.count = 1;
+    while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
+        ++depths.count;
+    if (!(depths.depth = calloc(depths.count, sizeof(*depths.depth))))
+    {
+        ERR("Failed to allocate Bézier depth array.\n");
+        return E_OUTOFMEMORY;
+    }
+    depths.size = initial = depths.count;
+    budget = max(initial * D2D_BEZIER_MAX_SEGMENT_FACTOR, D2D_BEZIER_MIN_SEGMENT_BUDGET);
+
     /* Split overlapping bezier control triangles. */
+    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
+    ord_p = 0;
     while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
     {
+        ++ord_p;
         d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_q);
-        while (idx_q.figure_idx < idx_p.figure_idx || idx_q.vertex_idx < idx_p.vertex_idx)
+        ord_q = 0;
+        while (ord_q < ord_p)
         {
             while (d2d_geometry_check_bezier_overlap(geometry, &idx_p, &idx_q))
             {
                 BOOL split_q = fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q))
                         > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p));
+
+                if (depths.depth[ord_p] >= D2D_BEZIER_MAX_SPLIT_DEPTH
+                        || depths.depth[ord_q] >= D2D_BEZIER_MAX_SPLIT_DEPTH)
+                    break;
+                if (depths.count >= budget)
+                {
+                    WARN("Bézier segment budget of %Iu exhausted, leaving control triangles overlapping.\n", budget);
+                    break;
+                }
 
                 /* Split the other segment if the larger one cannot be split
                  * any further, and leave the pair alone if neither can: the
@@ -4760,8 +4833,12 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
 
                 if (split_q)
                 {
-                    if (!d2d_geometry_split_bezier(geometry, &idx_q))
+                    if (!d2d_geometry_split_bezier(geometry, &idx_q) || !d2d_bezier_depths_split(&depths, ord_q))
+                    {
+                        free(depths.depth);
                         return E_OUTOFMEMORY;
+                    }
+                    ++ord_p;
                     if (idx_p.figure_idx == idx_q.figure_idx)
                     {
                         ++idx_p.vertex_idx;
@@ -4770,13 +4847,26 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
                 }
                 else
                 {
-                    if (!d2d_geometry_split_bezier(geometry, &idx_p))
+                    if (!d2d_geometry_split_bezier(geometry, &idx_p) || !d2d_bezier_depths_split(&depths, ord_p))
+                    {
+                        free(depths.depth);
                         return E_OUTOFMEMORY;
+                    }
                 }
             }
             d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_q);
+            ++ord_q;
         }
     }
+    if (TRACE_ON(d2d))
+    {
+        unsigned int max_depth = 0;
+
+        for (i = 0; i < depths.count; ++i)
+            max_depth = max(max_depth, depths.depth[i]);
+        TRACE("Split %Iu Bézier segments into %Iu, maximum depth %u.\n", initial, depths.count, max_depth);
+    }
+    free(depths.depth);
 
     if (!d2d_geometry_shared_bezier_caps(geometry, &emit, &emitted))
         return E_OUTOFMEMORY;
