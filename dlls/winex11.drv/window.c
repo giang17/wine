@@ -2442,6 +2442,30 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
 
 static void window_restack_below( struct x11drv_win_data *data, Window sibling );
 
+/* whether hwnd is owned by owner, directly or through a chain of owners */
+static BOOL is_owned_by( HWND hwnd, HWND owner )
+{
+    while ((hwnd = NtUserGetWindowRelative( hwnd, GW_OWNER )))
+        if (hwnd == owner) return TRUE;
+    return FALSE;
+}
+
+/***********************************************************************
+ *     get_visible_predecessor
+ *
+ * The visible window above hwnd in the win32 Z-order, not counting the popups
+ * hwnd owns: win32 keeps them above their owner, and the window manager does
+ * the same through WM_TRANSIENT_FOR, so they are no sibling to restack a
+ * managed window below.  Same rule as get_visible_predecessor() in win32u.
+ */
+static HWND get_visible_predecessor( HWND hwnd )
+{
+    HWND prev = NtUserGetWindowRelative( hwnd, GW_HWNDPREV );
+    while (prev && (!(NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE) || is_owned_by( prev, hwnd )))
+        prev = NtUserGetWindowRelative( prev, GW_HWNDPREV );
+    return prev;
+}
+
 /***********************************************************************
  *     net_client_list_stacking_notify
  *
@@ -2465,9 +2489,7 @@ void net_client_list_stacking_notify(void)
     if (!(foreground = NtUserGetForegroundWindow())) return;
     if (NtUserGetWindowThread( foreground, NULL ) != GetCurrentThreadId()) return;
 
-    prev = NtUserGetWindowRelative( foreground, GW_HWNDPREV );
-    while (prev && !(NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE))
-        prev = NtUserGetWindowRelative( prev, GW_HWNDPREV );
+    prev = get_visible_predecessor( foreground );
     if (!prev || !(sibling = X11DRV_get_whole_window( prev ))) return;
 
     if (!(data = get_win_data( foreground ))) return;
@@ -2695,8 +2717,11 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
         if (!prev) above = TRUE;  /* top child */
         /* should use stack_mode Below but most window managers don't get it right */
         /* and Above with a sibling doesn't work so well either, so we ignore it */
-        /* for managed windows the sibling-relative order goes out as _NET_RESTACK_WINDOW instead */
-        else if (data->managed) sibling = X11DRV_get_whole_window( prev );
+        /* for managed windows the sibling-relative order goes out as _NET_RESTACK_WINDOW instead;
+         * the window's own popups are no sibling there, the window manager keeps them above
+         * (an unmanaged window must not be raised over them, so they still count for "top") */
+        else if (data->managed && (prev = get_visible_predecessor( data->hwnd )))
+            sibling = X11DRV_get_whole_window( prev );
     }
 
     set_size_hints( data, style );
