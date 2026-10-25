@@ -10047,6 +10047,54 @@ static void test_bezier_non_finite(BOOL d3d11)
     ok(!refcount, "Factory has %lu references left.\n", refcount);
 }
 
+static void test_bezier_split_no_progress(BOOL d3d11)
+{
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    ID2D1Factory *factory;
+    D2D1_POINT_2F point;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* Closing this path used to hang. Resolving the overlapping Bézier
+     * control triangles split one of them down to a triangle a single ULP
+     * across, whose midpoints round back onto its own corners: every further
+     * split reproduced the same segment plus a point, and the overlap was
+     * never resolved. Found by fuzzing random paths on an integer grid. */
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1Factory_CreatePathGeometry(factory, &geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(geometry, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    set_point(&point, 2.0f, 0.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    cubic_to(sink, 1.0f, 5.0f, 1.0f, 0.0f, 2.0f, 1.0f);
+    line_to(sink, 3.0f, 5.0f);
+    line_to(sink, 3.0f, 3.0f);
+    line_to(sink, 4.0f, 4.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+    set_point(&point, 3.0f, 5.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 3.0f, 2.0f);
+    cubic_to(sink, 1.0f, 3.0f, 2.0f, 3.0f, 0.0f, 5.0f);
+    line_to(sink, 2.0f, 4.0f);
+    line_to(sink, 1.0f, 1.0f);
+    line_to(sink, 3.0f, 1.0f);
+    cubic_to(sink, 3.0f, 2.0f, 0.0f, 4.0f, 5.0f, 0.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    ID2D1GeometrySink_Release(sink);
+    ID2D1PathGeometry_Release(geometry);
+    refcount = ID2D1Factory_Release(factory);
+    ok(!refcount, "Factory has %lu references left.\n", refcount);
+}
+
 static void test_create_device(BOOL d3d11)
 {
     D2D1_CREATION_PROPERTIES properties = {0};
@@ -19715,6 +19763,7 @@ START_TEST(d2d1)
     queue_test(test_layer);
     queue_test(test_bezier_intersect);
     queue_d3d10_test(test_bezier_non_finite);
+    queue_d3d10_test(test_bezier_split_no_progress);
     queue_test(test_create_device);
     queue_test(test_create_device_context);
     queue_test(test_bitmap_surface);

@@ -4435,6 +4435,34 @@ static float d2d_geometry_bezier_ccw(struct d2d_geometry *geometry, const struct
             &figure->bezier_controls[idx->control_idx], &figure->vertices[next]);
 }
 
+/* Splitting a segment keeps its first half in place, and the overlap loop
+ * tests that half again. Once the control triangle is only a few ULPs across,
+ * the midpoints round back onto the existing coordinates and the first half
+ * comes out identical to the segment, while the second half is a single
+ * point. Such a split changes nothing, and the overlap test keeps reporting
+ * the same overlap because the area of the triangle is tiny but not zero.
+ * Only that exact case counts: a split that merely moves the midpoint onto an
+ * end point still changes the control point and may resolve the overlap a few
+ * splits later, and stopping there leaves an overlap the triangulation then
+ * has to cope with. */
+static BOOL d2d_geometry_bezier_split_progresses(const struct d2d_geometry *geometry,
+        const struct d2d_segment_idx *idx)
+{
+    const struct d2d_figure *figure = &geometry->u.path.figures[idx->figure_idx];
+    const D2D1_POINT_2F *p[3];
+    D2D1_POINT_2F q[3];
+
+    p[0] = &figure->vertices[idx->vertex_idx];
+    p[1] = &figure->bezier_controls[idx->control_idx];
+    p[2] = &figure->vertices[idx->vertex_idx + 1];
+
+    d2d_point_lerp(&q[0], p[0], p[1], 0.5f);
+    d2d_point_lerp(&q[1], p[1], p[2], 0.5f);
+    d2d_point_lerp(&q[2], &q[0], &q[1], 0.5f);
+
+    return q[0].x != p[1]->x || q[0].y != p[1]->y || q[2].x != p[2]->x || q[2].y != p[2]->y;
+}
+
 static BOOL d2d_geometry_split_bezier(struct d2d_geometry *geometry, const struct d2d_segment_idx *idx)
 {
     const D2D1_POINT_2F *p[3];
@@ -4625,7 +4653,21 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
         {
             while (d2d_geometry_check_bezier_overlap(geometry, &idx_p, &idx_q))
             {
-                if (fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q)) > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p)))
+                BOOL split_q = fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q))
+                        > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p));
+
+                /* Split the other segment if the larger one cannot be split
+                 * any further, and leave the pair alone if neither can: the
+                 * loop would otherwise insert the same point forever, growing
+                 * the figure until memory runs out. */
+                if (!d2d_geometry_bezier_split_progresses(geometry, split_q ? &idx_q : &idx_p))
+                {
+                    split_q = !split_q;
+                    if (!d2d_geometry_bezier_split_progresses(geometry, split_q ? &idx_q : &idx_p))
+                        break;
+                }
+
+                if (split_q)
                 {
                     if (!d2d_geometry_split_bezier(geometry, &idx_q))
                         return E_OUTOFMEMORY;
