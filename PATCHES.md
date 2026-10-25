@@ -800,6 +800,19 @@ This is the recommended branch. What it changes, by subsystem:
   the d2d1 tests report the same failures before and after on x86_64 and i386. Related upstream
   report: WineHQ bug 60265 (Affinity Designer 3); the depth limit proposed there for crossing
   curves is a separate change (issue 523).
+- **d2d1**: the walks of the fill triangulation end on degenerate paths. With points a few ULPs
+  apart and subnormal coordinates the orientation tests contradict each other: the walk that
+  removes the edges a new segment crosses (`d2d_cdt_cut_edges()`) went around in a circle and
+  grew its edge stack at about 3.5 GB/s (14 GB resident after 4 s), or destroyed an edge twice
+  or the edge it connects to next and crashed later; a face walk in `d2d_cdt_fixup()` and the
+  edge ring in `d2d_cdt_insert_segment()` never closed. The cut walk now refuses an edge it has
+  already collected and the edges the caller still needs, the other walks are bounded by the
+  vertex and edge counts, and each case skips the segment like the existing failure paths.
+  Measured with a fuzzer of random line paths with such coordinates: 87 failures in 20,000 paths
+  before (69 out of memory, 16 hangs, 2 crashes), none in 100,000 after; without subnormal
+  coordinates none before or after, and none of the new checks fires on those paths. Vanilla
+  Wine 11.0 crashed on 1,340 and hung on 12 of the same 20,000 paths (not analysed further);
+  WineHQ bug 60115 reports stack overflows in the same triangulation code for FL Studio + Serum 2.
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
