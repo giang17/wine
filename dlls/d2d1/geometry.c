@@ -2764,6 +2764,19 @@ static BOOL d2d_cdt_cut_edges(struct d2d_cdt *cdt, struct d2d_cdt_edge_ref *end_
         ccw = d2d_cdt_ccw(cdt, d2d_cdt_edge_destination(cdt, &next), end_vertex, start_vertex);
         if (ccw == 0.0f)
         {
+#ifndef D2D_NO_525_GUARDS
+            /* The start vertex is collinear with itself. A walk that reaches
+             * it has gone around rather than along the segment, and the
+             * caller would connect the vertex to itself. */
+            if (d2d_cdt_edge_destination(cdt, &next) == start_vertex)
+            {
+                static int once;
+                if (!once++)
+                    FIXME("Segment walk returns to its start vertex, skipping the segment.\n");
+                ret = FALSE;
+                break;
+            }
+#endif
             *end_edge = next;
             break;
         }
@@ -2894,7 +2907,30 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
 
             if (d2d_cdt_rightof(cdt, end_vertex, &next) && d2d_cdt_leftof(cdt, end_vertex, &current))
             {
+#ifndef D2D_NO_525_GUARDS
+                struct d2d_cdt_edge_ref third;
+#endif
+
                 d2d_cdt_edge_next_left(cdt, &base_edge, &current);
+#ifndef D2D_NO_525_GUARDS
+                /* The segment leaves the vertex between current and next,
+                 * so the face to the left of current has to be the triangle
+                 * of the three, with the segment crossing its far edge. On a
+                 * triangulation that an earlier failure left inconsistent
+                 * the ring says otherwise, and the walk that cut edges along
+                 * the far edge then went around the whole outline and
+                 * connected the vertex to itself. */
+                d2d_cdt_edge_next_left(cdt, &third, &base_edge);
+                if (d2d_cdt_edge_destination(cdt, &base_edge) != d2d_cdt_edge_destination(cdt, &next)
+                        || d2d_cdt_edge_destination(cdt, &third) != current_origin_vtx
+                        || !d2d_cdt_rightof(cdt, end_vertex, &base_edge))
+                {
+                    static int once;
+                    if (!once++)
+                        FIXME("Sector is not a triangle crossed by the segment, skipping the segment.\n");
+                    return FALSE;
+                }
+#endif
 
                 d2d_cdt_edge_sym(&base_edge, &base_edge);
                 if (!d2d_cdt_cut_edges(cdt, &target, &base_edge, &current,
@@ -2971,7 +3007,7 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
     struct d2d_cdt_edge_ref edge, new_edge;
     const struct d2d_figure *figure;
     const D2D1_POINT_2F *p;
-    BOOL ret = FALSE;
+    BOOL edge_valid;
 
     if (!(cdt->vertex_edge = malloc(cdt->vertex_count * sizeof(*cdt->vertex_edge))))
     {
@@ -3003,11 +3039,7 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
                 geometry->fill.vertex_count, sizeof(*p), d2d_cdt_compare_vertices);
         start_vertex = p - cdt->vertices;
 
-        if (!d2d_cdt_find_vertex_edge(cdt, start_vertex, &edge))
-        {
-            ERR("Edge not found.\n");
-            goto done;
-        }
+        edge_valid = d2d_cdt_find_vertex_edge(cdt, start_vertex, &edge);
 
         for (j = 0; j < figure->vertex_count; start_vertex = end_vertex, ++j)
         {
@@ -3018,24 +3050,34 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
             if (start_vertex == end_vertex)
                 continue;
 
+            /* A vertex without an edge, left behind by a skipped constraint
+             * on a degenerate path, cannot start a segment. Skip the segments
+             * that start there rather than failing the whole path: Windows
+             * closes such paths, and the faces are classified by the point
+             * in them, not by the constraints, so the fill is only off along
+             * the skipped segments. */
+            if (!edge_valid && !(edge_valid = d2d_cdt_find_vertex_edge(cdt, start_vertex, &edge)))
+            {
+                static int once;
+                if (!once++)
+                    FIXME("No edge at a vertex, skipping the segments starting there.\n");
+                continue;
+            }
+
             if (!d2d_cdt_insert_segment(cdt, geometry, &edge, &new_edge, end_vertex))
             {
                 /* Skip this constraint edge rather than aborting the entire
                  * triangulation. Find an edge starting at end_vertex so we
                  * can continue with the next segment. */
-                if (!d2d_cdt_find_vertex_edge(cdt, end_vertex, &edge))
-                    goto done;
+                edge_valid = d2d_cdt_find_vertex_edge(cdt, end_vertex, &edge);
                 continue;
             }
             edge = new_edge;
         }
     }
-    ret = TRUE;
-
-done:
     free(cdt->vertex_edge);
     cdt->vertex_edge = NULL;
-    return ret;
+    return TRUE;
 }
 
 static BOOL d2d_geometry_intersections_add(struct d2d_geometry_intersections *i,
@@ -3109,7 +3151,7 @@ static BOOL d2d_geometry_intersect_line_line(struct d2d_geometry *geometry,
     s = (v_q.x * v_qp.y - v_q.y * v_qp.x) / det;
     t = (v_p.x * v_qp.y - v_p.y * v_qp.x) / det;
 
-    if (s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f)
+    if (!(s >= 0.0f && s <= 1.0f && t >= 0.0f && t <= 1.0f))
         return TRUE;
 
     intersection.x = p[0]->x + v_p.x * s;
@@ -3136,7 +3178,13 @@ static BOOL d2d_geometry_add_bezier_line_intersections(struct d2d_geometry *geom
         t = (intersection.x - q[0]->x) / (q[1]->x - q[0]->x);
     else
         t = (intersection.y - q[0]->y) / (q[1]->y - q[0]->y);
-    if (t < 0.0f || t > 1.0f)
+    /* Written so that a NaN is rejected too: a line of zero length, two
+     * consecutive identical points, divides zero by zero here, and the
+     * intersection then went into the figure as a NaN vertex, which sorted
+     * after every other vertex and left the triangulation contradicting
+     * itself. Every failed Close() of a million random integer paths came
+     * from such a vertex. */
+    if (!(t >= 0.0f && t <= 1.0f))
         return TRUE;
 
     d2d_point_lerp(&intersection, q[0], q[1], t);
@@ -3200,7 +3248,7 @@ static BOOL d2d_geometry_intersect_bezier_line(struct d2d_geometry *geometry,
          * f(t) = (P₀ - 2P₁ + P₂)t² + 2(P₁ - P₀)t + P₀ = 0
          * t = -P₀ / 2(P₁ - P₀) */
         root = -y[0] / (2.0f * (y[1] - y[0]));
-        if (root < 0.0f || root > 1.0f)
+        if (!(root >= 0.0f && root <= 1.0f))
             return TRUE;
 
         return d2d_geometry_add_bezier_line_intersections(geometry, intersections, idx_p, p, idx_q, q, root);
@@ -5544,6 +5592,33 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
         return geometry->u.path.code;
 
     geometry->u.path.state = D2D_GEOMETRY_STATE_CLOSED;
+
+    /* Flush subnormal coordinates to zero. The orientation and incircle
+     * predicates of the triangulation are exact only while no intermediate
+     * product underflows; with a coordinate below FLT_MIN they contradict
+     * each other, the triangulation skips constraints, a vertex ends up
+     * without edges, and Close() fails. Such a coordinate lies within
+     * 1.2e-38 of zero, which nothing resolves. */
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        struct d2d_figure *figure = &geometry->u.path.figures[i];
+        size_t k;
+
+        for (k = 0; k < figure->vertex_count; ++k)
+        {
+            if (fabsf(figure->vertices[k].x) < FLT_MIN)
+                figure->vertices[k].x = 0.0f;
+            if (fabsf(figure->vertices[k].y) < FLT_MIN)
+                figure->vertices[k].y = 0.0f;
+        }
+        for (k = 0; k < figure->bezier_control_count; ++k)
+        {
+            if (fabsf(figure->bezier_controls[k].x) < FLT_MIN)
+                figure->bezier_controls[k].x = 0.0f;
+            if (fabsf(figure->bezier_controls[k].y) < FLT_MIN)
+                figure->bezier_controls[k].y = 0.0f;
+        }
+    }
 
     /* Remove collinear LINE vertices from figures to reduce CDT complexity.
      * This is safe because the outline data is already computed in EndFigure,
