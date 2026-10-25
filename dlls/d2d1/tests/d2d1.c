@@ -10367,6 +10367,105 @@ static void test_bezier_fold_back(BOOL d3d11)
     ok(!refcount, "Factory has %lu references left.\n", refcount);
 }
 
+static void test_close_zero_length_line(BOOL d3d11)
+{
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    ID2D1Factory *factory;
+    D2D1_POINT_2F point;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* The second figure closes with a line of zero length, back onto the
+     * point it is already at, and the cubics of the first figure cross it.
+     * Computing where a Bézier meets that line divided zero by zero, and a
+     * check written as "t < 0 || t > 1" let the NaN through: a NaN vertex
+     * went into the figure, the triangulation contradicted itself from
+     * there on, and Close() failed with E_FAIL and lost the figures. Windows
+     * closes the path. Found by fuzzing random paths on an integer grid. */
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1Factory_CreatePathGeometry(factory, &geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(geometry, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    set_point(&point, 3.0f, 4.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 0.0f, 1.0f);
+    line_to(sink, 5.0f, 5.0f);
+    cubic_to(sink, 4.0f, 1.0f, 5.0f, 5.0f, 2.0f, 1.0f);
+    cubic_to(sink, 5.0f, 0.0f, 4.0f, 4.0f, 0.0f, 4.0f);
+    line_to(sink, 5.0f, 2.0f);
+    line_to(sink, 1.0f, 2.0f);
+    line_to(sink, 5.0f, 4.0f);
+    line_to(sink, 3.0f, 5.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+    set_point(&point, 2.0f, 2.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 4.0f, 5.0f);
+    line_to(sink, 2.0f, 2.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    ID2D1GeometrySink_Release(sink);
+    ID2D1PathGeometry_Release(geometry);
+    refcount = ID2D1Factory_Release(factory);
+    ok(!refcount, "Factory has %lu references left.\n", refcount);
+}
+
+static void test_close_subnormal_coordinates(BOOL d3d11)
+{
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    ID2D1Factory *factory;
+    D2D1_POINT_2F point;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* Coordinates below FLT_MIN next to points a few ULPs apart. The exact
+     * orientation and incircle predicates of the triangulation assume that
+     * nothing underflows; on these they contradicted each other, the
+     * triangulation skipped segments and lost the edges of a vertex, and
+     * Close() failed with E_FAIL. Windows closes the path. Found by fuzzing
+     * random paths with such coordinates. */
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1Factory_CreatePathGeometry(factory, &geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(geometry, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    set_point(&point, 2.99900007f, 5.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 3.00000095f, 4.0f);
+    line_to(sink, 3.0f, 3.0f);
+    line_to(sink, 3.99999905f, 4.0f);
+    line_to(sink, 0.0f, 0.999998987f);
+    line_to(sink, 3.99999952f, 5.0f);
+    line_to(sink, 2.80259693e-45f, 1.00000012f);
+    line_to(sink, 1.0f, -1.40129846e-45f);
+    line_to(sink, 1.3125f, 1.87499952f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+    set_point(&point, 1.0f, 3.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    line_to(sink, 3.81249928f, 3.8125f);
+    line_to(sink, 2.80259693e-45f, 0.999999762f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    ID2D1GeometrySink_Release(sink);
+    ID2D1PathGeometry_Release(geometry);
+    refcount = ID2D1Factory_Release(factory);
+    ok(!refcount, "Factory has %lu references left.\n", refcount);
+}
+
 static void test_triangulation_degenerate(BOOL d3d11)
 {
     ID2D1PathGeometry *geometry;
@@ -19848,6 +19947,8 @@ START_TEST(d2d1)
     queue_d3d10_test(test_bezier_split_no_progress);
     queue_d3d10_test(test_bezier_split_depth);
     queue_d3d10_test(test_bezier_fold_back);
+    queue_d3d10_test(test_close_zero_length_line);
+    queue_d3d10_test(test_close_subnormal_coordinates);
     queue_d3d10_test(test_triangulation_degenerate);
     queue_test(test_create_device);
     queue_test(test_create_device_context);
