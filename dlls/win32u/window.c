@@ -3937,6 +3937,30 @@ done:
     return after;
 }
 
+/* whether hwnd is owned by owner, directly or through a chain of owners */
+static BOOL is_owned_by( HWND hwnd, HWND owner )
+{
+    while ((hwnd = get_window_relative( hwnd, GW_OWNER )))
+        if (hwnd == owner) return TRUE;
+    return FALSE;
+}
+
+/***********************************************************************
+ *           get_visible_predecessor
+ *
+ * The visible window above hwnd in the win32 Z-order, not counting the popups
+ * hwnd owns: Windows keeps them above their owner (swp_owner_popups), and so
+ * does the window manager through WM_TRANSIENT_FOR, so there is no order to
+ * restore for them.  winex11 applies the same rule.
+ */
+static HWND get_visible_predecessor( HWND hwnd )
+{
+    HWND prev = get_window_relative( hwnd, GW_HWNDPREV );
+    while (prev && (!(get_window_long( prev, GWL_STYLE ) & WS_VISIBLE) || is_owned_by( prev, hwnd )))
+        prev = get_window_relative( prev, GW_HWNDPREV );
+    return prev;
+}
+
 /***********************************************************************
  *           sync_zorder_after_wm_raise
  *
@@ -3957,10 +3981,8 @@ void sync_zorder_after_wm_raise( HWND hwnd, BOOL activated )
      * WM_WINDOWPOSCHANGING synchronously to a thread that may not be pumping messages */
     if (!is_current_thread_window( hwnd )) return;
 
-    prev = get_window_relative( hwnd, GW_HWNDPREV );
-    while (prev && !(get_window_long( prev, GWL_STYLE ) & WS_VISIBLE))
-        prev = get_window_relative( prev, GW_HWNDPREV );
-    if (!prev) return; /* already on top, nothing the native side could disagree with */
+    /* already on top of everything but its own popups: nothing the native side could disagree with */
+    if (!(prev = get_visible_predecessor( hwnd ))) return;
 
     TRACE( "hwnd %p raised by the window manager, win32 predecessor %p, activated %u\n", hwnd, prev, activated );
     if (activated) /* Windows brings an activated window to the top of its band */
