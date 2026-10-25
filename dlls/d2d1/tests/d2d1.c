@@ -10324,6 +10324,49 @@ static void test_bezier_split_depth(BOOL d3d11)
     ok(!refcount, "Factory has %lu references left.\n", refcount);
 }
 
+static void test_bezier_fold_back(BOOL d3d11)
+{
+    ID2D1PathGeometry *geometry;
+    ID2D1GeometrySink *sink;
+    ID2D1Factory *factory;
+    D2D1_POINT_2F point;
+    ULONG refcount;
+    HRESULT hr;
+
+    /* Cubics whose end point coincides with their last control point, or
+     * with their start point, run out along a straight line and fold back
+     * over themselves; here all of them lie on the line through (4, 3) and
+     * (1, 2). The pieces of such a curve run over each other, and the
+     * self-intersection pass used to report a crossing wherever rounding put
+     * the leaf points on opposite sides of the shared line: one of these
+     * cubics became 432 segments, the path 2,127, and closing it took 20 s in
+     * the triangulation. Found by fuzzing random paths with points on the
+     * line through two earlier points. */
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, NULL, (void **)&factory);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1Factory_CreatePathGeometry(factory, &geometry);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID2D1PathGeometry_Open(geometry, &sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    set_point(&point, 4.0f, 3.0f);
+    ID2D1GeometrySink_BeginFigure(sink, point, D2D1_FIGURE_BEGIN_FILLED);
+    cubic_to(sink, 1.0f, 2.0f, 4.0f, 3.0f, 4.0f, 3.0f);
+    cubic_to(sink, 1.0f, 2.0f, 3.8125f, 2.9375f, 3.8125f, 2.9375f);
+    cubic_to(sink, 0.0f, 4.0f, 4.0f, 3.0f, 1.18750012f, 2.0625f);
+    line_to(sink, 4.0f, 3.0f);
+    cubic_to(sink, 3.8125f, 2.9375f, 4.0f, 3.0f, 4.0f, 3.0f);
+    ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+
+    hr = ID2D1GeometrySink_Close(sink);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+
+    ID2D1GeometrySink_Release(sink);
+    ID2D1PathGeometry_Release(geometry);
+    refcount = ID2D1Factory_Release(factory);
+    ok(!refcount, "Factory has %lu references left.\n", refcount);
+}
+
 static void test_triangulation_degenerate(BOOL d3d11)
 {
     ID2D1PathGeometry *geometry;
@@ -19804,6 +19847,7 @@ START_TEST(d2d1)
     queue_d3d10_test(test_bezier_non_finite);
     queue_d3d10_test(test_bezier_split_no_progress);
     queue_d3d10_test(test_bezier_split_depth);
+    queue_d3d10_test(test_bezier_fold_back);
     queue_d3d10_test(test_triangulation_degenerate);
     queue_test(test_create_device);
     queue_test(test_create_device_context);
