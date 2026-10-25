@@ -1424,12 +1424,22 @@ enum
     NtUserCallHwndParam_SetRawWindowPos,
     NtUserCallHwndParam_GetPrivateData,
     NtUserCallHwndParam_SetPrivateData,
+    NtUserCallHwndParam_GetMinMaxTrack,  /* Wine-specific: cached WM_GETMINMAXINFO track sizes for the display driver */
 };
 
 struct get_window_rects_params
 {
     RECT *rect;
     UINT dpi;
+};
+
+/* NtUserCallHwndParam_GetMinMaxTrack: the ptMinTrackSize/ptMaxTrackSize a window last answered to
+ * WM_GETMINMAXINFO, in raw pixels of the window rect; max_track is 0 when the application set no
+ * limit.  Read from the cache win32u keeps, no message is sent. */
+struct get_min_max_track_params
+{
+    POINT min_track;
+    POINT max_track;
 };
 
 static inline BOOL NtUserClientToScreen( HWND hwnd, POINT *pt )
@@ -1645,6 +1655,11 @@ static inline BOOL NtUserExposeWindowSurface( HWND hwnd, UINT flags, const RECT 
 static inline UINT NtUserGetWinMonitorDpi( HWND hwnd, MONITOR_DPI_TYPE type )
 {
     return NtUserCallHwndParam( hwnd, type, NtUserCallHwndParam_GetWinMonitorDpi );
+}
+
+static inline BOOL NtUserGetMinMaxTrack( HWND hwnd, struct get_min_max_track_params *params )
+{
+    return NtUserCallHwndParam( hwnd, (UINT_PTR)params, NtUserCallHwndParam_GetMinMaxTrack );
 }
 
 struct set_raw_window_pos_params
