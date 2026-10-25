@@ -4515,6 +4515,8 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     RECT rc_max, rc_primary;
     DWORD adjusted_style;
     MINMAXINFO minmax;
+    POINT pos, default_max;
+    BOOL app_max;
     INT xinc, yinc;
     RECT rc;
     WND *win;
@@ -4526,6 +4528,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     get_window_rect( hwnd, &rc, get_thread_dpi() );
     minmax.ptReserved.x = rc.left;
     minmax.ptReserved.y = rc.top;
+    pos = minmax.ptReserved;
 
     if ((style & WS_CAPTION) == WS_CAPTION)
         adjusted_style = style & ~WS_BORDER; /* WS_CAPTION = WS_DLGFRAME | WS_BORDER */
@@ -4552,6 +4555,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     }
     minmax.ptMaxTrackSize.x = get_system_metrics( SM_CXMAXTRACK );
     minmax.ptMaxTrackSize.y = get_system_metrics( SM_CYMAXTRACK );
+    default_max = minmax.ptMaxTrackSize;
     minmax.ptMaxPosition.x = -xinc;
     minmax.ptMaxPosition.y = -yinc;
 
@@ -4562,6 +4566,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     }
 
     send_message( hwnd, WM_GETMINMAXINFO, 0, (LPARAM)&minmax );
+    app_max = minmax.ptMaxTrackSize.x != default_max.x || minmax.ptMaxTrackSize.y != default_max.y;
 
     /* if the app didn't change the values, adapt them for the current monitor */
 
@@ -4590,8 +4595,62 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     minmax.ptMaxTrackSize.x = max( minmax.ptMaxTrackSize.x, minmax.ptMinTrackSize.x );
     minmax.ptMaxTrackSize.y = max( minmax.ptMaxTrackSize.y, minmax.ptMinTrackSize.y );
 
+    /* keep the track sizes for the display driver, which hands them to the window manager as
+     * size hints (winex11 set_size_hints): only win32u can ask the application, and the driver
+     * updates its hints under its own lock, where it must not send messages */
+    if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    {
+        win->track_pos = pos;
+        win->min_track = minmax.ptMinTrackSize;
+        if (app_max) win->max_track = minmax.ptMaxTrackSize;
+        else win->max_track.x = win->max_track.y = 0;
+        win->track_dpi = get_thread_dpi();
+        win->track_valid = TRUE;
+        release_win_ptr( win );
+    }
+
     set_thread_dpi_awareness_context( context );
     return minmax;
+}
+
+/***********************************************************************
+ *           get_min_max_track
+ *
+ * The track sizes a window last answered to WM_GETMINMAXINFO, in raw pixels
+ * of the window rect, for the display driver (no message is sent).
+ */
+static BOOL get_min_max_track( HWND hwnd, struct get_min_max_track_params *params )
+{
+    POINT pos, min_track, max_track;
+    UINT dpi;
+    RECT rect;
+    WND *win;
+
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+    if (!win->track_valid)
+    {
+        release_win_ptr( win );
+        return FALSE;
+    }
+    pos = win->track_pos;
+    min_track = win->min_track;
+    max_track = win->max_track;
+    dpi = win->track_dpi;
+    release_win_ptr( win );
+
+    SetRect( &rect, pos.x, pos.y, pos.x + min_track.x, pos.y + min_track.y );
+    rect = map_rect_virt_to_raw( rect, dpi );
+    params->min_track.x = rect.right - rect.left;
+    params->min_track.y = rect.bottom - rect.top;
+    params->max_track.x = params->max_track.y = 0;
+    if (max_track.x || max_track.y)
+    {
+        SetRect( &rect, pos.x, pos.y, pos.x + max_track.x, pos.y + max_track.y );
+        rect = map_rect_virt_to_raw( rect, dpi );
+        params->max_track.x = rect.right - rect.left;
+        params->max_track.y = rect.bottom - rect.top;
+    }
+    return TRUE;
 }
 
 static POINT get_first_minimized_child_pos( const RECT *parent, const MINIMIZEDMETRICS *mm,
@@ -6334,6 +6393,9 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
         struct get_window_rects_params *params = (void *)param;
         return get_present_rect( hwnd, params->rect, params->dpi );
     }
+
+    case NtUserCallHwndParam_GetMinMaxTrack:
+        return get_min_max_track( hwnd, (void *)param );
 
     case NtUserCallHwndParam_GetWindowRelative:
         return HandleToUlong( get_window_relative( hwnd, param ));

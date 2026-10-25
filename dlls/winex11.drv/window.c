@@ -1056,6 +1056,34 @@ static void set_size_hints( struct x11drv_win_data *data, DWORD style )
             size_hints->min_height = size_hints->max_height;
             size_hints->flags |= PMinSize | PMaxSize;
         }
+        else
+        {
+            /* A resizable window gets the application's WM_GETMINMAXINFO limits.  Without
+             * PMinSize the window manager shrinks it below ptMinTrackSize during an interactive
+             * resize, win32 clamps every step back from WM_WINDOWPOSCHANGING, and after the
+             * release the X window stays small while win32 keeps the minimum (vatSys VSCS).
+             * win32u caches the sizes in raw pixels for the window rect; the hints describe the
+             * visible rect, so the frame win32 draws itself comes off. */
+            struct get_min_max_track_params track;
+
+            if (NtUserGetMinMaxTrack( data->hwnd, &track ))
+            {
+                int frame_w = (data->rects.window.right - data->rects.window.left)
+                              - (data->rects.visible.right - data->rects.visible.left);
+                int frame_h = (data->rects.window.bottom - data->rects.window.top)
+                              - (data->rects.visible.bottom - data->rects.visible.top);
+
+                size_hints->min_width = max( track.min_track.x - frame_w, 1 );
+                size_hints->min_height = max( track.min_track.y - frame_h, 1 );
+                size_hints->flags |= PMinSize;
+                if (track.max_track.x && track.max_track.y)
+                {
+                    size_hints->max_width = max( track.max_track.x - frame_w, size_hints->min_width );
+                    size_hints->max_height = max( track.max_track.y - frame_h, size_hints->min_height );
+                    size_hints->flags |= PMaxSize;
+                }
+            }
+        }
     }
 
     window_set_wm_normal_hints( data, size_hints );
