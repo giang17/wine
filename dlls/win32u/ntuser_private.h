@@ -71,7 +71,7 @@ typedef struct tagWND
     POINT              track_pos;     /* window position the cached track sizes were taken at (track_dpi) */
     POINT              min_track;     /* last ptMinTrackSize answered to WM_GETMINMAXINFO (track_dpi) */
     POINT              max_track;     /* last ptMaxTrackSize if the application set one, else 0 */
-    UINT               track_dpi;     /* DPI the track sizes are in (0 = per-monitor) */
+    struct ratio       track_dpi;     /* DPI ratio the track sizes are in (get_thread_dpi()) */
     BOOL               track_valid;   /* the track sizes above were cached at least once */
     int                swap_interval; /* OpenGL surface swap interval */
     int                pixel_format;  /* Pixel format set by the graphics driver */

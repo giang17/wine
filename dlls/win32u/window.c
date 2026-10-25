@@ -4861,7 +4861,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
 static BOOL get_min_max_track( HWND hwnd, struct get_min_max_track_params *params )
 {
     POINT pos, min_track, max_track;
-    UINT dpi;
+    struct ratio dpi;
     RECT rect;
     WND *win;
 
