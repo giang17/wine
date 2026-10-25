@@ -850,6 +850,28 @@ This is the recommended branch. What it changes, by subsystem:
   and the rosette, crossing-curve and arrow paths of issue 523 render identically except for
   the join of two petals of the cubic rosette that meet with opposite tangents, which no longer
   counts as a crossing (296 of 1016x1016 pixels, by up to 78 of 255).
+- **d2d1**: closing a large path takes time linear in its vertex count where three loops of
+  `ID2D1GeometrySink::Close()` were quadratic, for every path. `d2d_cdt_generate_faces()`
+  classified every face of the triangulation with `d2d_path_geometry_point_inside()`, a ray
+  cast over all figure edges (about 2n casts over n edges); the edges are now bucketed by rows
+  of the geometry's y-range once per path and a probe is cast over its row only, with the same
+  tests, figure bounds included, and a path whose edges mostly share one row is cast over the
+  figures directly as before. The grid loop of `d2d_geometry_intersect_self()` cleared its
+  array of tested segments with a `memset` per outer segment (a gigabyte of writes for 32,000
+  segments); the array now holds the index of the outer segment that last tested each one.
+  `d2d_cdt_insert_segments()` scanned all edges for one leaving the start vertex of every
+  figure; the cdt now keeps that edge per vertex, the one with the lowest index as the scan
+  found it, maintained where edges get their vertices and are destroyed. The results are the
+  same: the renders of 29 paths (the rosettes, crossing curves, fold-back cubics and fuzzer
+  reproducers of issues 523 and 526, the issue 458 arrow, polylines, polygons, a grid of 200
+  small figures) are hash-identical, the d2d1 tests report the same failures on x86_64 and
+  i386, and the fuzzers run 1,000,000 integer and 120,000 float paths with the same results
+  (no hang or crash; 152, 1,176 and 5,102 failed `Close()` calls, as before; the integer run takes 349 s instead of 414 s). `Close()` of a 32,000-point polyline spanning its height takes 181 ms instead of
+  1,335 ms, a 32,000-gon 63 ms instead of 303 ms, a grid of 1,600 polygons of 20 points 55 ms
+  instead of 243 ms; at 4,000 points 2.4, 2.6 and 1.9 ms instead of 26, 16 and 6.5 ms. A
+  polyline of 32,000 points along one line stays at 2.8 s: every face's probe still meets every
+  edge there (issue 528; a winding propagation over the triangulation would be linear for that
+  case too, not done).
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
