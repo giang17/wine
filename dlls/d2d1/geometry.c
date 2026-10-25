@@ -280,6 +280,11 @@ struct d2d_cdt
 
     const D2D1_POINT_2F *vertices;
     size_t vertex_count;
+
+    /* For each vertex the edge d2d_cdt_insert_segments() starts from: the
+     * one with the lowest index that has the vertex as origin, in its
+     * forward orientation if both do. NULL outside that function. */
+    struct d2d_cdt_edge_ref *vertex_edge;
 };
 
 struct d2d_geometry_intersection
@@ -1649,16 +1654,35 @@ static size_t d2d_cdt_edge_destination(const struct d2d_cdt *cdt, const struct d
     return cdt->edges[e->idx].vertex[!(e->r >> 1)];
 }
 
+/* Keep the table of starting edges at the edge with the lowest index. */
+static void d2d_cdt_vertex_edge_update(const struct d2d_cdt *cdt, size_t idx, size_t vertex)
+{
+    struct d2d_cdt_edge_ref *cached, e;
+
+    if (!cdt->vertex_edge || vertex >= cdt->vertex_count)
+        return;
+
+    e.idx = idx;
+    e.r = cdt->edges[idx].vertex[0] == vertex ? 0 : 2;
+    cached = &cdt->vertex_edge[vertex];
+    if (cached->idx >= cdt->edge_count || (cdt->edges[cached->idx].flags & D2D_CDT_EDGE_FLAG_FREED)
+            || d2d_cdt_edge_origin(cdt, cached) != vertex
+            || e.idx < cached->idx || (e.idx == cached->idx && e.r < cached->r))
+        *cached = e;
+}
+
 static void d2d_cdt_edge_set_origin(const struct d2d_cdt *cdt,
         const struct d2d_cdt_edge_ref *e, size_t vertex)
 {
     cdt->edges[e->idx].vertex[e->r >> 1] = vertex;
+    d2d_cdt_vertex_edge_update(cdt, e->idx, vertex);
 }
 
 static void d2d_cdt_edge_set_destination(const struct d2d_cdt *cdt,
         const struct d2d_cdt_edge_ref *e, size_t vertex)
 {
     cdt->edges[e->idx].vertex[!(e->r >> 1)] = vertex;
+    d2d_cdt_vertex_edge_update(cdt, e->idx, vertex);
 }
 
 static float d2d_cdt_ccw(const struct d2d_cdt *cdt, size_t a, size_t b, size_t c)
@@ -2042,6 +2066,16 @@ static void d2d_cdt_destroy_edge(struct d2d_cdt *cdt, const struct d2d_cdt_edge_
     }
 
     cdt->edges[e->idx].flags |= D2D_CDT_EDGE_FLAG_FREED;
+    if (cdt->vertex_edge)
+    {
+        size_t v = cdt->edges[e->idx].vertex[0];
+
+        if (v < cdt->vertex_count && cdt->vertex_edge[v].idx == e->idx)
+            cdt->vertex_edge[v].idx = ~(size_t)0;
+        v = cdt->edges[e->idx].vertex[1];
+        if (v < cdt->vertex_count && cdt->vertex_edge[v].idx == e->idx)
+            cdt->vertex_edge[v].idx = ~(size_t)0;
+    }
     cdt->edges[e->idx].next[D2D_EDGE_NEXT_ORIGIN].idx = cdt->free_edge;
     cdt->free_edge = e->idx;
 }
@@ -2311,8 +2345,214 @@ static BOOL d2d_path_geometry_point_inside(const struct d2d_geometry *geometry,
     return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
 }
 
+/* The figure edges the probe of a fill face is cast against, bucketed by rows
+ * of the geometry's y-range. d2d_cdt_generate_faces() classifies every face of
+ * the triangulation with d2d_path_geometry_point_inside(), a ray cast over all
+ * figure edges, so a path of n vertices cost about 2n casts over n edges:
+ * 3.3 s for a polyline of 32,000 points, all of it in that function. An edge
+ * can only be crossed at a y within its own range, so each row holds the edges
+ * that reach into it and a probe tests the edges of its row only. The tests
+ * are the ones of d2d_path_geometry_point_inside(), figure bounds included,
+ * merely in a different order, so every face is classified as before. */
+struct d2d_fill_edge
+{
+    const D2D1_POINT_2F *p0, *p1;
+    const struct d2d_figure *figure;
+};
+
+struct d2d_fill_edge_rows
+{
+    struct d2d_fill_edge *edges;
+    size_t *row_start;
+    size_t row_count;
+    float top, bottom;
+};
+
+static size_t d2d_fill_edge_rows_row(const struct d2d_fill_edge_rows *rows, float y)
+{
+    float f;
+
+    /* A NaN y crosses no edge, whichever row is tested. */
+    if (!(y > rows->top))
+        return 0;
+    if (!(y < rows->bottom))
+        return rows->row_count - 1;
+    f = (y - rows->top) / (rows->bottom - rows->top) * (float)rows->row_count;
+    return min((size_t)f, rows->row_count - 1);
+}
+
+/* The rows an edge reaches into. An edge with a non-finite coordinate is put
+ * into every row: d2d_path_geometry_point_inside() tests it for every probe,
+ * and an infinite one can count. */
+static void d2d_fill_edge_rows_range(const struct d2d_fill_edge_rows *rows,
+        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1, size_t *first, size_t *last)
+{
+    if (!isfinite(p0->x) || !isfinite(p0->y) || !isfinite(p1->x) || !isfinite(p1->y))
+    {
+        *first = 0;
+        *last = rows->row_count - 1;
+        return;
+    }
+    *first = d2d_fill_edge_rows_row(rows, min(p0->y, p1->y));
+    *last = d2d_fill_edge_rows_row(rows, max(p0->y, p1->y));
+}
+
+static void d2d_fill_edge_rows_cleanup(struct d2d_fill_edge_rows *rows)
+{
+    free(rows->edges);
+    free(rows->row_start);
+}
+
+static BOOL d2d_fill_edge_rows_init(struct d2d_fill_edge_rows *rows, const struct d2d_geometry *geometry)
+{
+    size_t i, j, r, first, last, edge_count = 0, entry_count, largest;
+    const struct d2d_figure *figure;
+    size_t *cursor = NULL;
+
+    memset(rows, 0, sizeof(*rows));
+    rows->top = FLT_MAX;
+    rows->bottom = -FLT_MAX;
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        figure = &geometry->u.path.figures[i];
+        for (j = 0; j < figure->vertex_count; ++j)
+        {
+            float y = figure->vertices[j].y;
+
+            if (!isfinite(y))
+                continue;
+            rows->top = min(rows->top, y);
+            rows->bottom = max(rows->bottom, y);
+        }
+        edge_count += figure->vertex_count;
+    }
+    if (!(rows->top < rows->bottom))
+        rows->top = rows->bottom = 0.0f;
+
+    /* Rows a few edges high. Long edges reach into many rows; if that makes
+     * the table much larger than the edge count, use fewer. */
+    rows->row_count = min(max(edge_count / 4, 1), 4096);
+    for (;;)
+    {
+        if (!(rows->row_start = calloc(rows->row_count + 1, sizeof(*rows->row_start))))
+        {
+            ERR("Failed to allocate fill edge rows.\n");
+            return FALSE;
+        }
+        for (i = 0; i < geometry->u.path.figure_count; ++i)
+        {
+            figure = &geometry->u.path.figures[i];
+            for (j = 0; j < figure->vertex_count; ++j)
+            {
+                d2d_fill_edge_rows_range(rows, &figure->vertices[j ? j - 1 : figure->vertex_count - 1],
+                        &figure->vertices[j], &first, &last);
+                for (r = first; r <= last; ++r)
+                    ++rows->row_start[r + 1];
+            }
+        }
+        for (r = 0, largest = 0; r < rows->row_count; ++r)
+        {
+            largest = max(largest, rows->row_start[r + 1]);
+            rows->row_start[r + 1] += rows->row_start[r];
+        }
+        entry_count = rows->row_start[rows->row_count];
+        if (rows->row_count == 1 || entry_count <= 8 * edge_count)
+            break;
+        free(rows->row_start);
+        rows->row_count /= 2;
+    }
+
+    /* With most edges in one row, as for a polyline along a line, the table
+     * saves nothing and its indirection costs a fifth; cast over the figures
+     * directly then. */
+    if (largest > entry_count / 2)
+    {
+        free(rows->row_start);
+        rows->row_start = NULL;
+        return FALSE;
+    }
+
+    if (!(rows->edges = malloc(max(entry_count, 1) * sizeof(*rows->edges)))
+            || !(cursor = malloc(rows->row_count * sizeof(*cursor))))
+    {
+        ERR("Failed to allocate fill edge table.\n");
+        free(cursor);
+        d2d_fill_edge_rows_cleanup(rows);
+        return FALSE;
+    }
+    memcpy(cursor, rows->row_start, rows->row_count * sizeof(*cursor));
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        figure = &geometry->u.path.figures[i];
+        for (j = 0; j < figure->vertex_count; ++j)
+        {
+            const D2D1_POINT_2F *p0 = &figure->vertices[j ? j - 1 : figure->vertex_count - 1];
+            const D2D1_POINT_2F *p1 = &figure->vertices[j];
+
+            d2d_fill_edge_rows_range(rows, p0, p1, &first, &last);
+            for (r = first; r <= last; ++r)
+            {
+                struct d2d_fill_edge *e = &rows->edges[cursor[r]++];
+
+                e->p0 = p0;
+                e->p1 = p1;
+                e->figure = figure;
+            }
+        }
+    }
+    free(cursor);
+
+    return TRUE;
+}
+
+/* d2d_path_geometry_point_inside(geometry, probe, TRUE) over the edges of the
+ * probe's row. */
+static BOOL d2d_fill_edge_rows_point_inside(const struct d2d_geometry *geometry,
+        const struct d2d_fill_edge_rows *rows, const D2D1_POINT_2F *probe)
+{
+    const struct d2d_fill_edge *e, *end;
+    D2D1_POINT_2F v_p, v_probe;
+    unsigned int score = 0;
+    size_t r;
+
+    r = d2d_fill_edge_rows_row(rows, probe->y);
+    for (e = &rows->edges[rows->row_start[r]], end = &rows->edges[rows->row_start[r + 1]]; e < end;)
+    {
+        /* The edges of a figure lie together in a row; the figure's bounds
+         * are checked once for the run, as for the figure in
+         * d2d_path_geometry_point_inside(). */
+        const struct d2d_figure *figure = e->figure;
+        const struct d2d_fill_edge *run_end = e + 1;
+
+        while (run_end < end && run_end->figure == figure)
+            ++run_end;
+        if (probe->x < figure->bounds.left || probe->x > figure->bounds.right
+                || probe->y < figure->bounds.top || probe->y > figure->bounds.bottom)
+        {
+            e = run_end;
+            continue;
+        }
+
+        for (; e < run_end; ++e)
+        {
+            d2d_point_subtract(&v_p, e->p1, e->p0);
+            d2d_point_subtract(&v_probe, probe, e->p0);
+
+            if ((probe->y < e->p0->y) != (probe->y < e->p1->y) && v_probe.x < v_p.x * (v_probe.y / v_p.y))
+            {
+                if (geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE || (probe->y < e->p0->y))
+                    ++score;
+                else
+                    --score;
+            }
+        }
+    }
+
+    return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
+}
+
 static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const struct d2d_cdt *cdt,
-        const struct d2d_cdt_edge_ref *base_edge)
+        const struct d2d_cdt_edge_ref *base_edge, const struct d2d_fill_edge_rows *rows)
 {
     struct d2d_cdt_edge_ref tmp;
     struct d2d_face *face;
@@ -2351,7 +2591,8 @@ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const
     probe.x += cdt->vertices[d2d_cdt_edge_origin(cdt, &tmp)].x * 0.50f;
     probe.y += cdt->vertices[d2d_cdt_edge_origin(cdt, &tmp)].y * 0.50f;
 
-    if (d2d_cdt_leftof(cdt, face->v[2], base_edge) && d2d_path_geometry_point_inside(geometry, &probe, TRUE))
+    if (d2d_cdt_leftof(cdt, face->v[2], base_edge) && (rows ? d2d_fill_edge_rows_point_inside(geometry, rows, &probe)
+            : d2d_path_geometry_point_inside(geometry, &probe, TRUE)))
         ++geometry->fill.face_count;
 
     return TRUE;
@@ -2359,8 +2600,13 @@ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const
 
 static BOOL d2d_cdt_generate_faces(const struct d2d_cdt *cdt, struct d2d_geometry *geometry)
 {
+    struct d2d_fill_edge_rows rows, *rows_ptr = &rows;
     struct d2d_cdt_edge_ref base_edge;
     size_t i;
+
+    /* Without the table every probe is cast over all edges, as before. */
+    if (!d2d_fill_edge_rows_init(&rows, geometry))
+        rows_ptr = NULL;
 
     for (i = 0; i < cdt->edge_count; ++i)
     {
@@ -2369,16 +2615,20 @@ static BOOL d2d_cdt_generate_faces(const struct d2d_cdt *cdt, struct d2d_geometr
 
         base_edge.idx = i;
         base_edge.r = 0;
-        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge))
+        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge, rows_ptr))
             goto fail;
         d2d_cdt_edge_sym(&base_edge, &base_edge);
-        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge))
+        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge, rows_ptr))
             goto fail;
     }
 
+    if (rows_ptr)
+        d2d_fill_edge_rows_cleanup(&rows);
     return TRUE;
 
 fail:
+    if (rows_ptr)
+        d2d_fill_edge_rows_cleanup(&rows);
     free(geometry->fill.faces);
     geometry->fill.faces = NULL;
     geometry->fill.faces_size = 0;
@@ -2680,13 +2930,63 @@ static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geo
     }
 }
 
+/* The edge with the lowest index leaving the vertex, as a scan over the edges
+ * finds it. The table in the cdt holds it for every vertex, filled by one pass
+ * here and kept by d2d_cdt_edge_set_origin(), d2d_cdt_edge_set_destination()
+ * and d2d_cdt_destroy_edge() while constraints are inserted; an entry that
+ * was invalidated is renewed by a scan. Scanning all edges for every figure
+ * made a path of many small figures quadratic in its size. */
+static BOOL d2d_cdt_find_vertex_edge(const struct d2d_cdt *cdt, size_t vertex, struct d2d_cdt_edge_ref *edge)
+{
+    size_t k;
+
+    *edge = cdt->vertex_edge[vertex];
+    if (edge->idx < cdt->edge_count && !(cdt->edges[edge->idx].flags & D2D_CDT_EDGE_FLAG_FREED)
+            && d2d_cdt_edge_origin(cdt, edge) == vertex)
+        return TRUE;
+
+    for (k = 0; k < cdt->edge_count; ++k)
+    {
+        if (cdt->edges[k].flags & D2D_CDT_EDGE_FLAG_FREED)
+            continue;
+
+        edge->idx = k;
+        edge->r = 0;
+        if (d2d_cdt_edge_origin(cdt, edge) == vertex)
+            break;
+        d2d_cdt_edge_sym(edge, edge);
+        if (d2d_cdt_edge_origin(cdt, edge) == vertex)
+            break;
+    }
+    if (k == cdt->edge_count)
+        return FALSE;
+
+    cdt->vertex_edge[vertex] = *edge;
+    return TRUE;
+}
+
 static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *geometry)
 {
     size_t start_vertex, end_vertex, i, j, k;
     struct d2d_cdt_edge_ref edge, new_edge;
     const struct d2d_figure *figure;
     const D2D1_POINT_2F *p;
-    BOOL found;
+    BOOL ret = FALSE;
+
+    if (!(cdt->vertex_edge = malloc(cdt->vertex_count * sizeof(*cdt->vertex_edge))))
+    {
+        ERR("Failed to allocate vertex edge table.\n");
+        return FALSE;
+    }
+    for (k = 0; k < cdt->vertex_count; ++k)
+        cdt->vertex_edge[k].idx = ~(size_t)0;
+    for (k = 0; k < cdt->edge_count; ++k)
+    {
+        if (cdt->edges[k].flags & D2D_CDT_EDGE_FLAG_FREED)
+            continue;
+        d2d_cdt_vertex_edge_update(cdt, k, cdt->edges[k].vertex[0]);
+        d2d_cdt_vertex_edge_update(cdt, k, cdt->edges[k].vertex[1]);
+    }
 
     for (i = 0; i < geometry->u.path.figure_count; ++i)
     {
@@ -2703,31 +3003,10 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
                 geometry->fill.vertex_count, sizeof(*p), d2d_cdt_compare_vertices);
         start_vertex = p - cdt->vertices;
 
-        for (k = 0, found = FALSE; k < cdt->edge_count; ++k)
-        {
-            if (cdt->edges[k].flags & D2D_CDT_EDGE_FLAG_FREED)
-                continue;
-
-            edge.idx = k;
-            edge.r = 0;
-
-            if (d2d_cdt_edge_origin(cdt, &edge) == start_vertex)
-            {
-                found = TRUE;
-                break;
-            }
-            d2d_cdt_edge_sym(&edge, &edge);
-            if (d2d_cdt_edge_origin(cdt, &edge) == start_vertex)
-            {
-                found = TRUE;
-                break;
-            }
-        }
-
-        if (!found)
+        if (!d2d_cdt_find_vertex_edge(cdt, start_vertex, &edge))
         {
             ERR("Edge not found.\n");
-            return FALSE;
+            goto done;
         }
 
         for (j = 0; j < figure->vertex_count; start_vertex = end_vertex, ++j)
@@ -2744,34 +3023,19 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
                 /* Skip this constraint edge rather than aborting the entire
                  * triangulation. Find an edge starting at end_vertex so we
                  * can continue with the next segment. */
-                BOOL refound = FALSE;
-                for (k = 0; k < cdt->edge_count; ++k)
-                {
-                    if (cdt->edges[k].flags & D2D_CDT_EDGE_FLAG_FREED)
-                        continue;
-                    edge.idx = k;
-                    edge.r = 0;
-                    if (d2d_cdt_edge_origin(cdt, &edge) == end_vertex)
-                    {
-                        refound = TRUE;
-                        break;
-                    }
-                    d2d_cdt_edge_sym(&edge, &edge);
-                    if (d2d_cdt_edge_origin(cdt, &edge) == end_vertex)
-                    {
-                        refound = TRUE;
-                        break;
-                    }
-                }
-                if (!refound)
-                    return FALSE;
+                if (!d2d_cdt_find_vertex_edge(cdt, end_vertex, &edge))
+                    goto done;
                 continue;
             }
             edge = new_edge;
         }
     }
+    ret = TRUE;
 
-    return TRUE;
+done:
+    free(cdt->vertex_edge);
+    cdt->vertex_edge = NULL;
+    return ret;
 }
 
 static BOOL d2d_geometry_intersections_add(struct d2d_geometry_intersections *i,
@@ -3368,7 +3632,7 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
     struct d2d_grid grid = {0};
     D2D_RECT_F total_bounds;
     BOOL use_grid = FALSE;
-    BOOL *tested = NULL;
+    size_t *tested = NULL;
 
     if (!geometry->u.path.figure_count)
         return TRUE;
@@ -3481,10 +3745,9 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
             const struct d2d_segment_desc *desc_i = &segment_descs[i];
             size_t cx0, cy0, cx1, cy1, cx, cy;
 
-            /* Clear tested flags for this outer iteration.
-             * Only clear entries that were actually set in previous iteration
-             * would be faster, but memset on segment_count bytes is cheap. */
-            memset(tested, 0, segment_count * sizeof(*tested));
+            /* tested[j] holds the outer index that last tested j, plus one:
+             * clearing a flag array for every outer segment instead wrote
+             * segment_count bytes per segment, a gigabyte for 32,000 segments. */
 
             /* Compute grid cell range for segment i */
             cx0 = (size_t)((desc_i->bounds.left   - grid.origin_x) / grid.cell_w);
@@ -3513,9 +3776,9 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
                             continue;
 
                         /* Skip if already tested via another shared cell */
-                        if (tested[j])
+                        if (tested[j] == i + 1)
                             continue;
-                        tested[j] = TRUE;
+                        tested[j] = i + 1;
 
                         /* Skip adjacent segments (share a vertex — endpoint
                          * intersections are filtered by s/t strictly in (0,1)) */
