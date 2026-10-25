@@ -787,6 +787,19 @@ This is the recommended branch. What it changes, by subsystem:
   `get_scratch_buffer()` once and hung at the first frame once; after, DXVK 4 of 5 runs of 300
   frames and wined3d 3 of 3 runs of 100 frames completed (the remaining DXVK run was at frame 200
   when the 180 s limit hit, no error).
+- **d2d1**: closing a path no longer hangs when resolving overlapping Bézier control triangles
+  reaches a triangle one ULP across. Halving such a triangle rounds every midpoint back onto its
+  corners, so the half that stays in place is bitwise identical to the segment, its area stays
+  tiny but non-zero, and `d2d_geometry_resolve_beziers()` inserted the same point forever —
+  `ID2D1GeometrySink::Close()` never returned and the figure grew without bound (134,268 to
+  374,781 vertices in 24 s, every split at the same index). The loop now splits the other segment
+  of the pair when the chosen one would not change, and leaves the pair alone when neither would;
+  only the exact no-change case counts, so every input the old loop finished takes the same path
+  as before. Found with the path fuzzer linked from WineHQ bug 60115 (random closed paths on a
+  6x6 grid): 2 hangs in 1,000,000 seeds before, none after;
+  the d2d1 tests report the same failures before and after on x86_64 and i386. Related upstream
+  report: WineHQ bug 60265 (Affinity Designer 3); the depth limit proposed there for crossing
+  curves is a separate change (issue 523).
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
