@@ -340,10 +340,12 @@ which builds Ableton Live 12 production setups on top of it.
 ## Relationship to upstream Wine
 
 This is a fork of [wine-mirror/wine](https://github.com/wine-mirror/wine), not a
-replacement for it. Small, self-contained fixes go to WineHQ as ordinary merge requests on
-[gitlab.winehq.org](https://gitlab.winehq.org/wine/wine) and several have been merged
-there. The large DirectComposition and Direct2D work stays here, where it can be rebased
-onto every devel tag and tested against real plugins every two weeks.
+replacement for it. Its fixes stay here: Wine's
+[Clean-Room Guidelines](https://gitlab.winehq.org/wine/wine/-/wikis/Clean-Room-Guidelines) do
+not accept LLM-generated code, the fork is developed with LLM assistance, and no merge
+requests are submitted to WineHQ while that rule stands. Several earlier fixes were merged
+upstream. The large DirectComposition and Direct2D work is rebased onto every devel tag and
+tested against real plugins every two weeks.
 
 The upstream Wine README — build requirements, configuration, documentation, where to get
 support for Wine itself — is kept unchanged as **[README.wine](README.wine)**.

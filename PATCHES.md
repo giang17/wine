@@ -2017,9 +2017,9 @@ installed again through `Setup.exe --silent`, the setup log showing the prerun's
 Deprecated since 2026-05-03; last update 2026-02-14, 15 patches against vanilla Wine 11.0
 (`git format-patch wine-11.0..d2d1-v6`). It was the upstream-targeted D2D1-only series
 and no longer reflects the current D2D1 work, all of which lives in `d2d1-dcomp-11.0`.
-No bundled successor series is planned: small targeted fixes go upstream as ordinary
-merge requests on gitlab.winehq.org, the fork itself stays a rolling devel-tracking
-distribution.
+No bundled successor series is planned, and no fixes are submitted upstream while Wine's
+Clean-Room Guidelines exclude LLM-generated code; the fork itself stays a rolling
+devel-tracking distribution.
 
 ## Related
 
