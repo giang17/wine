@@ -742,10 +742,11 @@ This is the recommended branch. What it changes, by subsystem:
   tests: the same five failures before and after.
 - **win32u**: the palette messages of an activation are sent only on a palettized display.
   `set_active_window()` sent `WM_QUERYNEWPALETTE` to every newly active window and, when the
-  window answered, broadcast `WM_PALETTEISCHANGING`. Windows sends them only when the display
-  is palettized: Wine's own user32 message tests carry `WM_QUERYNEWPALETTE` as `optional` in
-  every activation sequence and as `wine_only` in two of them, and ReactOS sends it only with
-  `PUSIF_PALETTEDISPLAY`, which it derives from `RC_PALETTE` of the display. WinForms answers
+  window answered, broadcast `WM_PALETTEISCHANGING`. Wine's own user32 message tests, which
+  also run on Windows, never require the message: `dlls/user32/tests/msg.c` lists
+  `WM_QUERYNEWPALETTE` 35 times, 33 times as `optional` and twice as `wine_only`, and two of the
+  optional entries carry the note that the message should not be sent. Both messages serve the
+  realization of a logical palette, which only a palettized display has. WinForms answers
   the message in `Control.WmQueryNewPalette` with `Invalidate(true)`, so under Wine every
   activation erased and repainted the whole window with its children. vatSys (giang17/wine
   issue 21) calls `SetFocus` on its map child on every `WM_MOUSEMOVE`; each time the pointer
