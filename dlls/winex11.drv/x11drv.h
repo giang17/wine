@@ -743,6 +743,8 @@ struct x11drv_win_data
     BOOL          unmaximize_retry;    /* _NET_WM_STATE_MAXIMIZED was cleared at our request, the first config the window manager sends on its own may be answered once */
     BOOL          wm_fullscreen;       /* _NET_WM_STATE_FULLSCREEN was set by the window manager on its own, not at our request */
     Window        map_predecessor;     /* owned WS_EX_APPWINDOW: X window of the win32 predecessor when the map was requested */
+    BOOL          noactivate_map;      /* the last map did not ask for activation, a demands-attention state is the window manager's own */
+    BOOL          flashing;            /* FlashWindowEx() asked for demands-attention */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
     unsigned long state_locks;         /* X11 state requests lock while updating win32 state */
 };
@@ -758,6 +760,7 @@ extern BOOL window_should_take_focus( HWND hwnd, Time time );
 extern BOOL window_has_pending_wm_state( HWND hwnd, UINT state );
 extern void window_wm_state_notify( struct x11drv_win_data *data, unsigned long serial, UINT value, Time time );
 extern void window_net_wm_state_notify( struct x11drv_win_data *data, unsigned long serial, UINT value );
+extern void window_drop_wm_demands_attention( struct x11drv_win_data *data, Display *display, Window window );
 extern void window_wm_hints_notify( struct x11drv_win_data *data, unsigned long serial, const XWMHints *hints );
 extern void window_mwm_hints_notify( struct x11drv_win_data *data, unsigned long serial, const MwmHints *hints );
 extern void window_wm_normal_hints_notify( struct x11drv_win_data *data, unsigned long serial, const XSizeHints *hints );
