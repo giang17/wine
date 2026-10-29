@@ -802,6 +802,25 @@ This is the recommended branch. What it changes, by subsystem:
   maximum. Measured with `scripts/repro-521-min-track-size.c` (minimum 400x300) on kwin_x11: an
   interactive corner drag left the X window at 92x41 against win32's 400x300 before (19 `mismatch
   config` warnings), and at 392x266 — the minimum less the frame — after, no mismatch.
+- **wineserver**: hit tests and rectangle mapping work at negative screen coordinates when the
+  window's DPI differs from the monitor's. `scale_dpi()` (`server/user.h`) multiplied the
+  signed coordinate by an unsigned DPI, so a negative value wrapped around (−780 at 120 → 96
+  DPI became 35790769) and `is_point_in_window()` missed every window whose point lay left of
+  or above the primary monitor: `WindowFromPoint()` returned NULL, mouse messages went to the
+  desktop thread, and the window got neither `WM_SETCURSOR` nor clicks there. Only a DPI-unaware
+  (or system-aware) window on a winecfg DPI above 96 with a second monitor at negative
+  coordinates reaches the mapping; at 96 DPI `map_dpi_point()` returns before scaling. vatSys
+  maximised on a second monitor whose top is at −144 (giang17/wine issue 26, problem 1): the
+  band from the client top (−95) to y = 0 — the MenuStrip and the top of the map — took no
+  input, so the menus were dead and the pointer kept the map cursor until it left the window at
+  the top. The multiplication is now done in signed 64 bits, the form of upstream merge request
+  12210 (open, Rémi Bernon). Measured with `projects/menuhit-533/menuhit.exe` (DPI-unaware,
+  menu bar, 28 px strip child, map child) at 120 DPI on a nested weston with two Xwayland
+  outputs and the primary on the right, window at x = −1000: before, six pointer positions over
+  menu bar, strip and map all missed (`WindowFromPoint()` NULL, no `WM_MOUSEMOVE`) and a click
+  on the menu bar did nothing; after, `HTMENU`, strip and map hits at the expected logical
+  points and the click opened the popup — the same on 11.0 and 11.20. Positive coordinates
+  were unaffected before and after.
 - **d2d1**: the bitmap methods that use the D3D11 immediate context take the lock of a
   multi-threaded factory as well. Since the device-context lock of issue 511,
   `ID2D1Bitmap::CopyFromMemory()`, `CopyFromBitmap()`/`CopyFromRenderTarget()`, `Map()` and
