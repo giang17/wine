@@ -3765,6 +3765,30 @@ static UINT calc_ncsize( WINDOWPOS *winpos, const struct window_rects *old_rects
     return wvr_flags;
 }
 
+/* whether a top-level window owned by hwnd lies below it in the Z-order */
+static BOOL has_owned_window_below( HWND hwnd )
+{
+    HWND next;
+
+    if (get_window_long( hwnd, GWL_STYLE ) & WS_CHILD) return FALSE;
+    for (next = get_window_relative( hwnd, GW_HWNDNEXT ); next; next = get_window_relative( next, GW_HWNDNEXT ))
+        if (get_window_relative( next, GW_OWNER ) == hwnd) return TRUE;
+    return FALSE;
+}
+
+/* whether any top-level window is owned by hwnd */
+static BOOL owns_windows( HWND hwnd )
+{
+    HWND *list;
+    BOOL ret = FALSE;
+    int i;
+
+    if (!(list = list_window_children( 0 ))) return FALSE;
+    for (i = 0; list[i] && !ret; i++) ret = get_window_relative( list[i], GW_OWNER ) == hwnd;
+    free( list );
+    return ret;
+}
+
 /* fix redundant flags and values in the WINDOWPOS structure */
 static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int parent_x, int parent_y )
 {
@@ -3823,7 +3847,9 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
 
     if (winpos->hwndInsertAfter == HWND_TOP)
     {
-        if (get_window_relative( winpos->hwnd, GW_HWNDFIRST ) == winpos->hwnd)
+        /* still a Z-order change while an owned window lies below: swp_owner_popups() lifts it */
+        if (get_window_relative( winpos->hwnd, GW_HWNDFIRST ) == winpos->hwnd &&
+            !has_owned_window_below( winpos->hwnd ))
             winpos->flags |= SWP_NOZORDER;
     }
     else if (winpos->hwndInsertAfter == HWND_BOTTOM)
@@ -3860,11 +3886,13 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
  * fix Z order taking into account owned popups -
  * basically we need to maintain them above the window that owns them
  *
- * FIXME: hide/show owned popups when owner visibility changes.
+ * For HWND_TOP this includes owned windows that lie below the owner (an
+ * owner set with GWLP_HWNDPARENT after creation), as measured on Windows 10
+ * (wine-dev issue 531).  The topmost band keeps the rules test_topmost covers.
  */
 static HWND swp_owner_popups( HWND hwnd, HWND after )
 {
-    HWND owner, *list = NULL;
+    HWND owner, *list = NULL, orig_after = after;
     unsigned int i;
 
     TRACE( "(%p) after = %p\n", hwnd, after );
@@ -3924,7 +3952,11 @@ static HWND swp_owner_popups( HWND hwnd, HWND after )
 
     for ( ; list[i]; i++)
     {
-        if (list[i] == hwnd) break;
+        if (list[i] == hwnd)
+        {
+            if (orig_after == HWND_TOP) continue;
+            break;
+        }
         if (get_window_relative( list[i], GW_OWNER ) != hwnd) continue;
         TRACE( "moving %p owned by %p after %p\n", list[i], hwnd, after );
         NtUserSetWindowPos( list[i], after, 0, 0, 0, 0,
@@ -5035,6 +5067,9 @@ static BOOL show_window( HWND hwnd, INT cmd )
         show_flag = FALSE;
         swp |= SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOMOVE;
         if (style & WS_CHILD) swp |= SWP_NOACTIVATE | SWP_NOZORDER;
+        /* Windows keeps the Z-order place of a hidden top-level window (wine-dev issue 531);
+         * hiding the active window or an owner moves it, as test_hide_window covers */
+        else if (hwnd != get_active_window() && !owns_windows( hwnd )) swp |= SWP_NOZORDER;
         break;
 
     case SW_SHOWMINNOACTIVE:
