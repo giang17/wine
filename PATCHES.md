@@ -761,9 +761,26 @@ This is the recommended branch. What it changes, by subsystem:
   entry, and owned windows follow their owner as on Windows. vatSys (giang17/wine issue 29)
   owns its strip windows and VSCS and gives them `WS_EX_APPWINDOW`; on Windows each has a
   taskbar button, under KDE none had one, because winex11 set `WM_TRANSIENT_FOR` to the owner
-  and task managers never list a transient window. winex11 now leaves such windows
-  untransient, with the owner as group leader. That took away the window manager's rule that
-  kept them above their owner, which exposed where Wine's own owner Z-order differed from
+  and task managers never list a transient window. winex11 now makes such windows transient
+  for the root window — a group transient (NETWM 7.3) — with the owner as group leader: KWin
+  keeps a group transient above every window of its group mapped before it, so the owner
+  never comes above them, and task managers list it (Plasma 5 X11 model
+  `xwindowtasksmodel.cpp:224` skips only transients for a known non-root window; the Plasma 6
+  Wayland model takes KWin's parent window, which a group transient does not have). The first
+  version of this change (issue 531) left the windows without any transient hint and had the
+  driver restack the owner after every raise; under KWin on Wayland each of those corrections
+  was a visible frame — the map click flicker of issue 517 came back — and an owner the
+  application activated during a move of an owned window (vatSys focuses its map on
+  `WM_MOUSEMOVE`) stayed above that window for good (giang17/wine issue 29, issue 538).
+  Measured with `projects/appwindow-taskbar-test/run-538.sh` on kwin_x11: with the group
+  transient the owned windows lie above the owner from the first map, and the driver's
+  stacking corrections after clicks and activations of the owner drop from 13 to 0 for
+  `tbtest` and from 11 to 0 for vatSys. Known cost of the group transient: KWin also keeps
+  it above the owned windows mapped before it, so an older owned window cannot be raised
+  above a younger one (vatSys VSCS, mapped before the strips, stays below them where they
+  overlap; the order changes with the map order after a minimise and restore). Taking the
+  owner's transient relation away in issue 531 also exposed where Wine's own owner Z-order
+  differed from
   Windows 10 (measured with `projects/appwindow-taskbar-test/ownerz.c` in the reference VM):
   `SetWindowPos(owner, HWND_TOP)` and showing the owner now lift all its owned windows above
   it, also those below it because the owner was set with `GWLP_HWNDPARENT` after creation;
