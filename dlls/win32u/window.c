@@ -5209,6 +5209,34 @@ void update_window_state( HWND hwnd )
 }
 
 /***********************************************************************
+ *              show_owned_windows
+ *
+ * Hide or show the top-level windows owned by owner, topmost first, as
+ * ShowWindow does on Windows when the owner is minimised or leaves the
+ * minimised state: SW_PARENTCLOSING before the owner changes, SW_PARENTOPENING
+ * after it, both handled by DefWindowProc.
+ */
+static void show_owned_windows( HWND owner, BOOL show )
+{
+    HWND *list;
+    int i;
+
+    if (!(list = list_window_children( 0 ))) return;
+    for (i = 0; list[i]; i++)
+    {
+        if (get_window_relative( list[i], GW_OWNER ) != owner) continue;
+        if (show)
+        {
+            if (win_get_flags( list[i] ) & WIN_NEEDS_SHOW_OWNEDPOPUP)
+                send_message( list[i], WM_SHOWWINDOW, SW_SHOWNORMAL, SW_PARENTOPENING );
+        }
+        else if (get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE)
+            send_message( list[i], WM_SHOWWINDOW, SW_HIDE, SW_PARENTCLOSING );
+    }
+    free( list );
+}
+
+/***********************************************************************
  *              show_window
  *
  * Implementation of ShowWindow and ShowWindowAsync.
@@ -5302,6 +5330,10 @@ static BOOL show_window( HWND hwnd, INT cmd )
         goto done;
     }
 
+    if ((swp & SWP_STATECHANGED) && !(style & (WS_MINIMIZE | WS_CHILD)) &&
+        (cmd == SW_MINIMIZE || cmd == SW_SHOWMINNOACTIVE || cmd == SW_FORCEMINIMIZE || cmd == SW_SHOWMINIMIZED))
+        show_owned_windows( hwnd, FALSE );
+
     if ((show_flag != was_visible || cmd == SW_SHOWNA) && cmd != SW_SHOWMAXIMIZED && !(swp & SWP_STATECHANGED))
     {
         send_message( hwnd, WM_SHOWWINDOW, show_flag, 0 );
@@ -5333,6 +5365,8 @@ static BOOL show_window( HWND hwnd, INT cmd )
                             newPos.right - newPos.left, newPos.bottom - newPos.top, swp );
 
     new_style = get_window_long( hwnd, GWL_STYLE );
+    if ((style & WS_MINIMIZE) && !(new_style & WS_MINIMIZE) && !(style & WS_CHILD))
+        show_owned_windows( hwnd, TRUE );
     if (((style ^ new_style) & WS_MINIMIZE) != 0)
     {
         if ((new_style & WS_MINIMIZE) != 0)
