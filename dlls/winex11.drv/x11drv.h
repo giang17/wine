@@ -742,6 +742,7 @@ struct x11drv_win_data
     BOOL          configure_retry;     /* the pending configure request follows such a change and may be re-issued once */
     BOOL          unmaximize_retry;    /* _NET_WM_STATE_MAXIMIZED was cleared at our request, the first config the window manager sends on its own may be answered once */
     BOOL          wm_fullscreen;       /* _NET_WM_STATE_FULLSCREEN was set by the window manager on its own, not at our request */
+    Window        map_predecessor;     /* owned WS_EX_APPWINDOW: X window of the win32 predecessor when the map was requested */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
     unsigned long state_locks;         /* X11 state requests lock while updating win32 state */
 };

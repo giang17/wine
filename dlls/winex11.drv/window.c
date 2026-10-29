@@ -1343,6 +1343,17 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
         }
     }
 
+    /* An owned WS_EX_APPWINDOW window has its own taskbar button on Windows.  Task
+     * managers do not list a window that is transient for another one (KDE's
+     * libtaskmanager), so keep the owner only as group leader: the stacking above the
+     * owner is restored after the map (window_wm_state_notify) and on every
+     * activation (net_active_window_notify).  wine-dev issue 531. */
+    if (owner_win && owner && (ex_style & WS_EX_APPWINDOW))
+    {
+        group_leader = owner_win;
+        owner_win = 0;
+    }
+
     if (owner_win)
     {
         XSetTransientForHint( data->display, data->whole_window, owner_win );
@@ -1870,6 +1881,16 @@ static void set_xembed_flags( struct x11drv_win_data *data, unsigned long flags 
                      x11drv_atom(_XEMBED_INFO), 32, PropModeReplace, (unsigned char*)info, 2 );
 }
 
+static HWND get_visible_predecessor( HWND hwnd );
+static void window_restack_below( struct x11drv_win_data *data, Window sibling );
+
+/* whether set_style_hints() leaves hwnd without WM_TRANSIENT_FOR although it has an owner */
+static BOOL is_owned_appwindow( HWND hwnd )
+{
+    if (!NtUserGetWindowRelative( hwnd, GW_OWNER )) return FALSE;
+    return (NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_APPWINDOW) != 0;
+}
+
 static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, BOOL activate )
 {
     UINT old_state = data->pending_state.wm_state;
@@ -1950,6 +1971,12 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
 
     data->pending_state.wm_state = new_state;
     data->pending_state.activate = activate;
+    if (new_state == NormalState && old_state == WithdrawnState && is_owned_appwindow( data->hwnd ))
+    {
+        /* the win32 place to restore once the window manager has mapped the window */
+        HWND prev = get_visible_predecessor( data->hwnd );
+        data->map_predecessor = prev ? X11DRV_get_whole_window( prev ) : 0;
+    }
     data->wm_state_serial = NextRequest( data->display );
     TRACE( "window %p/%lx, requesting WM_STATE %#x -> %#x serial %lu, foreground %p, activate %u\n", data->hwnd, data->whole_window,
            old_state, new_state, data->wm_state_serial, NtUserGetForegroundWindow(), activate );
@@ -2280,6 +2307,7 @@ void window_wm_state_notify( struct x11drv_win_data *data, unsigned long serial,
     UINT *desired = &data->desired_state.wm_state, *pending = &data->pending_state.wm_state, *current = &data->current_state.wm_state;
     unsigned long *expect_serial = &data->wm_state_serial;
     const char *reason = NULL, *expected, *received, *prefix;
+    UINT old_state = *current;
 
     prefix = wine_dbg_sprintf( "window %p/%lx ", data->hwnd, data->whole_window );
     received = wine_dbg_sprintf( "WM_STATE %#x/%lu", value, serial );
@@ -2293,6 +2321,35 @@ void window_wm_state_notify( struct x11drv_win_data *data, unsigned long serial,
     data->current_state.activate = data->pending_state.activate;
     data->reparenting = 0;
     data->unmaximize_retry = FALSE;
+
+    /* An owned WS_EX_APPWINDOW window has no WM_TRANSIENT_FOR (set_style_hints), so a
+     * window manager that maps it without activation stacks it below the active window
+     * (KWin: restackWindowUnderActive).  Put it back at its win32 place, then the owner
+     * below it. */
+    if (old_state == WithdrawnState && *current == NormalState && data->managed && is_owned_appwindow( data->hwnd ))
+    {
+        HWND owner = NtUserGetAncestor( NtUserGetWindowRelative( data->hwnd, GW_OWNER ), GA_ROOT );
+        Window owner_win = owner ? X11DRV_get_whole_window( owner ) : 0;
+
+        if (data->map_predecessor && data->map_predecessor != owner_win)
+            window_restack_below( data, data->map_predecessor );
+        if (owner_win && (NtUserGetWindowLongW( owner, GWL_STYLE ) & WS_VISIBLE))
+        {
+            XEvent xev = {0};
+
+            TRACE( "window %p/%lx mapped, restacking owner %p/%lx below it\n", data->hwnd, data->whole_window, owner, owner_win );
+            xev.xclient.type = ClientMessage;
+            xev.xclient.window = owner_win;
+            xev.xclient.message_type = x11drv_atom(_NET_RESTACK_WINDOW);
+            xev.xclient.send_event = True;
+            xev.xclient.display = data->display;
+            xev.xclient.format = 32;
+            xev.xclient.data.l[0] = 1; /* source indication: normal application */
+            xev.xclient.data.l[1] = data->whole_window;
+            xev.xclient.data.l[2] = Below;
+            XSendEvent( data->display, root_window, False, SubstructureRedirectMask | SubstructureNotifyMask, &xev );
+        }
+    }
 
     /* send any pending changes from the desired state */
     window_request_desired_state( data );
@@ -2466,9 +2523,13 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
      * owner thread passes that check through the same desktop fallback. */
     if (!(foreground = NtUserGetForegroundWindow())) foreground = NtUserGetDesktopWindow();
     NtUserPostMessage( foreground, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
-}
 
-static void window_restack_below( struct x11drv_win_data *data, Window sibling );
+    /* The window manager may restack before it confirms an activation we asked for (KWin
+     * raises an activated owner over the owned windows it has no WM_TRANSIENT_FOR for);
+     * the stacking check skips while X and win32 disagree on the active window, so repeat
+     * it now that they agree. */
+    net_client_list_stacking_notify();
+}
 
 /* whether hwnd is owned by owner, directly or through a chain of owners */
 static BOOL is_owned_by( HWND hwnd, HWND owner )
@@ -2484,12 +2545,15 @@ static BOOL is_owned_by( HWND hwnd, HWND owner )
  * The visible window above hwnd in the win32 Z-order, not counting the popups
  * hwnd owns: win32 keeps them above their owner, and the window manager does
  * the same through WM_TRANSIENT_FOR, so they are no sibling to restack a
- * managed window below.  Same rule as get_visible_predecessor() in win32u.
+ * managed window below.  Owned WS_EX_APPWINDOW windows count, they have no
+ * WM_TRANSIENT_FOR (set_style_hints).  Same rule as get_visible_predecessor()
+ * in win32u.
  */
 static HWND get_visible_predecessor( HWND hwnd )
 {
     HWND prev = NtUserGetWindowRelative( hwnd, GW_HWNDPREV );
-    while (prev && (!(NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE) || is_owned_by( prev, hwnd )))
+    while (prev && (!(NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE) ||
+                    (is_owned_by( prev, hwnd ) && !is_owned_appwindow( prev ))))
         prev = NtUserGetWindowRelative( prev, GW_HWNDPREV );
     return prev;
 }
