@@ -757,6 +757,36 @@ This is the recommended branch. What it changes, by subsystem:
   11 `WM_QUERYNEWPALETTE` before, 0 after. user32 `msg` tests: the same failure lines before
   and after; the `test_msg_setpos` steps that expect `WM_ACTIVATEAPP` where Wine sent
   `WM_QUERYNEWPALETTE` now pass inside their `todo_wine` blocks (9 steps).
+- **win32u / winex11 / wineserver**: owned `WS_EX_APPWINDOW` windows get their own taskbar
+  entry, and owned windows follow their owner as on Windows. vatSys (giang17/wine issue 29)
+  owns its strip windows and VSCS and gives them `WS_EX_APPWINDOW`; on Windows each has a
+  taskbar button, under KDE none had one, because winex11 set `WM_TRANSIENT_FOR` to the owner
+  and task managers never list a transient window. winex11 now leaves such windows
+  untransient, with the owner as group leader. That took away the window manager's rule that
+  kept them above their owner, which exposed where Wine's own owner Z-order differed from
+  Windows 10 (measured with `projects/appwindow-taskbar-test/ownerz.c` in the reference VM):
+  `SetWindowPos(owner, HWND_TOP)` and showing the owner now lift all its owned windows above
+  it, also those below it because the owner was set with `GWLP_HWNDPARENT` after creation;
+  `ShowWindow` minimising the owner sends `WM_SHOWWINDOW(SW_PARENTCLOSING)` to its owned
+  windows and leaving the minimised state `SW_PARENTOPENING`, so they hide and come back with
+  it; `SW_HIDE` keeps the Z-order place of a top-level window that is neither active nor an
+  owner. On the X side the driver restacks such a window below its win32 predecessor after
+  the map (KWin stacks a window mapped without activation below the active one) and the owner
+  below it, and repeats the stacking check once the window manager confirms an activation;
+  the server's expose heuristic no longer moves a window above a window it owns, nor above a
+  same-owner `WS_EX_APPWINDOW` sibling. Measured: `ownerz` order, visibility and messages
+  identical to Windows 10 under kwin_x11 (and under the null driver on the 11.20 experiment);
+  vatSys with six taskbar entries, the strips and VSCS above the map after activation,
+  minimise and restore. user32 tests on the 11.20 experiment with the same changes: `win` no
+  new failure and five `todo_wine` checks succeeding, `msg` identical failure lines.
+  Smoke-tested on the desktop with Ableton Live 12, the KM88 Editor, FL Studio 2026 and
+  Cubase 15 (its tool windows are ownerless and unaffected).
+- **winex11**: a window shown without activation no longer flashes in the taskbar. KWin marks
+  every normal window it does not activate on map with `_NET_WM_STATE_DEMANDS_ATTENTION`;
+  Windows flashes a taskbar button only on `FlashWindowEx()` or when another process keeps the
+  foreground. The driver now removes the state once per map when the map did not ask for
+  activation or the foreground belongs to the same process, unless `FlashWindowEx()` set it.
+  vatSys's strip windows and VSCS came up flashing on every start.
 - **win32u / winex11**: the window manager gets the application's minimum and maximum track
   size as `PMinSize`/`PMaxSize`. `set_size_hints()` sent them only for windows that are not
   resizable; a resizable window got position and gravity only, so the window manager shrank it
