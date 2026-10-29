@@ -469,6 +469,11 @@ static int check_fd_events( int fd, int events )
     return pfd.revents;
 }
 
+void X11DRV_FlushDisplay( void )
+{
+    XFlush( gdi_display );
+}
+
 /***********************************************************************
  *           ProcessEvents   (X11DRV.@)
  */

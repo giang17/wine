@@ -826,6 +826,7 @@ void flush_window_surfaces( BOOL idle )
 
     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
         window_surface_flush( surface );
+    user_driver->pFlushDisplay();
 done:
     pthread_mutex_unlock( &surfaces_lock );
 }
@@ -1404,6 +1405,7 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
             release_dc_opengl_drawable( drawable );
         }
     }
+    if (ret) user_driver->pFlushDisplay();
     return ret;
 }
 

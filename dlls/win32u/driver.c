@@ -792,6 +792,10 @@ static void nulldrv_GetDC( HDC hdc, HWND hwnd, HWND top_win, const RECT *win_rec
 {
 }
 
+static void nulldrv_FlushDisplay( void )
+{
+}
+
 static BOOL nulldrv_ProcessEvents( DWORD mask )
 {
     return FALSE;
@@ -1293,6 +1297,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_DestroyWindow,
     loaderdrv_FlashWindowEx,
     loaderdrv_GetDC,
+    nulldrv_FlushDisplay,
     nulldrv_ProcessEvents,
     nulldrv_ReleaseDC,
     nulldrv_ScrollDC,
@@ -1394,6 +1399,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(DestroyWindow);
     SET_USER_FUNC(FlashWindowEx);
     SET_USER_FUNC(GetDC);
+    SET_USER_FUNC(FlushDisplay);
     SET_USER_FUNC(ProcessEvents);
     SET_USER_FUNC(ReleaseDC);
     SET_USER_FUNC(ScrollDC);

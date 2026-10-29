@@ -1213,6 +1213,7 @@ static const struct user_driver_funcs x11drv_funcs =
     .pDestroyWindow = X11DRV_DestroyWindow,
     .pFlashWindowEx = X11DRV_FlashWindowEx,
     .pGetDC = X11DRV_GetDC,
+    .pFlushDisplay = X11DRV_FlushDisplay,
     .pProcessEvents = X11DRV_ProcessEvents,
     .pReleaseDC = X11DRV_ReleaseDC,
     .pScrollDC = X11DRV_ScrollDC,
