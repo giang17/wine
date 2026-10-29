@@ -1972,6 +1972,17 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
         HWND prev = get_visible_predecessor( data->hwnd );
         data->map_predecessor = prev ? X11DRV_get_whole_window( prev ) : 0;
     }
+    if (new_state == NormalState)
+    {
+        /* Windows flashes a taskbar button only when another process keeps the foreground */
+        DWORD pid = 0, fg_pid = 0;
+        if (foreground)
+        {
+            NtUserGetWindowThread( data->hwnd, &pid );
+            NtUserGetWindowThread( foreground, &fg_pid );
+        }
+        data->noactivate_map = !activate || (pid && pid == fg_pid);
+    }
     data->wm_state_serial = NextRequest( data->display );
     TRACE( "window %p/%lx, requesting WM_STATE %#x -> %#x serial %lu, foreground %p, activate %u\n", data->hwnd, data->whole_window,
            old_state, new_state, data->wm_state_serial, NtUserGetForegroundWindow(), activate );
@@ -4536,6 +4547,53 @@ failed:
     return -1;
 }
 
+/***********************************************************************
+ *     window_drop_wm_demands_attention
+ *
+ * KWin flags every normal window it does not activate on map as demanding
+ * attention (X11Window::manage).  A window that win32 showed without activation,
+ * or that another window of the foreground process took the activation from,
+ * does not flash on Windows, so take the state back once per map, unless
+ * FlashWindowEx() asked for it.  wine-dev issue 532.
+ */
+void window_drop_wm_demands_attention( struct x11drv_win_data *data, Display *display, Window window )
+{
+    unsigned long i, count, remaining;
+    BOOL found = FALSE;
+    Atom type, *state;
+    int format;
+    XEvent xev;
+
+    if (!data->noactivate_map || data->flashing || !data->managed) return;
+
+    if (!XGetWindowProperty( display, window, x11drv_atom(_NET_WM_STATE), 0, 65536 / sizeof(CARD32), False,
+                             XA_ATOM, &type, &format, &count, &remaining, (unsigned char **)&state ))
+    {
+        if (type == XA_ATOM && format == 32)
+            for (i = 0; i < count; i++) if (state[i] == x11drv_atom(_NET_WM_STATE_DEMANDS_ATTENTION)) found = TRUE;
+        XFree( state );
+    }
+    if (!found) return;
+
+    TRACE( "window %p/%lx mapped without activation, dropping the window manager's demands-attention\n",
+           data->hwnd, data->whole_window );
+    data->noactivate_map = FALSE;
+    xev.type = ClientMessage;
+    xev.xclient.window = data->whole_window;
+    xev.xclient.message_type = x11drv_atom( _NET_WM_STATE );
+    xev.xclient.serial = 0;
+    xev.xclient.display = data->display;
+    xev.xclient.send_event = True;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = _NET_WM_STATE_REMOVE;
+    xev.xclient.data.l[1] = x11drv_atom( _NET_WM_STATE_DEMANDS_ATTENTION );
+    xev.xclient.data.l[2] = 0;
+    xev.xclient.data.l[3] = 1;
+    xev.xclient.data.l[4] = 0;
+    XSendEvent( data->display, DefaultRootWindow( data->display ), False,
+                SubstructureRedirectMask | SubstructureNotifyMask, &xev );
+}
+
 void X11DRV_FlashWindowEx( FLASHWINFO *pfinfo )
 {
     struct x11drv_win_data *data = get_win_data( pfinfo->hwnd );
@@ -4553,6 +4611,7 @@ void X11DRV_FlashWindowEx( FLASHWINFO *pfinfo )
         xev.xclient.display = data->display;
         xev.xclient.send_event = True;
         xev.xclient.format = 32;
+        data->flashing = !!pfinfo->dwFlags;
         xev.xclient.data.l[0] = pfinfo->dwFlags ?  _NET_WM_STATE_ADD : _NET_WM_STATE_REMOVE;
         xev.xclient.data.l[1] = x11drv_atom( _NET_WM_STATE_DEMANDS_ATTENTION );
         xev.xclient.data.l[2] = 0;

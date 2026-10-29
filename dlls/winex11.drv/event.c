@@ -1302,6 +1302,7 @@ static void handle_net_wm_state_notify( HWND hwnd, XPropertyEvent *event )
     if (!(data = get_win_data( hwnd ))) return;
     if (event->state == PropertyNewValue) value = get_window_net_wm_state( event->display, event->window );
     window_net_wm_state_notify( data, event->serial, value );
+    if (event->state == PropertyNewValue) window_drop_wm_demands_attention( data, event->display, event->window );
     release_win_data( data );
 
     NtUserPostMessage( hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
