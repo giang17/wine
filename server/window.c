@@ -3312,6 +3312,13 @@ void set_window_rect_visible( user_handle_t window, struct rectangle rect )
             if (!rect_in_region( ptr->win_region, &tmp )) continue;
         }
         /* found a window obscuring the rectangle, now move win above this one */
+        /* never above a window it owns: win32 keeps owned windows above their owner, a window
+         * manager that raised the owner over them disagrees with win32, not the other way round */
+        if (ptr->owner == win->handle) break;
+        /* nor above a window with the same owner when both have WS_EX_APPWINDOW: the X11 driver
+         * gives them no WM_TRANSIENT_FOR, so their order changes only through win32, and under a
+         * compositor a freshly mapped window is exposed in full whatever the stacking */
+        if (win->owner && ptr->owner == win->owner && (win->ex_style & ptr->ex_style & WS_EX_APPWINDOW)) break;
         /* making sure to not violate the topmost rule */
         if (!(ptr->ex_style & WS_EX_TOPMOST) || (win->ex_style & WS_EX_TOPMOST))
         {
