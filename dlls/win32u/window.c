@@ -3983,8 +3983,10 @@ static BOOL is_owned_by( HWND hwnd, HWND owner )
  * The visible window above hwnd in the win32 Z-order, not counting the popups
  * hwnd owns: Windows keeps them above their owner (swp_owner_popups), and so
  * does the window manager through WM_TRANSIENT_FOR, so there is no order to
- * restore for them.  Owned WS_EX_APPWINDOW windows count: winex11 gives them no
- * WM_TRANSIENT_FOR, so they have a taskbar button.  winex11 applies the same rule.
+ * restore for them.  Owned WS_EX_APPWINDOW windows count: winex11 makes them group
+ * transients (transient for the root window), which keeps their taskbar button and
+ * which only a window manager implementing NETWM group transients keeps above the
+ * owner.  winex11 applies the same rule.
  */
 static HWND get_visible_predecessor( HWND hwnd )
 {

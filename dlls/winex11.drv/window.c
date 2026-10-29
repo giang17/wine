@@ -1345,19 +1345,30 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
 
     /* An owned WS_EX_APPWINDOW window has its own taskbar button on Windows.  Task
      * managers do not list a window that is transient for another one (KDE's
-     * libtaskmanager), so keep the owner only as group leader: the stacking above the
-     * owner is restored after the map (window_wm_state_notify) and on every
-     * activation (net_active_window_notify).  wine-dev issue 531. */
+     * libtaskmanager, Plasma 5 X11 model and the Plasma 6 Wayland model through KWin's
+     * parent window), but they do list a window that is transient for the root window:
+     * a group transient (NETWM 7.3), which the window manager keeps above every window
+     * of its group mapped before it -- the owner, which is made the group leader.  So
+     * the window manager enforces the owner order itself, and never raises an owner
+     * it was told to activate or that was clicked above the windows it owns.  Without
+     * any transient hint (wine-dev issue 531) the driver could only restack the owner
+     * after the window manager had raised it, visible as a flicker under KWin on
+     * Wayland and leaving an owned window behind a maximised owner while it was being
+     * moved (wine-dev issue 538).  Known cost: a group transient also stays above the
+     * owned windows mapped before it, so an older sibling cannot be raised above a
+     * younger one. */
     if (owner_win && owner && (ex_style & WS_EX_APPWINDOW))
     {
         group_leader = owner_win;
-        owner_win = 0;
+        owner_win = root_window;
     }
 
     if (owner_win)
     {
         XSetTransientForHint( data->display, data->whole_window, owner_win );
-        if (!owner_from_heuristic) group_leader = owner_win;
+        if (!owner_from_heuristic && owner_win != root_window) group_leader = owner_win;
+        TRACE( "window %p/%lx, requesting WM_TRANSIENT_FOR %lx (owner %p, group %lx)\n", data->hwnd, data->whole_window,
+               owner_win, owner, group_leader );
     }
 
     /* Only use dialog type for owned popups. Metacity allows making fullscreen
@@ -1884,7 +1895,7 @@ static void set_xembed_flags( struct x11drv_win_data *data, unsigned long flags 
 static HWND get_visible_predecessor( HWND hwnd );
 static void window_restack_below( struct x11drv_win_data *data, Window sibling );
 
-/* whether set_style_hints() leaves hwnd without WM_TRANSIENT_FOR although it has an owner */
+/* whether set_style_hints() makes hwnd a group transient (WM_TRANSIENT_FOR = root) instead of transient for its owner */
 static BOOL is_owned_appwindow( HWND hwnd )
 {
     if (!NtUserGetWindowRelative( hwnd, GW_OWNER )) return FALSE;
@@ -2520,8 +2531,8 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
     if (!(foreground = NtUserGetForegroundWindow())) foreground = NtUserGetDesktopWindow();
     NtUserPostMessage( foreground, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
 
-    /* The window manager may restack before it confirms an activation we asked for (KWin
-     * raises an activated owner over the owned windows it has no WM_TRANSIENT_FOR for);
+    /* The window manager may restack before it confirms an activation we asked for (one
+     * without NETWM group transients raises an activated owner over the owned windows);
      * the stacking check skips while X and win32 disagree on the active window, so repeat
      * it now that they agree. */
     net_client_list_stacking_notify();
@@ -2541,8 +2552,9 @@ static BOOL is_owned_by( HWND hwnd, HWND owner )
  * The visible window above hwnd in the win32 Z-order, not counting the popups
  * hwnd owns: win32 keeps them above their owner, and the window manager does
  * the same through WM_TRANSIENT_FOR, so they are no sibling to restack a
- * managed window below.  Owned WS_EX_APPWINDOW windows count, they have no
- * WM_TRANSIENT_FOR (set_style_hints).  Same rule as get_visible_predecessor()
+ * managed window below.  Owned WS_EX_APPWINDOW windows count: they are group
+ * transients (set_style_hints), which only a window manager implementing NETWM
+ * group transients keeps above the owner.  Same rule as get_visible_predecessor()
  * in win32u.
  */
 static HWND get_visible_predecessor( HWND hwnd )
