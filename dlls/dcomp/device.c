@@ -9318,10 +9318,66 @@ static const IDCompositionDevice5Vtbl dcomp_device5_vtbl =
  * Entry points
  * ===================================================================== */
 
+/* Every DCompositionCreateDevice*() succeeds here, while vanilla Wine returns
+ * E_NOTIMPL -- and an application with a working non-DComp path takes that
+ * path only when creation fails (issue 539).  WINE_DCOMP_REFUSE restores the
+ * vanilla answer: 1 or * refuses in every process that sees the variable
+ * (child processes inherit it), anything else is a comma-separated list of
+ * executable names, e.g. WINE_DCOMP_REFUSE=msedgewebview2.exe keeps DComp in a
+ * plug-in host and refuses it in its WebView2 processes.  Unlike
+ * WINEDLLOVERRIDES=dcomp=d the DLL still loads, so modules that import it
+ * statically (JUCE 8 plug-ins, Steinberg's graphics2d.dll, Studio Pro's
+ * cclgui.dll) start and can be checked too.  Off by default. */
+static BOOL dcomp_refuse_device(void)
+{
+    static int cached = -1;
+    const char *env;
+    WCHAR list[1024], path[MAX_PATH], *name, *entry, *next, *end;
+    int refuse = 0;
+
+    if (cached >= 0)
+        return cached;
+
+    env = getenv("WINE_DCOMP_REFUSE");
+    if (env && *env && strcmp(env, "0"))
+    {
+        if (!GetModuleFileNameW(NULL, path, ARRAY_SIZE(path)))
+            path[0] = 0;
+        name = (name = wcsrchr(path, '\\')) ? name + 1 : path;
+        if (!strcmp(env, "1") || !strcmp(env, "*"))
+            refuse = 1;
+        else if (MultiByteToWideChar(CP_UTF8, 0, env, -1, list, ARRAY_SIZE(list)))
+        {
+            for (entry = list; entry && !refuse; entry = next)
+            {
+                if ((next = wcschr(entry, ','))) *next++ = 0;
+                while (*entry == ' ') entry++;
+                end = entry + wcslen(entry);
+                while (end > entry && end[-1] == ' ') *--end = 0;
+                refuse = *entry && !wcsicmp(entry, name);
+            }
+        }
+        if (refuse)
+            FIXME("WINE_DCOMP_REFUSE=%s: refusing DirectComposition devices in %s with E_NOTIMPL, as vanilla does.\n",
+                    debugstr_a(env), debugstr_w(name));
+    }
+    /* Set once and only after the decision: a second thread must not see a
+     * half-made answer.  Two threads racing here both compute the same. */
+    cached = refuse;
+    return refuse;
+}
+
 static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void **device)
 {
     struct dcomp_device *object;
     HRESULT hr;
+
+    if (dcomp_refuse_device())
+    {
+        if (device)
+            *device = NULL;
+        return E_NOTIMPL;
+    }
 
     if (!(object = calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;
