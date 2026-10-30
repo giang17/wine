@@ -795,7 +795,9 @@ This is the recommended branch. What it changes, by subsystem:
   two owned `WS_EX_APPWINDOW` windows over it, five clicks into the map on `:99` with
   kwin_x11): `WM_WINDOWPOSCHANGING` to the main window, `WM_ERASEBKGND` and full-size
   `WM_PAINT` to the map 5/5/5 before, 0/0/0 after, also with the map focusing itself on
-  `WM_MOUSEMOVE` as vatSys does; vatSys map clicks resync as "already active" (3 of 3); the
+  `WM_MOUSEMOVE` as vatSys does — the same messages as Windows 10 19045 in the reference VM
+  (`selfclick`: `WM_MOUSEACTIVATE` to the map and the main window, `WM_LBUTTONDOWN`, no
+  Z-order or paint message); vatSys map clicks resync as "already active" (3 of 3); the
   Cubase pattern of `repro-517` (`tool`, `both`) keeps the tool window above after 8 of 8
   clicks. user32 `msg` tests: identical failure lines; `win`: no new failure.
 - **win32u**: the palette messages of an activation are sent only on a palettized display.
