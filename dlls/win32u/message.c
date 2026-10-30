@@ -2783,7 +2783,9 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
                 case MA_ACTIVATE:
                 case 0:
                     if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
-                    else sync_zorder_after_wm_raise( hwndTop, TRUE );
+                    /* a click into a child of the already active window activates nothing, and Windows
+                     * leaves the Z-order alone: only re-apply it, as for a click into the window itself */
+                    else sync_zorder_after_wm_raise( hwndTop, hwndTop != info.hwndActive );
                     break;
                 default:
                     WARN( "unknown WM_MOUSEACTIVATE code %d\n", ret );
