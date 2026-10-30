@@ -800,6 +800,18 @@ This is the recommended branch. What it changes, by subsystem:
   Z-order or paint message); vatSys map clicks resync as "already active" (3 of 3); the
   Cubase pattern of `repro-517` (`tool`, `both`) keeps the tool window above after 8 of 8
   clicks. user32 `msg` tests: identical failure lines; `win`: no new failure.
+  The re-application itself no longer touches the win32 Z-order either: it passed the nearest
+  *visible* predecessor as insert-after, and with windows that are never shown between that
+  predecessor and the main window (vatSys owns several, between its ATIS window and the main
+  window) the call moved the main window above them, ran `swp_owner_popups()` and invalidated
+  the whole window on every map click — the full map repaint the reporter still measured on
+  Plasma 6.7.5 after the change above, found and analysed by the reporter. It now passes
+  `SWP_NOZORDER`; the driver works the X sibling out of the win32 order anyway. `childclick.c`
+  with three never-shown owned windows (`hidden`): `WM_WINDOWPOSCHANGED`, `WM_ERASEBKGND` and
+  full `WM_PAINT` 5/5/5 before, 0/0/0 after, one restack request per click before and after;
+  Windows 10 19045 sends none of them with the same Z-order. vatSys map clicks: no
+  `swp_owner_popups()`, no post-move invalidation; `repro-517` keeps the owned and the tool
+  window above after 8 of 8 clicks.
 - **win32u**: the palette messages of an activation are sent only on a palettized display.
   `set_active_window()` sent `WM_QUERYNEWPALETTE` to every newly active window and, when the
   window answered, broadcast `WM_PALETTEISCHANGING`. Wine's own user32 message tests, which
