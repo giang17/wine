@@ -656,6 +656,21 @@ This is the recommended branch. What it changes, by subsystem:
   falls on a different part of the window after each step of a window manager drag; in
   SynthEdit 1.5 the menu bar items lit up one after another while the window was dragged
   by its title bar.
+- **winex11**: on Xwayland, a `LeaveNotify` that takes the pointer to an ancestor while it
+  still reports a position inside the window is treated as stale. Xwayland stops seeing the
+  pointer once it is on a decoration the compositor draws (KWin on Wayland); the crossing
+  event and `XQueryPointer()` then both repeat the point where the pointer was last seen
+  inside the window, so the report above put the server's position back at that point and
+  the `WM_MOUSEMOVE` the server synthesizes after every step of a window manager drag kept
+  landing inside the window. The driver now puts the pointer just outside the edge it left
+  through and, while the window manager moves the window, keeps it there relative to the
+  window (`X11DRV_GetWindowStateUpdates`). vatSys under KWin 5.27.11 on Wayland (Xwayland
+  23.2.6): the menu bar items lit up one after another while the window was dragged by its
+  title bar; in one capture the position the server held stayed at a single point 21–43 px
+  below the top of the window rect through 288 moves of the window, over the menu strip in
+  274 of 290 samples. With the fix no item lights up. An X server that sees the pointer
+  where it is (plain X11) reports the crossing with a position outside the window and is
+  unchanged.
 - **winex11**: while the window manager moves a window on `_NET_WM_MOVERESIZE` (a title bar
   the application reports as `HTCAPTION`), the driver holds the capture on that window and
   the loop waiting for the end of the move no longer passes it mouse messages — what the move
@@ -667,7 +682,7 @@ This is the recommended branch. What it changes, by subsystem:
   its six title bar buttons lit up one after another while the window was dragged, the
   frozen point wandering across 331–1493 px of the window's width in one capture; with the
   capture on the moved window in 405 of 412 samples of a drag, none lit up. A plain capture:
-  with `GUI_INMOVESIZE` the driver would grab the pointer the window manager holds
+  with `GUI_INMOVESIZE` the driver would grab the pointer the window manager holds.
 - **winex11**: the window manager is offered no close function (`MWM_FUNC_CLOSE`) while the
   window's `SC_CLOSE` is grayed, disabled or missing in its system menu or the class carries
   `CS_NOCLOSE`. That is the test `WM_DELETE_WINDOW` is already discarded under, and the

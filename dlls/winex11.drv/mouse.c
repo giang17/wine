@@ -1598,6 +1598,8 @@ BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *xev )
     struct x11drv_win_data *data;
     INPUT input;
 
+    x11drv_thread_data()->stale_leave_hwnd = 0; /* the pointer is seen again */
+
     if (buttonNum >= NB_BUTTONS) return FALSE;
 
     TRACE( "hwnd %p/%lx button %u pos %d,%d\n", hwnd, event->window, buttonNum, event->x, event->y );
@@ -1642,6 +1644,7 @@ BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *xev )
     int buttonNum = event->button - 1;
     INPUT input;
 
+    x11drv_thread_data()->stale_leave_hwnd = 0; /* the pointer is seen again */
     if (buttonNum >= NB_BUTTONS || !button_up_flags[buttonNum]) return FALSE;
 
     TRACE( "hwnd %p/%lx button %u pos %d,%d\n", hwnd, event->window, buttonNum, event->x, event->y );
@@ -1679,6 +1682,7 @@ BOOL X11DRV_MotionNotify( HWND hwnd, XEvent *xev )
 
     TRACE( "hwnd %p/%lx pos %d,%d is_hint %d serial %lu\n",
            hwnd, event->window, event->x, event->y, event->is_hint, event->serial );
+    x11drv_thread_data()->stale_leave_hwnd = 0; /* the pointer is seen again */
 
     input.mi.dx          = event->x;
     input.mi.dy          = event->y;
@@ -1698,6 +1702,18 @@ BOOL X11DRV_MotionNotify( HWND hwnd, XEvent *xev )
 }
 
 
+/* whether the X server is Xwayland: it stops seeing the pointer once that is on a decoration the
+ * compositor draws, and reports the last position inside the window instead */
+static BOOL is_xwayland(void)
+{
+    static int cached = -1;
+    int opcode, event, error;
+
+    if (cached < 0) cached = XQueryExtension( gdi_display, "XWAYLAND", &opcode, &event, &error );
+    return cached;
+}
+
+
 /***********************************************************************
  *           X11DRV_EnterNotify
  */
@@ -1709,6 +1725,7 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
     TRACE( "hwnd %p/%lx pos %d,%d detail %d\n", hwnd, event->window, event->x, event->y, event->detail );
 
     x11drv_thread_data()->keymapnotify_hwnd = hwnd;
+    x11drv_thread_data()->stale_leave_hwnd = 0; /* the pointer is seen again */
 
     if (hwnd == x11drv_thread_data()->grab_hwnd) return FALSE;
 
@@ -1752,10 +1769,13 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
  */
 BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
 {
+    struct x11drv_thread_data *thread_data = x11drv_thread_data();
     XCrossingEvent *event = &xev->xcrossing;
+    struct x11drv_win_data *data;
     Window root, child;
     int root_x, root_y, win_x, win_y;
     unsigned int state;
+    BOOL stale = FALSE;
     INPUT input;
     POINT pt;
 
@@ -1765,7 +1785,7 @@ BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
     if (!hwnd) return FALSE;
     /* the pointer went into a child of ours, it did not leave the window */
     if (event->detail == NotifyInferior) return FALSE;
-    if (hwnd == x11drv_thread_data()->grab_hwnd) return FALSE;
+    if (hwnd == thread_data->grab_hwnd) return FALSE;
 
     if (is_old_motion_event( event->serial ))
     {
@@ -1773,10 +1793,48 @@ BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
         return FALSE;
     }
 
-    if (!XQueryPointer( event->display, root_window, &root, &child, &root_x, &root_y, &win_x, &win_y, &state ))
-        return FALSE;
-    pt = root_to_virtual_screen( win_x, win_y );
-    TRACE( "pointer now at %s\n", wine_dbgstr_point(&pt) );
+    /* Xwayland does not see the pointer once it is on a decoration the compositor draws (KWin
+     * on Wayland): the crossing to the ancestor arrives with a position still inside the window,
+     * where the pointer was last seen, and XQueryPointer() repeats that point.  The server then
+     * puts every WM_MOUSEMOVE it synthesizes after a window move at that stale point, which
+     * wanders across the window while the window manager drags it (vatSys's menu bar lit up
+     * item by item).  A leave to the ancestor from a point inside the window is impossible
+     * otherwise, so put the pointer just outside the edge it left through, and keep it there
+     * relative to the window while the window manager moves it (X11DRV_GetWindowStateUpdates). */
+    if (event->mode == NotifyNormal && (event->detail == NotifyAncestor || event->detail == NotifyVirtual) &&
+        is_xwayland() && (data = get_win_data( hwnd )))
+    {
+        int x = event->x, y = event->y, w = data->rects.visible.right - data->rects.visible.left,
+            h = data->rects.visible.bottom - data->rects.visible.top;
+
+        if (event->window == data->whole_window && data->pending_state.wm_state == NormalState &&
+            x >= 0 && x < w && y >= 0 && y < h)
+        {
+            int dl = x, dr = w - 1 - x, dt = y, db = h - 1 - y;
+
+            if (dt <= dl && dt <= dr && dt <= db) y = -1;
+            else if (db <= dl && db <= dr) y = h;
+            else if (dl <= dr) x = -1;
+            else x = w;
+            thread_data->stale_leave_hwnd = hwnd;
+            thread_data->stale_leave_rel.x = x;
+            thread_data->stale_leave_rel.y = y;
+            pt = root_to_virtual_screen( event->x_root + x - event->x, event->y_root + y - event->y );
+            TRACE( "stale leave inside %p/%lx (%dx%d) at %d,%d, pointer kept at %d,%d -> %s\n", hwnd, event->window,
+                   w, h, event->x, event->y, x, y, wine_dbgstr_point(&pt) );
+            stale = TRUE;
+        }
+        release_win_data( data );
+    }
+
+    if (!stale)
+    {
+        thread_data->stale_leave_hwnd = 0;
+        if (!XQueryPointer( event->display, root_window, &root, &child, &root_x, &root_y, &win_x, &win_y, &state ))
+            return FALSE;
+        pt = root_to_virtual_screen( win_x, win_y );
+        TRACE( "pointer now at %s\n", wine_dbgstr_point(&pt) );
+    }
 
     input.type           = INPUT_MOUSE;
     input.mi.dx          = pt.x;
