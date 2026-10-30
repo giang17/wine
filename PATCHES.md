@@ -1055,6 +1055,21 @@ This is the recommended branch. What it changes, by subsystem:
   the application had already presented; Dorico 6's Qt toolbar popups (top levels drawn
   through a composition swapchain) came up black in one of four openings when the first
   GL swap won that race. Upstream (11.20) makes the same copy.
+- **win32u**: GDI output of a child window that presents offscreen no longer paints over the
+  presented frame. The DCs of a window with a pixel format draw straight into the top-level's
+  X drawable, which is harmless while the GL or Vulkan client window sits attached on top; a
+  child renders offscreen, though, and its frame reaches the top-level only through the copy
+  of each present, so the erase that `RedrawWindow(RDW_ERASE)` brings after every resize step
+  painted over it until the next present. vatSys presents its Direct3D 11 map about three
+  times a second during a modal resize, and the map went blank for most of a drag resize
+  (giang17/wine issue 29): 312 of 1801 frames with wined3d on an Xvfb display, 466 of 1172
+  with DXVK on the X11 desktop (NVIDIA), against 0 of 2638 screen dumps on Windows 10, where
+  the presented frame stays. A window that has presented by such a copy now has its DCs
+  bound to the top-level surface, whose flush leaves the child's client area alone; a window
+  whose content is GDI drawing keeps direct drawing. After the change: 0 blank frames with
+  both renderers, the SynthEdit 1.5 module panel click delivers its pixels and the MDI
+  canvases show no episode in the resize measurement, user32 `dce` and opengl32 `opengl`
+  pass, user32 `msg` fails in the same places as before.
 - **win32u**: the menu bar of a captioned window is measured and drawn through the
   undocumented non-client theming messages, as on Windows: `WM_UAHMEASUREMENUITEM`
   (0x0094) per item with an item size of 0x16, `WM_UAHINITMENU` (0x0093) before measuring
