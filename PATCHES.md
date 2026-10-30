@@ -1096,6 +1096,19 @@ This is the recommended branch. What it changes, by subsystem:
   DXVK 64-bit and 32-bit 0 of 6 correct before, 6 of 6 after, wined3d 6 of 6 before and after.
   Continuous presents: 60.2 fps with vsync before and after; without vsync 0.15 ms more per
   frame. Without libXdamage nothing changes.
+- **win32u / winex11**: a process that registered the keyboard with `RIDEV_INPUTSINK` gets keys while
+  a non-Wine window is active, as on Windows — dinput registers it that way for `DISCL_BACKGROUND`
+  keyboards. X delivers core key events only to the focused client, so vatSys's push-to-talk (a
+  DirectInput 8 keyboard with `DISCL_BACKGROUND`) only worked while a vatSys window had the focus
+  (giang17/wine issue 28). win32u now tells the driver when the process gets or loses such a
+  keyboard (new `pSetRawKeyboardSink()`, `WINE_GDI_DRIVER_VERSION` 109), and winex11 then selects
+  `XI_RawKeyPress/Release` on the root window; a raw key is only sent while no Wine window is the
+  foreground, so the key reaches sinks as `RIM_INPUTSINK` and no application gets a `WM_KEYDOWN`.
+  Processes without a keyboard sink never select raw keys. Measured on Xvfb with kwin_x11: keys typed
+  into a native X window arrive (before: nothing), held keys once down and once up, keys into the
+  probe and into a second Wine process are not doubled, a probe without `RIDEV_INPUTSINK` gets nothing.
+  Under Xwayland the X server only sees keys typed into Wayland windows if the compositor forwards
+  them (KDE: System Settings → Applications → Legacy X11 App Support, `XwaylandEavesdrops`).
 - **win32u**: the menu bar of a captioned window is measured and drawn through the
   undocumented non-client theming messages, as on Windows: `WM_UAHMEASUREMENUITEM`
   (0x0094) per item with an item size of 0x16, `WM_UAHINITMENU` (0x0093) before measuring
