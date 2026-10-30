@@ -4309,9 +4309,16 @@ void sync_zorder_after_wm_raise( HWND hwnd, BOOL activated )
     if (activated) /* Windows brings an activated window to the top of its band */
         NtUserSetWindowPos( hwnd, HWND_TOP, 0, 0, 0, 0,
                             SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_WINE_ZORDER_SYNC );
-    else /* an already active window keeps its win32 place: no-op for win32, the driver re-applies it */
-        NtUserSetWindowPos( hwnd, prev, 0, 0, 0, 0,
-                            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_WINE_ZORDER_SYNC );
+    /* An already active window keeps its win32 place: a no-op for win32, the driver re-applies it
+     * (sync_window_position() works the X sibling out of the win32 order for SWP_WINE_ZORDER_SYNC).
+     * SWP_NOZORDER says so explicitly: prev is the nearest *visible* predecessor, and with hidden
+     * windows between it and hwnd - vatSys owns several that are never shown - nothing would turn
+     * the insert-after into a no-op, the call would move hwnd above them, run swp_owner_popups()
+     * and invalidate the whole window on every click into it (wine-dev issue 552, found by the
+     * reporter of giang17/wine issue 29). */
+    else
+        NtUserSetWindowPos( hwnd, prev, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
+                            SWP_NOSENDCHANGING | SWP_WINE_ZORDER_SYNC );
 }
 
 /* NtUserSetWindowPos implementation */
