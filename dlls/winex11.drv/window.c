@@ -500,6 +500,21 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
     /* application windows are managed */
     ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
     if (ex_style & WS_EX_APPWINDOW) return TRUE;
+    /* Ownerless layered popups that never take the focus and are neither
+     * click-through nor topmost live as long as the application window they
+     * decorate: Codejock draws the drop shadow of its frames into one
+     * (XTPFrameShadow, WineHQ bug 60187). Unmanaged, the window manager keeps
+     * them above every window and on every desktop. Menus, tooltips and drag
+     * images are topmost or click-through and stay unmanaged; JUCE's shadow
+     * windows around them are layered tool windows too, but topmost and
+     * without WS_EX_NOACTIVATE. */
+    if ((style & WS_POPUP) && !NtUserGetWindowRelative( hwnd, GW_OWNER ) &&
+        (ex_style & (WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOPMOST)) ==
+        (WS_EX_LAYERED | WS_EX_NOACTIVATE))
+    {
+        TRACE( "%p: ownerless layered popup %08x/%08x is managed\n", hwnd, style, ex_style );
+        return TRUE;
+    }
     /* windows that own popups are managed */
     if (has_owned_popups( hwnd )) return TRUE;
     /* default: not managed */
