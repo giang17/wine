@@ -2293,6 +2293,7 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
     struct x11drv_win_data *data;
     HWND old_foreground, anchor;
+    POINT stale_pt;
 
     if (!state_cmd)
     {
@@ -2325,11 +2326,31 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
 
     if ((data = get_win_data( hwnd )))
     {
+        BOOL follow;
+
         if (!data->state_locks++) TRACE( "Locked window %p/%lx state\n", data->hwnd, data->whole_window );
         *state_cmd = window_update_client_state( data );
         *swp_flags = window_update_client_config( data );
         *rect = window_rect_from_visible( &data->rects, data->current_state.rect );
+        /* the pointer left this window onto a decoration the X server cannot see (X11DRV_LeaveNotify)
+         * and the window manager is moving the window under it: move the stale pointer position
+         * along, so that the WM_MOUSEMOVE the server synthesizes after the move stays outside */
+        if ((follow = *swp_flags && thread_data->stale_leave_hwnd == hwnd))
+        {
+            stale_pt.x = data->current_state.rect.left + thread_data->stale_leave_rel.x;
+            stale_pt.y = data->current_state.rect.top + thread_data->stale_leave_rel.y;
+        }
         release_win_data( data );
+        if (follow)
+        {
+            INPUT input = {.type = INPUT_MOUSE};
+
+            input.mi.dx = stale_pt.x;
+            input.mi.dy = stale_pt.y;
+            input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+            TRACE( "hwnd %p moved by the window manager, stale pointer kept at %s\n", hwnd, wine_dbgstr_point(&stale_pt) );
+            NtUserSendHardwareInput( 0, 0, &input, 0 );
+        }
     }
 
     if (!*state_cmd && !*swp_flags && !*foreground) return FALSE;

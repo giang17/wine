@@ -455,6 +455,8 @@ struct x11drv_thread_data
     struct display_state pending_state;       /* display state tracking the pending / requested state */
     struct display_state current_state;       /* display state tracking the current X11 state */
     unsigned long net_active_window_serial;   /* serial of last pending _NET_ACTIVE_WINDOW request */
+    HWND     stale_leave_hwnd;     /* window the pointer left onto a decoration the X server cannot see (Xwayland): its position is stale */
+    POINT    stale_leave_rel;      /* where the pointer is kept instead, relative to that window's X window, just outside it */
 };
 
 extern struct x11drv_thread_data *x11drv_init_thread_data(void);
