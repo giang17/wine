@@ -914,6 +914,42 @@ static BOOL window_clips_clients( HWND hwnd, HWND top_win )
 }
 
 /***********************************************************************
+ *           window_presents_offscreen
+ *
+ * Whether a client surface presents into this child window by copying an
+ * offscreen client window into the top-level (set_window_present_offscreen()).
+ *
+ * The DCs of a window with a pixel format draw straight into the X drawable of
+ * the top-level instead of the window surface - harmless while the GL or Vulkan
+ * client window sits attached on top and covers that output.  A child renders
+ * offscreen, though, and its frame reaches the top-level only through the copy
+ * of each present; whatever GDI draws through such a DC in between, typically
+ * the erase that RedrawWindow(RDW_ERASE) brings after every resize step, then
+ * paints over the presented frame until the next present.  vatSys's map control
+ * went blank for most of a drag resize this way (wine-dev issue 549: 312 of 1801
+ * frames blank, 0 on Windows 10, where the presented frame stays).  Bound to the
+ * top-level surface instead, that output lands in surface bits the flush leaves
+ * alone, since the server keeps the client area of a pixel format child out of
+ * the surface region (clip_pixel_format_children()).
+ *
+ * Only a window that has actually presented this way qualifies.  A window whose
+ * content is GDI drawing, e.g. a Direct2D target delivered through GDI with a
+ * swap chain on the same window, keeps direct drawing (window_clips_clients()).
+ */
+static BOOL window_presents_offscreen( HWND hwnd, HWND top_win )
+{
+    WND *win;
+    BOOL ret;
+
+    if (hwnd == top_win) return FALSE;
+    win = get_win_ptr( hwnd );
+    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+    ret = !!win->present_offscreen;
+    release_win_ptr( win );
+    return ret;
+}
+
+/***********************************************************************
  *           update_visible_region
  *
  * Set the visible region and X11 drawable for the DC associated to
@@ -973,7 +1009,8 @@ static void update_visible_region( struct dce *dce )
 
     /* don't use a surface to paint the client area of OpenGL windows */
     if (!(((paint_flags & SET_WINPOS_PIXEL_FORMAT) || window_clips_clients( dce->hwnd, top_win )) &&
-          user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW))
+          user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW) ||
+        window_presents_offscreen( dce->hwnd, top_win ))
     {
         win = get_win_ptr( top_win );
         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
