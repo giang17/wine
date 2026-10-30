@@ -65,6 +65,7 @@ MAKE_FUNCPTR(XcursorLibraryLoadCursor);
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(cursor);
+WINE_DECLARE_DEBUG_CHANNEL(key);
 
 /**********************************************************************/
 
@@ -408,6 +409,39 @@ void x11drv_xinput2_disable( Display *display, Window window )
 
 
 /***********************************************************************
+ *              X11DRV_SetRawKeyboardSink
+ *
+ * The process registered the keyboard with RIDEV_INPUTSINK (dinput does that for
+ * DISCL_BACKGROUND), or dropped it.  X sends core key events only to the client with the
+ * input focus, so select raw key events on the root window of this thread's display while
+ * the sink exists: they arrive whichever client has the focus.  Selecting them only on
+ * request keeps processes that never asked for background keys from seeing them.
+ */
+void X11DRV_SetRawKeyboardSink( BOOL enable )
+{
+    struct x11drv_thread_data *data;
+
+    if (!xinput2_available) return;
+    if (!(data = enable ? x11drv_init_thread_data() : x11drv_thread_data()) || data->raw_keyboard_sink == enable) return;
+
+    TRACE( "%s raw keyboard sink on display %p\n", enable ? "enabling" : "disabling", data->display );
+    data->raw_keyboard_sink = enable;
+    if (enable)
+    {
+        XISetMask( data->root_mask, XI_RawKeyPress );
+        XISetMask( data->root_mask, XI_RawKeyRelease );
+    }
+    else
+    {
+        XIClearMask( data->root_mask, XI_RawKeyPress );
+        XIClearMask( data->root_mask, XI_RawKeyRelease );
+    }
+    pXISelectEvents( data->display, DefaultRootWindow( data->display ), &data->root_events, 1 );
+    XFlush( data->display );
+}
+
+
+/***********************************************************************
  *              x11drv_xinput_init
  */
 void x11drv_xinput2_init( struct x11drv_thread_data *data )
@@ -452,6 +486,10 @@ void x11drv_xinput2_enable( Display *display, Window window )
 }
 
 void x11drv_xinput2_disable( Display *display, Window window )
+{
+}
+
+void X11DRV_SetRawKeyboardSink( BOOL enable )
 {
 }
 
@@ -1982,6 +2020,26 @@ static BOOL X11DRV_RawButtonEvent( XGenericEventCookie *cookie )
     return TRUE;
 }
 
+/***********************************************************************
+ *           X11DRV_RawKeyEvent
+ */
+static BOOL X11DRV_RawKeyEvent( XGenericEventCookie *xev )
+{
+    XIRawEvent *event = xev->data;
+    HWND foreground = NtUserGetForegroundWindow();
+
+    if (!x11drv_thread_data()->raw_keyboard_sink) return FALSE;
+    /* While a Wine window is active its core KeyPress events carry the key, in this or in
+     * another Wine process; the raw event would send it twice.  With another X client active
+     * the foreground is the desktop window (focus_out(), _NET_ACTIVE_WINDOW handling), and the
+     * server then hands the key to keyboard sinks as RIM_INPUTSINK. */
+    if (foreground && foreground != NtUserGetDesktopWindow()) return FALSE;
+
+    TRACE_(key)( "raw key %s keycode %u\n", xev->evtype == XI_RawKeyRelease ? "release" : "press", event->detail );
+    x11drv_send_raw_key( event->detail, xev->evtype == XI_RawKeyRelease, EVENT_x11_time_to_win32_time( event->time ) );
+    return TRUE;
+}
+
 static BOOL X11DRV_TouchEvent( HWND hwnd, XGenericEventCookie *xev )
 {
     RECT virtual = NtUserGetVirtualScreenRect( MDT_RAW_DPI );
@@ -2090,6 +2148,11 @@ BOOL X11DRV_GenericEvent( HWND hwnd, XEvent *xev )
     case XI_RawButtonRelease:
         ret = X11DRV_RawButtonEvent( event );
         break;
+    case XI_RawKeyPress:
+    case XI_RawKeyRelease:
+        ret = X11DRV_RawKeyEvent( event );
+        break;
+
     case XI_TouchBegin:
     case XI_TouchUpdate:
     case XI_TouchEnd:

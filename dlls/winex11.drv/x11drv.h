@@ -263,6 +263,7 @@ extern BOOL X11DRV_SystemParametersInfo( UINT action, UINT int_param, void *ptr_
                                          UINT flags );
 extern LRESULT X11DRV_WintabProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *buffer );
 extern void X11DRV_ThreadDetach(void);
+extern void X11DRV_SetRawKeyboardSink( BOOL enable );
 
 /* X11 driver internal functions */
 
@@ -439,6 +440,7 @@ struct x11drv_thread_data
     unsigned long warp_serial;     /* serial number of last pointer warp request */
     Window   clip_window;          /* window used for cursor clipping */
     BOOL     clipping_cursor;      /* whether thread is currently clipping the cursor */
+    BOOL     raw_keyboard_sink;    /* root raw key events selected, see X11DRV_SetRawKeyboardSink */
     Atom    *net_supported;        /* list of _NET_SUPPORTED atoms */
     int      net_supported_count;  /* number of _NET_SUPPORTED atoms */
     UINT     net_wm_state_mask;    /* mask of supported _NET_WM_STATE *bits */
@@ -639,6 +641,7 @@ extern BOOL X11DRV_MotionNotify( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *event );
+extern void x11drv_send_raw_key( unsigned int keycode, BOOL release, DWORD time );
 extern BOOL X11DRV_KeymapNotify( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_DestroyNotify( HWND hwnd, XEvent *event );
 extern BOOL X11DRV_SelectionRequest( HWND hWnd, XEvent *event );

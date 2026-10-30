@@ -1326,6 +1326,31 @@ static void X11DRV_send_keyboard_input( HWND hwnd, WORD vkey, WORD scan, UINT fl
 
 
 /***********************************************************************
+ *           x11drv_send_raw_key
+ *
+ * Send a key X reported as XI_RawKeyPress/Release while no Wine window is active, see
+ * X11DRV_RawKeyEvent().  A raw event carries no modifier state, so the key is mapped
+ * through the keycode tables alone, as X11DRV_KeyEvent() does for most keys.
+ */
+void x11drv_send_raw_key( unsigned int keycode, BOOL release, DWORD time )
+{
+    WORD vkey, scan;
+    UINT flags = 0;
+
+    if (keycode >= ARRAY_SIZE(keyc2vkey)) return;
+    pthread_mutex_lock( &kbd_mutex );
+    vkey = keyc2vkey[keycode];
+    scan = keyc2scan[keycode] & 0xff;
+    pthread_mutex_unlock( &kbd_mutex );
+    if (!vkey) return;
+
+    if (release) flags |= KEYEVENTF_KEYUP;
+    if (vkey & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
+    X11DRV_send_keyboard_input( 0, vkey & 0xff, scan, flags, time );
+}
+
+
+/***********************************************************************
  *           set_async_key_state
  */
 static void set_async_key_state( const BYTE state[256] )
