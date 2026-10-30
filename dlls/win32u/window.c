@@ -2027,6 +2027,27 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     if (rects->client.top < visible_rect.top || rects->client.left < visible_rect.left ||
         rects->client.bottom > visible_rect.bottom || rects->client.right > visible_rect.right)
         visible_rect = rects->window;
+    /* A captioned window whose client top is not where DefWindowProc's WM_NCCALCSIZE put it, or
+     * whose client DefWindowProc never computed, draws its own title bar inside the standard
+     * frame: the window manager's title bar would cover it, and the window rect the manager
+     * then moves the window to leaves the application's strip outside the window (a vatSys
+     * ASD window keeps a 30 px strip above an inset client while maximised). */
+    else if ((style & WS_CAPTION) == WS_CAPTION && (style_mask & WS_CAPTION) == WS_CAPTION)
+    {
+        int top = rects->client.top - rects->window.top, standard = -1;
+        WND *win;
+
+        if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+        {
+            if (win->nc_insets_valid) standard = win->nc_insets.top;
+            release_win_ptr( win );
+        }
+        if (top != standard)
+        {
+            TRACE( "hwnd %p draws its own frame: client top %d, DefWindowProc %d\n", hwnd, top, standard );
+            visible_rect = rects->window;
+        }
+    }
 
     TRACE( "hwnd %p, rects %s, style %#x, ex_style %#x -> visible_rect %s\n", hwnd,
            debugstr_window_rects( rects ), style, ex_style, wine_dbgstr_rect( &visible_rect ) );
