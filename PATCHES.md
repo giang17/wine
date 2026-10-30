@@ -1082,6 +1082,20 @@ This is the recommended branch. What it changes, by subsystem:
   both renderers, the SynthEdit 1.5 module panel click delivers its pixels and the MDI
   canvases show no episode in the resize measurement, user32 `dce` and opengl32 `opengl`
   pass, user32 `msg` fails in the same places as before.
+- **win32u / winex11**: an offscreen Vulkan surface (a child window presenting through DXVK or
+  vkd3d) shows the frame it has just presented, not the one before. Such a surface reaches the
+  top-level through a copy of its composite-redirected client window right after the host
+  present, and on NVIDIA the frame lands in that window 4 to 9 ms later, so the copy took the
+  previous frame; an application that presents only when something changes stayed one frame
+  behind until it presented again. In vatSys's strip windows with DXVK the selection marker
+  followed a selection made on the map only after the next click or scroll in the strip window
+  (giang17/wine issue 27); wined3d presents child swap chains through GDI and was not affected.
+  `vkQueueWaitIdle()` and `vkWaitForPresentKHR()` both return before the frame is there; the
+  window's XDamage event marks it, and the render thread now waits for that event (at most
+  100 ms) before the copy, as the GL path waits for its swap. Single presents of a D3D11 child:
+  DXVK 64-bit and 32-bit 0 of 6 correct before, 6 of 6 after, wined3d 6 of 6 before and after.
+  Continuous presents: 60.2 fps with vsync before and after; without vsync 0.15 ms more per
+  frame. Without libXdamage nothing changes.
 - **win32u**: the menu bar of a captioned window is measured and drawn through the
   undocumented non-client theming messages, as on Windows: `WM_UAHMEASUREMENUITEM`
   (0x0094) per item with an item size of 0x16, `WM_UAHINITMENU` (0x0093) before measuring
