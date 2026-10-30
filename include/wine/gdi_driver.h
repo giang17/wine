@@ -260,6 +260,10 @@ struct client_surface_funcs
     void (*present)( struct client_surface *surface, HDC hdc );
     /* try to set the client surface color space directly for vulkan pass-through */
     BOOL (*set_color_space)( struct client_surface *surface, VkColorSpaceKHR color_space );
+    /* optional: let present() of an offscreen surface wait until the frame has reached the client window;
+     * called from render thread without the surfaces lock, before (presented = FALSE) and after
+     * (presented = TRUE) the host present */
+    void (*wait)( struct client_surface *surface, BOOL presented );
 };
 
 struct client_surface

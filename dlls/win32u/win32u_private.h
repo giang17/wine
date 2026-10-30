@@ -343,6 +343,7 @@ extern BOOL client_surface_set_color_space( struct client_surface *surface, VkCo
 extern BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size, SIZE *monitor_size );
 extern void use_window_client_surface( struct client_surface *surface, BOOL use );
 extern struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL raw );
+extern void client_surface_wait( struct client_surface *surface, BOOL presented );
 extern HICON get_window_icon_info( HWND hwnd, UINT type, HICON icon, ICONINFO *ret );
 extern void init_startup_info(void);
 

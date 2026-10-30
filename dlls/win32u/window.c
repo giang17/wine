@@ -468,6 +468,13 @@ void client_surface_present( struct client_surface *surface )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
+/* see client_surface_funcs.wait; the caller holds a reference to the surface */
+void client_surface_wait( struct client_surface *surface, BOOL presented )
+{
+    if (surface->funcs->wait && InterlockedCompareExchange( &surface->offscreen, 0, 0 ))
+        surface->funcs->wait( surface, presented );
+}
+
 void client_surface_update( struct client_surface *surface )
 {
     pthread_mutex_lock( &surfaces_lock );
