@@ -232,7 +232,19 @@ This is the recommended branch. What it changes, by subsystem:
   and normal; in colour-marked captures 13 of 15 and 22 of 25 such events covered more than
   half the window before, 0 of 12 and 0 of 25 after. The strip a growing window gains before
   Chromium follows still shows the backdrop (`WINE_DCOMP_HOLD_ABSENT_LEAF=0` turns the hold
-  off)
+  off); `WINE_DCOMP_REFUSE` makes `DCompositionCreateDevice()`, `DCompositionCreateDevice2()`
+  and `DCompositionCreateDevice3()` fail with `E_NOTIMPL` as vanilla Wine does — `1` in every
+  process that sees the variable (child processes inherit it), or a comma-separated list of
+  executables such as `msedgewebview2.exe` — to check whether an application runs correctly
+  without DComp. Unlike `WINEDLLOVERRIDES=dcomp=d` the DLL still loads, which the modules that
+  import it statically need to load at all (129 of 186 dcomp users in the test prefix: JUCE 8
+  plug-ins, Steinberg's `graphics2d.dll`, Studio Pro's `cclgui.dll`). Measured with it, the
+  plug-ins in REAPER on Xvfb: Serum 2 (VSTGUI) draws its editor through a plain swapchain,
+  pixel-identical at rest; Cymatics Hotline (JUCE 8, Direct2D) creates its composition
+  swapchain, never presents and stays black. Power BI Desktop 2.158 on an NVIDIA desktop: the
+  WebView2 155 GPU process ends on a breakpoint exception in `msedge.dll` and is restarted five
+  times, the window stays black and in the end no WebView2 process is left — the same as with
+  `dcomp=d`. Off by default
 - **DComp on a layered top-level without attributes**: a rootless visual tree whose target
   is a top-level window with `WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP` and no layered
   attributes is presented with `UpdateLayeredWindow()`, composited over a transparent
