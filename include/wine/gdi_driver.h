@@ -218,7 +218,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 108
+#define WINE_GDI_DRIVER_VERSION 109
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -443,6 +443,9 @@ struct user_driver_funcs
     UINT    (*pOpenGLInit)(UINT,const struct opengl_funcs *,const struct opengl_driver_funcs **);
     /* thread management */
     void    (*pThreadDetach)(void);
+    /* raw input: the calling thread's process has (TRUE) or no longer has (FALSE) the keyboard
+     * registered with RIDEV_INPUTSINK, so it wants keys while none of its windows is active */
+    void    (*pSetRawKeyboardSink)(BOOL);
 };
 
 W32KAPI void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version );

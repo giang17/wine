@@ -656,11 +656,15 @@ static void register_rawinput_device( const RAWINPUTDEVICE *device )
     }
 }
 
+/* whether the process has the keyboard registered with RIDEV_INPUTSINK, see NtUserRegisterRawInputDevices */
+static LONG registered_keyboard_sink;
+
 /**********************************************************************
  *         NtUserRegisterRawInputDevices   (win32u.@)
  */
 BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT device_count, UINT device_size )
 {
+    BOOL keyboard_sink = FALSE;
     struct rawinput_device *server_devices;
     RAWINPUTDEVICE *new_registered_devices;
     SIZE_T size;
@@ -741,7 +745,18 @@ BOOL WINAPI NtUserRegisterRawInputDevices( const RAWINPUTDEVICE *devices, UINT d
 
     free( server_devices );
 
+    for (i = 0; ret && i < registered_device_count; ++i)
+        if (registered_devices[i].usUsagePage == HID_USAGE_PAGE_GENERIC &&
+            registered_devices[i].usUsage == HID_USAGE_GENERIC_KEYBOARD &&
+            (registered_devices[i].dwFlags & RIDEV_INPUTSINK)) keyboard_sink = TRUE;
+
     pthread_mutex_unlock( &rawinput_mutex );
+
+    /* The driver only sees keys while one of our windows has the input focus; a keyboard
+     * sink wants them while another application is active too, as on Windows.  Tell it only
+     * when that changes: most registrations (mouse, HID devices) have nothing to do with it. */
+    if (ret && InterlockedExchange( &registered_keyboard_sink, keyboard_sink ) != keyboard_sink)
+        user_driver->pSetRawKeyboardSink( keyboard_sink );
 
     return ret;
 }

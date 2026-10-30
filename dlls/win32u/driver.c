@@ -919,6 +919,10 @@ static void nulldrv_ThreadDetach( void )
 {
 }
 
+static void nulldrv_SetRawKeyboardSink( BOOL enable )
+{
+}
+
 static const WCHAR guid_key_prefixW[] =
 {
     '\\','R','e','g','i','s','t','r','y',
@@ -1240,6 +1244,11 @@ static UINT loaderdrv_OpenGLInit( UINT version, const struct opengl_funcs *openg
     return load_driver()->pOpenGLInit( version, opengl_funcs, driver_funcs );
 }
 
+static void loaderdrv_SetRawKeyboardSink( BOOL enable )
+{
+    load_driver()->pSetRawKeyboardSink( enable );
+}
+
 static const struct user_driver_funcs lazy_load_driver =
 {
     { NULL },
@@ -1316,6 +1325,8 @@ static const struct user_driver_funcs lazy_load_driver =
     loaderdrv_OpenGLInit,
     /* thread management */
     nulldrv_ThreadDetach,
+    /* raw input */
+    loaderdrv_SetRawKeyboardSink,
 };
 
 const struct user_driver_funcs *user_driver = &lazy_load_driver;
@@ -1410,6 +1421,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(VulkanInit);
     SET_USER_FUNC(OpenGLInit);
     SET_USER_FUNC(ThreadDetach);
+    SET_USER_FUNC(SetRawKeyboardSink);
 #undef SET_USER_FUNC
 
     prev = InterlockedCompareExchangePointer( (void **)&user_driver, driver, (void *)&lazy_load_driver );
