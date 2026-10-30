@@ -702,6 +702,20 @@ This is the recommended branch. What it changes, by subsystem:
   their own frame and are unchanged. Setting `DecorateToolWindows` to `N` under
   `HKCU\Software\Wine\X11 Driver`, or per application under
   `HKCU\Software\Wine\AppDefaults\<app.exe>\X11 Driver`, restores the previous behaviour.
+- **winex11**: an ownerless layered popup that never takes the focus (`WS_EX_NOACTIVATE`) and is
+  neither click-through (`WS_EX_TRANSPARENT`) nor topmost is managed by the window manager. Codejock
+  Xtreme Toolkit Pro draws the drop shadow of its frames into such a window (`XTPFrameShadow`,
+  style `0x94000000`, ex style `0x08080080`, WineHQ bug 60187); `is_window_managed()` mapped it
+  override-redirect, so the shadow stayed above every other window and on every virtual desktop,
+  where on Windows it is an ordinary top-level window. The bug's proposed test leaves out
+  `WS_EX_NOACTIVATE` and `WS_EX_TOPMOST` and would also catch the four shadow windows JUCE 8
+  creates around every popup menu and tooltip (ex style `0x00080088`, no `WS_EX_TRANSPARENT`).
+  Measured on Xvfb with kwin_x11 with a reproducer carrying the Codejock styles
+  (`shadow524.c`): override-redirect before, managed after with
+  `_NET_WM_DESKTOP` and skip-taskbar states, below a foreign window that is activated; topmost,
+  click-through, owned and non-`WS_EX_NOACTIVATE` variants and the JUCE 8 menu shadows stay
+  override-redirect. SynthEdit's menus, REAPER with a JUCE 8 plugin editor and FL Studio reach the
+  new branch zero times.
 - **win32u**: a captioned window whose client area reaches into the caption or the borders
   — an application that draws its own title bar from `WM_NCCALCSIZE` — is shown with its
   full window rectangle and without a window manager frame (upstream `6cfa941df3f`,
