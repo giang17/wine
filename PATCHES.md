@@ -825,6 +825,19 @@ This is the recommended branch. What it changes, by subsystem:
   new failure and five `todo_wine` checks succeeding, `msg` identical failure lines.
   Smoke-tested on the desktop with Ableton Live 12, the KM88 Editor, FL Studio 2026 and
   Cubase 15 (its tool windows are ownerless and unaffected).
+  A group transient is related only to the group members the window manager managed before
+  it (KWin `X11Window::checkGroup()`, the same in 5.27 and 6.7): an owned window shown before
+  its owner — vatSys shows VSCS and ATIS behind its splash screen and the main window after
+  it — stayed unrelated to the owner, and KWin raised the main window above those two on
+  every click and activation while OzStrips, shown later, stayed above (giang17/wine issue
+  29, issue 548). Such a window now takes the owner as `WM_HINTS` group leader only while
+  the owner is visible, and showing or hiding the owner rebuilds the hints of the owned
+  windows mapped before it, so KWin regroups them behind the owner and keeps them above it
+  from then on. Measured with `latemain.c` (owner shown 2 s after two owned windows) on
+  kwin_x11: the owner lies below them from the first snapshot and the driver's corrections
+  over five click rounds drop from 8 to 0; vatSys's main window, shown after VSCS and the
+  strip windows, is never above them after the start over map clicks and activations
+  (`run-vatsys-clicks.sh`, `xprop -spy`), where before every click raised and lowered it.
 - **winex11**: a window shown without activation no longer flashes in the taskbar. KWin marks
   every normal window it does not activate on map with `_NET_WM_STATE_DEMANDS_ATTENTION`;
   Windows flashes a taskbar button only on `FlashWindowEx()` or when another process keeps the

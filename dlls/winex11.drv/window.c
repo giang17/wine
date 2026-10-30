@@ -1356,10 +1356,19 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
      * Wayland and leaving an owned window behind a maximised owner while it was being
      * moved (wine-dev issue 538).  Known cost: a group transient also stays above the
      * owned windows mapped before it, so an older sibling cannot be raised above a
-     * younger one. */
+     * younger one.
+     *
+     * KWin makes a group transient transient only for the group members it managed before
+     * it (X11Window::checkGroup), never for a member that joins the group later.  An owned
+     * window shown before its owner -- vatSys shows VSCS and ATIS behind its splash screen
+     * and the main window after it -- would stay unrelated to the owner, which the window
+     * manager then raises above it on every click (giang17/wine issue 29).  So while the
+     * owner is hidden the window forms its own group, and it joins the owner's group when
+     * the owner is shown (refresh_owned_group_hints): the changed WM_HINTS group makes KWin
+     * regroup the window behind its owner, and the owner order holds from then on. */
     if (owner_win && owner && (ex_style & WS_EX_APPWINDOW))
     {
-        group_leader = owner_win;
+        if (NtUserGetWindowLongW( owner, GWL_STYLE ) & WS_VISIBLE) group_leader = owner_win;
         owner_win = root_window;
     }
 
@@ -1534,6 +1543,39 @@ static void set_wm_hints( struct x11drv_win_data *data )
     set_size_hints( data, style );
     set_mwm_hints( data, style, ex_style );
     set_style_hints( data, style, ex_style );
+}
+
+
+/***********************************************************************
+ *              refresh_owned_group_hints
+ *
+ * The owner of group-transient WS_EX_APPWINDOW windows was shown or hidden: rebuild the
+ * WM_HINTS of the owned windows this thread has mapped, so that they join the owner's
+ * window group behind it (or leave it while the owner is hidden), see set_style_hints().
+ * Bottom-up in the win32 Z-order, so that the join order keeps the sibling order the
+ * window manager derives from it.
+ */
+static void refresh_owned_group_hints( HWND owner )
+{
+    HWND hwnd = NtUserGetWindowRelative( NtUserGetDesktopWindow(), GW_CHILD );
+
+    if (hwnd) hwnd = NtUserGetWindowRelative( hwnd, GW_HWNDLAST );
+    for (; hwnd; hwnd = NtUserGetWindowRelative( hwnd, GW_HWNDPREV ))
+    {
+        struct x11drv_win_data *data;
+
+        if (NtUserGetWindowRelative( hwnd, GW_OWNER ) != owner) continue;
+        if (!(NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_APPWINDOW)) continue;
+        if (!(NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE)) continue;
+        if (NtUserGetWindowThread( hwnd, NULL ) != GetCurrentThreadId()) continue; /* the hints go through the thread's display */
+        if (!(data = get_win_data( hwnd ))) continue;
+        if (data->whole_window && data->managed && !data->embedded && data->desired_state.wm_state != WithdrawnState)
+        {
+            TRACE( "owner %p shown or hidden, rebuilding the hints of owned window %p/%lx\n", owner, hwnd, data->whole_window );
+            set_wm_hints( data );
+        }
+        release_win_data( data );
+    }
 }
 
 
@@ -4238,6 +4280,11 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     release_win_data( data );
 
     if (was_fullscreen) NtUserClipCursor( NULL );
+
+    /* owned group transients join the group of a shown owner behind it, and leave it when the owner hides */
+    if ((swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) && !(new_style & WS_CHILD) &&
+        NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow())
+        refresh_owned_group_hints( hwnd );
 }
 
 /* check if the window icon should be hidden (i.e. moved off-screen) */
