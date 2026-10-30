@@ -697,6 +697,33 @@ This is the recommended branch. What it changes, by subsystem:
   `0x0` and the whole window. The main windows of FL Studio 2026 (no
   `WS_CAPTION`), Ableton Live 12 and Cubase 15 (client area inside the frame) keep their
   frame and geometry unchanged.
+- **win32u**: a captioned window whose client top is not where `DefWindowProc`'s
+  `WM_NCCALCSIZE` put it, or whose client `DefWindowProc` never computed, is shown with its
+  full window rectangle and without a window manager frame as well (vatSys ASD window lost
+  its title bar when maximised, giang17/wine issue 26, issue 534). `DefWindowProc` records
+  the insets it returns from `WM_NCCALCSIZE` in the window, and the visible rect
+  computation compares the client top with that record. Before, the ASD window that
+  `Windows > Air` opens (`WS_OVERLAPPEDWINDOW`, its own 26 px title strip from
+  `WM_NCCALCSIZE`) was undecorated while restored, because its client reaches into the
+  frame; maximised by its own button, the application insets the client by 4/30/4/6, the
+  client lay inside the standard frame, the visible rect shrank to it, the decorations
+  flipped to `0x7a`, KWin put its title bar over the strip and moved the window down, and
+  the application's next `WM_NCCALCSIZE` flipped the hints back with the strip outside
+  the window. Now the decorations stay `0x0` through maximise and restore, the maximised
+  window is the work area ((0,0)-(1920,1080), client (0,26)-(1920,1078)) and the strip
+  stays on screen. A test window with a 30 px strip of its own
+  (`projects/nc-titlebar-test/ncfull.c`) behaves the same at 96 and 120 DPI and in a
+  prefix whose `CaptionHeight` makes the standard inset 30 px too, which a comparison
+  against the standard metrics could not tell apart. Nine standard non-client layouts
+  (plain, client edge, scroll bars, tool window, dialog frame, menu bar, a handler that
+  takes `DefWindowProc`'s answer unchanged, one that adds a band at the bottom) keep
+  `0x7a` and `0x1a` (`stdwin.c`). Unchanged, measured by the `_MOTIF_WM_HINTS` of every
+  mapped window and a `+win` trace: Pianoteq 9, REAPER 7 and its FX window, Ableton Live
+  12 Intro, Nuendo 15 (project window, MixConsole, VST MultiPanner), Power BI Desktop and
+  the NinjaTrader 8 log-in window (both undecorated before), and vatSys's main window and
+  tool windows. The window manager places the maximised undecorated window on the work
+  area, so an application frame that `WM_NCCALCSIZE` keeps at the edge is on screen there
+  (4 px for `ncfull.c`), where Windows keeps it off screen.
 - **win32u / winex11**: a top-level window the window manager raised on its own (a click
   under X11) is brought to the top of the win32 Z-order as well, as Windows does on
   activation, and the win32 order that results is applied back to the X stacking. An

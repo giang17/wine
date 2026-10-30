@@ -73,6 +73,8 @@ typedef struct tagWND
     POINT              max_track;     /* last ptMaxTrackSize if the application set one, else 0 */
     struct ratio       track_dpi;     /* DPI ratio the track sizes are in (get_thread_dpi()) */
     BOOL               track_valid;   /* the track sizes above were cached at least once */
+    RECT               nc_insets;     /* client insets (left, top, right, bottom) DefWindowProc last computed for WM_NCCALCSIZE */
+    BOOL               nc_insets_valid; /* nc_insets were recorded at least once */
     int                swap_interval; /* OpenGL surface swap interval */
     int                pixel_format;  /* Pixel format set by the graphics driver */
     int                clip_clients;  /* Has client surfaces that needs to be clipped out */
