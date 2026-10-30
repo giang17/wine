@@ -782,6 +782,22 @@ This is the recommended branch. What it changes, by subsystem:
   now names the tool window instead of the popup. The reporter's build with the equivalent
   win32u change: 0 resyncs in 26 map clicks against 9 of 13 before, no flicker. user32 `win`
   tests: the same five failures before and after.
+  A click into a child of the active window (the map, not the main window itself) went
+  through the `WM_MOUSEACTIVATE` branch of `process_mouse_message()` and resynced as an
+  activation, i.e. with `SetWindowPos(HWND_TOP)`, although the window was active before the
+  click and Windows leaves the Z-order alone. Once owned `WS_EX_APPWINDOW` windows counted as
+  predecessors (group transients, entry below), every plain map click in vatSys moved the main
+  window to the top, `swp_owner_popups()` lifted the owned windows back above it, and the map
+  was erased and repainted in full — the map flicker the reporter still saw on Plasma 6.7.5
+  under XWayland with no change of the X stacking (giang17/wine issue 29). Such a click now
+  takes the path of a click into the window itself and only re-applies the win32 place.
+  Measured with `projects/appwindow-taskbar-test/childclick.c` (main window with a child map,
+  two owned `WS_EX_APPWINDOW` windows over it, five clicks into the map on `:99` with
+  kwin_x11): `WM_WINDOWPOSCHANGING` to the main window, `WM_ERASEBKGND` and full-size
+  `WM_PAINT` to the map 5/5/5 before, 0/0/0 after, also with the map focusing itself on
+  `WM_MOUSEMOVE` as vatSys does; vatSys map clicks resync as "already active" (3 of 3); the
+  Cubase pattern of `repro-517` (`tool`, `both`) keeps the tool window above after 8 of 8
+  clicks. user32 `msg` tests: identical failure lines; `win`: no new failure.
 - **win32u**: the palette messages of an activation are sent only on a palettized display.
   `set_active_window()` sent `WM_QUERYNEWPALETTE` to every newly active window and, when the
   window answered, broadcast `WM_PALETTEISCHANGING`. Wine's own user32 message tests, which
