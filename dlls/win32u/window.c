@@ -274,6 +274,28 @@ void *free_user_handle( HANDLE handle, unsigned short type )
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list client_surfaces = LIST_INIT( client_surfaces );
 
+/* Remember whether a client surface presents into the child hwnd by copying an
+ * offscreen client window, see update_visible_region().  Called with surfaces_lock
+ * held, which is ordered before the user lock (client_surface_present() also takes
+ * a DC under it), so the flag lives in the WND where the DC code can read it
+ * without that lock. */
+static void set_window_present_offscreen( HWND hwnd, BOOL offscreen )
+{
+    WND *win;
+
+    if (NtUserGetAncestor( hwnd, GA_ROOT ) == hwnd) offscreen = FALSE;
+    win = get_win_ptr( hwnd );
+    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    if (win->present_offscreen != offscreen)
+    {
+        TRACE( "hwnd %p presents %s\n", hwnd, offscreen ? "offscreen" : "attached" );
+        win->present_offscreen = offscreen;
+        /* the DCs of the window pick their drawable again, see update_visible_region() */
+        invalidate_dce( win, NULL );
+    }
+    release_win_ptr( win );
+}
+
 void detach_client_surfaces( HWND hwnd )
 {
     struct list detached = LIST_INIT( detached );
@@ -300,6 +322,8 @@ void detach_client_surfaces( HWND hwnd )
         list_remove( &surface->entry );
         client_surface_release( surface );
     }
+
+    set_window_present_offscreen( hwnd, FALSE );
 }
 
 static void update_client_surfaces( HWND hwnd )
@@ -372,6 +396,7 @@ void client_surface_present( struct client_surface *surface )
         if (surface->offscreen) hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE );
         surface->funcs->present( surface, hdc );
         if (hdc) NtUserReleaseDC( hwnd, hdc );
+        set_window_present_offscreen( hwnd, surface->offscreen && hdc );
     }
     pthread_mutex_unlock( &surfaces_lock );
 }

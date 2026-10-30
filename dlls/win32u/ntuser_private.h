@@ -81,6 +81,7 @@ typedef struct tagWND
     int                swap_interval; /* OpenGL surface swap interval */
     int                pixel_format;  /* Pixel format set by the graphics driver */
     int                clip_clients;  /* Has client surfaces that needs to be clipped out */
+    int                present_offscreen; /* a client surface presents offscreen into this child, see update_visible_region() */
     int                cbWndExtra;    /* class cbWndExtra at window creation */
     DWORD_PTR          userdata;      /* User private data */
     DWORD              wExtra[1];     /* Window extra bytes */
