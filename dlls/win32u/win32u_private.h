@@ -310,6 +310,7 @@ extern HWND get_shell_window(void);
 extern HWND get_progman_window(void);
 extern HWND get_taskman_window(void);
 extern BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd );
+extern void client_surface_wait( struct client_surface *surface, BOOL presented );
 extern HICON get_window_icon_info( HWND hwnd, UINT type, HICON icon, ICONINFO *ret );
 extern void init_startup_info(void);
 

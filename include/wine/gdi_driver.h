@@ -256,6 +256,10 @@ struct client_surface_funcs
     void (*update)( struct client_surface *surface );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
     void (*present)( struct client_surface *surface, HDC hdc );
+    /* optional: let present() of an offscreen surface wait until the frame has reached the client window;
+     * called from render thread without the surfaces lock, before (presented = FALSE) and after
+     * (presented = TRUE) the host present */
+    void (*wait)( struct client_surface *surface, BOOL presented );
 };
 
 struct client_surface

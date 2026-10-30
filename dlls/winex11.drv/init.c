@@ -26,12 +26,19 @@
 
 #include <stdarg.h>
 #include <string.h>
+#include <dlfcn.h>
+#include <poll.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "windef.h"
 #include "winbase.h"
 #include "winreg.h"
 #include "x11drv.h"
 #include "xcomposite.h"
+#ifdef SONAME_LIBXDAMAGE
+#include <X11/extensions/Xdamage.h>
+#endif
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
@@ -382,6 +389,8 @@ struct x11drv_client_surface
     LONG reblitting;     /* x11drv_client_surface_reblit() is presenting this surface */
     LONG offscreen_hidden; /* the surface renders offscreen only because its window is not visible */
     BOOL vulkan;         /* a Vulkan surface, created without a pixel format */
+    XID damage;          /* XDamage object on the offscreen client window, see x11drv_client_surface_wait() */
+    BOOL damage_missed;  /* the last wait timed out, wait again only once a damage event is seen */
 };
 
 /* every x11drv client surface, so that a top-level's VisibilityNotify can find
@@ -393,6 +402,8 @@ static struct x11drv_client_surface *impl_from_client_surface( struct client_sur
 {
     return CONTAINING_RECORD( client, struct x11drv_client_surface, client );
 }
+
+static void client_surface_untrack_damage( struct x11drv_client_surface *surface );
 
 static void x11drv_client_surface_destroy( struct client_surface *client )
 {
@@ -412,6 +423,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
      * installed in a live window leaves the server holding it until the window
      * goes away, and the id is then already invalid by the time anything else
      * touches it -- a BadColor from the default error handler would be fatal */
+    client_surface_untrack_damage( surface );
     if (surface->window) destroy_client_window( hwnd, surface->window );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
@@ -473,6 +485,125 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     XConfigureWindow( gdi_display, surface->window, mask, &changes );
 }
 
+/* A host Vulkan present returns before its frame has reached the composite-
+ * redirected client window of an offscreen surface: on NVIDIA the window holds the
+ * new frame 4 to 9 ms later, and vkWaitForPresentKHR() or vkQueueWaitIdle() return
+ * before that.  The present blit then copies the previous frame, and an application
+ * that presents only when something changes stays one frame behind until it
+ * presents again (vatSys strip windows with DXVK, giang17/wine issue 27).  The
+ * GL path waits for its swap before the blit (glXWaitForSbcOML(), eglWaitClient());
+ * for Vulkan the X server says when the frame has landed: the window is damaged. */
+#ifdef SONAME_LIBXDAMAGE
+static int ignore_x_error( Display *display, XErrorEvent *event, void *arg );
+
+static typeof(XDamageQueryExtension) *pXDamageQueryExtension;
+static typeof(XDamageCreate) *pXDamageCreate;
+static typeof(XDamageDestroy) *pXDamageDestroy;
+static typeof(XDamageSubtract) *pXDamageSubtract;
+static int damage_event_base;
+static BOOL use_damage;
+
+static void load_damage(void)
+{
+    int error_base;
+    void *handle;
+
+    if (!(handle = dlopen( SONAME_LIBXDAMAGE, RTLD_NOW ))) return;
+#define LOAD(f) if (!(p##f = dlsym( handle, #f ))) return
+    LOAD( XDamageQueryExtension );
+    LOAD( XDamageCreate );
+    LOAD( XDamageDestroy );
+    LOAD( XDamageSubtract );
+#undef LOAD
+    use_damage = pXDamageQueryExtension( gdi_display, &damage_event_base, &error_base );
+    TRACE( "XDamage %s, event base %d\n", use_damage ? "available" : "not available", damage_event_base );
+}
+
+static void client_surface_track_damage( struct x11drv_client_surface *surface )
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+    pthread_once( &once, load_damage );
+    if (!use_damage || !surface->vulkan || surface->damage) return;
+    surface->damage = pXDamageCreate( gdi_display, surface->window, XDamageReportNonEmpty );
+    TRACE( "%s damage %#lx on window %lx\n", debugstr_client_surface( &surface->client ), surface->damage, surface->window );
+}
+
+static Bool is_surface_damage( Display *display, XEvent *event, XPointer arg )
+{
+    return event->type == damage_event_base + XDamageNotify && ((XDamageNotifyEvent *)event)->damage == (Damage)arg;
+}
+
+static ULONGLONG monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return ts.tv_sec * (ULONGLONG)1000 + ts.tv_nsec / 1000000;
+}
+
+/* Nobody reads events from gdi_display, the damage events of every surface stay in
+ * its queue until the render thread of that surface takes them.  Before the host
+ * present the damage of earlier frames is dropped and the region emptied, so that
+ * the event after it is the one of this frame. */
+static void x11drv_client_surface_wait( struct client_surface *client, BOOL presented )
+{
+    static const unsigned int timeout = 100; /* ms, the blit goes out anyway */
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    ULONGLONG start = monotonic_ms();
+    BOOL found = FALSE;
+    XEvent event;
+
+    if (!surface->damage) return;
+
+    if (!presented)
+    {
+        while (XCheckIfEvent( gdi_display, &event, is_surface_damage, (XPointer)surface->damage )) found = TRUE;
+        pXDamageSubtract( gdi_display, surface->damage, None, None );
+        XSync( gdi_display, False );
+        while (XCheckIfEvent( gdi_display, &event, is_surface_damage, (XPointer)surface->damage )) found = TRUE;
+        if (found && surface->damage_missed)
+        {
+            TRACE( "%s damage events are back\n", debugstr_client_surface( client ) );
+            surface->damage_missed = FALSE;
+        }
+        return;
+    }
+
+    if (surface->damage_missed) return;
+
+    for (;;)
+    {
+        struct pollfd pfd = {.fd = ConnectionNumber( gdi_display ), .events = POLLIN};
+
+        if ((found = XCheckIfEvent( gdi_display, &event, is_surface_damage, (XPointer)surface->damage ))) break;
+        if (monotonic_ms() - start >= timeout) break;
+        /* another thread may move the event into the queue while this one sleeps, keep the slices short */
+        poll( &pfd, 1, 1 );
+    }
+
+    if (found)
+        TRACE( "%s frame landed after %u ms\n", debugstr_client_surface( client ), (unsigned int)(monotonic_ms() - start) );
+    else
+    {
+        WARN( "%s no damage event within %u ms, presenting without waiting\n", debugstr_client_surface( client ), timeout );
+        surface->damage_missed = TRUE;
+    }
+}
+
+static void client_surface_untrack_damage( struct x11drv_client_surface *surface )
+{
+    if (!surface->damage) return;
+    X11DRV_expect_error( gdi_display, ignore_x_error, NULL );
+    pXDamageDestroy( gdi_display, surface->damage );
+    X11DRV_check_error();
+    surface->damage = 0;
+}
+#else
+static void client_surface_track_damage( struct x11drv_client_surface *surface ) {}
+static void client_surface_untrack_damage( struct x11drv_client_surface *surface ) {}
+#define x11drv_client_surface_wait NULL
+#endif
+
 /* set a client surface up for offscreen rendering: presenting it then blits the
  * composite-redirected client window into the top-level through hdc_src/hdc_dst */
 static void client_surface_redirect_offscreen( struct x11drv_client_surface *surface )
@@ -489,6 +620,7 @@ static void client_surface_redirect_offscreen( struct x11drv_client_surface *sur
     if (usexcomposite && !InterlockedExchange( &surface->redirected, TRUE ))
         pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
 #endif
+    client_surface_track_damage( surface );
 }
 
 static int ignore_x_error( Display *display, XErrorEvent *event, void *arg )
@@ -759,6 +891,7 @@ static const struct client_surface_funcs x11drv_client_surface_funcs =
     .detach = x11drv_client_surface_detach,
     .update = x11drv_client_surface_update,
     .present = X11DRV_client_surface_present,
+    .wait = x11drv_client_surface_wait,
 };
 
 static int visual_class_alloc( int class )
