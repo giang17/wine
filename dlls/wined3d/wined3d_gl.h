@@ -690,6 +690,10 @@ struct wined3d_context_gl
     unsigned int free_pipeline_statistics_query_count;
 
     GLuint blit_vbo;
+    /* Element array buffer for indexed indirect draws, see
+     * wined3d_context_gl_bind_index_scratch_bo(). */
+    GLuint index_scratch_bo;
+    GLsizeiptr index_scratch_size;
 
     unsigned int tex_unit_map[WINED3D_MAX_COMBINED_SAMPLERS];
     unsigned int rev_tex_unit_map[MAX_GL_FRAGMENT_SAMPLERS + WINED3D_MAX_VERTEX_SAMPLERS];
