@@ -1415,8 +1415,14 @@ This is the recommended branch. What it changes, by subsystem:
   no crash address outside the EXE could be attributed. A dump of the own process is written on
   the calling thread, with that thread in the thread list and only the other threads suspended
   (backport of bcff0d4155f from Wine 11.21, Wine bug 60547), so the callbacks run on the thread
-  that called `MiniDumpWriteDump()`, as the upstream test expects of Windows. Conformance tests
-  in `dlls/dbghelp/tests/minidump.c`
+  that called `MiniDumpWriteDump()`, as the upstream test expects of Windows. A crash handler that
+  suspended the other threads before the dump no longer hangs on the loader lock inside dbghelp:
+  ntdll's Wine entry points for the system-info stream are resolved when the DLL attaches, and the
+  version information of the own process's modules is read from the mapped images instead of
+  through `GetFileVersionInfoW()`, which loads each file through the loader. What remains in that
+  scenario is the lazy resolution of the debug entry points in `winecrt0`, which every builtin DLL
+  does on its first debug check; a process that has written a dump once before does not hit it.
+  Conformance tests in `dlls/dbghelp/tests/minidump.c`
 - **avrt (MMCSS)**: `AvSetMmThreadCharacteristics`, `AvSetMmThreadPriority` and
   `AvRevertMmThreadCharacteristics` were stubs. A thread that registers for the `Pro Audio`,
   `Audio`, `Capture` or `Playback` task is now scheduled `SCHED_FIFO` (priority 3 at
