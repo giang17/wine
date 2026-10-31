@@ -321,6 +321,37 @@ static void fetch_module_versioninfo(LPCWSTR filename, VS_FIXEDFILEINFO* ffi)
 }
 
 /******************************************************************
+ *		fetch_module_versioninfo_mapped
+ *
+ * The VS_FIXEDFILEINFO of a module mapped in this process, read from the image's
+ * version resource. GetFileVersionInfoW() loads the file as a data file through
+ * the loader and takes the loader lock, which a crash handler dumping its own
+ * process must not do: one of the threads it suspended may hold that lock.
+ */
+static BOOL fetch_module_versioninfo_mapped(DWORD64 base, VS_FIXEDFILEINFO* ffi)
+{
+    HMODULE     module = (HMODULE)(ULONG_PTR)base;
+    HRSRC       rsrc;
+    HGLOBAL     res;
+    const BYTE* data;
+    DWORD       size, i;
+
+    if (!(rsrc = FindResourceW(module, MAKEINTRESOURCEW(VS_VERSION_INFO), (LPCWSTR)RT_VERSION))) return FALSE;
+    if (!(size = SizeofResource(module, rsrc)) || !(res = LoadResource(module, rsrc)) ||
+        !(data = LockResource(res))) return FALSE;
+    /* VS_VERSIONINFO: the VS_FIXEDFILEINFO follows the key, at the first 32-bit aligned offset */
+    for (i = 0; i + sizeof(*ffi) <= size; i += sizeof(DWORD))
+    {
+        if (*(const DWORD*)(data + i) == VS_FFI_SIGNATURE)
+        {
+            memcpy(ffi, data + i, sizeof(*ffi));
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/******************************************************************
  *		minidump_add_memory_block
  *
  * Add a memory block to be dumped in a minidump
@@ -566,8 +597,15 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
             mdModule.ModuleNameRva = dc->rva;
             ms->Length -= sizeof(WCHAR);
             append(dc, ms, sizeof(ULONG) + ms->Length + sizeof(WCHAR));
-            if (!dump_elf) fetch_module_versioninfo(ms->Buffer, &mdModule.VersionInfo);
-            else memset(&mdModule.VersionInfo, 0, sizeof(mdModule.VersionInfo));
+            memset(&mdModule.VersionInfo, 0, sizeof(mdModule.VersionInfo));
+            if (!dump_elf)
+            {
+                if (dc->pid == GetCurrentProcessId())
+                    /* the image is mapped here: no file access, no loader lock */
+                    fetch_module_versioninfo_mapped(dc->modules[i].base, &mdModule.VersionInfo);
+                else
+                    fetch_module_versioninfo(ms->Buffer, &mdModule.VersionInfo);
+            }
             mdModule.CvRecord.DataSize = 0; /* FIXME */
             mdModule.CvRecord.Rva = 0; /* FIXME */
             mdModule.MiscRecord.DataSize = 0; /* FIXME */
