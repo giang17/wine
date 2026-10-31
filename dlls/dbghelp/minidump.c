@@ -600,8 +600,6 @@ static  unsigned        dump_system_info(struct dump_context* dc)
     ULONG                       slen;
     DWORD                       wine_extra = 0;
 
-    const char *(CDECL *wine_get_build_id)(void);
-    void (CDECL *wine_get_host_version)(const char **sysname, const char **release);
     const char* build_id = NULL;
     const char* sys_name = NULL;
     const char* release_name = NULL;
@@ -610,14 +608,12 @@ static  unsigned        dump_system_info(struct dump_context* dc)
     osInfo.dwOSVersionInfoSize = sizeof(osInfo);
     RtlGetVersion(&osInfo);
 
-    wine_get_build_id = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_build_id");
-    wine_get_host_version = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_host_version");
-    if (wine_get_build_id && wine_get_host_version)
+    if (pwine_get_build_id && pwine_get_host_version)
     {
         /* cheat minidump system information by adding specific wine information */
         wine_extra = 4 + 4 * sizeof(slen);
-        build_id = wine_get_build_id();
-        wine_get_host_version(&sys_name, &release_name);
+        build_id = pwine_get_build_id();
+        pwine_get_host_version(&sys_name, &release_name);
         wine_extra += strlen(build_id) + 1 + strlen(sys_name) + 1 + strlen(release_name) + 1;
     }
 

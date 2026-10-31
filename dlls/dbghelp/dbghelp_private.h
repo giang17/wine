@@ -118,6 +118,10 @@ extern BOOL     dbghelp_opt_extension_api;
 extern BOOL     dbghelp_opt_real_path;
 extern BOOL     dbghelp_opt_source_actual_path;
 extern SYSTEM_INFO sysinfo;
+/* ntdll's Wine entry points, resolved when the DLL attaches: the minidump code must not take
+ * the loader lock, a crash handler may have suspended a thread that holds it */
+extern const char *(CDECL *pwine_get_build_id)(void);
+extern void (CDECL *pwine_get_host_version)(const char **sysname, const char **release);
 
 /* FIXME: this could be optimized later on by using relative offsets and smaller integral sizes */
 struct addr_range
