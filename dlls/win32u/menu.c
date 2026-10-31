@@ -537,6 +537,17 @@ static void update_invalid_menu_bar_layout( struct menu *menu, HWND hwnd )
     NtUserReleaseDC( hwnd, hdc );
 }
 
+/* The same before the menu is locked: measuring the bar sends WM_UAHINITMENU and
+ * WM_UAHMEASUREMENUITEM to its owner, and a message sent while the user lock is held
+ * ends in the assertion of user_check_not_lock(). The call under the lock that follows
+ * finds the height valid and does nothing. */
+static void update_invalid_menu_bar_layout_unlocked( HMENU handle )
+{
+    struct menu *menu = unsafe_menu_ptr( handle );
+
+    if (menu) update_invalid_menu_bar_layout( menu, menu->hWnd );
+}
+
 /***********************************************************************
  *           find_item_by_coords
  *
@@ -834,6 +845,8 @@ BOOL WINAPI NtUserGetMenuItemRect( HWND hwnd, HMENU handle, UINT item, RECT *rec
 
     if (!rect)
         return FALSE;
+
+    update_invalid_menu_bar_layout_unlocked( handle );
 
     if (!(menu = find_menu_item( handle, item, MF_BYPOSITION, &pos )))
         return FALSE;
@@ -1590,6 +1603,8 @@ INT WINAPI NtUserMenuItemFromPoint( HWND hwnd, HMENU handle, int x, int y )
     POINT pt = { .x = x, .y = y };
     struct menu *menu;
     UINT pos;
+
+    update_invalid_menu_bar_layout_unlocked( handle );
 
     if (!(menu = grab_menu_ptr(handle))) return -1;
     if (find_item_by_coords( menu, pt, &pos ) != ht_item) pos = -1;
