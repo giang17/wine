@@ -9323,56 +9323,75 @@ static const IDCompositionDevice5Vtbl dcomp_device5_vtbl =
  * path only when creation fails (issue 539).  WINE_DCOMP_REFUSE restores the
  * vanilla answer: 1 or * refuses in every process that sees the variable
  * (child processes inherit it), anything else is a comma-separated list of
- * executable names, e.g. WINE_DCOMP_REFUSE=msedgewebview2.exe keeps DComp in a
- * plug-in host and refuses it in its WebView2 processes.  Unlike
- * WINEDLLOVERRIDES=dcomp=d the DLL still loads, so modules that import it
- * statically (JUCE 8 plug-ins, Steinberg's graphics2d.dll, Studio Pro's
- * cclgui.dll) start and can be checked too.  Off by default. */
-static BOOL dcomp_refuse_device(void)
+ * names, each matched against the executable of the process and against the
+ * module that called DCompositionCreateDevice*() (issue 554).  So
+ * WINE_DCOMP_REFUSE=msedgewebview2.exe keeps DComp in a plug-in host and
+ * refuses it in its WebView2 processes, and WINE_DCOMP_REFUSE=Serum2.vst3
+ * refuses one plug-in and leaves the others in the same host on DComp.
+ * Unlike WINEDLLOVERRIDES=dcomp=d the DLL still loads, so modules that import
+ * it statically (JUCE 8 plug-ins, Steinberg's graphics2d.dll, Studio Pro's
+ * cclgui.dll) start and can be checked too.  Decided on every call: the
+ * answer depends on the caller, and devices are created rarely.  Off by
+ * default. */
+static const WCHAR *dcomp_module_base_name(HMODULE module, WCHAR *path, DWORD size)
 {
-    static int cached = -1;
-    const char *env;
-    WCHAR list[1024], path[MAX_PATH], *name, *entry, *next, *end;
-    int refuse = 0;
+    const WCHAR *name;
 
-    if (cached >= 0)
-        return cached;
+    if (!GetModuleFileNameW(module, path, size))
+        path[0] = 0;
+    return (name = wcsrchr(path, '\\')) ? name + 1 : path;
+}
+
+static BOOL dcomp_refuse_device(const WCHAR *caller_name)
+{
+    const char *env;
+    WCHAR list[1024], path[MAX_PATH], *entry, *next, *end;
+    const WCHAR *exe_name;
+    BOOL refuse = FALSE;
 
     env = getenv("WINE_DCOMP_REFUSE");
-    if (env && *env && strcmp(env, "0"))
+    if (!env || !*env || !strcmp(env, "0"))
+        return FALSE;
+
+    exe_name = dcomp_module_base_name(NULL, path, ARRAY_SIZE(path));
+    if (!strcmp(env, "1") || !strcmp(env, "*"))
+        refuse = TRUE;
+    else if (MultiByteToWideChar(CP_UTF8, 0, env, -1, list, ARRAY_SIZE(list)))
     {
-        if (!GetModuleFileNameW(NULL, path, ARRAY_SIZE(path)))
-            path[0] = 0;
-        name = (name = wcsrchr(path, '\\')) ? name + 1 : path;
-        if (!strcmp(env, "1") || !strcmp(env, "*"))
-            refuse = 1;
-        else if (MultiByteToWideChar(CP_UTF8, 0, env, -1, list, ARRAY_SIZE(list)))
+        for (entry = list; entry && !refuse; entry = next)
         {
-            for (entry = list; entry && !refuse; entry = next)
-            {
-                if ((next = wcschr(entry, ','))) *next++ = 0;
-                while (*entry == ' ') entry++;
-                end = entry + wcslen(entry);
-                while (end > entry && end[-1] == ' ') *--end = 0;
-                refuse = *entry && !wcsicmp(entry, name);
-            }
+            if ((next = wcschr(entry, ','))) *next++ = 0;
+            while (*entry == ' ') entry++;
+            end = entry + wcslen(entry);
+            while (end > entry && end[-1] == ' ') *--end = 0;
+            refuse = *entry && (!wcsicmp(entry, exe_name) || (*caller_name && !wcsicmp(entry, caller_name)));
         }
-        if (refuse)
-            FIXME("WINE_DCOMP_REFUSE=%s: refusing DirectComposition devices in %s with E_NOTIMPL, as vanilla does.\n",
-                    debugstr_a(env), debugstr_w(name));
     }
-    /* Set once and only after the decision: a second thread must not see a
-     * half-made answer.  Two threads racing here both compute the same. */
-    cached = refuse;
+    if (refuse)
+        FIXME("WINE_DCOMP_REFUSE=%s: refusing DirectComposition devices for %s in %s with E_NOTIMPL, as vanilla does.\n",
+                debugstr_a(env), debugstr_w(caller_name), debugstr_w(exe_name));
     return refuse;
 }
 
-static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void **device)
+/* caller is the return address of the exported entry point.  Its module is
+ * the name WINE_DCOMP_REFUSE needs: the plug-in itself for JUCE 8 and VSTGUI
+ * plug-ins and msedge.dll for WebView2 (measured); Studio Pro's cclgui.dll and
+ * Steinberg's graphics2d.dll import dcomp and are probably theirs.  Not always
+ * the plug-in or the executable, so every device creation names it in the
+ * log. */
+static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void **device, const void *caller)
 {
     struct dcomp_device *object;
+    WCHAR caller_path[MAX_PATH];
+    const WCHAR *caller_name = L"";
+    HMODULE caller_module;
     HRESULT hr;
 
-    if (dcomp_refuse_device())
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            caller, &caller_module))
+        caller_name = dcomp_module_base_name(caller_module, caller_path, ARRAY_SIZE(caller_path));
+
+    if (dcomp_refuse_device(caller_name))
     {
         if (device)
             *device = NULL;
@@ -9403,8 +9422,8 @@ static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void 
                     object->d2d1_device);
     }
 
-    FIXME("Created dcomp device %p (rendering_device %p, d2d1_device %p).\n",
-            object, rendering_device, object->d2d1_device);
+    FIXME("Created dcomp device %p for %s (rendering_device %p, d2d1_device %p).\n",
+            object, debugstr_w(caller_name), rendering_device, object->d2d1_device);
 
     return IDCompositionDevice_QueryInterface(&object->IDCompositionDevice_iface, iid, device);
 }
@@ -9427,21 +9446,21 @@ HRESULT WINAPI DCompositionCreateDevice(IDXGIDevice *dxgi_device, REFIID iid, vo
 {
     TRACE("dxgi_device %p, iid %s, device %p.\n", dxgi_device, debugstr_guid(iid), device);
 
-    return dcomp_device_create((IUnknown *)dxgi_device, iid, device);
+    return dcomp_device_create((IUnknown *)dxgi_device, iid, device, __builtin_return_address(0));
 }
 
 HRESULT WINAPI DCompositionCreateDevice2(IUnknown *rendering_device, REFIID iid, void **device)
 {
     TRACE("rendering_device %p, iid %s, device %p.\n", rendering_device, debugstr_guid(iid), device);
 
-    return dcomp_device_create(rendering_device, iid, device);
+    return dcomp_device_create(rendering_device, iid, device, __builtin_return_address(0));
 }
 
 HRESULT WINAPI DCompositionCreateDevice3(IUnknown *rendering_device, REFIID iid, void **device)
 {
     TRACE("rendering_device %p, iid %s, device %p.\n", rendering_device, debugstr_guid(iid), device);
 
-    return dcomp_device_create(rendering_device, iid, device);
+    return dcomp_device_create(rendering_device, iid, device, __builtin_return_address(0));
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
