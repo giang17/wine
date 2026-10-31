@@ -394,6 +394,22 @@ This is the recommended branch. What it changes, by subsystem:
   `RtlWaitOnAddress()` entry is unlinked with release semantics and re-checked with acquire
   semantics, so a waiter cannot see its address cleared before the unlink is visible
   (ntdll, the queue the loader-lock wake above runs through)
+- **Backports from Wine 11.21** (nine upstream commits plus one test, cherry-picked with
+  their origin): the QPC values the audio drivers return with a capture buffer and a stream
+  position are passed through instead of being converted with `stamp * 10000000 / frequency`
+  — Wine's counter already counts 100 ns from `CLOCK_BOOTTIME`, and the product overflowed a
+  signed 64-bit integer after about 25.6 hours of system uptime (all four drivers; built
+  here: winealsa, winepulse); a failed Vulkan swapchain recreation no longer leaves the
+  destroyed swapchain and its freed semaphores referenced for the next present (wined3d, Wine
+  bug 58935); `parse_effect_inputs()` fetches the `Inputs` property again after adding
+  `MinInputs`/`MaxInputs`, which can reallocate the property array, and the failure paths of
+  `d2d_effect_create()` and of the WIC target initialisation release what they created
+  (d2d1); a font-set property pointer starts out NULL and the `HIDDEN` flag of a variation
+  axis is tested after the byte swap, not before (dwrite); and the flatness of a Bézier curve
+  is measured relative to its start point, so curves far from the origin are no longer split
+  into many more points than needed, while a curve with non-finite points or zero flatness no
+  longer loops forever (gdiplus, Wine bug 60041). The test of the translated curve is taken
+  without the warp-path tests next to it upstream, which came after 11.0
 - **wintypes**: `RoResolveNamespace()` looks up the `.winmd` files in `system32\WinMetadata`
   (backport of 5542cd8541f and 03d18c456aa from Wine 11.19, with their tests). The stub
   returned `RO_E_METADATA_NAME_NOT_FOUND` for every namespace, and the .NET Framework resolves
