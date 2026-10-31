@@ -796,7 +796,7 @@ static void test_scan_memory(void)
     data = minidump_open_for_read("foo.mdmp");
     ret = MiniDumpReadDumpStream(data, ModuleListStream, NULL, (void**)&module_list, NULL);
     ok(ret && module_list, "Couldn't find module-list stream\n");
-    ok(module_list->NumberOfModules == cb_info.num_referenced, "Unexpected number of modules %lu (%u)\n",
+    ok(module_list->NumberOfModules == cb_info.num_referenced, "Unexpected number of modules %u (%u)\n",
        module_list->NumberOfModules, cb_info.num_referenced);
     ok(minidump_has_module(data, (DWORD_PTR)GetModuleHandleW(NULL)), "Main module missing from the dump\n");
     ok(minidump_has_module(data, (DWORD_PTR)GetModuleHandleW(L"ntdll.dll")), "ntdll missing from the dump\n");
