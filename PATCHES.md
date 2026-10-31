@@ -235,8 +235,13 @@ This is the recommended branch. What it changes, by subsystem:
   off); `WINE_DCOMP_REFUSE` makes `DCompositionCreateDevice()`, `DCompositionCreateDevice2()`
   and `DCompositionCreateDevice3()` fail with `E_NOTIMPL` as vanilla Wine does — `1` in every
   process that sees the variable (child processes inherit it), or a comma-separated list of
-  executables such as `msedgewebview2.exe` — to check whether an application runs correctly
-  without DComp. Unlike `WINEDLLOVERRIDES=dcomp=d` the DLL still loads, which the modules that
+  names, each matched against the executable of the process and against the module that
+  called the function — to check whether an application runs correctly without DComp.
+  `msedgewebview2.exe` keeps DComp in a plug-in host and refuses it in its WebView2 processes;
+  `Serum2.vst3` refuses one plug-in and leaves the others in the same host on DComp. The
+  calling module is the plug-in itself for JUCE 8 and VSTGUI plug-ins and `msedge.dll` for
+  WebView2 (measured); dcomp names it in the log with every device it creates and every one
+  it refuses, so the name to use can be read there. Unlike `WINEDLLOVERRIDES=dcomp=d` the DLL still loads, which the modules that
   import it statically need to load at all (129 of 186 dcomp users in the test prefix: JUCE 8
   plug-ins, Steinberg's `graphics2d.dll`, Studio Pro's `cclgui.dll`). Measured with it, the
   plug-ins in REAPER on Xvfb: Serum 2 (VSTGUI) draws its editor through a plain swapchain,
@@ -244,7 +249,10 @@ This is the recommended branch. What it changes, by subsystem:
   swapchain, never presents and stays black. Power BI Desktop 2.158 on an NVIDIA desktop: the
   WebView2 155 GPU process ends on a breakpoint exception in `msedge.dll` and is restarted five
   times, the window stays black and in the end no WebView2 process is left — the same as with
-  `dcomp=d`. Off by default
+  `dcomp=d`. Per module, REAPER with Serum 2 and a JUCE 8 plug-in open at the same time and
+  `Serum2.vst3` refused: Serum 2 takes the plain swapchain and draws pixel-identical, Cymatics
+  Hotline on Xvfb and EPROM - Memory Rites on the NVIDIA desktop keep their composition swap
+  chain and present as without the variable. Off by default
 - **DComp on a layered top-level without attributes**: a rootless visual tree whose target
   is a top-level window with `WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP` and no layered
   attributes is presented with `UpdateLayeredWindow()`, composited over a transparent
