@@ -1348,10 +1348,13 @@ static bool use_buffer_chunk_suballocation(struct wined3d_device_gl *device_gl,
             return true;
 
         case GL_ELEMENT_ARRAY_BUFFER:
-            /* There is no way to specify an element array buffer offset for
-             * indirect draws in OpenGL. */
-            return device_gl->d.wined3d->flags & WINED3D_NO_DRAW_INDIRECT
-                    || !gl_info->supported[ARB_DRAW_INDIRECT];
+            /* OpenGL has no element array buffer offset for indirect draws;
+             * wined3d_context_gl_draw_indirect() copies the indices of a
+             * suballocated index buffer to a scratch buffer for those.
+             * Without suballocation every WRITE_DISCARD map of a dynamic
+             * index buffer creates a buffer object through the CS and waits
+             * for it (issue 561). */
+            return true;
 
         case GL_TEXTURE_BUFFER:
             return gl_info->supported[ARB_TEXTURE_BUFFER_RANGE];

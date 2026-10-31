@@ -1442,6 +1442,9 @@ static void wined3d_context_gl_cleanup(struct wined3d_context_gl *context_gl)
         if (context_gl->blit_vbo)
             GL_EXTCALL(glDeleteBuffers(1, &context_gl->blit_vbo));
 
+        if (context_gl->index_scratch_bo)
+            GL_EXTCALL(glDeleteBuffers(1, &context_gl->index_scratch_bo));
+
         for (i = 0; i < context_gl->free_pipeline_statistics_query_count; ++i)
         {
             union wined3d_gl_pipeline_statistics_query *q = &context_gl->free_pipeline_statistics_queries[i];
@@ -4825,6 +4828,43 @@ static void wined3d_context_gl_draw_primitive_arrays(struct wined3d_context_gl *
     }
 }
 
+/* glDrawElementsIndirect() reads the indices from the start of the bound
+ * element array buffer; unlike glDrawElements() it takes no offset into it.
+ * Copy the indices, starting at "src_offset" in "src_bo", to the start of a
+ * scratch buffer and bind that instead.  Binding through
+ * wined3d_context_gl_bind_bo() invalidates STATE_INDEXBUFFER, so the next
+ * draw binds the index buffer again. */
+static void wined3d_context_gl_bind_index_scratch_bo(struct wined3d_context_gl *context_gl,
+        struct wined3d_bo_gl *src_bo, GLintptr src_offset, GLsizeiptr size)
+{
+    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+
+    if (!gl_info->supported[ARB_COPY_BUFFER])
+    {
+        static unsigned int once;
+
+        if (!once++)
+            FIXME("ARB_copy_buffer is not supported; ignoring the index buffer offset of indirect draws.\n");
+        return;
+    }
+
+    if (!context_gl->index_scratch_bo)
+        GL_EXTCALL(glGenBuffers(1, &context_gl->index_scratch_bo));
+    wined3d_context_gl_bind_bo(context_gl, GL_ELEMENT_ARRAY_BUFFER, context_gl->index_scratch_bo);
+    if (context_gl->index_scratch_size < size)
+    {
+        GL_EXTCALL(glBufferData(GL_ELEMENT_ARRAY_BUFFER, size, NULL, GL_STREAM_COPY));
+        context_gl->index_scratch_size = size;
+    }
+
+    GL_EXTCALL(glBindBuffer(GL_COPY_READ_BUFFER, src_bo->id));
+    GL_EXTCALL(glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_ELEMENT_ARRAY_BUFFER, src_offset, 0, size));
+    GL_EXTCALL(glBindBuffer(GL_COPY_READ_BUFFER, 0));
+    checkGLcall("copy indices to the scratch buffer");
+
+    wined3d_context_gl_reference_bo(context_gl, src_bo);
+}
+
 static void wined3d_context_gl_draw_indirect(struct wined3d_context_gl *context_gl, const struct wined3d_state *state,
         const struct wined3d_indirect_draw_parameters *parameters, unsigned int idx_size)
 {
@@ -4845,8 +4885,16 @@ static void wined3d_context_gl_draw_indirect(struct wined3d_context_gl *context_
     if (idx_size)
     {
         GLenum idx_type = idx_size == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
-        if (state->index_offset)
-            FIXME("Ignoring index offset %u.\n", state->index_offset);
+        const struct wined3d_buffer *index_buffer = state->index_buffer;
+        struct wined3d_bo *index_bo = index_buffer ? index_buffer->buffer_object : NULL;
+
+        /* An index buffer suballocated from a chunk does not start at offset 0
+         * of its GL buffer, see use_buffer_chunk_suballocation(). */
+        if (index_bo && (index_bo->buffer_offset || state->index_offset)
+                && state->index_offset < index_buffer->resource.size)
+            wined3d_context_gl_bind_index_scratch_bo(context_gl, wined3d_bo_gl(index_bo),
+                    index_bo->buffer_offset + state->index_offset,
+                    index_buffer->resource.size - state->index_offset);
         GL_EXTCALL(glDrawElementsIndirect(gl_primitive_type, idx_type, offset));
     }
     else
