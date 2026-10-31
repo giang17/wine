@@ -20847,7 +20847,9 @@ static void test_uint_shader_instructions(void)
 
 static void test_index_buffer_offset(void)
 {
-    ID3D11Buffer *vb, *ib, *so_buffer, *args_buffer;
+    ID3D11Buffer *vb, *ib, *so_buffer, *args_buffer, *first_ib;
+    D3D11_MAPPED_SUBRESOURCE map_desc;
+    D3D11_BUFFER_DESC buffer_desc;
     struct d3d11_test_context test_context;
     ID3D11InputLayout *input_layout;
     ID3D11DeviceContext *context;
@@ -20983,7 +20985,28 @@ static void test_index_buffer_offset(void)
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
 
     vb = create_buffer(device, D3D11_BIND_VERTEX_BUFFER, sizeof(vertices), vertices);
-    ib = create_buffer(device, D3D11_BIND_INDEX_BUFFER, sizeof(indices), indices);
+    /* A dynamic index buffer, written through a WRITE_DISCARD map after
+     * another one with different indices, so that an implementation that
+     * suballocates dynamic buffers does not place it at the start of the
+     * underlying buffer, and reading from there gives a different result. */
+    buffer_desc.ByteWidth = sizeof(indices);
+    buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+    buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    buffer_desc.MiscFlags = 0;
+    buffer_desc.StructureByteStride = 0;
+    hr = ID3D11Device_CreateBuffer(device, &buffer_desc, NULL, &first_ib);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D11Device_CreateBuffer(device, &buffer_desc, NULL, &ib);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)first_ib, 0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    memset(map_desc.pData, 0, sizeof(indices));
+    ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)first_ib, 0);
+    hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)ib, 0, D3D11_MAP_WRITE_DISCARD, 0, &map_desc);
+    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+    memcpy(map_desc.pData, indices, sizeof(indices));
+    ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)ib, 0);
     so_buffer = create_buffer(device, D3D11_BIND_STREAM_OUTPUT, 1024, NULL);
 
     ID3D11DeviceContext_VSSetShader(context, vs, NULL, 0);
@@ -21056,6 +21079,7 @@ static void test_index_buffer_offset(void)
 
     ID3D11Buffer_Release(so_buffer);
     ID3D11Buffer_Release(args_buffer);
+    ID3D11Buffer_Release(first_ib);
     ID3D11Buffer_Release(ib);
     ID3D11Buffer_Release(vb);
     ID3D11VertexShader_Release(vs);
