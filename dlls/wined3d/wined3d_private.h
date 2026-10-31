@@ -2632,7 +2632,12 @@ HRESULT wined3d_output_get_gamma_ramp(struct wined3d_output *output, struct wine
 #ifdef _WIN64
 #define MAX_PERSISTENT_MAPPED_BYTES I64_MAX
 #else
-#define MAX_PERSISTENT_MAPPED_BYTES (128 * 1024 * 1024)
+/* With 64 MiB allocator chunks, 128 MiB kept only two chunks mapped; from the
+ * third one on every BO was unmapped after use and the next upload went through
+ * the CS (issue 561: ~40 000 CS round trips per full redraw in a 32-bit
+ * application).  Under WoW64, opengl32 keeps the Vulkan mapping of a buffer
+ * until the buffer is destroyed, so an unmap here frees no address space. */
+#define MAX_PERSISTENT_MAPPED_BYTES (1024 * 1024 * 1024)
 #endif
 
 /* The adapter structure */
