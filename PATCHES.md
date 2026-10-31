@@ -1406,6 +1406,17 @@ This is the recommended branch. What it changes, by subsystem:
   out and every Steinberg product opened its login page at start. The attributes are now
   stored with the credential and returned by the read, enumerate and ANSI functions; a
   conformance test in `dlls/advapi32/tests/cred.c` covers the round trip
+- **dbghelp (minidumps)**: with `MiniDumpScanMemory`, `MiniDumpWriteDump()` scans the thread
+  stacks it writes for pointers into the loaded modules and sets `ModuleReferencedByMemory` on
+  those modules before the `ModuleCallback`, as MSDN describes. The common crash-handler callback
+  keeps only the modules with that flag; Wine never set it, so the minidumps Steinberg's crash
+  handler writes (Cubase 13/15, HALion Sonic and The Grand 3 standalones; dump type
+  `MiniDumpScanMemory | MiniDumpWithIndirectlyReferencedMemory`) carried an empty module list, and
+  no crash address outside the EXE could be attributed. A dump of the own process is written on
+  the calling thread, with that thread in the thread list and only the other threads suspended
+  (backport of bcff0d4155f from Wine 11.21, Wine bug 60547), so the callbacks run on the thread
+  that called `MiniDumpWriteDump()`, as the upstream test expects of Windows. Conformance tests
+  in `dlls/dbghelp/tests/minidump.c`
 - **avrt (MMCSS)**: `AvSetMmThreadCharacteristics`, `AvSetMmThreadPriority` and
   `AvRevertMmThreadCharacteristics` were stubs. A thread that registers for the `Pro Audio`,
   `Audio`, `Capture` or `Playback` task is now scheduled `SCHED_FIFO` (priority 3 at
