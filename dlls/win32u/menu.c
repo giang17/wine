@@ -2373,10 +2373,16 @@ static void calc_menu_bar_size( HDC hdc, POINT pos, UINT width, struct menu *men
 UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y )
 {
     RECT rect = { org_x, org_y, org_x + width, 0 };
+    struct menu *menu;
     UINT height;
     HDC hdc;
 
     TRACE( "hwnd %p, width %d, at (%d, %d).\n", hwnd, width, org_x, org_y );
+
+    /* NtUserDrawMenuBarTemp() lays the bar out only while its height is invalid, and
+     * the height is invalidated only when the items change. The bar wraps by width:
+     * a height laid out for another width is invalid too. */
+    if ((menu = unsafe_menu_ptr( get_menu( hwnd ) )) && menu->Width != width) menu->Height = 0;
 
     hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_WINDOW );
     height = NtUserDrawMenuBarTemp( hwnd, hdc, &rect, 0, 0 );
