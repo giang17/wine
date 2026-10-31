@@ -409,6 +409,43 @@ DWORD get_compat_mode_version(compat_mode_t compat_mode)
 }
 
 /*
+ * IE 10 and 11 give a flex item a minimum size of zero.  The automatic minimum
+ * size of the CSS flexbox spec, the item's content size, which Gecko
+ * implements, they never had.  Pages written for them size a flex item to its
+ * container and let a child of it scroll; under Gecko the item grows to its
+ * content instead and runs out of the container -- in Power BI Desktop's
+ * options dialog over the footer, where it covered the OK and Cancel buttons
+ * with a transparent box that took every click.  An agent sheet gives every
+ * element the IE minimum; it only changes anything for flex items, the
+ * automatic minimum of all other elements is zero already, and any rule of
+ * the page itself still overrides it.
+ */
+static void load_ie_flex_minimum_sheet(HTMLDocumentNode *doc)
+{
+    static const char sheet[] = "data:text/css,*%7Bmin-width:0;min-height:0%7D";
+    nsIDOMWindowUtils *window_utils = NULL;
+    HTMLOuterWindow *outer;
+    nsACString uri;
+    nsresult nsres;
+
+    /* nsIDOMWindowUtils loads into the window's current document; document
+     * fragments share their window with it and lock a mode of their own. */
+    if(!doc->window || doc->window->doc != doc || !(outer = doc->window->base.outer_window)
+       || outer->base.inner_window != doc->window || !outer->nswindow)
+        return;
+    get_nsinterface((nsISupports*)outer->nswindow, &IID_nsIDOMWindowUtils, (void**)&window_utils);
+    if(!window_utils)
+        return;
+
+    nsACString_InitDepend(&uri, sheet);
+    nsres = nsIDOMWindowUtils_LoadSheetUsingURIString(window_utils, &uri, 0 /* AGENT_SHEET */);
+    if(NS_FAILED(nsres))
+        WARN("LoadSheetUsingURIString failed: %08lx\n", nsres);
+    nsACString_Finish(&uri);
+    nsIDOMWindowUtils_Release(window_utils);
+}
+
+/*
  * We may change document mode only in early stage of document lifetime.
  * Later attempts will not have an effect.
  */
@@ -428,6 +465,8 @@ compat_mode_t lock_document_mode(HTMLDocumentNode *doc)
 
         if(doc->html_document)
             nsIDOMHTMLDocument_SetIECompatMode(doc->html_document, get_compat_mode_version(doc->document_mode));
+        if(doc->document_mode >= COMPAT_MODE_IE10)
+            load_ie_flex_minimum_sheet(doc);
     }
 
     TRACE("%p: %d\n", doc, doc->document_mode);

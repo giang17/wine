@@ -4358,11 +4358,21 @@ static void test_CreateFontFaceFromHdc(void)
     IDWriteFontFileStream *stream, *stream2;
     void *font_data, *fragment_context;
     struct font_realization_info info;
+    IDWriteFontCollection *collection;
     const void *refkey, *fragment;
     IDWriteFontFileLoader *loader;
     DWORD data_size, num_fonts;
+    IDWriteFont *font;
     IDWriteGdiInterop *interop;
     IDWriteFontFace *fontface;
+    IDWriteLocalFontFileLoader *local_loader;
+    DWRITE_FONT_FILE_TYPE filetype;
+    DWRITE_FONT_FACE_TYPE facetype;
+    IDWriteFontFace *fontface2;
+    UINT32 length, num_faces;
+    IDWriteFontFile *file2;
+    BOOL is_supported;
+    WCHAR *upper, *p;
     IDWriteFactory *factory;
     UINT64 size, writetime;
     IDWriteFontFile *file;
@@ -4427,6 +4437,74 @@ static void test_CreateFontFaceFromHdc(void)
     IDWriteFontFileLoader_Release(loader);
     IDWriteFontFile_Release(file);
 
+    IDWriteFontFace_Release(fontface);
+    DeleteObject(SelectObject(hdc, oldhfont));
+
+    /* A face backed by an installed file maps back to the system collection. */
+    logfont.lfItalic = 0;
+    hfont = CreateFontIndirectW(&logfont);
+    oldhfont = SelectObject(hdc, hfont);
+
+    fontface = NULL;
+    hr = IDWriteGdiInterop_CreateFontFaceFromHdc(interop, hdc, &fontface);
+    ok(hr == S_OK, "Failed to create font face, hr %#lx.\n", hr);
+
+    hr = IDWriteFactory_GetSystemFontCollection(factory, &collection, FALSE);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    font = NULL;
+    hr = IDWriteFontCollection_GetFontFromFontFace(collection, fontface, &font);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    if (font)
+        IDWriteFont_Release(font);
+
+    /* The same installed file referenced under another spelling of its name. */
+    count = 1;
+    hr = IDWriteFontFace_GetFiles(fontface, &count, &file);
+    ok(hr == S_OK, "Failed to get font files, hr %#lx.\n", hr);
+    hr = IDWriteFontFile_GetLoader(file, &loader);
+    ok(hr == S_OK, "Failed to get file loader, hr %#lx.\n", hr);
+    local_loader = NULL;
+    hr = IDWriteFontFileLoader_QueryInterface(loader, &IID_IDWriteLocalFontFileLoader, (void **)&local_loader);
+    ok(hr == S_OK || broken(hr == E_NOINTERFACE) /* Vista */, "Expected local loader, hr %#lx.\n", hr);
+    IDWriteFontFileLoader_Release(loader);
+    if (local_loader)
+    {
+        hr = IDWriteFontFile_GetReferenceKey(file, &refkey, &count);
+        ok(hr == S_OK, "Failed to get reference key, hr %#lx.\n", hr);
+        hr = IDWriteLocalFontFileLoader_GetFilePathLengthFromKey(local_loader, refkey, count, &length);
+        ok(hr == S_OK, "Failed to get path length, hr %#lx.\n", hr);
+        upper = malloc((length + 1) * sizeof(*upper));
+        hr = IDWriteLocalFontFileLoader_GetFilePathFromKey(local_loader, refkey, count, upper, length + 1);
+        ok(hr == S_OK, "Failed to get path, hr %#lx.\n", hr);
+        /* Upper-case the file name, keep the directory. */
+        for (p = wcsrchr(upper, '\\'); p && *p; ++p)
+            if (*p >= 'a' && *p <= 'z') *p -= 'a' - 'A';
+
+        hr = IDWriteFactory_CreateFontFileReference(factory, upper, NULL, &file2);
+        ok(hr == S_OK, "Failed to create file reference, hr %#lx.\n", hr);
+        is_supported = FALSE;
+        hr = IDWriteFontFile_Analyze(file2, &is_supported, &filetype, &facetype, &num_faces);
+        ok(hr == S_OK && is_supported, "Unexpected hr %#lx, supported %d.\n", hr, is_supported);
+        fontface2 = NULL;
+        hr = IDWriteFactory_CreateFontFace(factory, facetype, 1, &file2, IDWriteFontFace_GetIndex(fontface),
+                DWRITE_FONT_SIMULATIONS_NONE, &fontface2);
+        ok(hr == S_OK, "Failed to create font face, hr %#lx.\n", hr);
+
+        font = NULL;
+        hr = IDWriteFontCollection_GetFontFromFontFace(collection, fontface2, &font);
+        ok(hr == S_OK, "Unexpected hr %#lx for %s.\n", hr, wine_dbgstr_w(upper));
+        if (font)
+            IDWriteFont_Release(font);
+
+        IDWriteFontFace_Release(fontface2);
+        IDWriteFontFile_Release(file2);
+        free(upper);
+        IDWriteLocalFontFileLoader_Release(local_loader);
+    }
+    IDWriteFontFile_Release(file);
+
+    IDWriteFontCollection_Release(collection);
     IDWriteFontFace_Release(fontface);
     DeleteObject(SelectObject(hdc, oldhfont));
 

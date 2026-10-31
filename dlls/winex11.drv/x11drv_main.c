@@ -73,6 +73,7 @@ BOOL use_primary_selection = FALSE;
 BOOL use_system_cursors = TRUE;
 BOOL grab_fullscreen = FALSE;
 BOOL managed_mode = TRUE;
+BOOL decorate_tool_windows = TRUE;
 BOOL private_color_map = FALSE;
 int primary_monitor = 0;
 BOOL client_side_graphics = TRUE;
@@ -130,6 +131,8 @@ const char * const X11DRV_atom_names[NB_XATOMS - FIRST_XATOM] =
     "_KDE_NET_WM_STATE_SKIP_SWITCHER",
     "_MOTIF_WM_HINTS",
     "_NET_ACTIVE_WINDOW",
+    "_NET_CLIENT_LIST_STACKING",
+    "_NET_RESTACK_WINDOW",
     "_NET_STARTUP_INFO_BEGIN",
     "_NET_STARTUP_INFO",
     "_NET_SUPPORTED",
@@ -157,6 +160,7 @@ const char * const X11DRV_atom_names[NB_XATOMS - FIRST_XATOM] =
     "_NET_WM_WINDOW_TYPE_DIALOG",
     "_NET_WM_WINDOW_TYPE_NORMAL",
     "_NET_WM_WINDOW_TYPE_UTILITY",
+    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
     "_NET_WORKAREA",
     "_GTK_WORKAREAS_D0",
     "_XEMBED",
@@ -217,7 +221,10 @@ static inline BOOL ignore_error( Display *display, XErrorEvent *event )
     {
         if (event->error_code == BadDrawable ||
             event->error_code == BadGC ||
-            event->error_code == BadWindow)
+            event->error_code == BadWindow ||
+            /* a colormap is released with the window it is installed in, so an
+             * id kept across that window's destruction is already invalid */
+            event->error_code == BadColor)
             return TRUE;
 #ifdef HAVE_X11_EXTENSIONS_XRENDER_H
         if (xrender_error_base)  /* check for XRender errors */
@@ -452,6 +459,9 @@ static void setup_options(void)
 
     if (!get_config_key( hkey, appkey, "Managed", buffer, sizeof(buffer) ))
         managed_mode = IS_OPTION_TRUE( buffer[0] );
+
+    if (!get_config_key( hkey, appkey, "DecorateToolWindows", buffer, sizeof(buffer) ))
+        decorate_tool_windows = IS_OPTION_TRUE( buffer[0] );
 
     if (!get_config_key( hkey, appkey, "UseEGL", buffer, sizeof(buffer) ))
         use_egl = IS_OPTION_TRUE( buffer[0] );

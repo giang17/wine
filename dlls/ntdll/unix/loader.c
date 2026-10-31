@@ -104,6 +104,7 @@ void *pKiUserEmulationDispatcher = NULL;
 void *pLdrInitializeThunk = NULL;
 void *pRtlUserThreadStart = NULL;
 void *p__wine_ctrl_routine = NULL;
+void *pWow64DbgUiRemoteBreakin = NULL;
 SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock = NULL;
 
 #ifdef __GNUC__
@@ -1593,6 +1594,7 @@ static void load_ntdll_wow64_functions( HMODULE module )
 #undef GET_FUNC
 
     p__wine_ctrl_routine = (void *)find_named_export( module, exports, "__wine_ctrl_routine" );
+    pWow64DbgUiRemoteBreakin = (void *)find_named_export( module, exports, "DbgUiRemoteBreakin" );
 
 #ifdef _WIN64
     {

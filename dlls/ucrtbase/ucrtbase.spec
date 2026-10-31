@@ -15,15 +15,15 @@
 @ cdecl -arch=i386 _CItan()
 @ cdecl -arch=i386 _CItanh()
 @ cdecl -norelay _Cbuild(double double)
-@ stub _Cmulcc
-@ stub _Cmulcr
+@ cdecl -norelay _Cmulcc(int128 int128)
+@ cdecl -norelay _Cmulcr(int128 double)
 @ cdecl _CreateFrameInfo(ptr ptr)
 @ stdcall _CxxThrowException(ptr ptr)
 @ cdecl -arch=i386 -norelay _EH_prolog()
 @ cdecl _Exit(long) _exit
 @ cdecl -norelay _FCbuild(float float)
-@ stub _FCmulcc
-@ stub _FCmulcr
+@ cdecl -norelay _FCmulcc(int64 int64)
+@ cdecl -norelay _FCmulcr(int64 float)
 @ cdecl _FindAndUnlinkFrame(ptr)
 @ stub _GetImageBase
 @ stub _GetThrowImageBase
@@ -2183,8 +2183,8 @@
 @ cdecl btowc(long)
 @ stub c16rtomb
 @ stub c32rtomb
-@ stub cabs
-@ stub cabsf
+@ cdecl cabs(int128)
+@ cdecl cabsf(int64)
 @ stub cabsl
 @ stub cacos
 @ stub cacosf
@@ -2220,7 +2220,7 @@
 @ cdecl ceil(double)
 @ cdecl -arch=!i386 ceilf(float)
 @ cdecl -norelay cexp(int128)
-@ stub cexpf
+@ cdecl -norelay cexpf(int64)
 @ stub cexpl
 @ cdecl cimag(int128)
 @ cdecl cimagf(int64)
@@ -2234,8 +2234,8 @@
 @ stub clog10l
 @ stub clogf
 @ stub clogl
-@ stub conj
-@ stub conjf
+@ cdecl -norelay conj(int128)
+@ cdecl -norelay conjf(int64)
 @ stub conjl
 @ cdecl copysign(double double)
 @ cdecl copysignf(float float)
@@ -2244,7 +2244,7 @@
 @ cdecl -arch=!i386 cosf(float)
 @ cdecl cosh(double)
 @ cdecl -arch=!i386 coshf(float)
-@ stub cpow
+@ cdecl -norelay cpow(int128 int128)
 @ stub cpowf
 @ stub cpowl
 @ stub cproj
@@ -2260,7 +2260,7 @@
 @ stub csinhl
 @ stub csinl
 @ stub csqrt
-@ stub csqrtf
+@ cdecl -norelay csqrtf(int64)
 @ stub csqrtl
 @ stub ctan
 @ stub ctanf

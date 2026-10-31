@@ -32,9 +32,17 @@ HKLM
                 {
                     NoRemove Tokens
                     {
-                        NoRemove 'Wine Default Voice'
+                        NoRemove 'Wine Default Voice' = s 'Wine Default Voice'
                         {
+                            val '409' = s 'Wine Default Voice'
                             NoRemove Attributes
+                            {
+                                val Age = s 'Adult'
+                                val Gender = s 'Neutral'
+                                val Language = s '409'
+                                val Name = s 'Wine Default Voice'
+                                val Vendor = s 'Wine'
+                            }
                         }
                     }
                 }

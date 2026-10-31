@@ -874,8 +874,40 @@ NTSTATUS WINAPI NtPrivilegeCheck( HANDLE token, PRIVILEGE_SET *privs, BOOLEAN *r
  */
 NTSTATUS WINAPI NtImpersonateAnonymousToken( HANDLE thread )
 {
-    FIXME( "(%p): stub\n", thread );
-    return STATUS_NOT_IMPLEMENTED;
+    static const SID anonymous_sid = { SID_REVISION, 1, { SECURITY_NT_AUTHORITY }, { SECURITY_ANONYMOUS_LOGON_RID } };
+    SECURITY_QUALITY_OF_SERVICE qos = { sizeof(qos), SecurityImpersonation, SECURITY_STATIC_TRACKING, FALSE };
+    OBJECT_ATTRIBUTES attr;
+    TOKEN_USER user;
+    TOKEN_GROUPS groups;
+    TOKEN_PRIMARY_GROUP group;
+    TOKEN_PRIVILEGES privs;
+    LARGE_INTEGER expire;
+    unsigned int status;
+    HANDLE token;
+    LUID id;
+
+    TRACE( "(%p)\n", thread );
+
+    /* The server takes the primary group from the group list, so the anonymous logon SID is
+     * both user and only group; Windows lists the untrusted mandatory label instead. */
+    user.User.Sid = (SID *)&anonymous_sid;
+    user.User.Attributes = 0;
+    groups.GroupCount = 1;
+    groups.Groups[0].Sid = (SID *)&anonymous_sid;
+    groups.Groups[0].Attributes = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+    group.PrimaryGroup = (SID *)&anonymous_sid;
+    privs.PrivilegeCount = 0;
+    expire.QuadPart = MAXLONGLONG;
+    InitializeObjectAttributes( &attr, NULL, 0, 0, NULL );
+    attr.SecurityQualityOfService = &qos;
+
+    if ((status = NtAllocateLocallyUniqueId( &id ))) return status;
+    if ((status = NtCreateToken( &token, TOKEN_IMPERSONATE | TOKEN_QUERY, &attr, TokenImpersonation, &id,
+                                 &expire, &user, &groups, &privs, NULL, &group, NULL, NULL )))
+        return status;
+    status = NtSetInformationThread( thread, ThreadImpersonationToken, &token, sizeof(token) );
+    NtClose( token );
+    return status;
 }
 
 

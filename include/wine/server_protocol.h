@@ -6291,6 +6291,18 @@ struct alpc_create_port_reply
 };
 
 
+
+struct set_process_dpi_awareness_request
+{
+    struct request_header __header;
+    unsigned int   dpi_context;
+};
+struct set_process_dpi_awareness_reply
+{
+    struct reply_header __header;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6604,6 +6616,7 @@ enum request
     REQ_d3dkmt_sync_wait,
     REQ_d3dkmt_sync_signal,
     REQ_alpc_create_port,
+    REQ_set_process_dpi_awareness,
     REQ_NB_REQUESTS
 };
 
@@ -6922,6 +6935,7 @@ union generic_request
     struct d3dkmt_sync_wait_request d3dkmt_sync_wait_request;
     struct d3dkmt_sync_signal_request d3dkmt_sync_signal_request;
     struct alpc_create_port_request alpc_create_port_request;
+    struct set_process_dpi_awareness_request set_process_dpi_awareness_request;
 };
 union generic_reply
 {
@@ -7238,8 +7252,9 @@ union generic_reply
     struct d3dkmt_sync_wait_reply d3dkmt_sync_wait_reply;
     struct d3dkmt_sync_signal_reply d3dkmt_sync_signal_reply;
     struct alpc_create_port_reply alpc_create_port_reply;
+    struct set_process_dpi_awareness_reply set_process_dpi_awareness_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 971
+#define SERVER_PROTOCOL_VERSION 972
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

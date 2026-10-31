@@ -82,6 +82,9 @@ struct transform_entry
     GUID category;
     BOOL hidden;
     BOOL attributes_initialized;
+    /* MF_MT_DEFAULT_STRIDE was added to the output type handed to a video processor
+     * to pin its row order, and has to stay off the type reported to the caller. */
+    BOOL pinned_stride;
 };
 
 struct media_stream
@@ -792,8 +795,12 @@ static HRESULT source_reader_push_transform_samples(struct source_reader *reader
     return hr;
 }
 
+static HRESULT transform_set_output_type(IMFTransform *transform, const GUID *category,
+        IMFMediaType *output_type, BOOL *pinned_stride);
+
 /* update the transform output type while keeping subtype which matches the desired type */
-static HRESULT set_matching_transform_output_type(IMFTransform *transform, IMFMediaType *old_output_type)
+static HRESULT set_matching_transform_output_type(IMFTransform *transform, const GUID *category,
+        IMFMediaType *old_output_type, BOOL *pinned_stride)
 {
     IMFMediaType *new_output_type;
     GUID subtype, desired;
@@ -806,7 +813,8 @@ static HRESULT set_matching_transform_output_type(IMFTransform *transform, IMFMe
     while (SUCCEEDED(hr = IMFTransform_GetOutputAvailableType(transform, 0, i++, &new_output_type)))
     {
         IMFMediaType_GetGUID(new_output_type, &MF_MT_SUBTYPE, &subtype);
-        if (IsEqualGUID(&subtype, &desired) && SUCCEEDED(hr = IMFTransform_SetOutputType(transform, 0, new_output_type, 0)))
+        if (IsEqualGUID(&subtype, &desired)
+                && SUCCEEDED(hr = transform_set_output_type(transform, category, new_output_type, pinned_stride)))
         {
             IMFMediaType_Release(new_output_type);
             return S_OK;
@@ -822,7 +830,8 @@ static HRESULT transform_entry_update_output_type(struct transform_entry *entry,
 {
     HRESULT hr;
 
-    if (SUCCEEDED(hr = set_matching_transform_output_type(entry->transform, old_output_type)))
+    if (SUCCEEDED(hr = set_matching_transform_output_type(entry->transform, &entry->category, old_output_type,
+            &entry->pinned_stride)))
         entry->pending_flags |= MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED;
 
     return hr;
@@ -916,7 +925,11 @@ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader
                     && SUCCEEDED(hr = IMFTransform_GetOutputCurrentType(entry->transform, 0, &media_type)))
             {
                 if (!next)
-                    hr = IMFMediaType_CopyAllItems(media_type, (IMFAttributes *)stream->current);
+                {
+                    if (SUCCEEDED(hr = IMFMediaType_CopyAllItems(media_type, (IMFAttributes *)stream->current))
+                            && entry->pinned_stride)
+                        IMFMediaType_DeleteItem(stream->current, &MF_MT_DEFAULT_STRIDE);
+                }
                 else
                     hr = transform_entry_update_input_type(next, media_type);
                 IMFMediaType_Release(media_type);
@@ -2139,6 +2152,45 @@ static HRESULT apply_pixel_aspect_ratio(IMFMediaType *dst_type, IMFMediaType *sr
     return S_OK;
 }
 
+/* The video processor emits bottom-up RGB buffers whenever the requested output type leaves the
+ * row order open, whereas native hands top-down samples to the source reader caller. Native also
+ * keeps MF_MT_DEFAULT_STRIDE off the media type it reports back when advanced video processing is
+ * enabled. So hand the processor a copy of the type with the stride pinned, which it keeps for
+ * every later re-creation of its conversion pipeline, and strip the stride again from the type
+ * reported to the caller (see *pinned_stride). */
+static HRESULT transform_set_output_type(IMFTransform *transform, const GUID *category,
+        IMFMediaType *output_type, BOOL *pinned_stride)
+{
+    IMFMediaType *pinned_type = NULL;
+    DWORD sample_size;
+    LONG stride;
+    HRESULT hr;
+
+    *pinned_stride = FALSE;
+
+    if (IsEqualGUID(category, &MFT_CATEGORY_VIDEO_PROCESSOR)
+            && FAILED(IMFMediaType_GetItem(output_type, &MF_MT_DEFAULT_STRIDE, NULL)))
+    {
+        hr = S_OK;
+        mediatype_get_stride_and_sample_size(output_type, &stride, &sample_size, &hr);
+        if (SUCCEEDED(hr) && SUCCEEDED(MFCreateMediaType(&pinned_type))
+                && (FAILED(IMFMediaType_CopyAllItems(output_type, (IMFAttributes *)pinned_type))
+                || FAILED(IMFMediaType_SetUINT32(pinned_type, &MF_MT_DEFAULT_STRIDE, abs(stride)))))
+        {
+            IMFMediaType_Release(pinned_type);
+            pinned_type = NULL;
+        }
+    }
+
+    if (!pinned_type)
+        return IMFTransform_SetOutputType(transform, 0, output_type, 0);
+
+    hr = IMFTransform_SetOutputType(transform, 0, pinned_type, 0);
+    *pinned_stride = SUCCEEDED(hr);
+    IMFMediaType_Release(pinned_type);
+    return hr;
+}
+
 static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL decoder, BOOL allow_processor,
         IMFMediaType *input_type, IMFMediaType *output_type, struct transform_entry **out)
 {
@@ -2230,7 +2282,7 @@ static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL
             if (SUCCEEDED(hr = IMFTransform_SetInputType(transform, 0, input_type, 0))
                     && SUCCEEDED(hr = IMFTransform_GetInputCurrentType(transform, 0, &media_type)))
             {
-                BOOL enable_advanced;
+                BOOL enable_advanced, pinned_stride = FALSE;
                 IMFMediaType *output_type_copy = NULL;
 
                 hr = MFCreateMediaType(&output_type_copy);
@@ -2241,8 +2293,9 @@ static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL
 
                 if (SUCCEEDED(hr) && (!enable_advanced || SUCCEEDED(hr = apply_pixel_aspect_ratio(output_type_copy, media_type)))
                         && (SUCCEEDED(hr = update_media_type(output_type_copy, media_type, enable_advanced)))
-                        && FAILED(hr = IMFTransform_SetOutputType(transform, 0, output_type_copy, 0))
-                        && FAILED(hr = set_matching_transform_output_type(transform, output_type_copy)) && allow_processor
+                        && FAILED(hr = transform_set_output_type(transform, &category, output_type_copy, &pinned_stride))
+                        && FAILED(hr = set_matching_transform_output_type(transform, &category, output_type_copy, &pinned_stride))
+                        && allow_processor
                         && SUCCEEDED(hr = IMFTransform_GetOutputAvailableType(transform, 0, 0, &media_type)))
                 {
                     struct transform_entry *converter;
@@ -2263,6 +2316,7 @@ static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL
                 if (SUCCEEDED(hr))
                 {
                     entry->transform = transform;
+                    entry->pinned_stride = pinned_stride;
                     *out = entry;
                     break;
                 }
@@ -2346,7 +2400,9 @@ static HRESULT source_reader_create_decoder_for_stream(struct source_reader *rea
                 WARN("Failed to get decoder output media type, hr %#lx\n", hr);
             else
             {
-                IMFMediaType_CopyAllItems(output_type, (IMFAttributes *)stream->current);
+                if (SUCCEEDED(IMFMediaType_CopyAllItems(output_type, (IMFAttributes *)stream->current))
+                        && service->pinned_stride)
+                    IMFMediaType_DeleteItem(stream->current, &MF_MT_DEFAULT_STRIDE);
                 IMFMediaType_Release(output_type);
             }
 

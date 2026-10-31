@@ -669,6 +669,10 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         {
             /* FIXME: hack for debugging 32-bit process without a 64-bit ntdll */
             if (is_old_wow64() && func == (void *)0x7ffe1000) func = pDbgUiRemoteBreakin;
+            /* a 64-bit debugger breaks in at its own DbgUiRemoteBreakin, but a thread of a
+             * wow64 process starts in 32-bit code: use the one of the 32-bit ntdll */
+            else if (is_wow64() && func == pDbgUiRemoteBreakin && pWow64DbgUiRemoteBreakin)
+                func = pWow64DbgUiRemoteBreakin;
             attr->TotalLength = sizeof(buffer);
             attr->Attributes[0].Attribute    = PS_ATTRIBUTE_CLIENT_ID;
             attr->Attributes[0].Size         = sizeof(id);

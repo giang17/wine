@@ -3257,6 +3257,12 @@ UINT get_thread_dpi_awareness_context(void)
     return context ? context : NTUSER_DPI_UNAWARE;
 }
 
+/* whether the process DPI awareness is still unset: a window created now takes it once it is set */
+BOOL process_dpi_awareness_unset(void)
+{
+    return !ReadNoFence( &dpi_context );
+}
+
 DWORD get_process_layout(void)
 {
     return process_layout == ~0u ? 0 : process_layout;
@@ -5250,6 +5256,20 @@ static BOOL get_dword_entry( union sysparam_all_entry *entry, UINT int_param, vo
     return TRUE;
 }
 
+/* load the ClearType contrast from the registry; a stored 0 reads back as the default */
+static BOOL get_contrast_entry( union sysparam_all_entry *entry, UINT int_param, void *ptr_param, UINT dpi )
+{
+    if (!ptr_param) return FALSE;
+
+    if (!entry->hdr.loaded)
+    {
+        DWORD val;
+        if (load_entry( &entry->hdr, &val, sizeof(val) ) == sizeof(DWORD) && val) entry->dword.val = val;
+    }
+    *(DWORD *)ptr_param = entry->dword.val;
+    return TRUE;
+}
+
 /* set a dword (binary) parameter in the registry */
 static BOOL set_dword_entry( union sysparam_all_entry *entry, UINT int_param, void *ptr_param, UINT flags )
 {
@@ -5744,8 +5764,8 @@ static TWIPS_ENTRY( ICONVERTICALSPACING, -1125, METRICS_KEY, "IconVerticalSpacin
 static TWIPS_ENTRY( MENUHEIGHT, -270, METRICS_KEY, "MenuHeight" );
 static TWIPS_ENTRY( MENUWIDTH, -270, METRICS_KEY, "MenuWidth" );
 static TWIPS_ENTRY( PADDEDBORDERWIDTH, 0, METRICS_KEY, "PaddedBorderWidth" );
-static TWIPS_ENTRY( SCROLLHEIGHT, -240, METRICS_KEY, "ScrollHeight" );
-static TWIPS_ENTRY( SCROLLWIDTH, -240, METRICS_KEY, "ScrollWidth" );
+static TWIPS_ENTRY( SCROLLHEIGHT, -255, METRICS_KEY, "ScrollHeight" );
+static TWIPS_ENTRY( SCROLLWIDTH, -255, METRICS_KEY, "ScrollWidth" );
 static TWIPS_ENTRY( SMCAPTIONHEIGHT, -225, METRICS_KEY, "SmCaptionHeight" );
 static TWIPS_ENTRY( SMCAPTIONWIDTH, -225, METRICS_KEY, "SmCaptionWidth" );
 
@@ -5757,7 +5777,12 @@ static DWORD_ENTRY( CARETWIDTH, 1, DESKTOP_KEY, "CaretWidth" );
 static DWORD_ENTRY( DPISCALINGVER, 0, DESKTOP_KEY, "DpiScalingVer" );
 static DWORD_ENTRY( FOCUSBORDERHEIGHT, 1, DESKTOP_KEY, "FocusBorderHeight" );
 static DWORD_ENTRY( FOCUSBORDERWIDTH, 1, DESKTOP_KEY, "FocusBorderWidth" );
-static DWORD_ENTRY( FONTSMOOTHINGCONTRAST, 0, DESKTOP_KEY, "FontSmoothingGamma" );
+/* SPI_GETFONTSMOOTHINGCONTRAST reports the documented default of 1400 (valid range 1000..2200)
+ * until a value is stored. A stored 0 counts as unset as well: earlier versions wrote their
+ * default of 0 into every new prefix, and applications divide by this value (JavaFX derives
+ * its text gamma from it, and 1/0 turns every LCD glyph into NaN, that is black). */
+static union sysparam_all_entry entry_FONTSMOOTHINGCONTRAST =
+    { .dword = { { get_contrast_entry, set_dword_entry, init_dword_entry, DESKTOP_KEY, "FontSmoothingGamma" }, 1400 } };
 static DWORD_ENTRY( FONTSMOOTHINGORIENTATION, FE_FONTSMOOTHINGORIENTATIONRGB, DESKTOP_KEY, "FontSmoothingOrientation" );
 static DWORD_ENTRY( FONTSMOOTHINGTYPE, FE_FONTSMOOTHINGSTANDARD, DESKTOP_KEY, "FontSmoothingType" );
 static DWORD_ENTRY( FOREGROUNDFLASHCOUNT, 3, DESKTOP_KEY, "ForegroundFlashCount" );
@@ -5941,7 +5966,18 @@ static DWORD get_config_key( HKEY defkey, HKEY appkey, const char *name,
     return ERROR_FILE_NOT_FOUND;
 }
 
-static char *get_app_compat_flags( const WCHAR *appname )
+static BOOL query_app_compat_layers( HKEY hkey, const WCHAR *path, const WCHAR *appname,
+                                     KEY_VALUE_PARTIAL_INFORMATION *value, ULONG size )
+{
+    /* Windows names the entry after the full path of the executable */
+    return (query_reg_value( hkey, path, value, size ) && value->Type == REG_SZ) ||
+           /* Wine extension: also accept the file name alone */
+           (query_reg_value( hkey, appname, value, size ) && value->Type == REG_SZ) ||
+           /* Wine extension: set default application flag using the default key value */
+           (query_reg_value( hkey, NULL, value, size ) && value->Type == REG_SZ);
+}
+
+static char *get_app_compat_flags( const WCHAR *path, const WCHAR *appname )
 {
     char buffer[4096];
     KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
@@ -5952,18 +5988,14 @@ static char *get_app_compat_flags( const WCHAR *appname )
 
     if ((hkey = reg_open_hkcu_key( "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers" )))
     {
-        if ((query_reg_value( hkey, appname, value, sizeof(buffer) ) && value->Type == REG_SZ) ||
-            /* Wine extension: set default application flag using the default key value */
-            (query_reg_value( hkey, NULL, value, sizeof(buffer) ) && value->Type == REG_SZ))
+        if (query_app_compat_layers( hkey, path, appname, value, sizeof(buffer) ))
             value_str = (WCHAR *)value->Data;
         NtClose( hkey );
     }
 
     if (!value_str && (hkey = reg_open_ascii_key( NULL, "Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers" )))
     {
-        if ((query_reg_value( hkey, appname, value, sizeof(buffer) ) && value->Type == REG_SZ) ||
-            /* Wine extension: set default application flag using the default key value */
-            (query_reg_value( hkey, NULL, value, sizeof(buffer) ) && value->Type == REG_SZ))
+        if (query_app_compat_layers( hkey, path, appname, value, sizeof(buffer) ))
             value_str = (WCHAR *)value->Data;
         NtClose( hkey );
     }
@@ -5976,7 +6008,7 @@ static char *get_app_compat_flags( const WCHAR *appname )
 
 void sysparams_init(void)
 {
-    WCHAR buffer[MAX_PATH+16], *p, *appname;
+    WCHAR buffer[MAX_PATH+16], *p, *path, *appname;
     char *app_compat_flags = NULL;
     DWORD i, dispos, dpi_scaling;
     WCHAR layout[KL_NAMELENGTH];
@@ -6046,7 +6078,7 @@ void sysparams_init(void)
 
     /* open the app-specific key */
 
-    appname = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
+    appname = path = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
     if ((p = wcsrchr( appname, '/' ))) appname = p + 1;
     if ((p = wcsrchr( appname, '\\' ))) appname = p + 1;
     len = lstrlenW( appname );
@@ -6060,8 +6092,8 @@ void sysparams_init(void)
         buffer[i] = 0;
         appname = buffer;
 
-        app_compat_flags = get_app_compat_flags( appname );
-        if (app_compat_flags) TRACE( "Found %s AppCompatFlags %s\n", debugstr_w(appname), debugstr_a(app_compat_flags) );
+        app_compat_flags = get_app_compat_flags( path, appname );
+        if (app_compat_flags) TRACE( "Found %s AppCompatFlags %s\n", debugstr_w(path), debugstr_a(app_compat_flags) );
 
         /* @@ Wine registry key: HKCU\Software\Wine\AppDefaults\app.exe\X11 Driver */
         if ((tmpkey = reg_open_hkcu_key( "Software\\Wine\\AppDefaults" )))
@@ -7484,6 +7516,14 @@ BOOL WINAPI NtUserSetProcessDpiAwarenessContext( ULONG context, ULONG unknown )
         return FALSE;
     }
 
+    /* windows created while the awareness was unset take it now, as on Windows */
+    SERVER_START_REQ( set_process_dpi_awareness )
+    {
+        req->dpi_context = context;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+
     TRACE( "set to %#x\n", context );
     return TRUE;
 }
@@ -7981,12 +8021,40 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         unlock_display_devices();
         return ret;
     }
+    case DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL:
+    {
+        DISPLAYCONFIG_SDR_WHITE_LEVEL *white_level = (DISPLAYCONFIG_SDR_WHITE_LEVEL *)packet;
+        struct monitor *monitor;
+
+        TRACE( "DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL.\n" );
+
+        if (packet->size < sizeof(*white_level))
+            return STATUS_INVALID_PARAMETER;
+
+        if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
+
+        LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
+        {
+            if (white_level->header.id != monitor->output_id) continue;
+            if (memcmp( &white_level->header.adapterId, &monitor->source->gpu->luid,
+                        sizeof(monitor->source->gpu->luid) ))
+                continue;
+
+            /* The value is a multiple of 80 nits, times 1000. There is no SDR brightness
+             * setting to report, so return the nominal SDR white of 80 nits. */
+            white_level->SDRWhiteLevel = 1000;
+            ret = STATUS_SUCCESS;
+            break;
+        }
+
+        unlock_display_devices();
+        return ret;
+    }
     case DISPLAYCONFIG_DEVICE_INFO_SET_TARGET_PERSISTENCE:
     case DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_BASE_TYPE:
     case DISPLAYCONFIG_DEVICE_INFO_GET_SUPPORT_VIRTUAL_RESOLUTION:
     case DISPLAYCONFIG_DEVICE_INFO_SET_SUPPORT_VIRTUAL_RESOLUTION:
     case DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE:
-    case DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL:
     default:
         FIXME( "Unimplemented packet type %u.\n", packet->type );
         return STATUS_INVALID_PARAMETER;

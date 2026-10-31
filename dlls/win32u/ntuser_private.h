@@ -69,9 +69,17 @@ typedef struct tagWND
     struct opengl_drawable *unused_drawable; /* unused GL client surface for this window */
     struct list        opengl_swapchains; /* swapchains created by other processes on this window */
     struct tagDIALOGINFO *dlgInfo;    /* Dialog additional info (dialogs only) */
+    POINT              track_pos;     /* window position the cached track sizes were taken at (track_dpi) */
+    POINT              min_track;     /* last ptMinTrackSize answered to WM_GETMINMAXINFO (track_dpi) */
+    POINT              max_track;     /* last ptMaxTrackSize if the application set one, else 0 */
+    struct ratio       track_dpi;     /* DPI ratio the track sizes are in (get_thread_dpi()) */
+    BOOL               track_valid;   /* the track sizes above were cached at least once */
+    RECT               nc_insets;     /* client insets (left, top, right, bottom) DefWindowProc last computed for WM_NCCALCSIZE */
+    BOOL               nc_insets_valid; /* nc_insets were recorded at least once */
     int                swap_interval; /* OpenGL surface swap interval */
     int                pixel_format;  /* Pixel format set by the graphics driver */
     int                clip_clients;  /* Has client surfaces that needs to be clipped out */
+    int                present_offscreen; /* a client surface presents offscreen into this child, see update_visible_region() */
 } WND;
 
 /* WND flags values */
@@ -82,6 +90,7 @@ typedef struct tagWND
 #define WIN_NEEDS_SHOW_OWNEDPOPUP 0x0020 /* WM_SHOWWINDOW:SC_SHOW must be sent in the next ShowOwnedPopup call */
 #define WIN_CHILDREN_MOVED        0x0040 /* children may have moved, ignore stored positions */
 #define WIN_HAS_IME_WIN           0x0080 /* the window has been registered with imm32 */
+#define WIN_IS_IN_ACTIVATION      0x0100 /* set_active_window() is running for this window */
 
 #define WND_OTHER_PROCESS ((WND *)1)  /* returned by get_win_ptr on unknown window handles */
 #define WND_DESKTOP       ((WND *)2)  /* returned by get_win_ptr on the desktop window */
@@ -133,6 +142,7 @@ struct user_thread_info
     struct mouse_tracking_info   *mouse_tracking_info;    /* NtUserTrackMouseEvent handling */
     struct opengl_thread_data    *opengl_data;            /* OpenGL private thread data */
     struct list                   known_pointers;         /* list of known pointers */
+    UINT                          paint_depth;            /* WM_NCPAINT / WM_ERASEBKGND sends in progress */
 };
 
 extern struct user_thread_info *get_user_thread_info(void);

@@ -708,8 +708,9 @@ BOOL set_window_menu( HWND hwnd, HMENU handle )
         return FALSE;
 
     hwnd = get_full_window_handle( hwnd );
-    if (get_capture() == hwnd)
-        set_capture_window( 0, GUI_INMENUMODE, NULL );  /* release the capture */
+    /* release the capture, unless it is held for a popup menu owned by the window */
+    if (get_capture() == hwnd && (!top_popup || top_popup == hwnd))
+        set_capture_window( 0, GUI_INMENUMODE, NULL );
 
     if (handle)
     {
@@ -2022,9 +2023,9 @@ static void get_bitmap_item_size( struct menu_item *item, SIZE *size, HWND owner
     }
 }
 
-/* Calculate the size of the menu item and store it in item->rect */
-static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, INT org_x, INT org_y,
-                                 BOOL menu_bar, struct menu *menu )
+/* Calculate the default size of the menu item and store it in item->rect */
+static void calc_default_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, INT org_x, INT org_y,
+                                         BOOL menu_bar, struct menu *menu )
 {
     UINT check_bitmap_width = get_system_metrics( SM_CXMENUCHECK );
     UINT arrow_bitmap_width;
@@ -2172,6 +2173,131 @@ static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, IN
     TRACE( "%s\n", wine_dbgstr_rect( &item->rect ));
 }
 
+/* Whether a visual style is active: the value uxtheme reads in UXTHEME_LoadTheme(). */
+static BOOL visual_style_is_active(void)
+{
+    static const WCHAR theme_activeW[] = {'T','h','e','m','e','A','c','t','i','v','e',0};
+    char buffer[offsetof( KEY_VALUE_PARTIAL_INFORMATION, Data[8 * sizeof(WCHAR)] )];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
+    BOOL ret = FALSE;
+    HKEY key;
+
+    if (!(key = reg_open_hkcu_key( "Software\\Microsoft\\Windows\\CurrentVersion\\ThemeManager" ))) return FALSE;
+    if (query_reg_value( key, theme_activeW, info, sizeof(buffer) ) && info->Type == REG_SZ
+        && info->DataLength >= sizeof(WCHAR))
+        ret = ((const WCHAR *)info->Data)[0] != '0';
+    NtClose( key );
+    return ret;
+}
+
+/* Whether the menu bar of a window goes through the WM_UAH* messages of the non-client
+ * theming. Measured on Windows 10: only captioned windows, and a single owner-drawn item
+ * takes the whole bar back to the classic path, its text items included. */
+static BOOL menu_bar_is_themed( struct menu *menu, HWND owner )
+{
+    UINT i;
+
+    if ((get_window_long( owner, GWL_STYLE ) & WS_CAPTION) != WS_CAPTION) return FALSE;
+    for (i = 0; i < menu->nItems; i++)
+        if (menu->items[i].fType & MF_OWNERDRAW) return FALSE;
+    return TRUE;
+}
+
+/* Whether the menu bar is also painted through WM_UAHDRAWMENU and WM_UAHDRAWMENUITEM.
+ * The messages come from the themed non-client painting, and an owner that paints its
+ * bar through them opens the theme's MENU class for the text (Cubase 15:
+ * OpenThemeData( NULL, L"MENU" ) and DrawThemeTextEx() per item); without an active
+ * visual style that handle is NULL and the bar came up with a background and no text.
+ * Measuring stays on WM_UAHMEASUREMENUITEM either way: the size the owner answers with
+ * is what the window's geometry is built on (Ableton Live 12's bar is 4 px taller than
+ * the default, and measured the classic way its main window grows to the maximal
+ * height, WineHQ bug 57955). */
+static BOOL menu_bar_is_drawn_themed( struct menu *menu, HWND owner )
+{
+    return menu_bar_is_themed( menu, owner ) && visual_style_is_active();
+}
+
+/* Whether the items of a popup menu are measured through WM_UAHMEASUREMENUITEM when the
+ * popup opens. Measured on Windows 10: every popup gets it (from a menu bar, a submenu, or
+ * TrackPopupMenu, whether or not the owner has WS_CAPTION or a themed bar), separators
+ * included; a single owner-drawn item takes the whole popup back to the classic path. The
+ * system menu was not measured and stays classic. */
+static BOOL popup_menu_is_themed( struct menu *menu )
+{
+    UINT i;
+
+    if ((menu->wFlags & (MF_POPUP | MF_SYSMENU)) != MF_POPUP || !menu->hwndOwner) return FALSE;
+    for (i = 0; i < menu->nItems; i++)
+        if (menu->items[i].fType & MF_OWNERDRAW) return FALSE;
+    return TRUE;
+}
+
+/* flags of struct uah_menu, as observed on Windows 10 */
+#define UAH_MENU_POPUP        0x001   /* the menu is a popup */
+#define UAH_MENU_IN_MENU_LOOP 0x004   /* an item is being tracked */
+#define UAH_MENU_INACTIVE     0x010   /* the window is not the active one */
+#define UAH_MENU_WHOLE_BAR    0x200   /* the item is drawn as part of the whole bar */
+#define UAH_MENU_BASE         0x800
+
+static void send_uah_init_menu( HWND owner, struct menu *menu, HDC hdc, DWORD flags )
+{
+    struct uah_menu uah = { menu->handle, hdc, flags };
+    send_message( owner, WM_UAHINITMENU, 0, (LPARAM)&uah );
+}
+
+/* Calculate the size of the menu item and store it in item->rect. uah_flags are the
+ * struct uah_menu flags of the menu when it is measured through WM_UAHMEASUREMENUITEM,
+ * without UAH_MENU_BASE. */
+static void calc_menu_item_size( HDC hdc, struct menu_item *item, HWND owner, INT org_x, INT org_y,
+                                 BOOL menu_bar, struct menu *menu, DWORD uah_flags )
+{
+    struct uah_measure_menu_item uah = {0};
+    BOOL themed;
+
+    /* The items of a menu bar and of a popup are measured through WM_UAHMEASUREMENUITEM,
+     * which lets the owner override the size DefWindowProc fills in. */
+    if (menu_bar) themed = !(item->fType & MF_SEPARATOR) && menu_bar_is_themed( menu, owner );
+    else themed = popup_menu_is_themed( menu );
+    if (!themed)
+    {
+        calc_default_menu_item_size( hdc, item, owner, org_x, org_y, menu_bar, menu );
+        return;
+    }
+
+    if (!od_item_height) od_item_height = HIWORD( get_dialog_base_units() );
+
+    uah.mis.CtlType    = ODT_MENU;
+    uah.mis.itemID     = item->wID;
+    uah.mis.itemHeight = od_item_height;
+    uah.mis.itemData   = item->dwItemData;
+    uah.menu.hmenu     = menu->handle;
+    uah.menu.hdc       = hdc;
+    uah.menu.flags     = UAH_MENU_BASE | uah_flags;
+    uah.item.pos       = item - menu->items;
+    /* DefWindowProc measures at the origin; the tab position of a popup item is absolute */
+    item->xTab = 0;
+    send_message( owner, WM_UAHMEASUREMENUITEM, 0, (LPARAM)&uah );
+
+    SetRect( &item->rect, org_x, org_y, org_x + uah.mis.itemWidth, org_y + uah.mis.itemHeight );
+    if (!menu_bar) item->xTab += org_x;
+    TRACE( "%s\n", wine_dbgstr_rect( &item->rect ));
+}
+
+/* default handling of WM_UAHMEASUREMENUITEM */
+void measure_uah_menu_item( HWND hwnd, struct uah_measure_menu_item *uah )
+{
+    struct menu *menu;
+    struct menu_item *item;
+
+    if (!uah || !(menu = unsafe_menu_ptr( uah->menu.hmenu ))) return;
+    if (uah->item.pos < 0 || uah->item.pos >= menu->nItems) return;
+
+    item = &menu->items[uah->item.pos];
+    calc_default_menu_item_size( uah->menu.hdc, item, hwnd, 0, 0, !(menu->wFlags & MF_POPUP), menu );
+    uah->mis.itemWidth  = item->rect.right;
+    uah->mis.itemHeight = item->rect.bottom;
+}
+
 /* Calculate the size of the menu bar */
 static void calc_menu_bar_size( HDC hdc, POINT pos, UINT width, struct menu *menu, HWND owner )
 {
@@ -2183,12 +2309,14 @@ static void calc_menu_bar_size( HDC hdc, POINT pos, UINT width, struct menu *men
 
     TRACE( "pos %s width %u\n", wine_dbgstr_point(&pos), width );
 
-    /* Start with a 1 pixel top border.
-       This corresponds to the difference between SM_CYMENU and SM_CYMENUSIZE. */
-    SetRect( &menu->items_rect, 0, 0, width, 1 );
+    /* The items start at the top of the bar. The difference between SM_CYMENU and
+       SM_CYMENUSIZE is the line below the bar, which is drawn by NtUserDrawMenuBarTemp()
+       and reserved by get_menu_bar_height(), not a border above the items. */
+    SetRect( &menu->items_rect, 0, 0, width, 0 );
     start = 0;
     help_pos = ~0u;
     menu->textOffset = 0;
+    if (menu_bar_is_themed( menu, owner )) send_uah_init_menu( owner, menu, hdc, UAH_MENU_WHOLE_BAR );
     while (start < menu->nItems)
     {
         item = &menu->items[start];
@@ -2202,7 +2330,7 @@ static void calc_menu_bar_size( HDC hdc, POINT pos, UINT width, struct menu *men
             if (i != start && (item->fType & (MF_MENUBREAK | MF_MENUBARBREAK))) break;
 
             TRACE("item org=(%d, %d) %s\n", org_x, org_y, debugstr_menuitem( item ));
-            calc_menu_item_size( hdc, item, owner, org_x, org_y, TRUE, menu );
+            calc_menu_item_size( hdc, item, owner, org_x, org_y, TRUE, menu, UAH_MENU_WHOLE_BAR );
 
             if (item->rect.right > menu->items_rect.right)
             {
@@ -2397,13 +2525,19 @@ got_bitmap:
     rop= ((item->fState & MF_HILITE) && !IS_MAGIC_BITMAP(bmp_to_draw)) ? NOTSRCCOPY : SRCCOPY;
     if ((item->fState & MF_HILITE) && item->hbmpItem)
         NtGdiGetAndSetDCDword( hdc, NtGdiSetBkColor, get_sys_color( COLOR_HIGHLIGHT ), NULL );
-    NtGdiBitBlt( hdc, left, top, w, h, mem_hdc, bmp_xoffset, 0, rop, 0, 0 );
+    if (bm.bmBitsPixel == 32)  /* 32-bpp ARGB bitmap: blend via alpha channel (BitBlt/SRCCOPY renders transparent pixels as black) */
+    {
+        int bw = bm.bmWidth - bmp_xoffset, bh = bm.bmHeight;
+        NtGdiAlphaBlend( hdc, left, top, bw, bh, mem_hdc, bmp_xoffset, 0, bw, bh,
+                         MAKEFOURCC( AC_SRC_OVER, 0, 255, AC_SRC_ALPHA ), 0 );
+    }
+    else NtGdiBitBlt( hdc, left, top, w, h, mem_hdc, bmp_xoffset, 0, rop, 0, 0 );
     NtGdiDeleteObjectApp( mem_hdc );
 }
 
-/* Draw a single menu item */
-static void draw_menu_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
-                            struct menu_item *item, BOOL menu_bar, UINT odaction )
+/* Draw a single menu item the default way */
+static void draw_default_menu_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
+                                    struct menu_item *item, BOOL menu_bar, UINT odaction )
 {
     UINT arrow_width = 0, arrow_height = 0;
     HRGN old_clip = NULL, clip;
@@ -2750,6 +2884,79 @@ done:
     if (old_clip) NtGdiDeleteObjectApp( old_clip );
 }
 
+static DWORD get_uah_menu_flags( HWND hwnd, DWORD flags )
+{
+    flags |= UAH_MENU_BASE;
+    if (top_popup) flags |= UAH_MENU_IN_MENU_LOOP;
+    if (!(win_get_flags( hwnd ) & WIN_NCACTIVATED)) flags |= UAH_MENU_INACTIVE;
+    return flags;
+}
+
+/* Draw one item of a themed menu bar through WM_UAHDRAWMENUITEM. The owner draws it
+ * itself or lets DefWindowProc do it (draw_menu_bar_item); the return value is ignored,
+ * as on Windows. Accelerators are always shown here, so ODS_NOACCEL is never set. */
+static void draw_uah_menu_bar_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
+                                    struct menu_item *item, UINT odaction, DWORD flags )
+{
+    struct uah_draw_menu_item uah = {0};
+    RECT rect = item->rect;
+
+    adjust_menu_item_rect( menu, &rect );
+
+    uah.dis.CtlType    = ODT_MENU;
+    uah.dis.itemID     = item->wID;
+    uah.dis.itemAction = odaction;
+    if (item->fState & MF_GRAYED) uah.dis.itemState |= ODS_GRAYED | ODS_DISABLED;
+    if (item->fState & MF_HILITE) uah.dis.itemState |= ODS_SELECTED;
+    if (flags & UAH_MENU_INACTIVE) uah.dis.itemState |= ODS_INACTIVE;
+    uah.dis.hwndItem   = (HWND)menu->handle;
+    uah.dis.hDC        = hdc;
+    uah.dis.rcItem     = rect;
+    uah.dis.itemData   = item->dwItemData;
+    uah.menu.hmenu     = menu->handle;
+    uah.menu.hdc       = hdc;
+    uah.menu.flags     = flags;
+    uah.item.pos       = item - menu->items;
+
+    TRACE( "owner %p item %d action %#x state %#x rect %s flags %#lx\n", owner, uah.item.pos,
+           odaction, uah.dis.itemState, wine_dbgstr_rect( &rect ), (long)flags );
+    send_message( owner, WM_UAHDRAWMENUITEM, 0, (LPARAM)&uah );
+}
+
+/* Draw a single menu item */
+static void draw_menu_item( HWND hwnd, struct menu *menu, HWND owner, HDC hdc,
+                            struct menu_item *item, BOOL menu_bar, UINT odaction )
+{
+    if (menu_bar && !(item->fType & (MF_SEPARATOR | MF_SYSMENU)) && menu_bar_is_drawn_themed( menu, owner ))
+        draw_uah_menu_bar_item( hwnd, menu, owner, hdc, item, odaction, get_uah_menu_flags( hwnd, 0 ));
+    else
+        draw_default_menu_item( hwnd, menu, owner, hdc, item, menu_bar, odaction );
+}
+
+/* default handling of WM_UAHDRAWMENU: the background of the menu bar */
+void draw_menu_bar_background( HWND hwnd, struct uah_menu *uah )
+{
+    BOOL flat_menu = FALSE;
+    struct menu *menu;
+
+    if (!uah || !(menu = unsafe_menu_ptr( uah->hmenu ))) return;
+
+    NtUserSystemParametersInfo( SPI_GETFLATMENU, 0, &flat_menu, 0 );
+    fill_rect( uah->hdc, &menu->items_rect, get_sys_color_brush( flat_menu ? COLOR_MENUBAR : COLOR_MENU ));
+}
+
+/* default handling of WM_UAHDRAWMENUITEM */
+void draw_menu_bar_item( HWND hwnd, struct uah_draw_menu_item *uah )
+{
+    struct menu *menu;
+
+    if (!uah || !(menu = unsafe_menu_ptr( uah->menu.hmenu ))) return;
+    if (uah->item.pos < 0 || uah->item.pos >= menu->nItems) return;
+
+    draw_default_menu_item( hwnd, menu, hwnd, uah->dis.hDC, &menu->items[uah->item.pos], TRUE,
+                            uah->dis.itemAction );
+}
+
 /***********************************************************************
  *           NtUserDrawMenuBarTemp   (win32u.@)
  */
@@ -2780,23 +2987,40 @@ DWORD WINAPI NtUserDrawMenuBarTemp( HWND hwnd, HDC hdc, RECT *rect, HMENU handle
 
     rect->bottom = rect->top + menu->Height;
 
-    fill_rect( hdc, rect, get_sys_color_brush( flat_menu ? COLOR_MENUBAR : COLOR_MENU ));
+    /* A themed menu bar is drawn through WM_UAHDRAWMENU and one WM_UAHDRAWMENUITEM per
+     * item, with the default drawing in DefWindowProc. The line below the bar is drawn
+     * here in both cases: on Windows it stays even when the owner paints the bar itself. */
+    if (menu_bar_is_drawn_themed( menu, hwnd ))
+    {
+        DWORD flags = get_uah_menu_flags( hwnd, UAH_MENU_WHOLE_BAR );
+        struct uah_menu uah = { menu->handle, hdc, flags };
+
+        send_uah_init_menu( hwnd, menu, hdc, flags );
+        send_message( hwnd, WM_UAHDRAWMENU, 0, (LPARAM)&uah );
+        for (i = 0; i < menu->nItems; i++)
+        {
+            if (menu->items[i].fType & (MF_SEPARATOR | MF_SYSMENU))
+                draw_default_menu_item( hwnd, menu, hwnd, hdc, &menu->items[i], TRUE, ODA_DRAWENTIRE );
+            else
+                draw_uah_menu_bar_item( hwnd, menu, hwnd, hdc, &menu->items[i], ODA_DRAWENTIRE, flags );
+        }
+    }
+    else
+    {
+        fill_rect( hdc, rect, get_sys_color_brush( flat_menu ? COLOR_MENUBAR : COLOR_MENU ));
+        for (i = 0; i < menu->nItems; i++)
+            draw_menu_item( hwnd, menu, hwnd, hdc, &menu->items[i], TRUE, ODA_DRAWENTIRE );
+    }
 
     NtGdiSelectPen( hdc, get_sys_color_pen( COLOR_3DFACE ));
     NtGdiMoveTo( hdc, rect->left, rect->bottom, NULL );
     NtGdiLineTo( hdc, rect->right, rect->bottom );
 
+    /* the items plus the line below the bar */
     if (menu->nItems)
-    {
-        for (i = 0; i < menu->nItems; i++)
-            draw_menu_item( hwnd, menu, hwnd, hdc, &menu->items[i], TRUE, ODA_DRAWENTIRE );
-
-        retvalue = menu->Height;
-    }
+        retvalue = menu->Height + 1;
     else
-    {
         retvalue = get_system_metrics( SM_CYMENU );
-    }
 
     if (prev_font) NtGdiSelectFont( hdc, prev_font );
     return retvalue;
@@ -2997,6 +3221,8 @@ static void calc_popup_menu_size( struct menu *menu, UINT max_height )
     BOOL textandbmp = FALSE, multi_col = FALSE;
     int org_x, org_y, max_tab, max_tab_width;
     struct menu_item *item;
+    struct menu *top_menu;
+    DWORD uah_flags = UAH_MENU_POPUP;
     UINT start, i;
     HDC hdc;
 
@@ -3007,6 +3233,12 @@ static void calc_popup_menu_size( struct menu *menu, UINT max_height )
     hdc = NtUserGetDC( 0 );
 
     NtGdiSelectFont( hdc, get_menu_font( FALSE ));
+
+    /* A themed popup announces itself with WM_UAHINITMENU before its items are measured:
+     * flags 0x5 below a tracked menu bar, 0x1 from TrackPopupMenu (Windows 10). */
+    if (top_popup_hmenu && (top_menu = unsafe_menu_ptr( top_popup_hmenu )) && !(top_menu->wFlags & MF_POPUP))
+        uah_flags |= UAH_MENU_IN_MENU_LOOP;
+    if (popup_menu_is_themed( menu )) send_uah_init_menu( menu->hwndOwner, menu, hdc, uah_flags );
 
     start = 0;
     menu->textOffset = 0;
@@ -3029,7 +3261,7 @@ static void calc_popup_menu_size( struct menu *menu, UINT max_height )
                 if (i != start) break;
             }
 
-            calc_menu_item_size( hdc, item, menu->hwndOwner, org_x, org_y, FALSE, menu );
+            calc_menu_item_size( hdc, item, menu->hwndOwner, org_x, org_y, FALSE, menu, uah_flags );
             menu->items_rect.right = max( menu->items_rect.right, item->rect.right );
             org_y = item->rect.bottom;
             if (IS_STRING_ITEM( item->fType ) && item->xTab)
@@ -4122,7 +4354,7 @@ static BOOL track_menu( HMENU hmenu, UINT flags, int x, int y, HWND hwnd, const 
     int executed_menu_id = -1;
     HWND capture_win;
     struct menu *menu;
-    BOOL remove;
+    BOOL remove, dispatch;
     MTRACKER mt;
     MSG msg;
 
@@ -4152,12 +4384,17 @@ static BOOL track_menu( HMENU hmenu, UINT flags, int x, int y, HWND hwnd, const 
 
     if (flags & TF_ENDMENU) exit_menu = TRUE;
 
-    /* owner may not be visible when tracking a popup, so use the menu itself */
-    capture_win = (flags & TPM_POPUPMENU) ? menu->hWnd : mt.hOwnerWnd;
-    set_capture_window( capture_win, GUI_INMENUMODE, NULL );
+    /* Windows keeps the capture on the owner. The owner of a popup may not be visible,
+     * so the driver grabs the pointer on the menu window instead. */
+    capture_win = (flags & TPM_POPUPMENU) ? menu->hWnd : 0;
+    if (!set_capture_window_grab( mt.hOwnerWnd, capture_win, GUI_INMENUMODE, NULL ) && capture_win)
+        set_capture_window( capture_win, GUI_INMENUMODE, NULL );
 
     if ((flags & TPM_POPUPMENU) && menu->nItems == 0)
+    {
+        set_capture_window_grab( 0, capture_win, GUI_INMENUMODE, NULL );
         return FALSE;
+    }
 
     while (!exit_menu)
     {
@@ -4197,7 +4434,7 @@ static BOOL track_menu( HMENU hmenu, UINT flags, int x, int y, HWND hwnd, const 
         mt.pt = msg.pt;
         if (msg.hwnd == menu->hWnd || msg.message != WM_TIMER) enter_idle_sent = FALSE;
 
-        remove = FALSE;
+        remove = dispatch = FALSE;
         if (msg.message >= WM_MOUSEFIRST && msg.message <= WM_MOUSELAST)
         {
             /*
@@ -4216,7 +4453,13 @@ static BOOL track_menu( HMENU hmenu, UINT flags, int x, int y, HWND hwnd, const 
                 /* no WM_NC... messages in captured state */
                 case WM_RBUTTONDBLCLK:
                 case WM_RBUTTONDOWN:
-                    if (!(flags & TPM_RIGHTBUTTON)) break;
+                    if (!(flags & TPM_RIGHTBUTTON))
+                    {
+                        /* a right click outside a popup ends it, unless the left button is held */
+                        if ((flags & TPM_POPUPMENU) && !hmenu && !(msg.wParam & MK_LBUTTON))
+                            exit_menu = TRUE;
+                        break;
+                    }
                     /* fall through */
                 case WM_LBUTTONDBLCLK:
                 case WM_LBUTTONDOWN:
@@ -4227,7 +4470,12 @@ static BOOL track_menu( HMENU hmenu, UINT flags, int x, int y, HWND hwnd, const 
                     break;
 
                 case WM_RBUTTONUP:
-                    if (!(flags & TPM_RIGHTBUTTON)) break;
+                    if (!(flags & TPM_RIGHTBUTTON))
+                    {
+                        /* the owner of a popup gets it, unless the left button is held */
+                        dispatch = (flags & TPM_POPUPMENU) && !(msg.wParam & MK_LBUTTON);
+                        break;
+                    }
                     /* fall through */
                 case WM_LBUTTONUP:
                     /* Check if a menu was selected by the mouse */
@@ -4251,6 +4499,13 @@ static BOOL track_menu( HMENU hmenu, UINT flags, int x, int y, HWND hwnd, const 
                     /* the selected menu item must be changed every time the mouse moves. */
                     if (hmenu) exit_menu |= !menu_mouse_move( &mt, hmenu, flags );
                     break;
+            }
+
+            if (dispatch)
+            {
+                NtUserPeekMessage( &msg, 0, msg.message, msg.message, PM_REMOVE );
+                NtUserDispatchMessage( &msg );
+                continue;
             }
         }
         else if (msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST)
@@ -4362,7 +4617,7 @@ static BOOL track_menu( HMENU hmenu, UINT flags, int x, int y, HWND hwnd, const 
         else mt.trackFlags &= ~TF_SKIPREMOVE;
     }
 
-    set_capture_window( 0, GUI_INMENUMODE, NULL );
+    set_capture_window_grab( 0, capture_win, GUI_INMENUMODE, NULL );
 
     /* If dropdown is still painted and the close box is clicked on
      * then the menu will be destroyed as part of the DispatchMessage above.
@@ -4523,6 +4778,16 @@ track_menu:
     exit_tracking( hwnd, FALSE );
 }
 
+/* the menu loop of the current thread holds the capture */
+static BOOL is_tracking_menu(void)
+{
+    GUITHREADINFO info;
+
+    info.cbSize = sizeof(info);
+    return NtUserGetGUIThreadInfo( GetCurrentThreadId(), &info ) && (info.flags & GUI_INMENUMODE) &&
+           is_current_thread_window( info.hwndMenuOwner );
+}
+
 /**********************************************************************
  *           NtUserTrackPopupMenuEx   (win32u.@)
  */
@@ -4542,7 +4807,8 @@ BOOL WINAPI NtUserTrackPopupMenuEx( HMENU handle, UINT flags, INT x, INT y, HWND
         return FALSE;
     }
 
-    if (is_window(menu->hWnd))
+    /* only TPM_RECURSE opens a menu while the thread tracks another one */
+    if (is_window(menu->hWnd) || (!(flags & TPM_RECURSE) && is_tracking_menu()))
     {
         RtlSetLastWin32Error( ERROR_POPUP_ALREADY_ACTIVE );
         return FALSE;

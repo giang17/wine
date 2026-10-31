@@ -1079,6 +1079,7 @@ SOURCES = \
 	windows.perception.spatial.idl \
 	windows.perception.spatial.surfaces.idl \
 	windows.security.authentication.onlineid.idl \
+	windows.security.authentication.web.core.idl \
 	windows.security.authorization.appcapabilityaccess.idl \
 	windows.security.credentials.idl \
 	windows.security.credentials.ui.idl \
@@ -1118,6 +1119,7 @@ SOURCES = \
 	wine/atsvc.idl \
 	wine/condrv.h \
 	wine/dcetypes.idl \
+	wine/dcomp_layer.h \
 	wine/debug.h \
 	wine/dplaysp.h \
 	wine/epm.idl \
@@ -1261,12 +1263,20 @@ SOURCES = \
 
 INSTALL_LIB = \
 	windows.applicationmodel.winmd \
+	windows.foundation.collections.winmd \
+	windows.foundation.metadata.winmd \
+	windows.foundation.winmd \
 	windows.globalization.winmd \
 	windows.graphics.winmd \
 	windows.media.winmd \
+	windows.networking.connectivity.winmd \
 	windows.networking.winmd \
 	windows.perception.winmd \
+	windows.storage.fileproperties.winmd \
+	windows.storage.streams.winmd \
 	windows.storage.winmd \
 	windows.system.winmd \
+	windows.ui.core.winmd \
 	windows.ui.winmd \
+	windows.ui.xaml.interop.winmd \
 	windows.ui.xaml.winmd

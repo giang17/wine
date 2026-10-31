@@ -198,6 +198,7 @@ extern void *pKiUserEmulationDispatcher;
 extern void *pLdrInitializeThunk;
 extern void *pRtlUserThreadStart;
 extern void *p__wine_ctrl_routine;
+extern void *pWow64DbgUiRemoteBreakin;
 extern SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock;
 
 struct _FILE_FS_DEVICE_INFORMATION;

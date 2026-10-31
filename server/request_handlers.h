@@ -318,6 +318,7 @@ DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(d3dkmt_sync_wait);
 DECL_HANDLER(d3dkmt_sync_signal);
 DECL_HANDLER(alpc_create_port);
+DECL_HANDLER(set_process_dpi_awareness);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -633,6 +634,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_sync_wait,
     (req_handler)req_d3dkmt_sync_signal,
     (req_handler)req_alpc_create_port,
+    (req_handler)req_set_process_dpi_awareness,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2413,3 +2415,5 @@ C_ASSERT( offsetof(struct alpc_create_port_request, max_msg_len) == 16 );
 C_ASSERT( sizeof(struct alpc_create_port_request) == 24 );
 C_ASSERT( offsetof(struct alpc_create_port_reply, handle) == 8 );
 C_ASSERT( sizeof(struct alpc_create_port_reply) == 16 );
+C_ASSERT( offsetof(struct set_process_dpi_awareness_request, dpi_context) == 12 );
+C_ASSERT( sizeof(struct set_process_dpi_awareness_request) == 16 );

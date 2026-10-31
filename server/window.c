@@ -22,6 +22,7 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -80,6 +81,7 @@ struct window
     unsigned int     is_layered : 1;  /* has layered info been set? */
     unsigned int     is_orphan : 1;   /* is window orphaned */
     unsigned int     set_foreground : 1;/* has window been foreground once */
+    unsigned int     dpi_unset : 1;   /* created before the process DPI awareness was set */
     unsigned int     color_key;       /* color key for a layered window */
     unsigned int     alpha;           /* alpha value for a layered window */
     unsigned int     layered_flags;   /* flags for a layered window */
@@ -425,19 +427,35 @@ static int set_parent_window( struct window *win, struct window *parent )
 
     if (parent)
     {
-        attach_parent_thread( win, false );
+        /* Windows attaches the thread input of a cross-thread parent for WS_CHILD
+         * windows only: a WS_POPUP window given a parent through SetParent() keeps
+         * its own input, and its activation deactivates the other thread's window
+         * through the foreground switch without waiting for that thread.  Attached,
+         * that window became the "previous" of set_active_window() and the
+         * deactivation a synchronous send -- FL Studio's ilbridge.exe reparents its
+         * plug-in window into FL's frame while FL's main thread waits for the
+         * bridge, and both sat there forever (WineHQ 44827).  Attach and detach are
+         * gated alike, so a popup that was never attached is not detached either
+         * (detach_thread_input would set an error on the request). */
+        bool child = (win->style & (WS_CHILD | WS_POPUP)) == WS_CHILD;
+
+        if (child) attach_parent_thread( win, false );
         if (win->parent) release_object( win->parent );
         win->parent = (struct window *)grab_object( parent );
-        attach_parent_thread( win, true );
+        if (child) attach_parent_thread( win, true );
         link_window( win, WINPTR_TOP );
 
         if (is_desktop_window( parent )) set_window_monitor_dpi( win );
-        else SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+        else
         {
-            shared->dpi         = parent->shared->dpi;
-            shared->raw_dpi     = parent->shared->raw_dpi;
+            SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+            {
+                shared->dpi         = parent->shared->dpi;
+                shared->raw_dpi     = parent->shared->raw_dpi;
+            }
+            SHARED_WRITE_END;
+            win->dpi_unset = parent->dpi_unset;
         }
-        SHARED_WRITE_END;
 
         if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))
             update_pixel_format_flags( win );
@@ -673,6 +691,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->is_layered     = 0;
     win->is_orphan      = 0;
     win->set_foreground = 0;
+    win->dpi_unset      = 0;
     win->text           = NULL;
     win->text_len       = 0;
     win->paint_flags    = 0;
@@ -976,7 +995,14 @@ static void get_window_list( struct desktop *desktop, struct window *win, struct
     }
     else if (!is_desktop_window( win ))  /* siblings starting from specified window */
     {
-        for (child = win; child; child = get_next_window( child ))
+        /* A window that is not linked into its parent's z-order sits in the
+         * parent's unlinked list (set_parent_window() with a NULL parent, the
+         * first step of destroying it from another thread).  Walking from there
+         * towards the end of the children list never gets there: it loops
+         * through the unlinked list, and the server with it. */
+        append_window_to_list( win, thread, 0, handles, count, max_count );
+        if (!win->is_linked) return;
+        for (child = get_next_window( win ); child; child = get_next_window( child ))
             append_window_to_list( child, thread, 0, handles, count, max_count );
     }
     else  /* desktop window siblings */
@@ -1248,6 +1274,51 @@ static void set_region_visible_rect( struct region *region, struct window *win )
 }
 
 
+/* a layered window without layered attributes is painted through UpdateLayeredWindow() only */
+static inline int is_ulw_window( const struct window *win )
+{
+    return (win->ex_style & WS_EX_LAYERED) && !win->is_layered;
+}
+
+
+/* A window painted through UpdateLayeredWindow() hands out a one-pixel surface
+ * rect (win32u, apply_window_pos()), which keeps GDI out of it and out of its
+ * children: on Windows such a window shows the bitmap given to
+ * UpdateLayeredWindow() and none of their GDI content.  A child with
+ * WS_EX_NOREDIRECTIONBITMAP has no GDI content on Windows to begin with; the DWM
+ * composes its DirectComposition tree over the layered image (measured on
+ * Windows 10).  Here dcomp delivers that tree with GDI, and a child of another
+ * process paints straight into the top-level's drawable, which the owner's
+ * surface flush leaves alone (clip_pixel_format_children()).  WebView2's GPU
+ * process owns such a child in NinjaTrader 8's WPF chat window.  A child of the
+ * owner's own process would paint into the layered surface instead, which the
+ * next UpdateLayeredWindow() overwrites, so that case keeps the clip. */
+static int composes_over_layered_ancestor( const struct window *win, const struct window *ancestor )
+{
+    if (!(win->ex_style & WS_EX_NOREDIRECTIONBITMAP) || !is_ulw_window( ancestor )) return 0;
+    if (!win->thread || !ancestor->thread) return 0;
+    return win->thread->process != ancestor->thread->process;
+}
+
+
+/* set the region to the client rect of an ancestor that clips win, in the ancestor's
+ * parent-relative coordinates; the one-pixel surface rect of a layered ancestor does
+ * not clip a child that composes over it, see composes_over_layered_ancestor() */
+static void set_region_ancestor_client_rect( struct region *region, struct window *ancestor,
+                                             const struct window *win )
+{
+    struct rectangle rect;
+
+    if (!composes_over_layered_ancestor( win, ancestor ))
+    {
+        set_region_client_rect( region, ancestor );
+        return;
+    }
+    intersect_rect( &rect, &ancestor->window_rect, &ancestor->client_rect );
+    set_region_rect( region, &rect );
+}
+
+
 /* get the top-level window to clip against for a given window */
 static inline struct window *get_top_clipping_window( struct window *win )
 {
@@ -1261,6 +1332,7 @@ static inline struct window *get_top_clipping_window( struct window *win )
 static struct region *get_visible_region( struct window *win, unsigned int flags )
 {
     struct region *tmp = NULL, *region;
+    const struct window *self = win;
     int offset_x, offset_y;
 
     if (!(region = create_empty_region())) return NULL;
@@ -1279,7 +1351,7 @@ static struct region *get_visible_region( struct window *win, unsigned int flags
 
     if ((flags & DCX_PARENTCLIP) && !is_desktop_window( win->parent ))
     {
-        set_region_client_rect( region, win->parent );
+        set_region_ancestor_client_rect( region, win->parent, win );
         offset_region( region, -win->parent->client_rect.left, -win->parent->client_rect.top );
     }
     else if (flags & DCX_WINDOW)
@@ -1320,7 +1392,7 @@ static struct region *get_visible_region( struct window *win, unsigned int flags
             offset_x += win->client_rect.left;
             offset_y += win->client_rect.top;
             offset_region( region, win->client_rect.left, win->client_rect.top );
-            set_region_client_rect( tmp, win );
+            set_region_ancestor_client_rect( tmp, win, self );
             if (win->win_region && !intersect_window_region( tmp, win )) goto error;
             if (!intersect_region( region, region, tmp )) goto error;
             if (is_region_empty( region )) break;
@@ -1337,9 +1409,46 @@ error:
 }
 
 
+/* A child window never gets a window surface of its own, it draws into the one
+ * of its top-level ancestor.  That only holds while both live in the same
+ * process: for a child of a foreign process update_visible_region() cannot
+ * reach that surface at all, since get_win_ptr( top_win ) returns
+ * WND_OTHER_PROCESS and no surface is bound to the DC.  Its drawing then falls
+ * through to the graphics driver, which hands out the top-level's drawable
+ * across the process boundary, so the child paints straight into it while the
+ * owner still collects into its surface and flushes with a delay.  The surface
+ * holds no content for the child's area, so every flush overlapping it
+ * overwrites the child's pixels with the owner's background.
+ *
+ * This is the same problem a GL or Vulkan child has, and it gets the same
+ * treatment: subtract the child's client rect from the surface region, which
+ * the graphics driver turns into a clip on the flush.  Only the client rect is
+ * subtracted, so the non-client frame around the child stays with the owner.
+ *
+ * WINE_DISABLE_FOREIGN_CHILD_CLIP=1 restores the previous behaviour. */
+static int foreign_child_clip_disabled(void)
+{
+    static int disabled = -1;
+
+    if (disabled < 0)
+    {
+        const char *str = getenv( "WINE_DISABLE_FOREIGN_CHILD_CLIP" );
+        disabled = (str && atoi( str )) ? 1 : 0;
+    }
+    return disabled;
+}
+
+static int child_draws_from_foreign_process( struct window *child, struct process *owner )
+{
+    if (foreign_child_clip_disabled()) return 0;
+    if (!owner || !child->thread) return 0;
+    return child->thread->process != owner;
+}
+
 /* clip all children with a custom pixel format out of the visible region */
 static struct region *clip_pixel_format_children( struct window *parent, struct region *parent_clip,
-                                                  struct region *region, int offset_x, int offset_y )
+                                                  struct region *region, int offset_x, int offset_y,
+                                                  struct process *owner, const struct window *top )
 {
     struct window *ptr;
     struct region *clip = create_empty_region();
@@ -1349,7 +1458,38 @@ static struct region *clip_pixel_format_children( struct window *parent, struct 
     LIST_FOR_EACH_ENTRY_REV( ptr, &parent->children, struct window, entry )
     {
         if (!(ptr->style & WS_VISIBLE)) continue;
-        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+        /* A transparent child does not obscure its parent for GDI painting, but a
+         * child that presents through its own pixel format still owns its client
+         * pixels: skipping it here leaves that area in the surface region, and the
+         * next flush that covers it overwrites what was presented there.  JUCE's
+         * OpenGL native window carries WS_EX_TRANSPARENT (windowIgnoresMouseClicks),
+         * so an embedded JUCE editor flickered with the host's background whenever
+         * the host repainted its whole window.  The same holds for a child that
+         * composes over a layered top-level from another process: Chromium's
+         * "Intermediate D3D Window" carries WS_EX_TRANSPARENT.
+         *
+         * A transparent child still has to be descended into, though: a foreign
+         * window below it draws into our drawable just the same.  WinForms gives a
+         * control with BackColor=Transparent WS_EX_TRANSPARENT, and Power BI Desktop
+         * hosts each of its WebView2 views in such a control; skipping the whole
+         * subtree left the browser windows in the surface region, so the full-window
+         * erase of the form's Refresh() on every step of its own title-bar drag was
+         * flushed over what the GPU process had drawn there.  The transparent child
+         * itself is neither added nor subtracted, only its subtree is walked. */
+        if ((ptr->ex_style & WS_EX_TRANSPARENT) &&
+            !(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD)) &&
+            !composes_over_layered_ancestor( ptr, top ))
+        {
+            if (foreign_child_clip_disabled()) continue;
+            set_region_rect( clip, &ptr->client_rect );
+            if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
+            offset_region( clip, offset_x, offset_y );
+            if (!intersect_region( clip, clip, parent_clip )) break;
+            if (!clip_pixel_format_children( ptr, clip, region, offset_x + ptr->client_rect.left,
+                                             offset_y + ptr->client_rect.top, owner, top ))
+                break;
+            continue;
+        }
 
         /* add the visible rect */
         set_region_rect( clip, &ptr->visible_rect );
@@ -1357,7 +1497,33 @@ static struct region *clip_pixel_format_children( struct window *parent, struct 
         offset_region( clip, offset_x, offset_y );
         if (!intersect_region( clip, clip, parent_clip )) break;
         if (!union_region( region, region, clip )) break;
-        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))) continue;
+
+        /* a child of a foreign process draws into our drawable behind our back,
+         * exactly like a pixel format child - subtract it for the same reason.
+         * The whole foreign subtree lives inside the rect removed here, so there
+         * is nothing below it left to clip. */
+        if (child_draws_from_foreign_process( ptr, owner ))
+        {
+            set_region_rect( clip, &ptr->client_rect );
+            if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
+            offset_region( clip, offset_x, offset_y );
+            if (!intersect_region( clip, clip, parent_clip )) break;
+            if (!subtract_region( region, region, clip )) break;
+            continue;
+        }
+
+        /* The descent below is normally taken only for a subtree known to hold a
+         * pixel format child, since PAINT_PIXEL_FORMAT_CHILD is maintained on the
+         * parents.  There is no equivalent flag for "a foreign window hangs below
+         * me", and a foreign child need not be a direct child of the top-level,
+         * so descend unconditionally.  This costs one tree walk per surface
+         * region recomputation - server-local pointer chasing on geometry
+         * changes, not per frame.  A parent flag maintained like
+         * PAINT_PIXEL_FORMAT_CHILD would avoid it and is the natural next step if
+         * this ever shows up in a profile. */
+        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD)) &&
+            foreign_child_clip_disabled())
+            continue;
 
         /* subtract the client rect if it uses a custom pixel format */
         set_region_rect( clip, &ptr->client_rect );
@@ -1368,7 +1534,7 @@ static struct region *clip_pixel_format_children( struct window *parent, struct 
             break;
 
         if (!clip_pixel_format_children( ptr, clip, region, offset_x + ptr->client_rect.left,
-                                         offset_y + ptr->client_rect.top ))
+                                         offset_y + ptr->client_rect.top, owner, top ))
             break;
     }
     free_region( clip );
@@ -1391,7 +1557,16 @@ static struct region *get_surface_region( struct window *win )
     set_region_rect( clip, &win->client_rect );
     if (win->win_region && !intersect_window_region( clip, win )) goto error;
 
-    if ((win->paint_flags & PAINT_HAS_PIXEL_FORMAT) && !subtract_region( region, region, clip ))
+    /* A layered window without layered attributes shows what UpdateLayeredWindow()
+     * put into its surface and nothing else.  A client window that a swap chain
+     * created on it is rendered offscreen (winex11, needs_offscreen_rendering()),
+     * so its pixel format does not take the client area away from the surface:
+     * WPF renders such a window through Direct3D 9 and hands each frame to
+     * UpdateLayeredWindow().  Children drawn by another process or through their
+     * own pixel format are still subtracted below; NinjaTrader 8's chat window
+     * is a WPF layered window around a WebView2 child of another process. */
+    if ((win->paint_flags & PAINT_HAS_PIXEL_FORMAT) && !is_ulw_window( win ) &&
+        !subtract_region( region, region, clip ))
         goto error;
 
     /* clip children */
@@ -1403,7 +1578,8 @@ static struct region *get_surface_region( struct window *win )
     }
     else offset_x = offset_y = 0;
 
-    if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y )) goto error;
+    if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y,
+                                     win->thread ? win->thread->process : NULL, win )) goto error;
 
     free_region( clip );
     return region;
@@ -2256,7 +2432,7 @@ DECL_HANDLER(create_window)
     if (!atom) atom = find_atom( table, cls_name );
 
     if (!(win = create_window( parent, owner, atom, req->class_instance, !!req->ansi,
-                               req->dpi_context, req->dpi, req->raw_dpi )))
+                               req->dpi_context & ~NTUSER_DPI_CONTEXT_FLAG_PROCESS, req->dpi, req->raw_dpi )))
         return;
 
     SHARED_WRITE_BEGIN( win->shared, window_shm_t )
@@ -2269,6 +2445,10 @@ DECL_HANDLER(create_window)
         }
     }
     SHARED_WRITE_END;
+
+    /* a window created while the process DPI awareness is unset takes the awareness once it is set
+     * (set_process_dpi_awareness); a child follows its parent */
+    win->dpi_unset = is_toplevel( win ) ? !!(req->dpi_context & NTUSER_DPI_CONTEXT_FLAG_PROCESS) : win->parent->dpi_unset;
 
     win->style = req->style;
     win->ex_style = req->ex_style;
@@ -2326,6 +2506,37 @@ DECL_HANDLER(set_parent)
     reply->old_parent  = win->parent->handle;
     reply->full_parent = parent ? parent->handle : 0;
     set_parent_window( win, parent );
+}
+
+
+/* set the process DPI awareness context: windows created while it was unset take it now, as on Windows
+ * (Windows 10 22H2, measured: every window of the process created before the call, whatever the thread
+ * context it was created under, reports the process awareness afterwards; a window that already had a
+ * higher awareness keeps it) */
+DECL_HANDLER(set_process_dpi_awareness)
+{
+    unsigned int context = req->dpi_context, awareness = NTUSER_DPI_CONTEXT_GET_AWARENESS( context );
+    struct process *process = current->process;
+    user_handle_t handle = 0;
+    struct window *win, *top;
+
+    /* a per-monitor context is stored as version 1, as for a new window */
+    if (NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( context )) context = NTUSER_DPI_PER_MONITOR_AWARE;
+
+    while ((win = next_user_handle( &handle, NTUSER_OBJ_WINDOW )))
+    {
+        if (!win->dpi_unset) continue;
+        /* the awareness of a child is that of its top-level window, including one of another process */
+        for (top = win; !is_toplevel( top ); top = top->parent) ;
+        if (!top->thread || top->thread->process != process) continue;
+        win->dpi_unset = 0;
+        if (NTUSER_DPI_CONTEXT_GET_AWARENESS( win->shared->dpi_context ) >= awareness) continue;
+        SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+        {
+            shared->dpi_context = context;
+        }
+        SHARED_WRITE_END;
+    }
 }
 
 
@@ -2600,7 +2811,8 @@ DECL_HANDLER(get_class_windows)
         if (!parent) parent = get_desktop_window( current );
         if (!(win = get_window( req->child ))) return;
         if (win->parent != parent) return;
-        if (!(win = get_next_window( win ))) return;
+        /* an unlinked window has no successor in the z-order, see get_window_list() */
+        if (!win->is_linked || !(win = get_next_window( win ))) return;
     }
     else if (parent && !(win = get_first_child( parent ))) return;
 
@@ -3100,6 +3312,13 @@ void set_window_rect_visible( user_handle_t window, struct rectangle rect )
             if (!rect_in_region( ptr->win_region, &tmp )) continue;
         }
         /* found a window obscuring the rectangle, now move win above this one */
+        /* never above a window it owns: win32 keeps owned windows above their owner, a window
+         * manager that raised the owner over them disagrees with win32, not the other way round */
+        if (ptr->owner == win->handle) break;
+        /* nor above a window with the same owner when both have WS_EX_APPWINDOW: the X11 driver
+         * gives them no WM_TRANSIENT_FOR, so their order changes only through win32, and under a
+         * compositor a freshly mapped window is exposed in full whatever the stacking */
+        if (win->owner && ptr->owner == win->owner && (win->ex_style & ptr->ex_style & WS_EX_APPWINDOW)) break;
         /* making sure to not violate the topmost rule */
         if (!(ptr->ex_style & WS_EX_TOPMOST) || (win->ex_style & WS_EX_TOPMOST))
         {

@@ -22,6 +22,7 @@
 
 #include "initguid.h"
 #include "sapiddk.h"
+#include "shlobj.h"
 #include "sperror.h"
 
 #include "wine/test.h"
@@ -54,10 +55,16 @@ static void test_data_key(void)
     hr = ISpRegDataKey_SetStringValue( data_key, L"Voice", L"Test" );
     ok( hr == E_HANDLE, "got %08lx\n", hr );
 
+    hr = ISpRegDataKey_EnumValues(data_key, 0, &value);
+    ok( hr == E_HANDLE, "got %08lx\n", hr );
+
     hr = ISpRegDataKey_SetKey( data_key, key, FALSE );
     ok( hr == S_OK, "got %08lx\n", hr );
     hr = ISpRegDataKey_SetKey( data_key, key, FALSE );
     ok( hr == SPERR_ALREADY_INITIALIZED, "got %08lx\n", hr );
+
+    hr = ISpRegDataKey_EnumValues(data_key, 0, &value);
+    ok( hr == SPERR_NO_MORE_ITEMS, "got %08lx\n", hr );
 
     hr = ISpRegDataKey_GetStringValue( data_key, L"Voice", &value );
     ok( hr == SPERR_NOT_FOUND, "got %08lx\n", hr );
@@ -72,6 +79,14 @@ static void test_data_key(void)
     ok( hr == S_OK, "got %08lx\n", hr );
     ok( !wcscmp( value, L"Test" ), "got %s\n", wine_dbgstr_w(value) );
     CoTaskMemFree( value );
+
+    hr = ISpRegDataKey_EnumValues(data_key, 0, &value);
+    ok( hr == S_OK, "got %08lx\n", hr );
+    ok( !wcscmp( value, L"Voice" ), "got %s\n", wine_dbgstr_w(value) );
+    CoTaskMemFree( value );
+
+    hr = ISpRegDataKey_EnumValues(data_key, 1, &value);
+    ok( hr == SPERR_NO_MORE_ITEMS, "got %08lx\n", hr );
 
     hr = ISpRegDataKey_OpenKey( data_key, L"Testing", &sub );
     ok( hr == SPERR_NOT_FOUND, "got %08lx\n", hr );
@@ -574,6 +589,158 @@ static void test_default_token_id(void)
     ISpObjectTokenCategory_Release( cat );
 }
 
+static const WCHAR default_cat_key[] = L"Software\\Winetest\\sapi\\DefaultChoice";
+
+/* Recreates the category HKEY_CURRENT_USER\Software\Winetest\sapi\DefaultChoice with tokens
+ * named "A", "B", ... and the given Language attributes (NULL: no Attributes key). */
+static ISpObjectTokenCategory *create_default_category( const WCHAR **langs, unsigned int count )
+{
+    ISpObjectTokenCategory *cat;
+    WCHAR path[MAX_PATH];
+    unsigned int i;
+    LSTATUS ret;
+    HRESULT hr;
+    HKEY key;
+
+    RegDeleteTreeW( HKEY_CURRENT_USER, default_cat_key );
+    swprintf( path, ARRAY_SIZE(path), L"%ls\\Tokens", default_cat_key );
+    ret = RegCreateKeyExW( HKEY_CURRENT_USER, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL );
+    ok( ret == ERROR_SUCCESS, "got %ld\n", ret );
+    RegCloseKey( key );
+
+    for (i = 0; i < count; i++)
+    {
+        if (langs[i])
+            swprintf( path, ARRAY_SIZE(path), L"%ls\\Tokens\\%c\\Attributes", default_cat_key, 'A' + i );
+        else
+            swprintf( path, ARRAY_SIZE(path), L"%ls\\Tokens\\%c", default_cat_key, 'A' + i );
+        ret = RegCreateKeyExW( HKEY_CURRENT_USER, path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL );
+        ok( ret == ERROR_SUCCESS, "got %ld\n", ret );
+        if (langs[i])
+            RegSetValueExW( key, L"Language", 0, REG_SZ, (const BYTE *)langs[i],
+                            (wcslen( langs[i] ) + 1) * sizeof(WCHAR) );
+        RegCloseKey( key );
+    }
+
+    hr = CoCreateInstance( &CLSID_SpObjectTokenCategory, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_ISpObjectTokenCategory, (void **)&cat );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    swprintf( path, ARRAY_SIZE(path), L"HKEY_CURRENT_USER\\%ls", default_cat_key );
+    hr = ISpObjectTokenCategory_SetId( cat, path, FALSE );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    return cat;
+}
+
+/* Checks the DefaultTokenId stored in the category key: the token name, or NULL for none. */
+#define check_stored_default(a) check_stored_default_(__LINE__, a)
+static void check_stored_default_( unsigned int line, const WCHAR *name )
+{
+    WCHAR value[MAX_PATH] = { 0 }, expect[MAX_PATH];
+    DWORD size = sizeof(value);
+    LSTATUS ret;
+
+    ret = RegGetValueW( HKEY_CURRENT_USER, default_cat_key, L"DefaultTokenId", RRF_RT_REG_SZ,
+                        NULL, value, &size );
+    if (!name)
+    {
+        ok_(__FILE__, line)( ret == ERROR_FILE_NOT_FOUND, "got %ld, %s\n", ret, wine_dbgstr_w(value) );
+        return;
+    }
+    swprintf( expect, ARRAY_SIZE(expect), L"HKEY_CURRENT_USER\\%ls\\Tokens\\%ls", default_cat_key, name );
+    ok_(__FILE__, line)( ret == ERROR_SUCCESS, "got %ld\n", ret );
+    ok_(__FILE__, line)( !wcscmp( value, expect ), "got %s\n", wine_dbgstr_w(value) );
+}
+
+#define check_default(a, b, c) check_default_(__LINE__, a, b, c)
+static void check_default_( unsigned int line, ISpObjectTokenCategory *cat, HRESULT expect_hr,
+                            const WCHAR *name )
+{
+    WCHAR expect[MAX_PATH], *id = NULL;
+    HRESULT hr;
+
+    hr = ISpObjectTokenCategory_GetDefaultTokenId( cat, &id );
+    ok_(__FILE__, line)( hr == expect_hr, "got %08lx\n", hr );
+    if (hr != S_OK) return;
+    swprintf( expect, ARRAY_SIZE(expect), L"HKEY_CURRENT_USER\\%ls\\Tokens\\%ls", default_cat_key, name );
+    ok_(__FILE__, line)( !wcscmp( id, expect ), "got %s\n", wine_dbgstr_w(id) );
+    CoTaskMemFree( id );
+}
+
+static void test_default_token_choice(void)
+{
+    WCHAR ui[16], primary[16], other[16], list[32], path[MAX_PATH];
+    LANGID lang = GetUserDefaultUILanguage();
+    IEnumSpObjectTokens *enum_tokens;
+    ISpObjectTokenCategory *cat;
+    const WCHAR *langs[3];
+    HRESULT hr;
+
+    /* the user's UI language, the same primary language with another sublanguage, and
+     * another language */
+    swprintf( ui, ARRAY_SIZE(ui), L"%x", lang );
+    swprintf( primary, ARRAY_SIZE(primary), L"%x",
+              MAKELANGID( PRIMARYLANGID(lang), SUBLANGID(lang) == SUBLANG_DEFAULT ? 2 : SUBLANG_DEFAULT ) );
+    swprintf( other, ARRAY_SIZE(other), L"%x", PRIMARYLANGID(lang) == LANG_FRENCH ? 0x410 : 0x40c );
+    swprintf( list, ARRAY_SIZE(list), L"%ls;%ls", other, ui );
+
+    /* Without a default, the first token of the UI language becomes the default and is
+     * stored in the category key. */
+    langs[0] = other; langs[1] = ui; langs[2] = ui;
+    cat = create_default_category( langs, 3 );
+    check_stored_default( NULL );
+    check_default( cat, S_OK, L"B" );
+    check_stored_default( L"B" );
+    ISpObjectTokenCategory_Release( cat );
+
+    /* A token that only shares the primary language does not count, the first token wins. */
+    langs[0] = other; langs[1] = primary;
+    cat = create_default_category( langs, 2 );
+    check_default( cat, S_OK, L"A" );
+    check_stored_default( L"A" );
+    ISpObjectTokenCategory_Release( cat );
+
+    langs[0] = other; langs[1] = list;
+    cat = create_default_category( langs, 2 );
+    check_default( cat, S_OK, L"B" );
+    ISpObjectTokenCategory_Release( cat );
+
+    langs[0] = NULL; langs[1] = ui;
+    cat = create_default_category( langs, 2 );
+    check_default( cat, S_OK, L"B" );
+    ISpObjectTokenCategory_Release( cat );
+
+    cat = create_default_category( langs, 0 );
+    check_default( cat, SPERR_NOT_FOUND, NULL );
+    check_stored_default( NULL );
+    ISpObjectTokenCategory_Release( cat );
+
+    /* EnumTokens() stores the default as well. */
+    langs[0] = other; langs[1] = ui;
+    cat = create_default_category( langs, 2 );
+    hr = ISpObjectTokenCategory_EnumTokens( cat, NULL, NULL, &enum_tokens );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    IEnumSpObjectTokens_Release( enum_tokens );
+    check_stored_default( L"B" );
+    ISpObjectTokenCategory_Release( cat );
+
+    /* SetDefaultTokenId() stores any id, even one without a token. */
+    cat = create_default_category( langs, 2 );
+    swprintf( path, ARRAY_SIZE(path), L"HKEY_CURRENT_USER\\%ls\\Tokens\\A", default_cat_key );
+    hr = ISpObjectTokenCategory_SetDefaultTokenId( cat, path );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    check_stored_default( L"A" );
+    check_default( cat, S_OK, L"A" );
+    swprintf( path, ARRAY_SIZE(path), L"HKEY_CURRENT_USER\\%ls\\Tokens\\Missing", default_cat_key );
+    hr = ISpObjectTokenCategory_SetDefaultTokenId( cat, path );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    check_stored_default( L"Missing" );
+    hr = ISpObjectTokenCategory_SetDefaultTokenId( cat, NULL );
+    ok( hr == E_INVALIDARG, "got %08lx\n", hr );
+    ISpObjectTokenCategory_Release( cat );
+
+    RegDeleteTreeW( HKEY_CURRENT_USER, default_cat_key );
+}
+
 static void tests_token_voices(void)
 {
     ISpObjectTokenCategory *cat;
@@ -1003,6 +1170,234 @@ static void test_object_token(void)
     RegDeleteTreeA( HKEY_LOCAL_MACHINE, "Software\\Winetest\\sapi" );
 }
 
+static const WCHAR storage_token_id[] = L"HKEY_CURRENT_USER\\Software\\Winetest\\sapi\\StorageToken";
+
+static ISpObjectToken *create_storage_token( ISpDataKey **attrs )
+{
+    ISpObjectToken *token;
+    HRESULT hr;
+
+    hr = CoCreateInstance( &CLSID_SpObjectToken, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_ISpObjectToken, (void **)&token );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    hr = ISpObjectToken_SetId( token, NULL, storage_token_id, TRUE );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    hr = ISpObjectToken_CreateKey( token, L"Attributes", attrs );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    hr = ISpDataKey_SetStringValue( *attrs, L"Language", L"409;9" );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    hr = ISpDataKey_SetStringValue( *attrs, L"Gender", L"Female" );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    return token;
+}
+
+static void test_object_token_init(void)
+{
+    ISpObjectTokenInit *init;
+    ISpObjectToken *token, *token2;
+    ISpDataKey *attrs;
+    WCHAR *str;
+    HRESULT hr;
+
+    hr = CoCreateInstance( &CLSID_SpObjectToken, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_ISpObjectToken, (void **)&token );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    hr = ISpObjectToken_QueryInterface( token, &IID_ISpObjectTokenInit, (void **)&init );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    ok( (void *)init == (void *)token, "got %p, %p\n", init, token );
+    ISpObjectTokenInit_Release( init );
+    ISpObjectToken_Release( token );
+
+    token = create_storage_token( &attrs );
+
+    hr = CoCreateInstance( &CLSID_SpObjectToken, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_ISpObjectTokenInit, (void **)&init );
+    ok( hr == S_OK, "got %08lx\n", hr );
+
+    hr = ISpObjectTokenInit_InitFromDataKey( init, NULL, NULL, attrs );
+    ok( hr == E_POINTER, "got %08lx\n", hr );
+    hr = ISpObjectTokenInit_InitFromDataKey( init, NULL, L"TestToken", NULL );
+    ok( hr == E_POINTER, "got %08lx\n", hr );
+    hr = ISpObjectTokenInit_InitFromDataKey( init, NULL, L"TestToken", attrs );
+    ok( hr == S_OK, "got %08lx\n", hr );
+
+    str = NULL;
+    hr = ISpObjectTokenInit_GetId( init, &str );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    ok( str && !wcscmp( str, L"TestToken" ), "got %s\n", wine_dbgstr_w(str) );
+    CoTaskMemFree( str );
+
+    str = NULL;
+    hr = ISpObjectTokenInit_GetStringValue( init, L"Gender", &str );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    ok( str && !wcscmp( str, L"Female" ), "got %s\n", wine_dbgstr_w(str) );
+    CoTaskMemFree( str );
+
+    hr = ISpObjectTokenInit_InitFromDataKey( init, NULL, L"TestToken2", attrs );
+    ok( hr == SPERR_ALREADY_INITIALIZED, "got %08lx\n", hr );
+    hr = ISpObjectTokenInit_SetId( init, NULL, storage_token_id, FALSE );
+    ok( hr == SPERR_ALREADY_INITIALIZED, "got %08lx\n", hr );
+
+    hr = ISpObjectTokenInit_QueryInterface( init, &IID_ISpObjectToken, (void **)&token2 );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    ok( (void *)token2 == (void *)init, "got %p, %p\n", token2, init );
+    ISpObjectToken_Release( token2 );
+    ISpObjectTokenInit_Release( init );
+
+    hr = CoCreateInstance( &CLSID_SpObjectToken, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_ISpObjectTokenInit, (void **)&init );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    hr = ISpObjectTokenInit_SetId( init, NULL, storage_token_id, FALSE );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    hr = ISpObjectTokenInit_InitFromDataKey( init, NULL, L"TestToken", attrs );
+    ok( hr == SPERR_ALREADY_INITIALIZED, "got %08lx\n", hr );
+    ISpObjectTokenInit_Release( init );
+
+    ISpDataKey_Release( attrs );
+    ISpObjectToken_Release( token );
+    RegDeleteTreeA( HKEY_CURRENT_USER, "Software\\Winetest\\sapi" );
+}
+
+static void test_object_token_matches(void)
+{
+    static const struct
+    {
+        const WCHAR *attrs;
+        BOOL match;
+    }
+    tests[] =
+    {
+        { L"Language=409", TRUE },
+        { L"Language=9", TRUE },
+        { L"Language=407", FALSE },
+        { L"Gender=Female;Language=409", TRUE },
+        { L"Gender=Male;Language=409", FALSE },
+        { L"Gender", TRUE },
+        { L"Age", FALSE },
+        { L"Age!=Adult", TRUE },
+        { L"Gender!=Female", FALSE },
+        { L"Gender!=Male", TRUE },
+        { L"gender=female", TRUE },
+        { L"", TRUE },
+        { NULL, TRUE },
+    };
+    ISpObjectToken *token;
+    ISpDataKey *attrs;
+    unsigned int i;
+    BOOL match;
+    HRESULT hr;
+
+    hr = CoCreateInstance( &CLSID_SpObjectToken, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_ISpObjectToken, (void **)&token );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    match = 0xdeadbeef;
+    hr = ISpObjectToken_MatchesAttributes( token, L"Language=409", &match );
+    ok( hr == SPERR_UNINITIALIZED, "got %08lx\n", hr );
+    ok( match == 0xdeadbeef, "got %d\n", match );
+    ISpObjectToken_Release( token );
+
+    token = create_storage_token( &attrs );
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        match = !tests[i].match;
+        hr = ISpObjectToken_MatchesAttributes( token, tests[i].attrs, &match );
+        ok( hr == S_OK, "%u: got %08lx\n", i, hr );
+        ok( match == tests[i].match, "%u: got %d\n", i, match );
+    }
+
+    hr = ISpObjectToken_MatchesAttributes( token, L"Language=409", NULL );
+    ok( hr == E_INVALIDARG, "got %08lx\n", hr );
+
+    ISpDataKey_Release( attrs );
+    ISpObjectToken_Release( token );
+    RegDeleteTreeA( HKEY_CURRENT_USER, "Software\\Winetest\\sapi" );
+}
+
+static void test_object_token_storage(void)
+{
+    static const WCHAR files_key[] = L"Software\\Winetest\\sapi\\StorageToken\\" TESTCLASS_CLSID L"\\Files";
+    static const WCHAR stored_prefix[] = L"%1a%\\Microsoft\\Speech\\Files\\Winetest\\SP_";
+    WCHAR appdata[MAX_PATH], dir[MAX_PATH], expect[MAX_PATH], buf[MAX_PATH], *path, *path2;
+    ISpObjectToken *token;
+    ISpDataKey *attrs;
+    DWORD size;
+    HRESULT hr;
+    LONG res;
+
+    hr = CoCreateInstance( &CLSID_SpObjectToken, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_ISpObjectToken, (void **)&token );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    hr = ISpObjectToken_GetStorageFileName( token, &CLSID_TestClass, L"Datafile", L"Winetest\\",
+                                            CSIDL_APPDATA | CSIDL_FLAG_CREATE, &path );
+    ok( hr == SPERR_UNINITIALIZED, "got %08lx\n", hr );
+    ISpObjectToken_Release( token );
+
+    token = create_storage_token( &attrs );
+
+    hr = ISpObjectToken_GetStorageFileName( token, &CLSID_TestClass, NULL, L"Winetest\\",
+                                            CSIDL_APPDATA | CSIDL_FLAG_CREATE, &path );
+    ok( hr == E_INVALIDARG, "got %08lx\n", hr );
+    hr = ISpObjectToken_GetStorageFileName( token, &CLSID_TestClass, L"Datafile", L"Winetest\\",
+                                            CSIDL_APPDATA | CSIDL_FLAG_CREATE, NULL );
+    ok( hr == E_POINTER, "got %08lx\n", hr );
+
+    /* Without a folder, nothing is created. */
+    hr = ISpObjectToken_GetStorageFileName( token, &CLSID_TestClass, L"Datafile", NULL, 0, &path );
+    ok( hr == SPERR_NOT_FOUND, "got %08lx\n", hr );
+    hr = ISpObjectToken_GetStorageFileName( token, &CLSID_TestClass, L"Datafile", L"C:\\winetest-sapi\\", 0, &path );
+    ok( hr == SPERR_NOT_FOUND, "got %08lx\n", hr );
+
+    SHGetFolderPathW( NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appdata );
+    swprintf( dir, ARRAY_SIZE(dir), L"%s\\Microsoft\\Speech\\Files\\Winetest", appdata );
+    swprintf( expect, ARRAY_SIZE(expect), L"%s\\SP_", dir );
+
+    /* A new file gets a generated name and S_FALSE. */
+    path = NULL;
+    hr = ISpObjectToken_GetStorageFileName( token, &CLSID_TestClass, L"Datafile", L"Winetest\\",
+                                            CSIDL_APPDATA | CSIDL_FLAG_CREATE, &path );
+    ok( hr == S_FALSE, "got %08lx\n", hr );
+    ok( path && !wcsncmp( path, expect, wcslen( expect ) ) && wcslen( path ) == wcslen( expect ) + 36 &&
+        !wcscmp( path + wcslen( path ) - 4, L".dat" ), "got %s\n", wine_dbgstr_w(path) );
+    ok( GetFileAttributesW( path ) != INVALID_FILE_ATTRIBUTES, "file %s not created\n", wine_dbgstr_w(path) );
+
+    size = sizeof(buf);
+    res = RegGetValueW( HKEY_CURRENT_USER, files_key, L"Datafile", RRF_RT_REG_SZ, NULL, buf, &size );
+    ok( !res, "got %ld\n", res );
+    ok( !wcsncmp( buf, stored_prefix, wcslen( stored_prefix ) ) &&
+        !wcscmp( buf + wcslen( stored_prefix ), path + wcslen( expect ) ), "got %s\n", wine_dbgstr_w(buf) );
+
+    /* From now on the stored file is returned, whatever the other arguments are. */
+    path2 = NULL;
+    hr = ISpObjectToken_GetStorageFileName( token, &CLSID_TestClass, L"Datafile", L"Other\\",
+                                            CSIDL_LOCAL_APPDATA, &path2 );
+    ok( hr == S_OK, "got %08lx\n", hr );
+    ok( path2 && !wcscmp( path, path2 ), "got %s, expected %s\n", wine_dbgstr_w(path2), wine_dbgstr_w(path) );
+    CoTaskMemFree( path2 );
+
+    path2 = NULL;
+    hr = ISpObjectToken_GetStorageFileName( token, &CLSID_TestClass, L"Named", L"Winetest\\named.dat",
+                                            CSIDL_APPDATA | CSIDL_FLAG_CREATE, &path2 );
+    ok( hr == S_FALSE, "got %08lx\n", hr );
+    swprintf( expect, ARRAY_SIZE(expect), L"%s\\named.dat", dir );
+    ok( path2 && !wcscmp( path2, expect ), "got %s\n", wine_dbgstr_w(path2) );
+    ok( GetFileAttributesW( path2 ) != INVALID_FILE_ATTRIBUTES, "file %s not created\n", wine_dbgstr_w(path2) );
+    size = sizeof(buf);
+    res = RegGetValueW( HKEY_CURRENT_USER, files_key, L"Named", RRF_RT_REG_SZ, NULL, buf, &size );
+    ok( !res, "got %ld\n", res );
+    ok( !wcscmp( buf, L"%1a%\\Microsoft\\Speech\\Files\\Winetest\\named.dat" ), "got %s\n", wine_dbgstr_w(buf) );
+
+    DeleteFileW( path2 );
+    CoTaskMemFree( path2 );
+    DeleteFileW( path );
+    CoTaskMemFree( path );
+    RemoveDirectoryW( dir );
+
+    ISpDataKey_Release( attrs );
+    ISpObjectToken_Release( token );
+    RegDeleteTreeA( HKEY_CURRENT_USER, "Software\\Winetest\\sapi" );
+}
+
 START_TEST(token)
 {
     CoInitialize( NULL );
@@ -1012,7 +1407,11 @@ START_TEST(token)
     test_token_category();
     test_token_enum();
     test_default_token_id();
+    test_default_token_choice();
     test_object_token();
+    test_object_token_init();
+    test_object_token_matches();
+    test_object_token_storage();
     tests_token_voices();
     CoUninitialize();
 }

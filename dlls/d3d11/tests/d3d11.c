@@ -21431,7 +21431,8 @@ static void check_format_support(ID3D11Device *device, const unsigned int *forma
 
         if (formats[i].fl_required <= feature_level)
         {
-            todo_wine_if (feature_flag == D3D11_FORMAT_SUPPORT_DISPLAY)
+            todo_wine_if (feature_flag == D3D11_FORMAT_SUPPORT_DISPLAY
+                    && format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM)
                 ok(supported || broken(warp),
                         "Format %#x - %s not supported, format support %#x.\n",
                         format, feature_name, format_support[format]);
@@ -21454,6 +21455,7 @@ static void check_format_support(ID3D11Device *device, const unsigned int *forma
 static void test_format_support(const D3D_FEATURE_LEVEL feature_level)
 {
     unsigned int format_support[DXGI_FORMAT_B4G4R4A4_UNORM + 1];
+    D3D11_FEATURE_DATA_FORMAT_SUPPORT2 feature_data2;
     D3D11_FEATURE_DATA_FORMAT_SUPPORT feature_data;
     struct device_desc device_desc;
     ID3D11Device *device;
@@ -21462,6 +21464,12 @@ static void test_format_support(const D3D_FEATURE_LEVEL feature_level)
     UINT support;
     HRESULT hr;
 
+    static const unsigned int uav_atomics = D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_ADD
+            | D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS
+            | D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE
+            | D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE
+            | D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX
+            | D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
     static const struct format_support index_buffers[] =
     {
         {DXGI_FORMAT_R32_UINT, D3D_FEATURE_LEVEL_9_2},
@@ -21588,7 +21596,6 @@ static void test_format_support(const D3D_FEATURE_LEVEL feature_level)
 
     ok(format_support[DXGI_FORMAT_R8G8B8A8_UNORM] & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE,
             "SHADER_SAMPLE is not supported for R8G8B8A8_UNORM.\n");
-    todo_wine
     ok(!(format_support[DXGI_FORMAT_R32G32B32A32_UINT] & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE),
             "SHADER_SAMPLE is supported for R32G32B32A32_UINT.\n");
     if (feature_level >= D3D_FEATURE_LEVEL_10_0)
@@ -21596,6 +21603,122 @@ static void test_format_support(const D3D_FEATURE_LEVEL feature_level)
         ok(format_support[DXGI_FORMAT_R32G32B32A32_UINT] & D3D11_FORMAT_SUPPORT_SHADER_LOAD,
                 "SHADER_LOAD is not supported for R32G32B32A32_UINT.\n");
     }
+
+    /* What a format is restricts what it supports, whatever the hardware. */
+    ok(!(format_support[DXGI_FORMAT_R32G32B32A32_UINT] & (D3D11_FORMAT_SUPPORT_BLENDABLE
+            | D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE)),
+            "Got unexpected format support %#x for R32G32B32A32_UINT.\n",
+            format_support[DXGI_FORMAT_R32G32B32A32_UINT]);
+    ok(!(format_support[DXGI_FORMAT_R8G8B8A8_TYPELESS] & (D3D11_FORMAT_SUPPORT_SHADER_LOAD
+            | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_RENDER_TARGET
+            | D3D11_FORMAT_SUPPORT_BLENDABLE | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN | D3D11_FORMAT_SUPPORT_BUFFER)),
+            "Got unexpected format support %#x for R8G8B8A8_TYPELESS.\n",
+            format_support[DXGI_FORMAT_R8G8B8A8_TYPELESS]);
+    ok(!(format_support[DXGI_FORMAT_D32_FLOAT] & (D3D11_FORMAT_SUPPORT_SHADER_LOAD
+            | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON
+            | D3D11_FORMAT_SUPPORT_RENDER_TARGET | D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_TEXTURE3D)),
+            "Got unexpected format support %#x for D32_FLOAT.\n", format_support[DXGI_FORMAT_D32_FLOAT]);
+    ok(!(format_support[DXGI_FORMAT_BC1_UNORM] & (D3D11_FORMAT_SUPPORT_BUFFER
+            | D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_RENDER_TARGET)),
+            "Got unexpected format support %#x for BC1_UNORM.\n", format_support[DXGI_FORMAT_BC1_UNORM]);
+    ok(!(format_support[DXGI_FORMAT_R8G8B8A8_UNORM_SRGB] & (D3D11_FORMAT_SUPPORT_BUFFER
+            | D3D11_FORMAT_SUPPORT_IA_VERTEX_BUFFER | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)),
+            "Got unexpected format support %#x for R8G8B8A8_UNORM_SRGB.\n",
+            format_support[DXGI_FORMAT_R8G8B8A8_UNORM_SRGB]);
+    ok(!(format_support[DXGI_FORMAT_R11G11B10_FLOAT] & D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT),
+            "Got unexpected format support %#x for R11G11B10_FLOAT.\n",
+            format_support[DXGI_FORMAT_R11G11B10_FLOAT]);
+    for (format = DXGI_FORMAT_UNKNOWN; format <= DXGI_FORMAT_B4G4R4A4_UNORM; ++format)
+    {
+        if (format_support[format] & D3D11_FORMAT_SUPPORT_BACK_BUFFER_CAST)
+            ok(format_support[format] & D3D11_FORMAT_SUPPORT_DISPLAY,
+                    "Format %#x: BACK_BUFFER_CAST without DISPLAY, format support %#x.\n",
+                    format, format_support[format]);
+        if (feature_level < D3D_FEATURE_LEVEL_10_0)
+            ok(!(format_support[format] & (D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT
+                    | D3D11_FORMAT_SUPPORT_SO_BUFFER | D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)),
+                    "Format %#x: unexpected format support %#x on feature level %#x.\n",
+                    format, format_support[format], feature_level);
+        else if (feature_level < D3D_FEATURE_LEVEL_11_0)
+            ok(!(format_support[format] & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW),
+                    "Format %#x: unexpected format support %#x on feature level %#x.\n",
+                    format, format_support[format], feature_level);
+    }
+    if (feature_level >= D3D_FEATURE_LEVEL_10_0)
+    {
+        ok(format_support[DXGI_FORMAT_R32_FLOAT] & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON,
+                "Got unexpected format support %#x for R32_FLOAT.\n", format_support[DXGI_FORMAT_R32_FLOAT]);
+        ok(format_support[DXGI_FORMAT_R32G32B32A32_FLOAT] & D3D11_FORMAT_SUPPORT_SO_BUFFER,
+                "Got unexpected format support %#x for R32G32B32A32_FLOAT.\n",
+                format_support[DXGI_FORMAT_R32G32B32A32_FLOAT]);
+        ok((format_support[DXGI_FORMAT_R8G8B8A8_UNORM] & (D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT
+                | D3D11_FORMAT_SUPPORT_BACK_BUFFER_CAST)) == (D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT
+                | D3D11_FORMAT_SUPPORT_BACK_BUFFER_CAST),
+                "Got unexpected format support %#x for R8G8B8A8_UNORM.\n",
+                format_support[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        ok(format_support[DXGI_FORMAT_R8G8B8A8_TYPELESS] & D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT,
+                "Got unexpected format support %#x for R8G8B8A8_TYPELESS.\n",
+                format_support[DXGI_FORMAT_R8G8B8A8_TYPELESS]);
+    }
+
+    /* FORMAT_SUPPORT2 */
+    feature_data2.InFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2, NULL, 0);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2, &feature_data2, 0);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2, &feature_data2, sizeof(feature_data2) - 1);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+    hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2, &feature_data2, sizeof(feature_data2) + 1);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
+
+    for (format = DXGI_FORMAT_UNKNOWN; format <= DXGI_FORMAT_B4G4R4A4_UNORM; ++format)
+    {
+        winetest_push_context("format %#x", format);
+        feature_data2.InFormat = format;
+        feature_data2.OutFormatSupport2 = 0xdeadbeef;
+        hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2,
+                &feature_data2, sizeof(feature_data2));
+        ok((hr == S_OK && feature_data2.OutFormatSupport2) || (hr == E_FAIL && !feature_data2.OutFormatSupport2),
+                "Got unexpected hr %#lx, format support %#x.\n", hr, feature_data2.OutFormatSupport2);
+        if (feature_data2.OutFormatSupport2 & (D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE))
+            ok(format_support[format] & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW,
+                    "Typed UAV load or store without typed UAV, format support %#x, %#x.\n",
+                    format_support[format], feature_data2.OutFormatSupport2);
+        if (feature_level < D3D_FEATURE_LEVEL_11_0)
+            ok(!(feature_data2.OutFormatSupport2 & (D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD
+                    | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE | uav_atomics)),
+                    "Got unexpected format support %#x on feature level %#x.\n",
+                    feature_data2.OutFormatSupport2, feature_level);
+        winetest_pop_context();
+    }
+    if (feature_level >= D3D_FEATURE_LEVEL_11_0)
+    {
+        feature_data2.InFormat = DXGI_FORMAT_R32_UINT;
+        hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2, &feature_data2, sizeof(feature_data2));
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok((feature_data2.OutFormatSupport2 & (uav_atomics | D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD
+                | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE)) == (uav_atomics | D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD
+                | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE),
+                "Got unexpected format support %#x for R32_UINT.\n", feature_data2.OutFormatSupport2);
+        feature_data2.InFormat = DXGI_FORMAT_R32_FLOAT;
+        hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2, &feature_data2, sizeof(feature_data2));
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok((feature_data2.OutFormatSupport2 & (uav_atomics | D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD
+                | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE)) == (D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE
+                | D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE),
+                "Got unexpected format support %#x for R32_FLOAT.\n", feature_data2.OutFormatSupport2);
+        feature_data2.InFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+        hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2, &feature_data2, sizeof(feature_data2));
+        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+        ok(feature_data2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+                "Got unexpected format support %#x for R8G8B8A8_UNORM.\n", feature_data2.OutFormatSupport2);
+    }
+    feature_data2.InFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+    hr = ID3D11Device_CheckFeatureSupport(device, D3D11_FEATURE_FORMAT_SUPPORT2, &feature_data2, sizeof(feature_data2));
+    ok(hr == E_FAIL, "Got unexpected hr %#lx.\n", hr);
+    ok(!feature_data2.OutFormatSupport2, "Got unexpected format support %#x for R32G32B32_FLOAT.\n",
+            feature_data2.OutFormatSupport2);
 
     check_format_support(device, format_support, feature_level,
             index_buffers, ARRAY_SIZE(index_buffers),
@@ -36585,7 +36708,7 @@ static void test_nv12(void)
     device_context = test_context.immediate_context;
 
     hr = ID3D11Device_CheckFormatSupport(device, DXGI_FORMAT_NV12, &support);
-    todo_wine_if (!damavand) ok(hr == S_OK || broken(hr == E_FAIL) /* Win7 */, "Got hr %#lx.\n", hr);
+    ok(hr == S_OK || broken(hr == E_FAIL) /* Win7 */, "Got hr %#lx.\n", hr);
 
     if (!(support & D3D11_FORMAT_SUPPORT_TEXTURE2D))
     {

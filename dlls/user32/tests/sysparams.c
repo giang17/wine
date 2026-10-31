@@ -3898,7 +3898,8 @@ static void test_SetProcessDpiAwarenessContext( ULONG arg )
         (DPI_AWARENESS_CONTEXT)0x22,
     };
     DPI_AWARENESS_CONTEXT context, ctx, old_ctx, expect_ctx;
-    UINT ret, i;
+    HWND hwnd, unaware_hwnd, aware_hwnd;
+    UINT ret, i, awareness;
 
     /* 0x11 is system aware DPI and only works with the current system DPI */
     if (arg == 0x11) context = contexts[2];
@@ -3960,12 +3961,42 @@ static void test_SetProcessDpiAwarenessContext( ULONG arg )
     ctx = pGetThreadDpiAwarenessContext();
     ok( ctx == (DPI_AWARENESS_CONTEXT)0x6010, "got %p\n", ctx );
 
+    /* windows created before the process awareness is set take it, whatever thread context they were
+     * created under, unless their awareness is already higher */
+    hwnd = CreateWindowA( "static", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( hwnd != 0, "failed to create window\n" );
+    old_ctx = pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE );
+    ok( old_ctx == (DPI_AWARENESS_CONTEXT)0x80006010, "got %p\n", old_ctx );
+    unaware_hwnd = CreateWindowA( "static", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( unaware_hwnd != 0, "failed to create window\n" );
+    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_SYSTEM_AWARE );
+    aware_hwnd = CreateWindowA( "static", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( aware_hwnd != 0, "failed to create window\n" );
+    pSetThreadDpiAwarenessContext( old_ctx );
+    ctx = pGetWindowDpiAwarenessContext( hwnd );
+    ok( ctx == (DPI_AWARENESS_CONTEXT)0x6010, "got %p\n", ctx );
+    ctx = pGetWindowDpiAwarenessContext( unaware_hwnd );
+    ok( ctx == (DPI_AWARENESS_CONTEXT)0x6010, "got %p\n", ctx );
+    ctx = pGetWindowDpiAwarenessContext( aware_hwnd );
+    ok( pGetAwarenessFromDpiAwarenessContext( ctx ) == DPI_AWARENESS_SYSTEM_AWARE, "got %p\n", ctx );
+
     SetLastError( 0xdeadbeef );
     ret = pSetProcessDpiAwarenessContext( context );
     ok( ret, "SetProcessDpiAwarenessContext failed, error %lu\n", GetLastError() );
     ok( GetLastError() == 0xdeadbeef, "got %#lx\n", GetLastError() );
     ctx = pGetThreadDpiAwarenessContext();
     ok( ctx == expect_ctx, "got %p\n", ctx );
+
+    awareness = (UINT_PTR)expect_ctx & 0x0f;
+    ctx = pGetWindowDpiAwarenessContext( hwnd );
+    ok( pGetAwarenessFromDpiAwarenessContext( ctx ) == awareness, "got %p\n", ctx );
+    ctx = pGetWindowDpiAwarenessContext( unaware_hwnd );
+    ok( pGetAwarenessFromDpiAwarenessContext( ctx ) == awareness, "got %p\n", ctx );
+    ctx = pGetWindowDpiAwarenessContext( aware_hwnd );
+    ok( pGetAwarenessFromDpiAwarenessContext( ctx ) == max( awareness, DPI_AWARENESS_SYSTEM_AWARE ), "got %p\n", ctx );
+    DestroyWindow( aware_hwnd );
+    DestroyWindow( unaware_hwnd );
+    DestroyWindow( hwnd );
 
     for (i = 0; i < ARRAY_SIZE(contexts); i++)
     {
@@ -4359,7 +4390,8 @@ static void test_GetAwarenessFromDpiAwarenessContext(void)
 static void test_dpi_context(void)
 {
     DPI_AWARENESS awareness;
-    DPI_AWARENESS_CONTEXT context;
+    DPI_AWARENESS_CONTEXT context, system_ctx;
+    HWND hwnd, child, unaware_hwnd, aware_hwnd, new_hwnd;
     BOOL ret;
     UINT dpi;
     HANDLE process;
@@ -4370,6 +4402,32 @@ static void test_dpi_context(void)
     awareness = pGetAwarenessFromDpiAwarenessContext( context );
     ok( awareness == DPI_AWARENESS_UNAWARE, "wrong awareness %u\n", awareness );
     ok( !pIsProcessDPIAware(), "already aware\n" );
+
+    /* windows created while the process awareness is unset take the process awareness once it is set,
+     * whatever thread context they were created under */
+    hwnd = CreateWindowA( "DpiTestClass", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( hwnd != 0, "failed to create window\n" );
+    child = CreateWindowA( "DpiTestClass", "Test", WS_CHILD, 0, 0, 100, 100, hwnd, 0, GetModuleHandleA(0), NULL );
+    ok( child != 0, "failed to create window\n" );
+    context = pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_UNAWARE );
+    ok( context == (DPI_AWARENESS_CONTEXT)0x80006010, "wrong context %p\n", context );
+    unaware_hwnd = CreateWindowA( "DpiTestClass", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( unaware_hwnd != 0, "failed to create window\n" );
+    pSetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_SYSTEM_AWARE );
+    aware_hwnd = CreateWindowA( "DpiTestClass", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( aware_hwnd != 0, "failed to create window\n" );
+    pSetThreadDpiAwarenessContext( context );
+    context = pGetWindowDpiAwarenessContext( hwnd );
+    ok( context == (DPI_AWARENESS_CONTEXT)0x6010, "wrong context %p\n", context );
+    context = pGetWindowDpiAwarenessContext( child );
+    ok( context == (DPI_AWARENESS_CONTEXT)0x6010, "wrong context %p\n", context );
+    context = pGetWindowDpiAwarenessContext( unaware_hwnd );
+    ok( context == (DPI_AWARENESS_CONTEXT)0x6010, "wrong context %p\n", context );
+    context = pGetWindowDpiAwarenessContext( aware_hwnd );
+    awareness = pGetAwarenessFromDpiAwarenessContext( context );
+    ok( awareness == DPI_AWARENESS_SYSTEM_AWARE, "wrong awareness %u\n", awareness );
+    dpi = pGetDpiForWindow( child );
+    ok( dpi == USER_DEFAULT_SCREEN_DPI, "wrong dpi %u\n", dpi );
     dpi = pGetDpiForSystem();
     todo_wine_if (real_dpi != USER_DEFAULT_SCREEN_DPI)
         ok( dpi == USER_DEFAULT_SCREEN_DPI, "wrong dpi %u\n", dpi );
@@ -4388,6 +4446,28 @@ static void test_dpi_context(void)
     ok( ret, "got %d\n", ret );
     ok( pIsProcessDPIAware(), "not aware\n" );
     real_dpi = pGetDpiForSystem();
+
+    system_ctx = (DPI_AWARENESS_CONTEXT)(0x11 | ((UINT_PTR)real_dpi << 8));
+    context = pGetWindowDpiAwarenessContext( hwnd );
+    ok( context == system_ctx, "wrong context %p\n", context );
+    context = pGetWindowDpiAwarenessContext( child );
+    ok( context == system_ctx, "wrong context %p\n", context );
+    context = pGetWindowDpiAwarenessContext( unaware_hwnd );
+    ok( context == system_ctx, "wrong context %p\n", context );
+    context = pGetWindowDpiAwarenessContext( aware_hwnd );
+    ok( context == system_ctx, "wrong context %p\n", context );
+    dpi = pGetDpiForWindow( child );
+    ok( dpi == real_dpi, "wrong dpi %u\n", dpi );
+    /* and the child can move into a window created system aware */
+    new_hwnd = CreateWindowA( "DpiTestClass", "Test", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, 0, 0, GetModuleHandleA(0), NULL );
+    ok( new_hwnd != 0, "failed to create window\n" );
+    SetLastError( 0xdeadbeef );
+    ok( SetParent( child, new_hwnd ) == hwnd, "SetParent failed err %lu\n", GetLastError() );
+    ok( GetAncestor( child, GA_PARENT ) == new_hwnd, "wrong parent\n" );
+    DestroyWindow( new_hwnd );
+    DestroyWindow( aware_hwnd );
+    DestroyWindow( unaware_hwnd );
+    DestroyWindow( hwnd );
     SetLastError( 0xdeadbeef );
     ret = pSetProcessDpiAwarenessContext( DPI_AWARENESS_CONTEXT_SYSTEM_AWARE );
     ok( !ret, "got %d\n", ret );

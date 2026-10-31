@@ -608,6 +608,13 @@ struct GpFontCollection{
     INT allocated;
 };
 
+#define MS_MAKE_TAG(ch0, ch1, ch2, ch3) \
+                    ((DWORD)(BYTE)(ch0) | ((DWORD)(BYTE)(ch1) << 8) | \
+                    ((DWORD)(BYTE)(ch2) << 16) | ((DWORD)(BYTE)(ch3) << 24))
+#define MS_OS2_TAG MS_MAKE_TAG('O','S','/','2')
+#define MS_HHEA_TAG MS_MAKE_TAG('h','h','e','a')
+#define MS_VDMX_TAG MS_MAKE_TAG('V','D','M','X')
+
 struct GpFontFamily{
     WCHAR FamilyName[LF_FACESIZE];
     WCHAR VerticalFamilyName[LF_FACESIZE];

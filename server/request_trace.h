@@ -3563,6 +3563,11 @@ static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *re
     fprintf( stderr, " handle=%04x", req->handle );
 }
 
+static void dump_set_process_dpi_awareness_request( const struct set_process_dpi_awareness_request *req )
+{
+    fprintf( stderr, " dpi_context=%08x", req->dpi_context );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3878,6 +3883,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_sync_wait_request,
     (dump_func)dump_d3dkmt_sync_signal_request,
     (dump_func)dump_alpc_create_port_request,
+    (dump_func)dump_set_process_dpi_awareness_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4193,6 +4199,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_sync_wait_reply,
     NULL,
     (dump_func)dump_alpc_create_port_reply,
+    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4508,6 +4515,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_sync_wait",
     "d3dkmt_sync_signal",
     "alpc_create_port",
+    "set_process_dpi_awareness",
 };
 
 static const struct
@@ -4591,6 +4599,7 @@ static const struct
     { "INVALID_USER_BUFFER",         STATUS_INVALID_USER_BUFFER },
     { "IO_REPARSE_DATA_INVALID",     STATUS_IO_REPARSE_DATA_INVALID },
     { "IO_REPARSE_TAG_INVALID",      STATUS_IO_REPARSE_TAG_INVALID },
+    { "IO_REPARSE_TAG_NOT_HANDLED",  STATUS_IO_REPARSE_TAG_NOT_HANDLED },
     { "IO_TIMEOUT",                  STATUS_IO_TIMEOUT },
     { "KERNEL_APC",                  STATUS_KERNEL_APC },
     { "KEY_DELETED",                 STATUS_KEY_DELETED },

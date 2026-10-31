@@ -289,6 +289,7 @@ struct gdi_font
     UINT                   fake_bold : 1;
     UINT                   scalable : 1;
     UINT                   use_logfont_name : 1;
+    UINT                   wine_font : 1;         /* face comes from the Wine data directory */
     struct gdi_font       *base_font;
     void                  *gsub_table;
     void                  *vert_feature;
@@ -315,6 +316,7 @@ struct gdi_font
 #define ADDFONT_ADD_RESOURCE  0x08  /* added through AddFontResource */
 #define ADDFONT_VERTICAL_FONT 0x10
 #define ADDFONT_EXTERNAL_FOUND 0x20
+#define ADDFONT_WINE_FONT     0x40  /* from the Wine data directory (Wine's own Tahoma clones etc.) */
 #define ADDFONT_AA_FLAGS(flags) ((flags) << 16)
 
 struct font_backend_funcs

@@ -25,6 +25,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 #define D2D_FIGURE_FLAG_HOLLOW          0x00000002u
 
 #define D2D_CDT_EDGE_FLAG_FREED         0x80000000u
+#define D2D_CDT_EDGE_FLAG_CUT           0x40000000u
 #define D2D_CDT_EDGE_FLAG_VISITED(r)    (1u << (r))
 
 #define D2D_FP_EPS (1.0f / (1 << FLT_MANT_DIG))
@@ -157,10 +158,18 @@ static bool d2d_figure_new_segment(struct d2d_geometry *geometry, enum d2d_segme
         const void *data, unsigned int count)
 {
     struct d2d_figure *figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
-    size_t segment_size = d2d_figure_get_segment_data_size(type) * count;
+    size_t element_size = d2d_figure_get_segment_data_size(type);
     unsigned int segment_flags = geometry->u.path.segment_flags;
-    size_t size = segment_size + sizeof(struct d2d_segment);
+    size_t segment_size, size;
     struct d2d_segment *segment;
+
+    /* Guard the size math against overflow: on the 32-bit (i386 PE) build
+     * size_t is 32-bit, so a pathological count could wrap to an undersized
+     * allocation and OOB on replay. */
+    if (count > (SIZE_MAX - sizeof(struct d2d_segment)) / element_size)
+        return false;
+    segment_size = element_size * count;
+    size = segment_size + sizeof(struct d2d_segment);
 
     if (!d2d_array_reserve((void **)&figure->segments.data, &figure->segments.capacity,
             figure->segments.size + size, 1))
@@ -184,8 +193,14 @@ static bool d2d_figure_append_segment_data(struct d2d_geometry *geometry,
         enum d2d_segment_type type, const void *data, unsigned int count)
 {
     struct d2d_figure *figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
-    size_t size = d2d_figure_get_segment_data_size(type) * count;
+    size_t element_size = d2d_figure_get_segment_data_size(type);
+    size_t size;
     struct d2d_segment *segment;
+
+    /* Same overflow guard as d2d_figure_new_segment (32-bit PE size_t wrap). */
+    if (count > SIZE_MAX / element_size)
+        return false;
+    size = element_size * count;
 
     if (!d2d_array_reserve((void **)&figure->segments.data, &figure->segments.capacity,
             figure->segments.size + size, 1))
@@ -207,6 +222,12 @@ static bool d2d_figure_add_segment_data(struct d2d_geometry *geometry,
     struct d2d_figure *figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
     struct d2d_segment *current = d2d_figure_get_current_segment(figure);
     unsigned int segment_flags = geometry->u.path.segment_flags;
+
+    /* Nothing to add: a zero count would reach a memcpy() with size 0 and a
+     * possibly-NULL source (e.g. AddLines(NULL, 0)), which is C UB even for
+     * n == 0. */
+    if (!count)
+        return true;
 
     if (!current || current->flags != segment_flags || current->type != type)
         return d2d_figure_new_segment(geometry, type, data, count);
@@ -258,6 +279,12 @@ struct d2d_cdt
     size_t free_edge;
 
     const D2D1_POINT_2F *vertices;
+    size_t vertex_count;
+
+    /* For each vertex the edge d2d_cdt_insert_segments() starts from: the
+     * one with the lowest index that has the vertex as origin, in its
+     * forward orientation if both do. NULL outside that function. */
+    struct d2d_cdt_edge_ref *vertex_edge;
 };
 
 struct d2d_geometry_intersection
@@ -1057,11 +1084,126 @@ static BOOL d2d_figure_add_original_bezier_controls(struct d2d_figure *figure, s
     return TRUE;
 }
 
+/* Reducing a cubic Bézier to the quadratic that shares its end points places the
+ * quadratic control at (3 * (p1 + p2) - (p0 + p3)) / 4. The deviation that leaves
+ * is exactly |p3 - 3 * p2 + 3 * p1 - p0| / (12 * sqrt(3)) - the third difference of
+ * the control points times a constant - and it is signed, so a quadratic cannot
+ * follow a cubic through an inflection at all: an S shaped curve reduces to an arc.
+ *
+ * Subdividing the cubic first and reducing each piece separately fixes both, because
+ * de Casteljau subdivision into n pieces scales the third difference by 1 / n^3.
+ * That cube root is what keeps the piece count small even for very large curves. */
+#define D2D_BEZIER_REDUCTION_DEVIATION 0.0481125f
+/* The quadratics are rendered as curves and the world transform is applied after
+ * this, so the error budget here has to be tighter than a flattening tolerance
+ * would be; a tenth of it costs only cbrt(10) times as many pieces. */
+#define D2D_BEZIER_REDUCTION_TOLERANCE D2D1_DEFAULT_FLATTENING_TOLERANCE
+/* Bounds the pathological cases; a curve big enough to need this is already far
+ * outside anything the rest of the pipeline handles gracefully. */
+#define D2D_BEZIER_MAX_QUADRATICS 32
+
+static void d2d_cubic_bezier_reduce(D2D1_POINT_2F *control, const D2D1_POINT_2F *p)
+{
+    control->x = (p[1].x + p[2].x) * 0.75f - (p[0].x + p[3].x) * 0.25f;
+    control->y = (p[1].y + p[2].y) * 0.75f - (p[0].y + p[3].y) * 0.25f;
+}
+
+/* Split a cubic Bézier at t into the piece before t and the piece after it. Either
+ * output may alias the input, which is what lets a caller peel pieces off the front
+ * of a curve in place. */
+static void d2d_cubic_bezier_split(D2D1_POINT_2F *before, D2D1_POINT_2F *after,
+        const D2D1_POINT_2F *p, float t)
+{
+    D2D1_POINT_2F p0 = p[0], p3 = p[3], a, b, c, d, e, f;
+
+    d2d_point_lerp(&a, &p[0], &p[1], t);
+    d2d_point_lerp(&b, &p[1], &p[2], t);
+    d2d_point_lerp(&c, &p[2], &p[3], t);
+    d2d_point_lerp(&d, &a, &b, t);
+    d2d_point_lerp(&e, &b, &c, t);
+    d2d_point_lerp(&f, &d, &e, t);
+
+    before[0] = p0; before[1] = a; before[2] = d; before[3] = f;
+    after[0] = f; after[1] = e; after[2] = c; after[3] = p3;
+}
+
+static unsigned int d2d_cubic_bezier_quadratic_count(const D2D1_POINT_2F *p)
+{
+    float deviation, count, turn = 1.0f, t0x, t0y, t1x, t1y, l0, l1;
+    D2D1_POINT_2F e;
+
+    e.x = p[3].x - 3.0f * p[2].x + 3.0f * p[1].x - p[0].x;
+    e.y = p[3].y - 3.0f * p[2].y + 3.0f * p[1].y - p[0].y;
+    deviation = sqrtf(e.x * e.x + e.y * e.y) * D2D_BEZIER_REDUCTION_DEVIATION;
+
+    /* The deviation is measured in geometry units, which say nothing about
+     * pixels once the geometry is scaled up, and a single quadratic through a
+     * quarter circle lies up to 1.1 % of the radius inside it (0.14 px on a
+     * 13 px ring, as a stroke drawn under Scale 2 showed). Give a curve at
+     * least one piece per 45 degrees of turn between its end tangents, which
+     * halves that error for every fourth piece and does not depend on units. */
+    t0x = p[1].x - p[0].x;
+    t0y = p[1].y - p[0].y;
+    t1x = p[3].x - p[2].x;
+    t1y = p[3].y - p[2].y;
+    l0 = sqrtf(t0x * t0x + t0y * t0y);
+    l1 = sqrtf(t1x * t1x + t1y * t1y);
+    if (l0 > 0.0f && l1 > 0.0f)
+        turn = ceilf(acosf(max(-1.0f, min(1.0f, (t0x * t1x + t0y * t1y) / (l0 * l1)))) / (float)(M_PI / 4.0) - 1e-3f);
+
+    /* Negated so that a deviation that is not a number ends up with one piece. */
+    if (!(deviation > D2D_BEZIER_REDUCTION_TOLERANCE))
+        count = 1.0f;
+    else
+        count = ceilf(powf(deviation / D2D_BEZIER_REDUCTION_TOLERANCE, 1.0f / 3.0f));
+    if (turn > count)
+        count = turn;
+    if (count >= (float)D2D_BEZIER_MAX_QUADRATICS)
+        return D2D_BEZIER_MAX_QUADRATICS;
+
+    return count < 1.0f ? 1 : count;
+}
+
+struct d2d_quadratic_bezier
+{
+    D2D1_POINT_2F p0, control, p2;
+};
+
+/* Express a cubic Bézier as a chain of quadratics, subdividing it as far as the
+ * tolerance requires. Returns the number written; the caller provides room for
+ * D2D_BEZIER_MAX_QUADRATICS of them. */
+static unsigned int d2d_cubic_bezier_to_quadratics(const D2D1_POINT_2F *p,
+        struct d2d_quadratic_bezier *quadratics)
+{
+    D2D1_POINT_2F cubic[4], piece[4];
+    unsigned int count, i;
+
+    memcpy(cubic, p, sizeof(cubic));
+    count = d2d_cubic_bezier_quadratic_count(cubic);
+
+    for (i = 0; i < count; ++i)
+    {
+        /* Peel the next piece off the front of what is left of the curve. The
+         * last piece is the remainder, so its end point stays bit exact. */
+        if (i + 1 < count)
+            d2d_cubic_bezier_split(piece, cubic, cubic, 1.0f / (float)(count - i));
+        else
+            memcpy(piece, cubic, sizeof(piece));
+
+        quadratics[i].p0 = piece[0];
+        d2d_cubic_bezier_reduce(&quadratics[i].control, piece);
+        quadratics[i].p2 = piece[3];
+    }
+
+    return count;
+}
+
 static bool d2d_figure_add_beziers(struct d2d_figure *figure, const D2D1_BEZIER_SEGMENT *beziers,
         UINT32 count)
 {
-    D2D1_POINT_2F p;
-    unsigned int i;
+    struct d2d_quadratic_bezier quadratics[D2D_BEZIER_MAX_QUADRATICS];
+    unsigned int i, j, quadratic_count;
+    D2D1_POINT_2F cubic[4];
 
     for (i = 0; i < count; ++i)
     {
@@ -1073,23 +1215,33 @@ static bool d2d_figure_add_beziers(struct d2d_figure *figure, const D2D1_BEZIER_
             return false;
         }
 
-        /* FIXME: This tries to approximate a cubic Bézier with a quadratic one. */
-        p.x = (beziers[i].point1.x + beziers[i].point2.x) * 0.75f;
-        p.y = (beziers[i].point1.y + beziers[i].point2.y) * 0.75f;
-        p.x -= (figure->vertices[figure->vertex_count - 1].x + beziers[i].point3.x) * 0.25f;
-        p.y -= (figure->vertices[figure->vertex_count - 1].y + beziers[i].point3.y) * 0.25f;
-        figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_BEZIER;
+        cubic[0] = figure->vertices[figure->vertex_count - 1];
+        cubic[1] = beziers[i].point1;
+        cubic[2] = beziers[i].point2;
+        cubic[3] = beziers[i].point3;
+        quadratic_count = d2d_cubic_bezier_to_quadratics(cubic, quadratics);
 
-        d2d_rect_get_bezier_bounds(&bezier_bounds, &figure->vertices[figure->vertex_count - 1],
-                &p, &beziers[i].point3);
+        for (j = 0; j < quadratic_count; ++j)
+        {
+            /* Only the first piece opens the segment the application added. The
+             * others are marked as splits, which is the same thing the tessellator
+             * does when it subdivides a quadratic - Simplify(), Widen(), the dash
+             * and outline code all skip those and keep seeing one cubic per
+             * segment, with its original control points. */
+            figure->vertex_types[figure->vertex_count - 1] = j ? D2D_VERTEX_TYPE_SPLIT_BEZIER
+                    : D2D_VERTEX_TYPE_BEZIER;
 
-        if (!d2d_figure_add_bezier_controls(figure, 1, &p))
-            return false;
+            d2d_rect_get_bezier_bounds(&bezier_bounds, &quadratics[j].p0,
+                    &quadratics[j].control, &quadratics[j].p2);
 
-        if (!d2d_figure_add_vertex(figure, beziers[i].point3))
-            return false;
+            if (!d2d_figure_add_bezier_controls(figure, 1, &quadratics[j].control))
+                return false;
 
-        d2d_rect_union(&figure->bounds, &bezier_bounds);
+            if (!d2d_figure_add_vertex(figure, quadratics[j].p2))
+                return false;
+
+            d2d_rect_union(&figure->bounds, &bezier_bounds);
+        }
     }
 
     return true;
@@ -1429,9 +1581,12 @@ static bool d2d_figure_begin(struct d2d_figure *figure, D2D1_POINT_2F start_poin
     return d2d_figure_add_vertex(figure, start_point);
 }
 
-static void d2d_figure_end(struct d2d_figure *figure, D2D1_FIGURE_END figure_end)
+static bool d2d_figure_end(struct d2d_figure *figure, D2D1_FIGURE_END figure_end)
 {
-    d2d_figure_produce_vertices(figure);
+    /* Propagate allocation failures from deferred segment replay instead of
+     * dereferencing a partially-materialized vertex array below. */
+    if (!d2d_figure_produce_vertices(figure))
+        return false;
 
     if (memcmp(&figure->vertices[0], &figure->vertices[figure->vertex_count - 1], sizeof(*figure->vertices)))
         figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_LINE;
@@ -1439,6 +1594,8 @@ static void d2d_figure_end(struct d2d_figure *figure, D2D1_FIGURE_END figure_end
         figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_END;
     if (figure_end == D2D1_FIGURE_END_CLOSED)
         figure->flags |= D2D_FIGURE_FLAG_CLOSED;
+
+    return true;
 }
 
 static void d2d_figure_cleanup(struct d2d_figure *figure)
@@ -1497,16 +1654,35 @@ static size_t d2d_cdt_edge_destination(const struct d2d_cdt *cdt, const struct d
     return cdt->edges[e->idx].vertex[!(e->r >> 1)];
 }
 
+/* Keep the table of starting edges at the edge with the lowest index. */
+static void d2d_cdt_vertex_edge_update(const struct d2d_cdt *cdt, size_t idx, size_t vertex)
+{
+    struct d2d_cdt_edge_ref *cached, e;
+
+    if (!cdt->vertex_edge || vertex >= cdt->vertex_count)
+        return;
+
+    e.idx = idx;
+    e.r = cdt->edges[idx].vertex[0] == vertex ? 0 : 2;
+    cached = &cdt->vertex_edge[vertex];
+    if (cached->idx >= cdt->edge_count || (cdt->edges[cached->idx].flags & D2D_CDT_EDGE_FLAG_FREED)
+            || d2d_cdt_edge_origin(cdt, cached) != vertex
+            || e.idx < cached->idx || (e.idx == cached->idx && e.r < cached->r))
+        *cached = e;
+}
+
 static void d2d_cdt_edge_set_origin(const struct d2d_cdt *cdt,
         const struct d2d_cdt_edge_ref *e, size_t vertex)
 {
     cdt->edges[e->idx].vertex[e->r >> 1] = vertex;
+    d2d_cdt_vertex_edge_update(cdt, e->idx, vertex);
 }
 
 static void d2d_cdt_edge_set_destination(const struct d2d_cdt *cdt,
         const struct d2d_cdt_edge_ref *e, size_t vertex)
 {
     cdt->edges[e->idx].vertex[!(e->r >> 1)] = vertex;
+    d2d_cdt_vertex_edge_update(cdt, e->idx, vertex);
 }
 
 static float d2d_cdt_ccw(const struct d2d_cdt *cdt, size_t a, size_t b, size_t c)
@@ -1890,6 +2066,16 @@ static void d2d_cdt_destroy_edge(struct d2d_cdt *cdt, const struct d2d_cdt_edge_
     }
 
     cdt->edges[e->idx].flags |= D2D_CDT_EDGE_FLAG_FREED;
+    if (cdt->vertex_edge)
+    {
+        size_t v = cdt->edges[e->idx].vertex[0];
+
+        if (v < cdt->vertex_count && cdt->vertex_edge[v].idx == e->idx)
+            cdt->vertex_edge[v].idx = ~(size_t)0;
+        v = cdt->edges[e->idx].vertex[1];
+        if (v < cdt->vertex_count && cdt->vertex_edge[v].idx == e->idx)
+            cdt->vertex_edge[v].idx = ~(size_t)0;
+    }
     cdt->edges[e->idx].next[D2D_EDGE_NEXT_ORIGIN].idx = cdt->free_edge;
     cdt->free_edge = e->idx;
 }
@@ -2079,16 +2265,35 @@ static BOOL d2d_cdt_triangulate(struct d2d_cdt *cdt, size_t start_vertex, size_t
     return TRUE;
 }
 
+/* Order NaNs after all numbers and equal to each other, so that the result is
+ * a total order.  Comparing the difference against zero instead would return
+ * "less than" for every pair involving a NaN, including a pair of equal ones,
+ * which is not an ordering qsort() and bsearch() can work with. */
+static int d2d_compare_float(float a, float b)
+{
+    if (a < b)
+        return -1;
+    if (a > b)
+        return 1;
+    if (a == b)
+        return 0;
+    if (!isnan(a))
+        return -1;
+    if (!isnan(b))
+        return 1;
+    return 0;
+}
+
 static int __cdecl d2d_cdt_compare_vertices(const void *a, const void *b)
 {
     const D2D1_POINT_2F *p0 = a;
     const D2D1_POINT_2F *p1 = b;
-    float diff = p0->x - p1->x;
+    int ret;
 
-    if (diff == 0.0f)
-        diff = p0->y - p1->y;
+    if ((ret = d2d_compare_float(p0->x, p1->x)))
+        return ret;
 
-    return diff == 0.0f ? 0 : (diff > 0.0f ? 1 : -1);
+    return d2d_compare_float(p0->y, p1->y);
 }
 
 /* Determine whether a given point is inside the geometry, using the current
@@ -2140,8 +2345,214 @@ static BOOL d2d_path_geometry_point_inside(const struct d2d_geometry *geometry,
     return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
 }
 
+/* The figure edges the probe of a fill face is cast against, bucketed by rows
+ * of the geometry's y-range. d2d_cdt_generate_faces() classifies every face of
+ * the triangulation with d2d_path_geometry_point_inside(), a ray cast over all
+ * figure edges, so a path of n vertices cost about 2n casts over n edges:
+ * 3.3 s for a polyline of 32,000 points, all of it in that function. An edge
+ * can only be crossed at a y within its own range, so each row holds the edges
+ * that reach into it and a probe tests the edges of its row only. The tests
+ * are the ones of d2d_path_geometry_point_inside(), figure bounds included,
+ * merely in a different order, so every face is classified as before. */
+struct d2d_fill_edge
+{
+    const D2D1_POINT_2F *p0, *p1;
+    const struct d2d_figure *figure;
+};
+
+struct d2d_fill_edge_rows
+{
+    struct d2d_fill_edge *edges;
+    size_t *row_start;
+    size_t row_count;
+    float top, bottom;
+};
+
+static size_t d2d_fill_edge_rows_row(const struct d2d_fill_edge_rows *rows, float y)
+{
+    float f;
+
+    /* A NaN y crosses no edge, whichever row is tested. */
+    if (!(y > rows->top))
+        return 0;
+    if (!(y < rows->bottom))
+        return rows->row_count - 1;
+    f = (y - rows->top) / (rows->bottom - rows->top) * (float)rows->row_count;
+    return min((size_t)f, rows->row_count - 1);
+}
+
+/* The rows an edge reaches into. An edge with a non-finite coordinate is put
+ * into every row: d2d_path_geometry_point_inside() tests it for every probe,
+ * and an infinite one can count. */
+static void d2d_fill_edge_rows_range(const struct d2d_fill_edge_rows *rows,
+        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1, size_t *first, size_t *last)
+{
+    if (!isfinite(p0->x) || !isfinite(p0->y) || !isfinite(p1->x) || !isfinite(p1->y))
+    {
+        *first = 0;
+        *last = rows->row_count - 1;
+        return;
+    }
+    *first = d2d_fill_edge_rows_row(rows, min(p0->y, p1->y));
+    *last = d2d_fill_edge_rows_row(rows, max(p0->y, p1->y));
+}
+
+static void d2d_fill_edge_rows_cleanup(struct d2d_fill_edge_rows *rows)
+{
+    free(rows->edges);
+    free(rows->row_start);
+}
+
+static BOOL d2d_fill_edge_rows_init(struct d2d_fill_edge_rows *rows, const struct d2d_geometry *geometry)
+{
+    size_t i, j, r, first, last, edge_count = 0, entry_count, largest;
+    const struct d2d_figure *figure;
+    size_t *cursor = NULL;
+
+    memset(rows, 0, sizeof(*rows));
+    rows->top = FLT_MAX;
+    rows->bottom = -FLT_MAX;
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        figure = &geometry->u.path.figures[i];
+        for (j = 0; j < figure->vertex_count; ++j)
+        {
+            float y = figure->vertices[j].y;
+
+            if (!isfinite(y))
+                continue;
+            rows->top = min(rows->top, y);
+            rows->bottom = max(rows->bottom, y);
+        }
+        edge_count += figure->vertex_count;
+    }
+    if (!(rows->top < rows->bottom))
+        rows->top = rows->bottom = 0.0f;
+
+    /* Rows a few edges high. Long edges reach into many rows; if that makes
+     * the table much larger than the edge count, use fewer. */
+    rows->row_count = min(max(edge_count / 4, 1), 4096);
+    for (;;)
+    {
+        if (!(rows->row_start = calloc(rows->row_count + 1, sizeof(*rows->row_start))))
+        {
+            ERR("Failed to allocate fill edge rows.\n");
+            return FALSE;
+        }
+        for (i = 0; i < geometry->u.path.figure_count; ++i)
+        {
+            figure = &geometry->u.path.figures[i];
+            for (j = 0; j < figure->vertex_count; ++j)
+            {
+                d2d_fill_edge_rows_range(rows, &figure->vertices[j ? j - 1 : figure->vertex_count - 1],
+                        &figure->vertices[j], &first, &last);
+                for (r = first; r <= last; ++r)
+                    ++rows->row_start[r + 1];
+            }
+        }
+        for (r = 0, largest = 0; r < rows->row_count; ++r)
+        {
+            largest = max(largest, rows->row_start[r + 1]);
+            rows->row_start[r + 1] += rows->row_start[r];
+        }
+        entry_count = rows->row_start[rows->row_count];
+        if (rows->row_count == 1 || entry_count <= 8 * edge_count)
+            break;
+        free(rows->row_start);
+        rows->row_count /= 2;
+    }
+
+    /* With most edges in one row, as for a polyline along a line, the table
+     * saves nothing and its indirection costs a fifth; cast over the figures
+     * directly then. */
+    if (largest > entry_count / 2)
+    {
+        free(rows->row_start);
+        rows->row_start = NULL;
+        return FALSE;
+    }
+
+    if (!(rows->edges = malloc(max(entry_count, 1) * sizeof(*rows->edges)))
+            || !(cursor = malloc(rows->row_count * sizeof(*cursor))))
+    {
+        ERR("Failed to allocate fill edge table.\n");
+        free(cursor);
+        d2d_fill_edge_rows_cleanup(rows);
+        return FALSE;
+    }
+    memcpy(cursor, rows->row_start, rows->row_count * sizeof(*cursor));
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        figure = &geometry->u.path.figures[i];
+        for (j = 0; j < figure->vertex_count; ++j)
+        {
+            const D2D1_POINT_2F *p0 = &figure->vertices[j ? j - 1 : figure->vertex_count - 1];
+            const D2D1_POINT_2F *p1 = &figure->vertices[j];
+
+            d2d_fill_edge_rows_range(rows, p0, p1, &first, &last);
+            for (r = first; r <= last; ++r)
+            {
+                struct d2d_fill_edge *e = &rows->edges[cursor[r]++];
+
+                e->p0 = p0;
+                e->p1 = p1;
+                e->figure = figure;
+            }
+        }
+    }
+    free(cursor);
+
+    return TRUE;
+}
+
+/* d2d_path_geometry_point_inside(geometry, probe, TRUE) over the edges of the
+ * probe's row. */
+static BOOL d2d_fill_edge_rows_point_inside(const struct d2d_geometry *geometry,
+        const struct d2d_fill_edge_rows *rows, const D2D1_POINT_2F *probe)
+{
+    const struct d2d_fill_edge *e, *end;
+    D2D1_POINT_2F v_p, v_probe;
+    unsigned int score = 0;
+    size_t r;
+
+    r = d2d_fill_edge_rows_row(rows, probe->y);
+    for (e = &rows->edges[rows->row_start[r]], end = &rows->edges[rows->row_start[r + 1]]; e < end;)
+    {
+        /* The edges of a figure lie together in a row; the figure's bounds
+         * are checked once for the run, as for the figure in
+         * d2d_path_geometry_point_inside(). */
+        const struct d2d_figure *figure = e->figure;
+        const struct d2d_fill_edge *run_end = e + 1;
+
+        while (run_end < end && run_end->figure == figure)
+            ++run_end;
+        if (probe->x < figure->bounds.left || probe->x > figure->bounds.right
+                || probe->y < figure->bounds.top || probe->y > figure->bounds.bottom)
+        {
+            e = run_end;
+            continue;
+        }
+
+        for (; e < run_end; ++e)
+        {
+            d2d_point_subtract(&v_p, e->p1, e->p0);
+            d2d_point_subtract(&v_probe, probe, e->p0);
+
+            if ((probe->y < e->p0->y) != (probe->y < e->p1->y) && v_probe.x < v_p.x * (v_probe.y / v_p.y))
+            {
+                if (geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE || (probe->y < e->p0->y))
+                    ++score;
+                else
+                    --score;
+            }
+        }
+    }
+
+    return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
+}
+
 static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const struct d2d_cdt *cdt,
-        const struct d2d_cdt_edge_ref *base_edge)
+        const struct d2d_cdt_edge_ref *base_edge, const struct d2d_fill_edge_rows *rows)
 {
     struct d2d_cdt_edge_ref tmp;
     struct d2d_face *face;
@@ -2180,7 +2591,8 @@ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const
     probe.x += cdt->vertices[d2d_cdt_edge_origin(cdt, &tmp)].x * 0.50f;
     probe.y += cdt->vertices[d2d_cdt_edge_origin(cdt, &tmp)].y * 0.50f;
 
-    if (d2d_cdt_leftof(cdt, face->v[2], base_edge) && d2d_path_geometry_point_inside(geometry, &probe, TRUE))
+    if (d2d_cdt_leftof(cdt, face->v[2], base_edge) && (rows ? d2d_fill_edge_rows_point_inside(geometry, rows, &probe)
+            : d2d_path_geometry_point_inside(geometry, &probe, TRUE)))
         ++geometry->fill.face_count;
 
     return TRUE;
@@ -2188,8 +2600,13 @@ static BOOL d2d_path_geometry_add_fill_face(struct d2d_geometry *geometry, const
 
 static BOOL d2d_cdt_generate_faces(const struct d2d_cdt *cdt, struct d2d_geometry *geometry)
 {
+    struct d2d_fill_edge_rows rows, *rows_ptr = &rows;
     struct d2d_cdt_edge_ref base_edge;
     size_t i;
+
+    /* Without the table every probe is cast over all edges, as before. */
+    if (!d2d_fill_edge_rows_init(&rows, geometry))
+        rows_ptr = NULL;
 
     for (i = 0; i < cdt->edge_count; ++i)
     {
@@ -2198,16 +2615,20 @@ static BOOL d2d_cdt_generate_faces(const struct d2d_cdt *cdt, struct d2d_geometr
 
         base_edge.idx = i;
         base_edge.r = 0;
-        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge))
+        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge, rows_ptr))
             goto fail;
         d2d_cdt_edge_sym(&base_edge, &base_edge);
-        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge))
+        if (!d2d_path_geometry_add_fill_face(geometry, cdt, &base_edge, rows_ptr))
             goto fail;
     }
 
+    if (rows_ptr)
+        d2d_fill_edge_rows_cleanup(&rows);
     return TRUE;
 
 fail:
+    if (rows_ptr)
+        d2d_fill_edge_rows_cleanup(&rows);
     free(geometry->fill.faces);
     geometry->fill.faces = NULL;
     geometry->fill.faces_size = 0;
@@ -2215,132 +2636,369 @@ fail:
     return FALSE;
 }
 
+/* Both loops below are bounded by the number of vertices: a face cannot have
+ * more edges than there are vertices, and retriangulating the faces next to
+ * one new edge cannot add more edges than that either. On degenerate input a
+ * face walk that never returns to its start was seen to spin forever. */
 static BOOL d2d_cdt_fixup(struct d2d_cdt *cdt, const struct d2d_cdt_edge_ref *base_edge)
 {
-    struct d2d_cdt_edge_ref candidate, next, new_base;
-    unsigned int count = 0;
+    struct d2d_cdt_edge_ref *stack = NULL;
+    size_t stack_count = 0, stack_capacity = 0, connects = 0;
+    BOOL result = TRUE;
 
-    d2d_cdt_edge_next_left(cdt, &next, base_edge);
-    if (next.idx == base_edge->idx)
+    if (!d2d_array_reserve((void **)&stack, &stack_capacity, 1, sizeof(*stack)))
     {
-        ERR("Degenerate face.\n");
+        ERR("Failed to allocate fixup stack.\n");
         return FALSE;
     }
+    stack[stack_count++] = *base_edge;
 
-    candidate = next;
-    while (d2d_cdt_edge_destination(cdt, &next) != d2d_cdt_edge_origin(cdt, base_edge))
+    while (stack_count > 0)
     {
-        if (d2d_cdt_incircle(cdt, d2d_cdt_edge_origin(cdt, base_edge), d2d_cdt_edge_destination(cdt, base_edge),
-                d2d_cdt_edge_destination(cdt, &candidate), d2d_cdt_edge_destination(cdt, &next)))
-            candidate = next;
-        d2d_cdt_edge_next_left(cdt, &next, &next);
-        ++count;
+        struct d2d_cdt_edge_ref current_base = stack[--stack_count];
+        struct d2d_cdt_edge_ref candidate, next, new_base;
+        unsigned int count = 0;
+
+        d2d_cdt_edge_next_left(cdt, &next, &current_base);
+        if (next.idx == current_base.idx)
+        {
+            ERR("Degenerate face.\n");
+            result = FALSE;
+            break;
+        }
+
+        candidate = next;
+        while (d2d_cdt_edge_destination(cdt, &next) != d2d_cdt_edge_origin(cdt, &current_base))
+        {
+            if (d2d_cdt_incircle(cdt, d2d_cdt_edge_origin(cdt, &current_base),
+                    d2d_cdt_edge_destination(cdt, &current_base),
+                    d2d_cdt_edge_destination(cdt, &candidate), d2d_cdt_edge_destination(cdt, &next)))
+                candidate = next;
+            d2d_cdt_edge_next_left(cdt, &next, &next);
+            if (++count > cdt->vertex_count)
+                break;
+        }
+        if (count > cdt->vertex_count)
+        {
+            static int once;
+            if (!once++)
+                FIXME("Face walk does not close.\n");
+            result = FALSE;
+            break;
+        }
+
+        if (count > 1)
+        {
+            if (++connects > cdt->vertex_count)
+            {
+                static int once;
+                if (!once++)
+                    FIXME("Too many edges added while restoring the triangulation.\n");
+                result = FALSE;
+                break;
+            }
+            d2d_cdt_edge_next_left(cdt, &next, &candidate);
+            if (d2d_cdt_edge_destination(cdt, &next) == d2d_cdt_edge_origin(cdt, &current_base))
+                d2d_cdt_edge_next_left(cdt, &next, &current_base);
+            else
+                next = current_base;
+            if (!d2d_cdt_connect(cdt, &new_base, &candidate, &next))
+            {
+                result = FALSE;
+                break;
+            }
+            if (!d2d_array_reserve((void **)&stack, &stack_capacity,
+                    stack_count + 2, sizeof(*stack)))
+            {
+                ERR("Failed to grow fixup stack.\n");
+                result = FALSE;
+                break;
+            }
+            /* Push sym side first (processed second), then normal side (processed first). */
+            d2d_cdt_edge_sym(&new_base, &new_base);
+            stack[stack_count++] = new_base;
+            d2d_cdt_edge_sym(&new_base, &new_base);
+            stack[stack_count++] = new_base;
+        }
     }
 
-    if (count > 1)
-    {
-        d2d_cdt_edge_next_left(cdt, &next, &candidate);
-        if (d2d_cdt_edge_destination(cdt, &next) == d2d_cdt_edge_origin(cdt, base_edge))
-            d2d_cdt_edge_next_left(cdt, &next, base_edge);
-        else
-            next = *base_edge;
-        if (!d2d_cdt_connect(cdt, &new_base, &candidate, &next))
-            return FALSE;
-        if (!d2d_cdt_fixup(cdt, &new_base))
-            return FALSE;
-        d2d_cdt_edge_sym(&new_base, &new_base);
-        if (!d2d_cdt_fixup(cdt, &new_base))
-            return FALSE;
-    }
-
-    return TRUE;
+    free(stack);
+    return result;
 }
 
-static void d2d_cdt_cut_edges(struct d2d_cdt *cdt, struct d2d_cdt_edge_ref *end_edge,
-        const struct d2d_cdt_edge_ref *base_edge, size_t start_vertex, size_t end_vertex)
+/* Walks from base_edge towards end_vertex and removes every edge the segment
+ * crosses. On consistent geometry each edge is crossed at most once. With
+ * duplicate and nearly collinear vertices the inexact orientation tests can
+ * send the walk around in a circle instead: it then collected the same edges
+ * again and again until memory ran out, destroyed an edge twice, or destroyed
+ * an edge the caller connects to afterwards, and the triangulation was left
+ * pointing at freed edges. An edge that comes up a second time, and a walk
+ * that would destroy base_edge, keep or the edge it ends on, end the walk
+ * without changing anything, and the caller skips the segment. */
+static BOOL d2d_cdt_cut_edges(struct d2d_cdt *cdt, struct d2d_cdt_edge_ref *end_edge,
+        const struct d2d_cdt_edge_ref *base_edge, const struct d2d_cdt_edge_ref *keep,
+        size_t start_vertex, size_t end_vertex)
 {
-    struct d2d_cdt_edge_ref next;
-    float ccw;
+    struct d2d_cdt_edge_ref *destroy_stack = NULL;
+    size_t destroy_count = 0, destroy_capacity = 0;
+    struct d2d_cdt_edge_ref current = *base_edge;
+    BOOL ret = TRUE;
 
-    d2d_cdt_edge_next_left(cdt, &next, base_edge);
-    if (d2d_cdt_edge_destination(cdt, &next) == end_vertex)
+    /* The caller destroys base_edge itself and connects to keep afterwards;
+     * the walk must collect neither. */
+    cdt->edges[base_edge->idx].flags |= D2D_CDT_EDGE_FLAG_CUT;
+    cdt->edges[keep->idx].flags |= D2D_CDT_EDGE_FLAG_CUT;
+
+    for (;;)
     {
-        *end_edge = next;
-        return;
+        struct d2d_cdt_edge_ref next;
+        float ccw;
+
+        d2d_cdt_edge_next_left(cdt, &next, &current);
+        if (d2d_cdt_edge_destination(cdt, &next) == end_vertex)
+        {
+            *end_edge = next;
+            break;
+        }
+
+        ccw = d2d_cdt_ccw(cdt, d2d_cdt_edge_destination(cdt, &next), end_vertex, start_vertex);
+        if (ccw == 0.0f)
+        {
+#ifndef D2D_NO_525_GUARDS
+            /* The start vertex is collinear with itself. A walk that reaches
+             * it has gone around rather than along the segment, and the
+             * caller would connect the vertex to itself. */
+            if (d2d_cdt_edge_destination(cdt, &next) == start_vertex)
+            {
+                static int once;
+                if (!once++)
+                    FIXME("Segment walk returns to its start vertex, skipping the segment.\n");
+                ret = FALSE;
+                break;
+            }
+#endif
+            *end_edge = next;
+            break;
+        }
+
+        if (ccw > 0.0f)
+            d2d_cdt_edge_next_left(cdt, &next, &next);
+
+        d2d_cdt_edge_sym(&next, &next);
+
+        if (cdt->edges[next.idx].flags & D2D_CDT_EDGE_FLAG_CUT)
+        {
+            static int once;
+            if (!once++)
+                FIXME("Segment walk crosses an edge twice, skipping the segment.\n");
+            ret = FALSE;
+            break;
+        }
+
+        if (!d2d_array_reserve((void **)&destroy_stack, &destroy_capacity,
+                destroy_count + 1, sizeof(*destroy_stack)))
+        {
+            ERR("Failed to grow destroy stack.\n");
+            ret = FALSE;
+            break;
+        }
+        cdt->edges[next.idx].flags |= D2D_CDT_EDGE_FLAG_CUT;
+        destroy_stack[destroy_count++] = next;
+        current = next;
     }
 
-    ccw = d2d_cdt_ccw(cdt, d2d_cdt_edge_destination(cdt, &next), end_vertex, start_vertex);
-    if (ccw == 0.0f)
+    /* The edge the walk ends on is connected to by the caller, so it must not
+     * be one that is about to be destroyed. Ending on keep is fine. */
+    if (ret && end_edge->idx != keep->idx && (cdt->edges[end_edge->idx].flags & D2D_CDT_EDGE_FLAG_CUT))
     {
-        *end_edge = next;
-        return;
+        static int once;
+        if (!once++)
+            FIXME("Segment walk ends on a crossed edge, skipping the segment.\n");
+        ret = FALSE;
     }
 
-    if (ccw > 0.0f)
-        d2d_cdt_edge_next_left(cdt, &next, &next);
+    cdt->edges[base_edge->idx].flags &= ~D2D_CDT_EDGE_FLAG_CUT;
+    cdt->edges[keep->idx].flags &= ~D2D_CDT_EDGE_FLAG_CUT;
+    if (!ret)
+    {
+        while (destroy_count > 0)
+            cdt->edges[destroy_stack[--destroy_count].idx].flags &= ~D2D_CDT_EDGE_FLAG_CUT;
+    }
+    while (destroy_count > 0)
+        d2d_cdt_destroy_edge(cdt, &destroy_stack[--destroy_count]);
 
-    d2d_cdt_edge_sym(&next, &next);
-    d2d_cdt_cut_edges(cdt, end_edge, &next, start_vertex, end_vertex);
-    d2d_cdt_destroy_edge(cdt, &next);
+    free(destroy_stack);
+    return ret;
 }
 
 static BOOL d2d_cdt_insert_segment(struct d2d_cdt *cdt, struct d2d_geometry *geometry,
         const struct d2d_cdt_edge_ref *origin, struct d2d_cdt_edge_ref *edge, size_t end_vertex)
 {
-    struct d2d_cdt_edge_ref base_edge, current, new_origin, next, target;
-    size_t current_destination, current_origin;
+    struct d2d_cdt_edge_ref current_origin = *origin;
+    size_t last_origin_vtx = ~(size_t)0;
+    size_t collinear_steps = 0, steps = 0;
 
-    for (current = *origin;; current = next)
+    for (;;)
     {
-        d2d_cdt_edge_next_origin(cdt, &next, &current);
+        struct d2d_cdt_edge_ref base_edge, current, new_origin, next, target;
+        size_t current_destination, current_origin_vtx, ring = 0;
 
-        current_destination = d2d_cdt_edge_destination(cdt, &current);
-        if (current_destination == end_vertex)
+        /* Every pass continues from a vertex further along the segment, so
+         * there cannot be more passes than vertices. More means the passes
+         * go around in a circle on degenerate input. */
+        if (++steps > cdt->vertex_count)
         {
-            d2d_cdt_edge_sym(edge, &current);
-            return TRUE;
-        }
-
-        current_origin = d2d_cdt_edge_origin(cdt, &current);
-        if (d2d_cdt_ccw(cdt, end_vertex, current_origin, current_destination) == 0.0f
-                && (cdt->vertices[current_destination].x > cdt->vertices[current_origin].x)
-                == (cdt->vertices[end_vertex].x > cdt->vertices[current_origin].x)
-                && (cdt->vertices[current_destination].y > cdt->vertices[current_origin].y)
-                == (cdt->vertices[end_vertex].y > cdt->vertices[current_origin].y))
-        {
-            d2d_cdt_edge_sym(&new_origin, &current);
-            return d2d_cdt_insert_segment(cdt, geometry, &new_origin, edge, end_vertex);
-        }
-
-        if (d2d_cdt_rightof(cdt, end_vertex, &next) && d2d_cdt_leftof(cdt, end_vertex, &current))
-        {
-            d2d_cdt_edge_next_left(cdt, &base_edge, &current);
-
-            d2d_cdt_edge_sym(&base_edge, &base_edge);
-            d2d_cdt_cut_edges(cdt, &target, &base_edge, d2d_cdt_edge_origin(cdt, origin), end_vertex);
-            d2d_cdt_destroy_edge(cdt, &base_edge);
-
-            if (!d2d_cdt_connect(cdt, &base_edge, &target, &current))
-                return FALSE;
-            *edge = base_edge;
-            if (!d2d_cdt_fixup(cdt, &base_edge))
-                return FALSE;
-            d2d_cdt_edge_sym(&base_edge, &base_edge);
-            if (!d2d_cdt_fixup(cdt, &base_edge))
-                return FALSE;
-
-            if (d2d_cdt_edge_origin(cdt, edge) == end_vertex)
-                return TRUE;
-            new_origin = *edge;
-            return d2d_cdt_insert_segment(cdt, geometry, &new_origin, edge, end_vertex);
-        }
-
-        if (next.idx == origin->idx)
-        {
-            ERR("Triangle not found.\n");
+            static int once;
+            if (!once++)
+                FIXME("Segment insertion does not advance, skipping the segment.\n");
             return FALSE;
         }
+
+        for (current = current_origin;; current = next)
+        {
+            /* The edges around a vertex form a ring of at most edge_count
+             * edges; a walk that does not come back has run into a damaged
+             * triangulation. */
+            if (++ring > cdt->edge_count)
+            {
+                static int once;
+                if (!once++)
+                    FIXME("Edge ring around a vertex does not close.\n");
+                return FALSE;
+            }
+            d2d_cdt_edge_next_origin(cdt, &next, &current);
+
+            current_destination = d2d_cdt_edge_destination(cdt, &current);
+            if (current_destination == end_vertex)
+            {
+                d2d_cdt_edge_sym(edge, &current);
+                return TRUE;
+            }
+
+            current_origin_vtx = d2d_cdt_edge_origin(cdt, &current);
+            if (d2d_cdt_ccw(cdt, end_vertex, current_origin_vtx, current_destination) == 0.0f
+                    && (cdt->vertices[current_destination].x > cdt->vertices[current_origin_vtx].x)
+                    == (cdt->vertices[end_vertex].x > cdt->vertices[current_origin_vtx].x)
+                    && (cdt->vertices[current_destination].y > cdt->vertices[current_origin_vtx].y)
+                    == (cdt->vertices[end_vertex].y > cdt->vertices[current_origin_vtx].y))
+            {
+                /* Cycle detection: if we revisit the same origin vertex via
+                 * collinear edges, we are stuck in a loop. */
+                if (current_destination == last_origin_vtx)
+                {
+                    static int once;
+                    if (!once++)
+                        FIXME("Collinear cycle detected, aborting.\n");
+                    return FALSE;
+                }
+                last_origin_vtx = current_origin_vtx;
+                if (++collinear_steps > cdt->edge_count)
+                {
+                    static int once2;
+                    if (!once2++)
+                        FIXME("Too many collinear steps (%lu), aborting.\n",
+                            (unsigned long)collinear_steps);
+                    return FALSE;
+                }
+                d2d_cdt_edge_sym(&new_origin, &current);
+                current_origin = new_origin;
+                goto next_segment;
+            }
+
+            if (d2d_cdt_rightof(cdt, end_vertex, &next) && d2d_cdt_leftof(cdt, end_vertex, &current))
+            {
+#ifndef D2D_NO_525_GUARDS
+                struct d2d_cdt_edge_ref third;
+#endif
+
+                d2d_cdt_edge_next_left(cdt, &base_edge, &current);
+#ifndef D2D_NO_525_GUARDS
+                /* The segment leaves the vertex between current and next,
+                 * so the face to the left of current has to be the triangle
+                 * of the three, with the segment crossing its far edge. On a
+                 * triangulation that an earlier failure left inconsistent
+                 * the ring says otherwise, and the walk that cut edges along
+                 * the far edge then went around the whole outline and
+                 * connected the vertex to itself. */
+                d2d_cdt_edge_next_left(cdt, &third, &base_edge);
+                if (d2d_cdt_edge_destination(cdt, &base_edge) != d2d_cdt_edge_destination(cdt, &next)
+                        || d2d_cdt_edge_destination(cdt, &third) != current_origin_vtx
+                        || !d2d_cdt_rightof(cdt, end_vertex, &base_edge))
+                {
+                    static int once;
+                    if (!once++)
+                        FIXME("Sector is not a triangle crossed by the segment, skipping the segment.\n");
+                    return FALSE;
+                }
+#endif
+
+                d2d_cdt_edge_sym(&base_edge, &base_edge);
+                if (!d2d_cdt_cut_edges(cdt, &target, &base_edge, &current,
+                        d2d_cdt_edge_origin(cdt, &current_origin), end_vertex))
+                    return FALSE;
+                d2d_cdt_destroy_edge(cdt, &base_edge);
+
+                if (!d2d_cdt_connect(cdt, &base_edge, &target, &current))
+                    return FALSE;
+                *edge = base_edge;
+                if (!d2d_cdt_fixup(cdt, &base_edge))
+                    return FALSE;
+                d2d_cdt_edge_sym(&base_edge, &base_edge);
+                if (!d2d_cdt_fixup(cdt, &base_edge))
+                    return FALSE;
+
+                if (d2d_cdt_edge_origin(cdt, edge) == end_vertex)
+                    return TRUE;
+                current_origin = *edge;
+                goto next_segment;
+            }
+
+            if (next.idx == current_origin.idx)
+            {
+                static int once;
+                if (!once++)
+                    FIXME("Triangle not found.\n");
+                return FALSE;
+            }
+        }
+    next_segment:
+        continue;
     }
+}
+
+/* The edge with the lowest index leaving the vertex, as a scan over the edges
+ * finds it. The table in the cdt holds it for every vertex, filled by one pass
+ * here and kept by d2d_cdt_edge_set_origin(), d2d_cdt_edge_set_destination()
+ * and d2d_cdt_destroy_edge() while constraints are inserted; an entry that
+ * was invalidated is renewed by a scan. Scanning all edges for every figure
+ * made a path of many small figures quadratic in its size. */
+static BOOL d2d_cdt_find_vertex_edge(const struct d2d_cdt *cdt, size_t vertex, struct d2d_cdt_edge_ref *edge)
+{
+    size_t k;
+
+    *edge = cdt->vertex_edge[vertex];
+    if (edge->idx < cdt->edge_count && !(cdt->edges[edge->idx].flags & D2D_CDT_EDGE_FLAG_FREED)
+            && d2d_cdt_edge_origin(cdt, edge) == vertex)
+        return TRUE;
+
+    for (k = 0; k < cdt->edge_count; ++k)
+    {
+        if (cdt->edges[k].flags & D2D_CDT_EDGE_FLAG_FREED)
+            continue;
+
+        edge->idx = k;
+        edge->r = 0;
+        if (d2d_cdt_edge_origin(cdt, edge) == vertex)
+            break;
+        d2d_cdt_edge_sym(edge, edge);
+        if (d2d_cdt_edge_origin(cdt, edge) == vertex)
+            break;
+    }
+    if (k == cdt->edge_count)
+        return FALSE;
+
+    cdt->vertex_edge[vertex] = *edge;
+    return TRUE;
 }
 
 static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *geometry)
@@ -2349,7 +3007,22 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
     struct d2d_cdt_edge_ref edge, new_edge;
     const struct d2d_figure *figure;
     const D2D1_POINT_2F *p;
-    BOOL found;
+    BOOL edge_valid;
+
+    if (!(cdt->vertex_edge = malloc(cdt->vertex_count * sizeof(*cdt->vertex_edge))))
+    {
+        ERR("Failed to allocate vertex edge table.\n");
+        return FALSE;
+    }
+    for (k = 0; k < cdt->vertex_count; ++k)
+        cdt->vertex_edge[k].idx = ~(size_t)0;
+    for (k = 0; k < cdt->edge_count; ++k)
+    {
+        if (cdt->edges[k].flags & D2D_CDT_EDGE_FLAG_FREED)
+            continue;
+        d2d_cdt_vertex_edge_update(cdt, k, cdt->edges[k].vertex[0]);
+        d2d_cdt_vertex_edge_update(cdt, k, cdt->edges[k].vertex[1]);
+    }
 
     for (i = 0; i < geometry->u.path.figure_count; ++i)
     {
@@ -2366,32 +3039,7 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
                 geometry->fill.vertex_count, sizeof(*p), d2d_cdt_compare_vertices);
         start_vertex = p - cdt->vertices;
 
-        for (k = 0, found = FALSE; k < cdt->edge_count; ++k)
-        {
-            if (cdt->edges[k].flags & D2D_CDT_EDGE_FLAG_FREED)
-                continue;
-
-            edge.idx = k;
-            edge.r = 0;
-
-            if (d2d_cdt_edge_origin(cdt, &edge) == start_vertex)
-            {
-                found = TRUE;
-                break;
-            }
-            d2d_cdt_edge_sym(&edge, &edge);
-            if (d2d_cdt_edge_origin(cdt, &edge) == start_vertex)
-            {
-                found = TRUE;
-                break;
-            }
-        }
-
-        if (!found)
-        {
-            ERR("Edge not found.\n");
-            return FALSE;
-        }
+        edge_valid = d2d_cdt_find_vertex_edge(cdt, start_vertex, &edge);
 
         for (j = 0; j < figure->vertex_count; start_vertex = end_vertex, ++j)
         {
@@ -2402,12 +3050,33 @@ static BOOL d2d_cdt_insert_segments(struct d2d_cdt *cdt, struct d2d_geometry *ge
             if (start_vertex == end_vertex)
                 continue;
 
+            /* A vertex without an edge, left behind by a skipped constraint
+             * on a degenerate path, cannot start a segment. Skip the segments
+             * that start there rather than failing the whole path: Windows
+             * closes such paths, and the faces are classified by the point
+             * in them, not by the constraints, so the fill is only off along
+             * the skipped segments. */
+            if (!edge_valid && !(edge_valid = d2d_cdt_find_vertex_edge(cdt, start_vertex, &edge)))
+            {
+                static int once;
+                if (!once++)
+                    FIXME("No edge at a vertex, skipping the segments starting there.\n");
+                continue;
+            }
+
             if (!d2d_cdt_insert_segment(cdt, geometry, &edge, &new_edge, end_vertex))
-                return FALSE;
+            {
+                /* Skip this constraint edge rather than aborting the entire
+                 * triangulation. Find an edge starting at end_vertex so we
+                 * can continue with the next segment. */
+                edge_valid = d2d_cdt_find_vertex_edge(cdt, end_vertex, &edge);
+                continue;
+            }
             edge = new_edge;
         }
     }
-
+    free(cdt->vertex_edge);
+    cdt->vertex_edge = NULL;
     return TRUE;
 }
 
@@ -2482,7 +3151,7 @@ static BOOL d2d_geometry_intersect_line_line(struct d2d_geometry *geometry,
     s = (v_q.x * v_qp.y - v_q.y * v_qp.x) / det;
     t = (v_p.x * v_qp.y - v_p.y * v_qp.x) / det;
 
-    if (s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f)
+    if (!(s >= 0.0f && s <= 1.0f && t >= 0.0f && t <= 1.0f))
         return TRUE;
 
     intersection.x = p[0]->x + v_p.x * s;
@@ -2509,7 +3178,13 @@ static BOOL d2d_geometry_add_bezier_line_intersections(struct d2d_geometry *geom
         t = (intersection.x - q[0]->x) / (q[1]->x - q[0]->x);
     else
         t = (intersection.y - q[0]->y) / (q[1]->y - q[0]->y);
-    if (t < 0.0f || t > 1.0f)
+    /* Written so that a NaN is rejected too: a line of zero length, two
+     * consecutive identical points, divides zero by zero here, and the
+     * intersection then went into the figure as a NaN vertex, which sorted
+     * after every other vertex and left the triangulation contradicting
+     * itself. Every failed Close() of a million random integer paths came
+     * from such a vertex. */
+    if (!(t >= 0.0f && t <= 1.0f))
         return TRUE;
 
     d2d_point_lerp(&intersection, q[0], q[1], t);
@@ -2573,7 +3248,7 @@ static BOOL d2d_geometry_intersect_bezier_line(struct d2d_geometry *geometry,
          * f(t) = (P₀ - 2P₁ + P₂)t² + 2(P₁ - P₀)t + P₀ = 0
          * t = -P₀ / 2(P₁ - P₀) */
         root = -y[0] / (2.0f * (y[1] - y[0]));
-        if (root < 0.0f || root > 1.0f)
+        if (!(root >= 0.0f && root <= 1.0f))
             return TRUE;
 
         return d2d_geometry_add_bezier_line_intersections(geometry, intersections, idx_p, p, idx_q, q, root);
@@ -2596,15 +3271,76 @@ static BOOL d2d_geometry_intersect_bezier_line(struct d2d_geometry *geometry,
     return TRUE;
 }
 
+/* Two quadratic segments describe the same curve, possibly traversed in
+ * opposite directions. The tolerance is a fraction of a DIP well below anything
+ * rasterisation resolves, scaled with the coordinate magnitude so that float
+ * rounding in the caller's own conversion (a cubic converted twice into the
+ * same quadratics) does not defeat the test. */
+static BOOL d2d_point_approx_equal(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b)
+{
+    float eps = 1e-4f * fmaxf(1.0f, fmaxf(fabsf(a->x), fabsf(a->y)));
+
+    return fabsf(a->x - b->x) <= eps && fabsf(a->y - b->y) <= eps;
+}
+
+static BOOL d2d_bezier_segments_coincide(const D2D1_POINT_2F *const p[3], const D2D1_POINT_2F *const q[3])
+{
+    if (!d2d_point_approx_equal(p[1], q[1]))
+        return FALSE;
+    if (d2d_point_approx_equal(p[0], q[0]) && d2d_point_approx_equal(p[2], q[2]))
+        return TRUE;
+    return d2d_point_approx_equal(p[0], q[2]) && d2d_point_approx_equal(p[2], q[0]);
+}
+
+/* Whether the segments p0-p1 and q0-q1 cross or touch. Collinear segments do
+ * not count, just like parallel lines in d2d_geometry_intersect_line_line(). */
+static BOOL d2d_point_segments_cross(const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1,
+        const D2D1_POINT_2F *q0, const D2D1_POINT_2F *q1)
+{
+    float a, b, c, d;
+
+    a = d2d_point_ccw(q0, q1, p0);
+    b = d2d_point_ccw(q0, q1, p1);
+    if ((a > 0.0f && b > 0.0f) || (a < 0.0f && b < 0.0f))
+        return FALSE;
+
+    c = d2d_point_ccw(p0, p1, q0);
+    d = d2d_point_ccw(p0, p1, q1);
+    if ((c > 0.0f && d > 0.0f) || (c < 0.0f && d < 0.0f))
+        return FALSE;
+
+    return a != 0.0f || b != 0.0f;
+}
+
+/* Whether the segment q0-q1 runs along the line through p0 and p1, within the
+ * rounding of the coordinates: both of its end points lie no further from the
+ * line than a few ULPs of the coordinate magnitude, or p0-p1 is itself that
+ * short. A cubic whose end point coincides with its last control point, or
+ * with its start point, folds back along a straight line, and its pieces run
+ * over each other. The leaf points of two such pieces are rounded onto either
+ * side of the shared line, so d2d_point_segments_cross() found a crossing in
+ * about every other leaf, and one such cubic became 432 segments. */
+static BOOL d2d_point_segment_along(const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1,
+        const D2D1_POINT_2F *q0, const D2D1_POINT_2F *q1)
+{
+    float eps = 1e-6f * fmaxf(1.0f, fmaxf(fabsf(p0->x), fabsf(p0->y)));
+    float len = sqrtf((p1->x - p0->x) * (p1->x - p0->x) + (p1->y - p0->y) * (p1->y - p0->y));
+
+    if (len <= eps)
+        return TRUE;
+
+    return fabsf(d2d_point_ccw(p0, p1, q0)) <= eps * len && fabsf(d2d_point_ccw(p0, p1, q1)) <= eps * len;
+}
+
 static BOOL d2d_geometry_intersect_bezier_bezier(struct d2d_geometry *geometry,
         struct d2d_geometry_intersections *intersections,
         const struct d2d_segment_idx *idx_p, float start_p, float end_p,
         const struct d2d_segment_idx *idx_q, float start_q, float end_q)
 {
+    D2D1_POINT_2F intersection, p_start, p_end, q_start, q_end;
     const D2D1_POINT_2F *p[3], *q[3];
     const struct d2d_figure *figure;
     D2D_RECT_F p_bounds, q_bounds;
-    D2D1_POINT_2F intersection;
     float centre_p, centre_q;
     size_t next;
 
@@ -2626,11 +3362,40 @@ static BOOL d2d_geometry_intersect_bezier_bezier(struct d2d_geometry *geometry,
     if (!d2d_rect_check_overlap(&p_bounds, &q_bounds))
         return TRUE;
 
+    /* Coincident segments never cross, so there is no intersection to report,
+     * just like d2d_geometry_intersect_line_line() reports none for parallel
+     * lines. Subdividing them instead finds an overlap in all four sub-pairs on
+     * every level, visits 4^10 leaves before the termination below and adds
+     * about two million duplicate intersections, all but a thousand of which
+     * d2d_geometry_apply_intersections() throws away again: a 13 DIP icon whose
+     * figures share a stroke cap took over a second to close. */
+    if (start_p == 0.0f && end_p == 1.0f && start_q == 0.0f && end_q == 1.0f
+            && d2d_bezier_segments_coincide(p, q))
+        return TRUE;
+
     centre_p = (start_p + end_p) / 2.0f;
     centre_q = (start_q + end_q) / 2.0f;
 
     if (end_p - start_p < 1e-3f)
     {
+        /* Overlapping bounds are not a crossing yet. Two curves that run along
+         * each other closer than the size of a leaf, such as the round caps of
+         * strokes meeting at a point, which lie on the same circle, overlap in
+         * every leaf along the shared stretch. Reporting each of those split
+         * both curves about every other leaf: the caps at the tip of a 1 DIP
+         * wide arrow icon became about 2100 pieces, and the pairwise passes
+         * after this one took 70 ms to close the path. Only report the leaves
+         * in which the two pieces actually cross. */
+        d2d_point_calculate_bezier(&p_start, p[0], p[1], p[2], start_p);
+        d2d_point_calculate_bezier(&p_end, p[0], p[1], p[2], end_p);
+        d2d_point_calculate_bezier(&q_start, q[0], q[1], q[2], start_q);
+        d2d_point_calculate_bezier(&q_end, q[0], q[1], q[2], end_q);
+        if (d2d_point_segment_along(&p_start, &p_end, &q_start, &q_end)
+                || d2d_point_segment_along(&q_start, &q_end, &p_start, &p_end))
+            return TRUE;
+        if (!d2d_point_segments_cross(&p_start, &p_end, &q_start, &q_end))
+            return TRUE;
+
         d2d_point_calculate_bezier(&intersection, p[0], p[1], p[2], centre_p);
         if (start_p > 0.0f && end_p < 1.0f && !d2d_geometry_intersections_add(intersections,
                 idx_p, centre_p, intersection))
@@ -2720,9 +3485,187 @@ static BOOL d2d_geometry_apply_intersections(struct d2d_geometry *geometry,
     return TRUE;
 }
 
-/* Intersect the geometry's segments with themselves. This uses the
- * straightforward approach of testing everything against everything, but
- * there certainly exist more scalable algorithms for this. */
+
+/* ---- Grid-accelerated self-intersection infrastructure (Phase 1) ---- */
+
+struct d2d_segment_desc
+{
+    struct d2d_segment_idx idx;
+    enum d2d_vertex_type type;
+    D2D_RECT_F bounds;
+    size_t flat_idx;  /* global segment index across all figures */
+};
+
+struct d2d_grid_entry
+{
+    size_t segment_idx;  /* index into segment_descs[] */
+    size_t next;         /* next entry in this cell, SIZE_MAX = end */
+};
+
+struct d2d_grid
+{
+    size_t *cells;                    /* cells[row * cols + col] = first grid_entry index */
+    struct d2d_grid_entry *entries;
+    size_t entry_count;
+    size_t entry_capacity;
+    size_t cols, rows;
+    float cell_w, cell_h;
+    float origin_x, origin_y;
+};
+
+static void d2d_segment_get_line_bounds(D2D_RECT_F *bounds,
+        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1)
+{
+    bounds->left   = min(p0->x, p1->x);
+    bounds->top    = min(p0->y, p1->y);
+    bounds->right  = max(p0->x, p1->x);
+    bounds->bottom = max(p0->y, p1->y);
+}
+
+static BOOL d2d_grid_init(struct d2d_grid *grid, const D2D_RECT_F *total_bounds,
+        size_t segment_count)
+{
+    float width, height, aspect;
+    size_t grid_size, i;
+
+    width  = total_bounds->right - total_bounds->left;
+    height = total_bounds->bottom - total_bounds->top;
+
+    if (width < 1e-6f) width = 1.0f;
+    if (height < 1e-6f) height = 1.0f;
+
+    /* Target ~4 segments per cell on average.
+     * cell_count ≈ segment_count / 4, distributed by aspect ratio. */
+    if (segment_count < 16)
+    {
+        grid->cols = 1;
+        grid->rows = 1;
+    }
+    else
+    {
+        float target_cells = (float)segment_count / 4.0f;
+        aspect = width / height;
+        grid->cols = (size_t)(sqrtf(target_cells * aspect) + 0.5f);
+        grid->rows = (size_t)(sqrtf(target_cells / aspect) + 0.5f);
+        if (grid->cols < 1) grid->cols = 1;
+        if (grid->rows < 1) grid->rows = 1;
+        if (grid->cols > 256) grid->cols = 256;
+        if (grid->rows > 256) grid->rows = 256;
+    }
+
+    grid->cell_w = width / (float)grid->cols;
+    grid->cell_h = height / (float)grid->rows;
+    grid->origin_x = total_bounds->left;
+    grid->origin_y = total_bounds->top;
+
+    grid_size = grid->cols * grid->rows;
+    grid->cells = calloc(grid_size, sizeof(*grid->cells));
+    if (!grid->cells)
+        return FALSE;
+    for (i = 0; i < grid_size; ++i)
+        grid->cells[i] = SIZE_MAX;
+
+    /* Allocate entry pool: each segment typically spans 1-4 cells.
+     * We use 8x as generous upper bound and grow if needed. */
+    grid->entry_capacity = segment_count * 8;
+    if (grid->entry_capacity < 64)
+        grid->entry_capacity = 64;
+    grid->entries = calloc(grid->entry_capacity, sizeof(*grid->entries));
+    if (!grid->entries)
+    {
+        free(grid->cells);
+        grid->cells = NULL;
+        return FALSE;
+    }
+    grid->entry_count = 0;
+
+    return TRUE;
+}
+
+static BOOL d2d_grid_insert(struct d2d_grid *grid, size_t segment_idx,
+        const D2D_RECT_F *bounds)
+{
+    size_t cx0, cy0, cx1, cy1, cx, cy, cell_idx;
+    double fx0, fy0, fx1, fy1;
+    struct d2d_grid_entry *entry;
+
+    /* Map AABB to grid cell range. Compute as signed doubles first: a slightly
+     * negative coordinate (float drift at the min edge) must clamp to cell 0,
+     * not wrap to a huge size_t (which the upper-bound clamp below would then
+     * fold to cols-1/rows-1, mis-bucketing boundary-heavy inputs). */
+    fx0 = (bounds->left   - grid->origin_x) / grid->cell_w;
+    fy0 = (bounds->top    - grid->origin_y) / grid->cell_h;
+    fx1 = (bounds->right  - grid->origin_x) / grid->cell_w;
+    fy1 = (bounds->bottom - grid->origin_y) / grid->cell_h;
+
+    cx0 = fx0 < 0.0 ? 0 : (size_t)fx0;
+    cy0 = fy0 < 0.0 ? 0 : (size_t)fy0;
+    cx1 = fx1 < 0.0 ? 0 : (size_t)fx1;
+    cy1 = fy1 < 0.0 ? 0 : (size_t)fy1;
+
+    /* Clamp the upper bound to grid extents (handles floating-point edge cases) */
+    if (cx0 >= grid->cols) cx0 = grid->cols - 1;
+    if (cy0 >= grid->rows) cy0 = grid->rows - 1;
+    if (cx1 >= grid->cols) cx1 = grid->cols - 1;
+    if (cy1 >= grid->rows) cy1 = grid->rows - 1;
+
+    for (cy = cy0; cy <= cy1; ++cy)
+    {
+        for (cx = cx0; cx <= cx1; ++cx)
+        {
+            /* Grow entry pool if needed */
+            if (grid->entry_count >= grid->entry_capacity)
+            {
+                size_t new_cap = grid->entry_capacity * 2;
+                struct d2d_grid_entry *new_entries = realloc(grid->entries,
+                        new_cap * sizeof(*new_entries));
+                if (!new_entries)
+                    return FALSE;
+                grid->entries = new_entries;
+                grid->entry_capacity = new_cap;
+            }
+
+            entry = &grid->entries[grid->entry_count];
+            entry->segment_idx = segment_idx;
+            cell_idx = cy * grid->cols + cx;
+            entry->next = grid->cells[cell_idx];
+            grid->cells[cell_idx] = grid->entry_count;
+            ++grid->entry_count;
+        }
+    }
+
+    return TRUE;
+}
+
+static void d2d_grid_destroy(struct d2d_grid *grid)
+{
+    free(grid->cells);
+    free(grid->entries);
+    memset(grid, 0, sizeof(*grid));
+}
+
+static BOOL d2d_segments_adjacent(const struct d2d_segment_desc *a,
+        const struct d2d_segment_desc *b, const struct d2d_geometry *geometry)
+{
+    size_t diff, n;
+
+    if (a->idx.figure_idx != b->idx.figure_idx)
+        return FALSE;
+
+    n = geometry->u.path.figures[a->idx.figure_idx].vertex_count;
+    if (a->idx.vertex_idx > b->idx.vertex_idx)
+        diff = a->idx.vertex_idx - b->idx.vertex_idx;
+    else
+        diff = b->idx.vertex_idx - a->idx.vertex_idx;
+
+    return (diff == 1 || diff == n - 1);
+}
+
+
+/* Intersect the geometry's segments with themselves. For small segment
+ * counts (< 16), use the straightforward O(n^2) approach. For larger
+ * geometries, build a uniform spatial grid and only test segment pairs
+ * that share at least one grid cell. */
 static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
 {
     struct d2d_geometry_intersections intersections = {0};
@@ -2732,70 +3675,282 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
     BOOL ret = FALSE;
     size_t max_q;
 
+    struct d2d_segment_desc *segment_descs = NULL;
+    size_t segment_count = 0, segment_capacity = 0;
+    struct d2d_grid grid = {0};
+    D2D_RECT_F total_bounds;
+    BOOL use_grid = FALSE;
+    size_t *tested = NULL;
+
     if (!geometry->u.path.figure_count)
         return TRUE;
 
-    for (idx_p.figure_idx = 0; idx_p.figure_idx < geometry->u.path.figure_count; ++idx_p.figure_idx)
+    /* --- Step 1: Count segments and decide whether to use grid --- */
     {
-        figure_p = &geometry->u.path.figures[idx_p.figure_idx];
-        idx_p.control_idx = 0;
-        for (idx_p.vertex_idx = 0; idx_p.vertex_idx < figure_p->vertex_count; ++idx_p.vertex_idx)
+        size_t fi, vi;
+        for (fi = 0; fi < geometry->u.path.figure_count; ++fi)
         {
-            if ((type_p = figure_p->vertex_types[idx_p.vertex_idx]) == D2D_VERTEX_TYPE_END)
-                continue;
-
-            for (idx_q.figure_idx = 0; idx_q.figure_idx <= idx_p.figure_idx; ++idx_q.figure_idx)
+            const struct d2d_figure *fig = &geometry->u.path.figures[fi];
+            for (vi = 0; vi < fig->vertex_count; ++vi)
             {
-                figure_q = &geometry->u.path.figures[idx_q.figure_idx];
-                if (idx_q.figure_idx != idx_p.figure_idx)
-                {
-                    if (!d2d_rect_check_overlap(&figure_p->bounds, &figure_q->bounds))
-                        continue;
-                    if ((max_q = figure_q->vertex_count)
-                            && figure_q->vertex_types[max_q - 1] == D2D_VERTEX_TYPE_END)
-                        --max_q;
-                }
-                else
-                {
-                    max_q = idx_p.vertex_idx;
-                }
+                if (fig->vertex_types[vi] != D2D_VERTEX_TYPE_END)
+                    ++segment_capacity;
+            }
+        }
+    }
 
-                idx_q.control_idx = 0;
-                for (idx_q.vertex_idx = 0; idx_q.vertex_idx < max_q; ++idx_q.vertex_idx)
+    if (segment_capacity >= 16)
+    {
+        /* --- Step 2: Build segment descriptors with per-segment AABBs --- */
+        segment_descs = calloc(segment_capacity, sizeof(*segment_descs));
+        if (segment_descs)
+        {
+            size_t fi, vi, ci;
+
+            total_bounds.left = FLT_MAX;
+            total_bounds.top = FLT_MAX;
+            total_bounds.right = -FLT_MAX;
+            total_bounds.bottom = -FLT_MAX;
+
+            for (fi = 0; fi < geometry->u.path.figure_count; ++fi)
+            {
+                const struct d2d_figure *fig = &geometry->u.path.figures[fi];
+                ci = 0;
+                for (vi = 0; vi < fig->vertex_count; ++vi)
                 {
-                    type_q = figure_q->vertex_types[idx_q.vertex_idx];
-                    if (d2d_vertex_type_is_bezier(type_q))
+                    enum d2d_vertex_type vtype = fig->vertex_types[vi];
+                    if (vtype == D2D_VERTEX_TYPE_END)
+                        continue;
+
+                    if (segment_count < segment_capacity)
                     {
-                        if (d2d_vertex_type_is_bezier(type_p))
+                        struct d2d_segment_desc *desc = &segment_descs[segment_count];
+                        size_t next_vi = vi + 1;
+
+                        desc->idx.figure_idx = fi;
+                        desc->idx.vertex_idx = vi;
+                        desc->idx.control_idx = ci;
+                        desc->type = vtype;
+                        desc->flat_idx = segment_count;
+
+                        if (d2d_vertex_type_is_bezier(vtype))
                         {
-                            if (!d2d_geometry_intersect_bezier_bezier(geometry, &intersections,
-                                    &idx_p, 0.0f, 1.0f, &idx_q, 0.0f, 1.0f))
-                                goto done;
+                            d2d_rect_get_bezier_bounds(&desc->bounds,
+                                    &fig->vertices[vi],
+                                    &fig->bezier_controls[ci],
+                                    &fig->vertices[next_vi]);
                         }
                         else
                         {
-                            if (!d2d_geometry_intersect_bezier_line(geometry, &intersections, &idx_q, &idx_p))
-                                goto done;
+                            if (next_vi >= fig->vertex_count)
+                                next_vi = 0;
+                            d2d_segment_get_line_bounds(&desc->bounds,
+                                    &fig->vertices[vi],
+                                    &fig->vertices[next_vi]);
                         }
-                        ++idx_q.control_idx;
+
+                        d2d_rect_union(&total_bounds, &desc->bounds);
+                        ++segment_count;
                     }
-                    else
+
+                    if (d2d_vertex_type_is_bezier(vtype))
+                        ++ci;
+                }
+            }
+
+            /* --- Step 3: Build spatial grid --- */
+            if (segment_count >= 16 && d2d_grid_init(&grid, &total_bounds, segment_count))
+            {
+                size_t si;
+                use_grid = TRUE;
+                for (si = 0; si < segment_count; ++si)
+                {
+                    if (!d2d_grid_insert(&grid, si, &segment_descs[si].bounds))
                     {
-                        if (d2d_vertex_type_is_bezier(type_p))
+                        use_grid = FALSE;
+                        break;
+                    }
+                }
+            }
+
+            /* Allocate tested-array for duplicate avoidance */
+            if (use_grid)
+            {
+                tested = calloc(segment_count, sizeof(*tested));
+                if (!tested)
+                    use_grid = FALSE;
+            }
+        }
+    }
+
+    if (use_grid)
+    {
+        /* --- Grid-accelerated intersection loop --- */
+        size_t i, j;
+
+        for (i = 0; i < segment_count; ++i)
+        {
+            const struct d2d_segment_desc *desc_i = &segment_descs[i];
+            size_t cx0, cy0, cx1, cy1, cx, cy;
+
+            /* tested[j] holds the outer index that last tested j, plus one:
+             * clearing a flag array for every outer segment instead wrote
+             * segment_count bytes per segment, a gigabyte for 32,000 segments. */
+
+            /* Compute grid cell range for segment i */
+            cx0 = (size_t)((desc_i->bounds.left   - grid.origin_x) / grid.cell_w);
+            cy0 = (size_t)((desc_i->bounds.top    - grid.origin_y) / grid.cell_h);
+            cx1 = (size_t)((desc_i->bounds.right  - grid.origin_x) / grid.cell_w);
+            cy1 = (size_t)((desc_i->bounds.bottom - grid.origin_y) / grid.cell_h);
+            if (cx0 >= grid.cols) cx0 = grid.cols - 1;
+            if (cy0 >= grid.rows) cy0 = grid.rows - 1;
+            if (cx1 >= grid.cols) cx1 = grid.cols - 1;
+            if (cy1 >= grid.rows) cy1 = grid.rows - 1;
+
+            for (cy = cy0; cy <= cy1; ++cy)
+            {
+                for (cx = cx0; cx <= cx1; ++cx)
+                {
+                    size_t ei = grid.cells[cy * grid.cols + cx];
+
+                    while (ei != SIZE_MAX)
+                    {
+                        const struct d2d_grid_entry *entry = &grid.entries[ei];
+                        j = entry->segment_idx;
+                        ei = entry->next;
+
+                        /* Only test j < i to avoid duplicates (like original) */
+                        if (j >= i)
+                            continue;
+
+                        /* Skip if already tested via another shared cell */
+                        if (tested[j] == i + 1)
+                            continue;
+                        tested[j] = i + 1;
+
+                        /* Skip adjacent segments (share a vertex — endpoint
+                         * intersections are filtered by s/t strictly in (0,1)) */
+                        if (d2d_segments_adjacent(desc_i, &segment_descs[j], geometry))
+                            continue;
+
+                        /* Fine-grained AABB overlap check */
+                        if (!d2d_rect_check_overlap(&desc_i->bounds,
+                                &segment_descs[j].bounds))
+                            continue;
+
+                        /* Perform actual intersection test */
                         {
-                            if (!d2d_geometry_intersect_bezier_line(geometry, &intersections, &idx_p, &idx_q))
-                                goto done;
-                        }
-                        else
-                        {
-                            if (!d2d_geometry_intersect_line_line(geometry, &intersections, &idx_p, &idx_q))
-                                goto done;
+                            const struct d2d_segment_desc *desc_j = &segment_descs[j];
+
+                            if (d2d_vertex_type_is_bezier(desc_j->type))
+                            {
+                                if (d2d_vertex_type_is_bezier(desc_i->type))
+                                {
+                                    if (!d2d_geometry_intersect_bezier_bezier(geometry,
+                                            &intersections, &desc_i->idx, 0.0f, 1.0f,
+                                            &desc_j->idx, 0.0f, 1.0f))
+                                        goto done;
+                                }
+                                else
+                                {
+                                    if (!d2d_geometry_intersect_bezier_line(geometry,
+                                            &intersections, &desc_j->idx, &desc_i->idx))
+                                        goto done;
+                                }
+                            }
+                            else
+                            {
+                                if (d2d_vertex_type_is_bezier(desc_i->type))
+                                {
+                                    if (!d2d_geometry_intersect_bezier_line(geometry,
+                                            &intersections, &desc_i->idx, &desc_j->idx))
+                                        goto done;
+                                }
+                                else
+                                {
+                                    if (!d2d_geometry_intersect_line_line(geometry,
+                                            &intersections, &desc_i->idx, &desc_j->idx))
+                                        goto done;
+                                }
+                            }
                         }
                     }
                 }
             }
-            if (d2d_vertex_type_is_bezier(type_p))
-                ++idx_p.control_idx;
+        }
+    }
+    else
+    {
+        /* --- Original brute-force loop for small geometries --- */
+        for (idx_p.figure_idx = 0; idx_p.figure_idx < geometry->u.path.figure_count;
+                ++idx_p.figure_idx)
+        {
+            figure_p = &geometry->u.path.figures[idx_p.figure_idx];
+            idx_p.control_idx = 0;
+            for (idx_p.vertex_idx = 0; idx_p.vertex_idx < figure_p->vertex_count;
+                    ++idx_p.vertex_idx)
+            {
+                if ((type_p = figure_p->vertex_types[idx_p.vertex_idx]) == D2D_VERTEX_TYPE_END)
+                    continue;
+
+                for (idx_q.figure_idx = 0; idx_q.figure_idx <= idx_p.figure_idx;
+                        ++idx_q.figure_idx)
+                {
+                    figure_q = &geometry->u.path.figures[idx_q.figure_idx];
+                    if (idx_q.figure_idx != idx_p.figure_idx)
+                    {
+                        if (!d2d_rect_check_overlap(&figure_p->bounds, &figure_q->bounds))
+                            continue;
+                        if ((max_q = figure_q->vertex_count)
+                                && figure_q->vertex_types[max_q - 1] == D2D_VERTEX_TYPE_END)
+                            --max_q;
+                    }
+                    else
+                    {
+                        max_q = idx_p.vertex_idx;
+                    }
+
+                    idx_q.control_idx = 0;
+                    for (idx_q.vertex_idx = 0; idx_q.vertex_idx < max_q; ++idx_q.vertex_idx)
+                    {
+                        type_q = figure_q->vertex_types[idx_q.vertex_idx];
+                        if (d2d_vertex_type_is_bezier(type_q))
+                        {
+                            if (d2d_vertex_type_is_bezier(type_p))
+                            {
+                                if (!d2d_geometry_intersect_bezier_bezier(geometry,
+                                        &intersections, &idx_p, 0.0f, 1.0f,
+                                        &idx_q, 0.0f, 1.0f))
+                                    goto done;
+                            }
+                            else
+                            {
+                                if (!d2d_geometry_intersect_bezier_line(geometry,
+                                        &intersections, &idx_q, &idx_p))
+                                    goto done;
+                            }
+                            ++idx_q.control_idx;
+                        }
+                        else
+                        {
+                            if (d2d_vertex_type_is_bezier(type_p))
+                            {
+                                if (!d2d_geometry_intersect_bezier_line(geometry,
+                                        &intersections, &idx_p, &idx_q))
+                                    goto done;
+                            }
+                            else
+                            {
+                                if (!d2d_geometry_intersect_line_line(geometry,
+                                        &intersections, &idx_p, &idx_q))
+                                    goto done;
+                            }
+                        }
+                    }
+                }
+                if (d2d_vertex_type_is_bezier(type_p))
+                    ++idx_p.control_idx;
+            }
         }
     }
 
@@ -2804,6 +3959,9 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
     ret = d2d_geometry_apply_intersections(geometry, &intersections);
 
 done:
+    free(tested);
+    d2d_grid_destroy(&grid);
+    free(segment_descs);
     free(intersections.intersections);
     return ret;
 }
@@ -2867,6 +4025,7 @@ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
 
     cdt.free_edge = ~0u;
     cdt.vertices = vertices;
+    cdt.vertex_count = vertex_count;
 
 #ifdef __i386__
     control_word_x87 = _controlfp(0, 0);
@@ -2920,14 +4079,27 @@ static BOOL d2d_path_geometry_add_figure(struct d2d_geometry *geometry)
     return TRUE;
 }
 
+/* The four vertices of a join sit on the corner. "prev" and "next" are the unit
+ * directions into and out of it; which corner of the join kite a vertex stands
+ * for is encoded in the vector lengths, 1 or 2: inner point (1, 1), edge point
+ * of prev (1, 2), edge point of next (2, 1), tip (2, 2). The outline vertex
+ * shader builds the kite for the stroke's line join from that, so the join
+ * type does not have to be known when the geometry is tessellated. A straight
+ * continuation needs no join; a hairpin is left to the shader, which draws the
+ * half disc of a round join there and nothing for the others. */
 static BOOL d2d_geometry_outline_add_join(struct d2d_geometry *geometry,
         const D2D1_POINT_2F *prev, const D2D1_POINT_2F *p0, const D2D1_POINT_2F *next)
 {
-    static const D2D1_POINT_2F origin = {0.0f, 0.0f};
     struct d2d_outline_vertex *v;
     struct d2d_face *f;
     size_t base_idx;
-    float ccw;
+    float dx, dy;
+
+    /* prev points from p0 back to the previous vertex. */
+    dx = -prev->x;
+    dy = -prev->y;
+    if (dx * next->x + dy * next->y > 0.9999f)
+        return TRUE;
 
     if (!d2d_array_reserve((void **)&geometry->outline.vertices, &geometry->outline.vertices_size,
             geometry->outline.vertex_count + 4, sizeof(*geometry->outline.vertices)))
@@ -2946,34 +4118,62 @@ static BOOL d2d_geometry_outline_add_join(struct d2d_geometry *geometry,
     }
     f = &geometry->outline.faces[geometry->outline.face_count];
 
-    ccw = d2d_point_ccw(&origin, prev, next);
-    if (ccw == 0.0f)
-    {
-        d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
-        d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
-        d2d_outline_vertex_set(&v[2], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
-                 prev->x,  prev->y,  prev->x,  prev->y);
-        d2d_outline_vertex_set(&v[3], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
-                -prev->x, -prev->y, -prev->x, -prev->y);
-    }
-    else if (ccw < 0.0f)
-    {
-        d2d_outline_vertex_set(&v[0], p0->x, p0->y,  next->x,  next->y, -prev->x, -prev->y);
-        d2d_outline_vertex_set(&v[1], p0->x, p0->y, -next->x, -next->y, -next->x, -next->y);
-        d2d_outline_vertex_set(&v[2], p0->x, p0->y, -next->x, -next->y,  prev->x,  prev->y);
-        d2d_outline_vertex_set(&v[3], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
-    }
-    else
-    {
-        d2d_outline_vertex_set(&v[0], p0->x, p0->y,  prev->x,  prev->y, -next->x, -next->y);
-        d2d_outline_vertex_set(&v[1], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
-        d2d_outline_vertex_set(&v[2], p0->x, p0->y, -prev->x, -prev->y,  next->x,  next->y);
-        d2d_outline_vertex_set(&v[3], p0->x, p0->y,  next->x,  next->y,  next->x,  next->y);
-    }
+    d2d_outline_vertex_set(&v[0], p0->x, p0->y, dx, dy, next->x, next->y);
+    d2d_outline_vertex_set(&v[1], p0->x, p0->y, dx, dy, 2.0f * next->x, 2.0f * next->y);
+    d2d_outline_vertex_set(&v[2], p0->x, p0->y, 2.0f * dx, 2.0f * dy, next->x, next->y);
+    d2d_outline_vertex_set(&v[3], p0->x, p0->y, 2.0f * dx, 2.0f * dy, 2.0f * next->x, 2.0f * next->y);
     geometry->outline.vertex_count += 4;
 
-    d2d_face_set(&f[0], base_idx + 1, base_idx + 0, base_idx + 2);
-    d2d_face_set(&f[1], base_idx + 2, base_idx + 0, base_idx + 3);
+    d2d_face_set(&f[0], base_idx + 2, base_idx + 3, base_idx + 0);
+    d2d_face_set(&f[1], base_idx + 0, base_idx + 3, base_idx + 1);
+    geometry->outline.face_count += 2;
+
+    return TRUE;
+}
+
+/* The four vertices of a cap sit on the end point, "prev" is the outward
+ * direction and "next" its opposite; the vector lengths encode the corner of
+ * the cap quad as for a join, with the lengths 3 and 4 in place of 1 and 2 on
+ * the next vector of a start cap and on the prev vector of an end cap, which
+ * tells the outline vertex shader that it is a cap and which cap style to use. */
+void d2d_outline_cap_vertices(struct d2d_outline_vertex *v, const D2D1_POINT_2F *p,
+        float dx, float dy, BOOL start)
+{
+    float a = start ? 1.0f : 3.0f, b = start ? 3.0f : 1.0f;
+
+    d2d_outline_vertex_set(&v[0], p->x, p->y, a * dx, a * dy, -b * dx, -b * dy);
+    d2d_outline_vertex_set(&v[1], p->x, p->y, a * dx, a * dy, -(b + 1.0f) * dx, -(b + 1.0f) * dy);
+    d2d_outline_vertex_set(&v[2], p->x, p->y, (a + 1.0f) * dx, (a + 1.0f) * dy, -b * dx, -b * dy);
+    d2d_outline_vertex_set(&v[3], p->x, p->y, (a + 1.0f) * dx, (a + 1.0f) * dy, -(b + 1.0f) * dx, -(b + 1.0f) * dy);
+}
+
+static BOOL d2d_geometry_outline_add_cap(struct d2d_geometry *geometry,
+        const D2D1_POINT_2F *p, const D2D1_POINT_2F *outward, BOOL start)
+{
+    struct d2d_face *f;
+    size_t base_idx;
+
+    if (!d2d_array_reserve((void **)&geometry->outline.vertices, &geometry->outline.vertices_size,
+            geometry->outline.vertex_count + 4, sizeof(*geometry->outline.vertices)))
+    {
+        ERR("Failed to grow outline vertices array.\n");
+        return FALSE;
+    }
+    base_idx = geometry->outline.vertex_count;
+
+    if (!d2d_array_reserve((void **)&geometry->outline.faces, &geometry->outline.faces_size,
+            geometry->outline.face_count + 2, sizeof(*geometry->outline.faces)))
+    {
+        ERR("Failed to grow outline faces array.\n");
+        return FALSE;
+    }
+    f = &geometry->outline.faces[geometry->outline.face_count];
+
+    d2d_outline_cap_vertices(&geometry->outline.vertices[base_idx], p, outward->x, outward->y, start);
+    geometry->outline.vertex_count += 4;
+
+    d2d_face_set(&f[0], base_idx + 2, base_idx + 3, base_idx + 0);
+    d2d_face_set(&f[1], base_idx + 0, base_idx + 3, base_idx + 1);
     geometry->outline.face_count += 2;
 
     return TRUE;
@@ -3008,9 +4208,9 @@ static BOOL d2d_geometry_outline_add_line_segment(struct d2d_geometry *geometry,
     d2d_point_normalise(&q_next);
 
     d2d_outline_vertex_set(&v[0], p0->x, p0->y,  q_next.x,  q_next.y,  q_next.x,  q_next.y);
-    d2d_outline_vertex_set(&v[1], p0->x, p0->y, -q_next.x, -q_next.y, -q_next.x, -q_next.y);
+    d2d_outline_vertex_set(&v[1], p0->x, p0->y, -2.0f * q_next.x, -2.0f * q_next.y, -2.0f * q_next.x, -2.0f * q_next.y);
     d2d_outline_vertex_set(&v[2], next->x, next->y,  q_next.x,  q_next.y,  q_next.x,  q_next.y);
-    d2d_outline_vertex_set(&v[3], next->x, next->y, -q_next.x, -q_next.y, -q_next.x, -q_next.y);
+    d2d_outline_vertex_set(&v[3], next->x, next->y, -2.0f * q_next.x, -2.0f * q_next.y, -2.0f * q_next.x, -2.0f * q_next.y);
     geometry->outline.vertex_count += 4;
 
     d2d_face_set(&f[0], base_idx + 0, base_idx + 1, base_idx + 2);
@@ -3219,9 +4419,35 @@ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
                 return FALSE;
             }
         }
+        else
+        {
+            D2D1_POINT_2F outward;
+
+            /* The start cap of an open figure points away from the first segment. */
+            d2d_point_subtract(&outward, p0, next);
+            d2d_point_normalise(&outward);
+            if (!d2d_geometry_outline_add_cap(geometry, p0, &outward, TRUE))
+            {
+                ERR("Failed to add start cap.\n");
+                return FALSE;
+            }
+        }
 
         p0 = p1;
         prev = next_prev;
+    }
+
+    if (figure_end != D2D1_FIGURE_END_CLOSED)
+    {
+        D2D1_POINT_2F outward;
+
+        d2d_point_subtract(&outward, p0, prev);
+        d2d_point_normalise(&outward);
+        if (!d2d_geometry_outline_add_cap(geometry, p0, &outward, FALSE))
+        {
+            ERR("Failed to add end cap.\n");
+            return FALSE;
+        }
     }
 
     return TRUE;
@@ -3245,7 +4471,7 @@ static BOOL d2d_geometry_fill_add_arc_triangle(struct d2d_geometry *geometry,
     return TRUE;
 }
 
-static void d2d_geometry_cleanup(struct d2d_geometry *geometry)
+void d2d_geometry_cleanup(struct d2d_geometry *geometry)
 {
     free(geometry->outline.arc_faces);
     free(geometry->outline.arcs);
@@ -3441,7 +4667,11 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_EndFigure(ID2D1GeometrySink *ifa
     }
 
     figure = &geometry->u.path.figures[geometry->u.path.figure_count - 1];
-    d2d_figure_end(figure, figure_end);
+    if (!d2d_figure_end(figure, figure_end))
+    {
+        d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
+        return;
+    }
 
     if (figure_end == D2D1_FIGURE_END_CLOSED)
         ++geometry->u.path.segment_count;
@@ -3515,6 +4745,7 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
     const struct d2d_figure *figure;
     D2D1_POINT_2F v_q[3], v_p, v_qp;
     unsigned int i, j, score;
+    float ccw_a, ccw_b;
     float det, t;
 
     figure = &geometry->u.path.figures[idx_p->figure_idx];
@@ -3527,7 +4758,37 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
     b[1] = &figure->bezier_controls[idx_q->control_idx];
     b[2] = &figure->vertices[idx_q->vertex_idx + 1];
 
-    if (d2d_point_ccw(a[0], a[1], a[2]) == 0.0f || d2d_point_ccw(b[0], b[1], b[2]) == 0.0f)
+    /* Two control triangles whose bounding boxes lie strictly apart share no
+     * point, so neither the edge crossings nor the containment tests below
+     * can find one. The caller tries every pair of Bézier segments in the
+     * geometry against each other; for the glyph outlines a JUCE application
+     * draws as paths that is up to several thousand pairs per path, nearly
+     * all of them far apart, and the full test below took half of Close().
+     * Boxes that touch keep the full test, as does a non-finite coordinate,
+     * for which no comparison here holds. */
+    if (max(a[0]->x, max(a[1]->x, a[2]->x)) < min(b[0]->x, min(b[1]->x, b[2]->x))
+            || max(b[0]->x, max(b[1]->x, b[2]->x)) < min(a[0]->x, min(a[1]->x, a[2]->x))
+            || max(a[0]->y, max(a[1]->y, a[2]->y)) < min(b[0]->y, min(b[1]->y, b[2]->y))
+            || max(b[0]->y, max(b[1]->y, b[2]->y)) < min(a[0]->y, min(a[1]->y, a[2]->y)))
+        return FALSE;
+
+    /* Degenerate control triangles can't overlap in a way that splitting them
+     * would resolve.  Note that a non-finite area needs to be rejected here as
+     * well: every comparison against a NaN is false, so none of the tests below
+     * would ever reject an overlap, and the caller would keep subdividing the
+     * curve indefinitely. */
+    ccw_a = d2d_point_ccw(a[0], a[1], a[2]);
+    ccw_b = d2d_point_ccw(b[0], b[1], b[2]);
+    if (!isfinite(ccw_a) || ccw_a == 0.0f || !isfinite(ccw_b) || ccw_b == 0.0f)
+        return FALSE;
+
+    /* Coincident segments have the same control triangle. Splitting one of
+     * them would only produce two smaller triangles that still coincide with
+     * the other's halves, and because the two curves would be split in a
+     * different order they would end up with different vertices along the
+     * same curve, leaving slivers between them. Keep them identical instead;
+     * their curve triangles then cancel or add exactly. */
+    if (d2d_bezier_segments_coincide(a, b))
         return FALSE;
 
     d2d_point_subtract(&v_q[0], b[1], b[0]);
@@ -3599,6 +4860,34 @@ static float d2d_geometry_bezier_ccw(struct d2d_geometry *geometry, const struct
             &figure->bezier_controls[idx->control_idx], &figure->vertices[next]);
 }
 
+/* Splitting a segment keeps its first half in place, and the overlap loop
+ * tests that half again. Once the control triangle is only a few ULPs across,
+ * the midpoints round back onto the existing coordinates and the first half
+ * comes out identical to the segment, while the second half is a single
+ * point. Such a split changes nothing, and the overlap test keeps reporting
+ * the same overlap because the area of the triangle is tiny but not zero.
+ * Only that exact case counts: a split that merely moves the midpoint onto an
+ * end point still changes the control point and may resolve the overlap a few
+ * splits later, and stopping there leaves an overlap the triangulation then
+ * has to cope with. */
+static BOOL d2d_geometry_bezier_split_progresses(const struct d2d_geometry *geometry,
+        const struct d2d_segment_idx *idx)
+{
+    const struct d2d_figure *figure = &geometry->u.path.figures[idx->figure_idx];
+    const D2D1_POINT_2F *p[3];
+    D2D1_POINT_2F q[3];
+
+    p[0] = &figure->vertices[idx->vertex_idx];
+    p[1] = &figure->bezier_controls[idx->control_idx];
+    p[2] = &figure->vertices[idx->vertex_idx + 1];
+
+    d2d_point_lerp(&q[0], p[0], p[1], 0.5f);
+    d2d_point_lerp(&q[1], p[1], p[2], 0.5f);
+    d2d_point_lerp(&q[2], &q[0], &q[1], 0.5f);
+
+    return q[0].x != p[1]->x || q[0].y != p[1]->y || q[2].x != p[2]->x || q[2].y != p[2]->y;
+}
+
 static BOOL d2d_geometry_split_bezier(struct d2d_geometry *geometry, const struct d2d_segment_idx *idx)
 {
     const D2D1_POINT_2F *p[3];
@@ -3626,29 +4915,264 @@ static BOOL d2d_geometry_split_bezier(struct d2d_geometry *geometry, const struc
     return TRUE;
 }
 
+struct d2d_bezier_cap
+{
+    D2D1_POINT_2F p[3];     /* Canonical: p[0] is the lesser end point. */
+    size_t ordinal;         /* Position in the bezier segment iteration order. */
+    size_t group;
+    BOOL reversed;
+};
+
+static int d2d_bezier_cap_compare(const void *a, const void *b)
+{
+    const struct d2d_bezier_cap *ca = a, *cb = b;
+
+    if (ca->p[0].x < cb->p[0].x)
+        return -1;
+    return ca->p[0].x > cb->p[0].x;
+}
+
+/* Coincident curve segments of different figures keep the same control
+ * triangle (d2d_geometry_check_bezier_overlap() refuses to split them), so
+ * their curve triangles would be rasterised on top of each other. The fill
+ * rule says how many of them count: two arcs running the same way fill their
+ * side once, an arc and its reverse cancel out, and under the alternate rule
+ * every pair cancels. Emit a single curve triangle for a group with a
+ * non-zero net winding and none otherwise. The chords stay in their figures
+ * and are handled by the triangulation like any other edge, so the polygon
+ * part of the fill is already correct. */
+static BOOL d2d_geometry_shared_bezier_caps(struct d2d_geometry *geometry, BOOL **emit, size_t *emitted)
+{
+    struct d2d_bezier_cap *caps, *ca, *cb;
+    struct d2d_segment_idx idx;
+    const D2D1_POINT_2F *p[3];
+    struct d2d_figure *figure;
+    size_t count, i, j, next;
+    BOOL *e;
+
+    *emit = NULL;
+    *emitted = 0;
+    if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx))
+        return TRUE;
+    count = 1;
+    while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx))
+        ++count;
+    *emitted = count;
+    if (count < 2)
+        return TRUE;
+
+    if (!(caps = calloc(count, sizeof(*caps))))
+        return FALSE;
+    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx);
+    for (i = 0; i < count; ++i, d2d_geometry_get_next_bezier_segment_idx(geometry, &idx))
+    {
+        figure = &geometry->u.path.figures[idx.figure_idx];
+        p[0] = &figure->vertices[idx.vertex_idx];
+        p[1] = &figure->bezier_controls[idx.control_idx];
+        if ((next = idx.vertex_idx + 1) == figure->vertex_count)
+            next = 0;
+        p[2] = &figure->vertices[next];
+
+        ca = &caps[i];
+        ca->ordinal = i;
+        ca->group = i;
+        ca->reversed = p[2]->x < p[0]->x || (p[2]->x == p[0]->x && p[2]->y < p[0]->y);
+        ca->p[0] = ca->reversed ? *p[2] : *p[0];
+        ca->p[1] = *p[1];
+        ca->p[2] = ca->reversed ? *p[0] : *p[2];
+    }
+    qsort(caps, count, sizeof(*caps), d2d_bezier_cap_compare);
+
+    /* Sorted by the lesser end point's x, so coincident segments sit next to
+     * each other, at most a tolerance apart. */
+    for (i = 0; i < count; ++i)
+    {
+        const D2D1_POINT_2F *pa[3], *pb[3];
+
+        ca = &caps[i];
+        if (ca->group != ca->ordinal)
+            continue;
+        pa[0] = &ca->p[0]; pa[1] = &ca->p[1]; pa[2] = &ca->p[2];
+        for (j = i + 1; j < count; ++j)
+        {
+            cb = &caps[j];
+            if (cb->p[0].x - ca->p[0].x > 1e-4f * fmaxf(1.0f, fabsf(ca->p[0].x)))
+                break;
+            if (cb->group != cb->ordinal)
+                continue;
+            pb[0] = &cb->p[0]; pb[1] = &cb->p[1]; pb[2] = &cb->p[2];
+            if (d2d_bezier_segments_coincide(pa, pb))
+                cb->group = ca->ordinal;
+        }
+    }
+
+    if (!(e = malloc(count * sizeof(*e))))
+    {
+        free(caps);
+        return FALSE;
+    }
+    for (i = 0; i < count; ++i)
+        e[i] = TRUE;
+
+    for (i = 0; i < count; ++i)
+    {
+        int net = 0;
+        size_t n = 0;
+
+        ca = &caps[i];
+        if (ca->group != ca->ordinal)
+            continue;
+        for (j = i; j < count; ++j)
+        {
+            cb = &caps[j];
+            if (cb->group != ca->ordinal)
+                continue;
+            net += cb->reversed == ca->reversed ? 1 : -1;
+            ++n;
+            if (j != i)
+                e[cb->ordinal] = FALSE;
+        }
+        if (n < 2)
+            continue;
+        if (geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? !(n & 1) : !net)
+            e[ca->ordinal] = FALSE;
+        TRACE("%Iu coincident bezier segments, net winding %d.\n", n, net);
+    }
+
+    *emitted = 0;
+    for (i = 0; i < count; ++i)
+        if (e[i])
+            ++*emitted;
+    *emit = e;
+    free(caps);
+    return TRUE;
+}
+
+/* Whether the control point of a quadratic piece lies on its chord to within 1e-4
+ * of the chord's length. */
+static BOOL d2d_quadratic_is_degenerate(const D2D1_POINT_2F *p0, const D2D1_POINT_2F *c, const D2D1_POINT_2F *p2)
+{
+    float ex = p2->x - p0->x, ey = p2->y - p0->y, l2 = ex * ex + ey * ey;
+    float cross = (c->x - p0->x) * ey - (c->y - p0->y) * ex;
+
+    return cross * cross <= 1e-8f * l2 * l2;
+}
+
+/* Splitting a pair of overlapping control triangles separates them only if
+ * the curves themselves do not cross. Where they do cross, or run along each
+ * other, the halves keep overlapping at every level, and without a bound the
+ * loop below only stops once a triangle has rounded down to a point: at a
+ * depth of about 25 for coordinates in the hundreds. Every split adds a
+ * segment that is tested against all earlier ones and shifts the figure
+ * arrays behind it, so that tail is what makes a path with many crossings
+ * take seconds, and a cluster of nodes at nearly the same coordinates grow
+ * past a million vertices without finishing (WineHQ bug 60265). Stop at a
+ * depth where a piece covers 1/256 of its curve. The pair then keeps an
+ * overlap no larger than that piece's control triangle, the same state the
+ * loop reaches through rounding, only sooner. */
+#define D2D_BEZIER_MAX_SPLIT_DEPTH 8
+
+/* Ceiling on the number of Bézier segments a path may grow to while
+ * splitting, as a multiple of the count it started with. The depth bound
+ * alone still allows every segment to become 256, which a path of a few
+ * thousand near-coincident curves would turn into memory exhaustion. */
+#define D2D_BEZIER_MAX_SEGMENT_FACTOR 16
+#define D2D_BEZIER_MIN_SEGMENT_BUDGET 4096
+
+/* The subdivision depth of every Bézier segment, in the order in which
+ * d2d_geometry_get_next_bezier_segment_idx() visits them. A split leaves the
+ * first half at the segment's position and inserts the second half right
+ * after it, so the array is kept in step with the figure arrays. */
+struct d2d_bezier_depths
+{
+    unsigned char *depth;
+    size_t size;
+    size_t count;
+};
+
+static BOOL d2d_bezier_depths_split(struct d2d_bezier_depths *depths, size_t idx)
+{
+    if (!d2d_array_reserve((void **)&depths->depth, &depths->size, depths->count + 1, sizeof(*depths->depth)))
+    {
+        ERR("Failed to grow Bézier depth array.\n");
+        return FALSE;
+    }
+
+    memmove(&depths->depth[idx + 2], &depths->depth[idx + 1], (depths->count - idx - 1) * sizeof(*depths->depth));
+    depths->depth[idx + 1] = ++depths->depth[idx];
+    ++depths->count;
+
+    return TRUE;
+}
+
 static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
 {
     struct d2d_segment_idx idx_p, idx_q;
+    struct d2d_bezier_depths depths = {0};
+    size_t ord_p, ord_q, budget, initial;
     struct d2d_curve_vertex *b;
     const D2D1_POINT_2F *p[3];
     struct d2d_figure *figure;
-    size_t bezier_idx, i;
+    size_t bezier_idx, i, ordinal, emitted;
+    BOOL *emit;
 
     if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
         return S_OK;
 
+    depths.count = 1;
+    while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
+        ++depths.count;
+    if (!(depths.depth = calloc(depths.count, sizeof(*depths.depth))))
+    {
+        ERR("Failed to allocate Bézier depth array.\n");
+        return E_OUTOFMEMORY;
+    }
+    depths.size = initial = depths.count;
+    budget = max(initial * D2D_BEZIER_MAX_SEGMENT_FACTOR, D2D_BEZIER_MIN_SEGMENT_BUDGET);
+
     /* Split overlapping bezier control triangles. */
+    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
+    ord_p = 0;
     while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
     {
+        ++ord_p;
         d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_q);
-        while (idx_q.figure_idx < idx_p.figure_idx || idx_q.vertex_idx < idx_p.vertex_idx)
+        ord_q = 0;
+        while (ord_q < ord_p)
         {
             while (d2d_geometry_check_bezier_overlap(geometry, &idx_p, &idx_q))
             {
-                if (fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q)) > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p)))
+                BOOL split_q = fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q))
+                        > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p));
+
+                if (depths.depth[ord_p] >= D2D_BEZIER_MAX_SPLIT_DEPTH
+                        || depths.depth[ord_q] >= D2D_BEZIER_MAX_SPLIT_DEPTH)
+                    break;
+                if (depths.count >= budget)
                 {
-                    if (!d2d_geometry_split_bezier(geometry, &idx_q))
+                    WARN("Bézier segment budget of %Iu exhausted, leaving control triangles overlapping.\n", budget);
+                    break;
+                }
+
+                /* Split the other segment if the larger one cannot be split
+                 * any further, and leave the pair alone if neither can: the
+                 * loop would otherwise insert the same point forever, growing
+                 * the figure until memory runs out. */
+                if (!d2d_geometry_bezier_split_progresses(geometry, split_q ? &idx_q : &idx_p))
+                {
+                    split_q = !split_q;
+                    if (!d2d_geometry_bezier_split_progresses(geometry, split_q ? &idx_q : &idx_p))
+                        break;
+                }
+
+                if (split_q)
+                {
+                    if (!d2d_geometry_split_bezier(geometry, &idx_q) || !d2d_bezier_depths_split(&depths, ord_q))
+                    {
+                        free(depths.depth);
                         return E_OUTOFMEMORY;
+                    }
+                    ++ord_p;
                     if (idx_p.figure_idx == idx_q.figure_idx)
                     {
                         ++idx_p.vertex_idx;
@@ -3657,40 +5181,63 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
                 }
                 else
                 {
-                    if (!d2d_geometry_split_bezier(geometry, &idx_p))
+                    if (!d2d_geometry_split_bezier(geometry, &idx_p) || !d2d_bezier_depths_split(&depths, ord_p))
+                    {
+                        free(depths.depth);
                         return E_OUTOFMEMORY;
+                    }
                 }
             }
             d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_q);
+            ++ord_q;
         }
     }
-
-    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    if (TRACE_ON(d2d))
     {
-        if (geometry->u.path.figures[i].flags & D2D_FIGURE_FLAG_HOLLOW)
-            continue;
-        geometry->fill.bezier_vertex_count += 3 * geometry->u.path.figures[i].bezier_control_count;
-    }
+        unsigned int max_depth = 0;
 
-    if (!(geometry->fill.bezier_vertices = calloc(geometry->fill.bezier_vertex_count,
+        for (i = 0; i < depths.count; ++i)
+            max_depth = max(max_depth, depths.depth[i]);
+        TRACE("Split %Iu Bézier segments into %Iu, maximum depth %u.\n", initial, depths.count, max_depth);
+    }
+    free(depths.depth);
+
+    if (!d2d_geometry_shared_bezier_caps(geometry, &emit, &emitted))
+        return E_OUTOFMEMORY;
+    geometry->fill.bezier_vertex_count = 3 * emitted;
+
+    if (emitted && !(geometry->fill.bezier_vertices = calloc(geometry->fill.bezier_vertex_count,
             sizeof(*geometry->fill.bezier_vertices))))
     {
         ERR("Failed to allocate bezier vertices array.\n");
         geometry->fill.bezier_vertex_count = 0;
+        free(emit);
         return E_OUTOFMEMORY;
     }
 
     bezier_idx = 0;
-    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
-    for (;;)
+    ordinal = 0;
+    if (d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p)) do
     {
         float sign = -1.0f;
+
+        if (emit && !emit[ordinal++])
+            continue;
 
         figure = &geometry->u.path.figures[idx_p.figure_idx];
         p[0] = &figure->vertices[idx_p.vertex_idx];
         p[1] = &figure->bezier_controls[idx_p.control_idx];
 
+        /* A piece whose control point lies on its chord, as on a straight edge
+         * that was added as a Bézier, encloses nothing worth a curve triangle:
+         * at the threshold a chord of 1000 px is 0.05 px off the curve. Fill
+         * along the chord instead. Inserting the control point into the outline,
+         * as for one inside the filled area, would put three collinear points on
+         * it, and the triangulation makes a triangle of no area there that leaves
+         * the outline beside it without antialiasing. */
         i = idx_p.vertex_idx + 1;
+        if (d2d_quadratic_is_degenerate(p[0], p[1], &figure->vertices[i == figure->vertex_count ? 0 : i]))
+            continue;
         if (d2d_path_geometry_point_inside(geometry, p[1], FALSE))
         {
             sign = 1.0f;
@@ -3704,23 +5251,334 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
             i = 0;
         p[2] = &figure->vertices[i];
 
-        b = &geometry->fill.bezier_vertices[bezier_idx * 3];
+        b = &geometry->fill.bezier_vertices[bezier_idx++ * 3];
         d2d_curve_vertex_set(&b[0], p[0], 0.0f, 0.0f, sign);
         d2d_curve_vertex_set(&b[1], p[1], 0.5f, 0.0f, sign);
         d2d_curve_vertex_set(&b[2], p[2], 1.0f, 1.0f, sign);
+    } while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p));
 
-        if (!d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
-            break;
-        ++bezier_idx;
+    geometry->fill.bezier_vertex_count = bezier_idx * 3;
+    free(emit);
+    return S_OK;
+}
+
+
+/* Cache of closed path tessellations, keyed by the figure data.
+ *
+ * Native Direct2D keeps the glyph tessellation per font and size; JUCE 8
+ * applications that draw their text as path outlines (Cymatics Hotline, and
+ * every JUCE 8 renderer that does not take the glyph run route) rebuild the
+ * same geometries every frame: Hotline's editor closes 27 paths per frame
+ * with about 1000 quadratic Béziers between them, and only 37 distinct paths
+ * recur over hundreds of frames. Closing a path means resolving self
+ * intersections and overlapping control triangles and a constrained Delaunay
+ * triangulation, about 0.2 ms per glyph path; that was 40 % of the main
+ * thread. Identical input produces identical output, so the result of
+ * Close() is kept by its input and copied back on the next identical path.
+ * The key is the fill mode and every figure's flags, vertices, vertex types
+ * and control points, compared bit for bit; the value is the figure state
+ * after Close() (intersections and split pieces are inserted into the
+ * figures) and the fill arrays. Entries are evicted least recently used
+ * when the cache exceeds its size; WINE_D2D_FILL_CACHE=0 disables it. */
+
+#define D2D_FILL_CACHE_BUCKETS 256
+#define D2D_FILL_CACHE_MAX_ENTRY_SIZE (256 * 1024)
+#define D2D_FILL_CACHE_MAX_SIZE (8 * 1024 * 1024)
+
+struct d2d_fill_cache_entry
+{
+    struct list lru_entry;
+    struct list bucket_entry;
+    uint32_t hash;
+    size_t key_size;
+    size_t value_size;
+    uint8_t *data;
+};
+
+struct d2d_blob
+{
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+    BOOL failed;
+};
+
+static CRITICAL_SECTION d2d_fill_cache_cs;
+static CRITICAL_SECTION_DEBUG d2d_fill_cache_cs_debug =
+{
+    0, 0, &d2d_fill_cache_cs,
+    { &d2d_fill_cache_cs_debug.ProcessLocksList, &d2d_fill_cache_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": d2d_fill_cache_cs") }
+};
+static CRITICAL_SECTION d2d_fill_cache_cs = { &d2d_fill_cache_cs_debug, -1, 0, 0, 0, 0 };
+
+static struct
+{
+    struct list lru;
+    struct list buckets[D2D_FILL_CACHE_BUCKETS];
+    size_t size;
+    BOOL initialised;
+} d2d_fill_cache;
+
+static BOOL d2d_fill_cache_enabled(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_CACHE", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+static void d2d_blob_write(struct d2d_blob *blob, const void *data, size_t size)
+{
+    if (blob->failed || !size)
+        return;
+    if (!d2d_array_reserve((void **)&blob->data, &blob->capacity, blob->size + size, 1))
+    {
+        blob->failed = TRUE;
+        return;
+    }
+    memcpy(blob->data + blob->size, data, size);
+    blob->size += size;
+}
+
+#define d2d_blob_write_value(blob, v) d2d_blob_write(blob, &(v), sizeof(v))
+
+static void d2d_blob_read(const uint8_t **p, void *dst, size_t size)
+{
+    memcpy(dst, *p, size);
+    *p += size;
+}
+
+#define d2d_blob_read_value(p, v) d2d_blob_read(p, &(v), sizeof(v))
+
+/* Replaces *array with a copy of count elements from the blob; count 0 leaves
+ * NULL. Returns FALSE on allocation failure. */
+static BOOL d2d_blob_read_array(const uint8_t **p, void **array, size_t *capacity, size_t count, size_t size)
+{
+    void *copy = NULL;
+
+    if (count && !(copy = malloc(count * size)))
+        return FALSE;
+    if (count)
+        memcpy(copy, *p, count * size);
+    *p += count * size;
+    free(*array);
+    *array = copy;
+    *capacity = count;
+    return TRUE;
+}
+
+static uint32_t d2d_fill_cache_hash(const uint8_t *data, size_t size)
+{
+    uint32_t h = 2166136261u, w;
+    size_t i;
+
+    for (i = 0; i + sizeof(w) <= size; i += sizeof(w))
+    {
+        memcpy(&w, data + i, sizeof(w));
+        h ^= w;
+        h *= 0x9e3779b1u;
+        h ^= h >> 15;
+    }
+    for (; i < size; ++i)
+        h = (h ^ data[i]) * 16777619u;
+    return h;
+}
+
+static void d2d_path_geometry_fill_cache_key(const struct d2d_geometry *geometry, struct d2d_blob *key)
+{
+    uint32_t fill_mode = geometry->u.path.fill_mode;
+    size_t i;
+
+    d2d_blob_write_value(key, fill_mode);
+    d2d_blob_write_value(key, geometry->u.path.figure_count);
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        const struct d2d_figure *figure = &geometry->u.path.figures[i];
+
+        d2d_blob_write_value(key, figure->flags);
+        d2d_blob_write_value(key, figure->vertex_count);
+        d2d_blob_write_value(key, figure->bezier_control_count);
+        d2d_blob_write(key, figure->vertices, figure->vertex_count * sizeof(*figure->vertices));
+        d2d_blob_write(key, figure->vertex_types, figure->vertex_count * sizeof(*figure->vertex_types));
+        d2d_blob_write(key, figure->bezier_controls, figure->bezier_control_count * sizeof(*figure->bezier_controls));
+    }
+}
+
+static void d2d_path_geometry_fill_cache_value(const struct d2d_geometry *geometry, struct d2d_blob *value)
+{
+    size_t i;
+
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        const struct d2d_figure *figure = &geometry->u.path.figures[i];
+
+        d2d_blob_write_value(value, figure->flags);
+        d2d_blob_write_value(value, figure->bounds);
+        d2d_blob_write_value(value, figure->vertex_count);
+        d2d_blob_write_value(value, figure->bezier_control_count);
+        d2d_blob_write(value, figure->vertices, figure->vertex_count * sizeof(*figure->vertices));
+        d2d_blob_write(value, figure->vertex_types, figure->vertex_count * sizeof(*figure->vertex_types));
+        d2d_blob_write(value, figure->bezier_controls, figure->bezier_control_count * sizeof(*figure->bezier_controls));
+    }
+    d2d_blob_write_value(value, geometry->fill.vertex_count);
+    d2d_blob_write(value, geometry->fill.vertices, geometry->fill.vertex_count * sizeof(*geometry->fill.vertices));
+    d2d_blob_write_value(value, geometry->fill.face_count);
+    d2d_blob_write(value, geometry->fill.faces, geometry->fill.face_count * sizeof(*geometry->fill.faces));
+    d2d_blob_write_value(value, geometry->fill.bezier_vertex_count);
+    d2d_blob_write(value, geometry->fill.bezier_vertices,
+            geometry->fill.bezier_vertex_count * sizeof(*geometry->fill.bezier_vertices));
+    d2d_blob_write_value(value, geometry->fill.arc_vertex_count);
+    d2d_blob_write(value, geometry->fill.arc_vertices,
+            geometry->fill.arc_vertex_count * sizeof(*geometry->fill.arc_vertices));
+}
+
+static BOOL d2d_path_geometry_fill_cache_restore(struct d2d_geometry *geometry, const uint8_t *p)
+{
+    size_t i, count;
+
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        struct d2d_figure *figure = &geometry->u.path.figures[i];
+        size_t vertex_count, control_count;
+
+        d2d_blob_read_value(&p, figure->flags);
+        d2d_blob_read_value(&p, figure->bounds);
+        d2d_blob_read_value(&p, vertex_count);
+        d2d_blob_read_value(&p, control_count);
+        if (!d2d_blob_read_array(&p, (void **)&figure->vertices, &figure->vertices_size,
+                vertex_count, sizeof(*figure->vertices)))
+            return FALSE;
+        if (!d2d_blob_read_array(&p, (void **)&figure->vertex_types, &figure->vertex_types_size,
+                vertex_count, sizeof(*figure->vertex_types)))
+            return FALSE;
+        figure->vertex_count = vertex_count;
+        if (!d2d_blob_read_array(&p, (void **)&figure->bezier_controls, &figure->bezier_controls_size,
+                control_count, sizeof(*figure->bezier_controls)))
+            return FALSE;
+        figure->bezier_control_count = control_count;
     }
 
-    return S_OK;
+    d2d_blob_read_value(&p, count);
+    if (!d2d_blob_read_array(&p, (void **)&geometry->fill.vertices, &count, count, sizeof(*geometry->fill.vertices)))
+        return FALSE;
+    geometry->fill.vertex_count = count;
+    d2d_blob_read_value(&p, count);
+    if (!d2d_blob_read_array(&p, (void **)&geometry->fill.faces, &geometry->fill.faces_size,
+            count, sizeof(*geometry->fill.faces)))
+        return FALSE;
+    geometry->fill.face_count = count;
+    d2d_blob_read_value(&p, count);
+    if (!d2d_blob_read_array(&p, (void **)&geometry->fill.bezier_vertices, &geometry->fill.bezier_vertices_size,
+            count, sizeof(*geometry->fill.bezier_vertices)))
+        return FALSE;
+    geometry->fill.bezier_vertex_count = count;
+    d2d_blob_read_value(&p, count);
+    if (!d2d_blob_read_array(&p, (void **)&geometry->fill.arc_vertices, &geometry->fill.arc_vertices_size,
+            count, sizeof(*geometry->fill.arc_vertices)))
+        return FALSE;
+    geometry->fill.arc_vertex_count = count;
+    return TRUE;
+}
+
+static void d2d_fill_cache_init(void)
+{
+    size_t i;
+
+    if (d2d_fill_cache.initialised)
+        return;
+    list_init(&d2d_fill_cache.lru);
+    for (i = 0; i < D2D_FILL_CACHE_BUCKETS; ++i)
+        list_init(&d2d_fill_cache.buckets[i]);
+    d2d_fill_cache.initialised = TRUE;
+}
+
+static struct d2d_fill_cache_entry *d2d_fill_cache_find(const struct d2d_blob *key, uint32_t hash)
+{
+    struct d2d_fill_cache_entry *entry;
+
+    LIST_FOR_EACH_ENTRY(entry, &d2d_fill_cache.buckets[hash % D2D_FILL_CACHE_BUCKETS],
+            struct d2d_fill_cache_entry, bucket_entry)
+    {
+        if (entry->hash == hash && entry->key_size == key->size && !memcmp(entry->data, key->data, key->size))
+            return entry;
+    }
+    return NULL;
+}
+
+/* Returns TRUE if the geometry was filled from the cache; *hr then says whether
+ * copying the entry succeeded. */
+static BOOL d2d_fill_cache_lookup(struct d2d_geometry *geometry, const struct d2d_blob *key,
+        uint32_t hash, HRESULT *hr)
+{
+    struct d2d_fill_cache_entry *entry;
+    BOOL found = FALSE;
+
+    EnterCriticalSection(&d2d_fill_cache_cs);
+    d2d_fill_cache_init();
+    if ((entry = d2d_fill_cache_find(key, hash)))
+    {
+        list_remove(&entry->lru_entry);
+        list_add_head(&d2d_fill_cache.lru, &entry->lru_entry);
+        *hr = d2d_path_geometry_fill_cache_restore(geometry, entry->data + entry->key_size) ? S_OK : E_OUTOFMEMORY;
+        found = TRUE;
+    }
+    LeaveCriticalSection(&d2d_fill_cache_cs);
+    return found;
+}
+
+static void d2d_fill_cache_insert(const struct d2d_blob *key, uint32_t hash, const struct d2d_blob *value)
+{
+    struct d2d_fill_cache_entry *entry;
+    size_t size = key->size + value->size;
+
+    if (size > D2D_FILL_CACHE_MAX_ENTRY_SIZE)
+        return;
+    if (!(entry = malloc(sizeof(*entry))) || !(entry->data = malloc(size)))
+    {
+        free(entry);
+        return;
+    }
+    memcpy(entry->data, key->data, key->size);
+    memcpy(entry->data + key->size, value->data, value->size);
+    entry->hash = hash;
+    entry->key_size = key->size;
+    entry->value_size = value->size;
+
+    EnterCriticalSection(&d2d_fill_cache_cs);
+    d2d_fill_cache_init();
+    if (d2d_fill_cache_find(key, hash))
+    {
+        /* Another thread closed the same path meanwhile. */
+        LeaveCriticalSection(&d2d_fill_cache_cs);
+        free(entry->data);
+        free(entry);
+        return;
+    }
+    list_add_head(&d2d_fill_cache.buckets[hash % D2D_FILL_CACHE_BUCKETS], &entry->bucket_entry);
+    list_add_head(&d2d_fill_cache.lru, &entry->lru_entry);
+    d2d_fill_cache.size += size;
+    while (d2d_fill_cache.size > D2D_FILL_CACHE_MAX_SIZE)
+    {
+        entry = LIST_ENTRY(list_tail(&d2d_fill_cache.lru), struct d2d_fill_cache_entry, lru_entry);
+        list_remove(&entry->lru_entry);
+        list_remove(&entry->bucket_entry);
+        d2d_fill_cache.size -= entry->key_size + entry->value_size;
+        free(entry->data);
+        free(entry);
+    }
+    LeaveCriticalSection(&d2d_fill_cache_cs);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *iface)
 {
     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
+    struct d2d_blob key = {0}, value = {0};
     HRESULT hr = E_FAIL;
+    uint32_t hash = 0;
+    size_t i;
 
     TRACE("iface %p.\n", iface);
 
@@ -3735,6 +5593,86 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
 
     geometry->u.path.state = D2D_GEOMETRY_STATE_CLOSED;
 
+    /* Flush subnormal coordinates to zero. The orientation and incircle
+     * predicates of the triangulation are exact only while no intermediate
+     * product underflows; with a coordinate below FLT_MIN they contradict
+     * each other, the triangulation skips constraints, a vertex ends up
+     * without edges, and Close() fails. Such a coordinate lies within
+     * 1.2e-38 of zero, which nothing resolves. */
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        struct d2d_figure *figure = &geometry->u.path.figures[i];
+        size_t k;
+
+        for (k = 0; k < figure->vertex_count; ++k)
+        {
+            if (fabsf(figure->vertices[k].x) < FLT_MIN)
+                figure->vertices[k].x = 0.0f;
+            if (fabsf(figure->vertices[k].y) < FLT_MIN)
+                figure->vertices[k].y = 0.0f;
+        }
+        for (k = 0; k < figure->bezier_control_count; ++k)
+        {
+            if (fabsf(figure->bezier_controls[k].x) < FLT_MIN)
+                figure->bezier_controls[k].x = 0.0f;
+            if (fabsf(figure->bezier_controls[k].y) < FLT_MIN)
+                figure->bezier_controls[k].y = 0.0f;
+        }
+    }
+
+    /* Remove collinear LINE vertices from figures to reduce CDT complexity.
+     * This is safe because the outline data is already computed in EndFigure,
+     * and removing collinear points does not change the filled area. */
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        struct d2d_figure *figure = &geometry->u.path.figures[i];
+        size_t k;
+
+        if (figure->vertex_count < 3)
+            continue;
+
+        for (k = 1; k + 1 < figure->vertex_count;)
+        {
+            float cross;
+
+            if (figure->vertex_types[k] != D2D_VERTEX_TYPE_LINE)
+            {
+                ++k;
+                continue;
+            }
+
+            /* Check if vertex k is collinear with k-1 and k+1 using cross product. */
+            cross = (figure->vertices[k].x - figure->vertices[k - 1].x)
+                    * (figure->vertices[k + 1].y - figure->vertices[k - 1].y)
+                    - (figure->vertices[k].y - figure->vertices[k - 1].y)
+                    * (figure->vertices[k + 1].x - figure->vertices[k - 1].x);
+
+            if (cross >= -1e-6f && cross <= 1e-6f)
+            {
+                memmove(&figure->vertices[k], &figure->vertices[k + 1],
+                        (figure->vertex_count - k - 1) * sizeof(*figure->vertices));
+                memmove(&figure->vertex_types[k], &figure->vertex_types[k + 1],
+                        (figure->vertex_count - k - 1) * sizeof(*figure->vertex_types));
+                --figure->vertex_count;
+            }
+            else
+            {
+                ++k;
+            }
+        }
+    }
+
+    if (d2d_fill_cache_enabled())
+    {
+        d2d_path_geometry_fill_cache_key(geometry, &key);
+        if (!key.failed)
+        {
+            hash = d2d_fill_cache_hash(key.data, key.size);
+            if (d2d_fill_cache_lookup(geometry, &key, hash, &hr))
+                goto done;
+        }
+    }
+
     if (!d2d_geometry_intersect_self(geometry))
         goto done;
     if (FAILED(hr = d2d_geometry_resolve_beziers(geometry)))
@@ -3742,7 +5680,16 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
     if (FAILED(hr = d2d_path_geometry_triangulate(geometry)))
         goto done;
 
+    if (SUCCEEDED(hr) && key.data && !key.failed)
+    {
+        d2d_path_geometry_fill_cache_value(geometry, &value);
+        if (!value.failed)
+            d2d_fill_cache_insert(&key, hash, &value);
+    }
+
 done:
+    free(key.data);
+    free(value.data);
     if (FAILED(hr))
     {
         free(geometry->fill.bezier_vertices);
@@ -3797,6 +5744,7 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_AddQuadraticBeziers(ID2D1Geometr
 
     geometry->u.path.segment_count += bezier_count;
 }
+
 
 static void STDMETHODCALLTYPE d2d_geometry_sink_AddArc(ID2D1GeometrySink *iface, const D2D1_ARC_SEGMENT *arc)
 {
@@ -3943,9 +5891,11 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetBounds(ID2D1PathGeometry1 
     for (i = 0; i < geometry->u.path.figure_count; ++i)
     {
         const struct d2d_figure *figure = &geometry->u.path.figures[i];
+        struct d2d_quadratic_bezier quadratics[D2D_BEZIER_MAX_QUADRATICS];
         enum d2d_vertex_type type = D2D_VERTEX_TYPE_NONE;
+        unsigned int k, quadratic_count;
         D2D1_RECT_F bezier_bounds;
-        D2D1_POINT_2F p, p1, p2;
+        D2D1_POINT_2F p, cubic[4];
         size_t j, bezier_idx;
 
         if (figure->flags & D2D_FIGURE_FLAG_HOLLOW)
@@ -3980,22 +5930,26 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetBounds(ID2D1PathGeometry1 
                     break;
 
                 case D2D_VERTEX_TYPE_BEZIER:
-                    /* FIXME: This attempts to approximate a cubic Bézier with
-                     * a quadratic one. */
-                    p1 = figure->original_bezier_controls[bezier_idx++];
-                    d2d_point_transform(&p1, transform, p1.x, p1.y);
-                    p2 = figure->original_bezier_controls[bezier_idx++];
-                    d2d_point_transform(&p2, transform, p2.x, p2.y);
-                    p1.x = (p1.x + p2.x) * 0.75f;
-                    p1.y = (p1.y + p2.y) * 0.75f;
-                    p2 = figure->vertices[j];
-                    d2d_point_transform(&p2, transform, p2.x, p2.y);
-                    p1.x -= (p.x + p2.x) * 0.25f;
-                    p1.y -= (p.y + p2.y) * 0.25f;
+                    cubic[0] = p;
+                    cubic[1] = figure->original_bezier_controls[bezier_idx++];
+                    d2d_point_transform(&cubic[1], transform, cubic[1].x, cubic[1].y);
+                    cubic[2] = figure->original_bezier_controls[bezier_idx++];
+                    d2d_point_transform(&cubic[2], transform, cubic[2].x, cubic[2].y);
+                    cubic[3] = figure->vertices[j];
+                    d2d_point_transform(&cubic[3], transform, cubic[3].x, cubic[3].y);
 
-                    d2d_rect_get_bezier_bounds(&bezier_bounds, &p, &p1, &p2);
-                    d2d_rect_union(bounds, &bezier_bounds);
-                    p = p2;
+                    /* Bound the same chain of quadratics the figure itself is
+                     * built from. A single reduced quadratic cannot follow the
+                     * cubic through an inflection, so the rectangle it reports
+                     * can leave part of the curve outside. */
+                    quadratic_count = d2d_cubic_bezier_to_quadratics(cubic, quadratics);
+                    for (k = 0; k < quadratic_count; ++k)
+                    {
+                        d2d_rect_get_bezier_bounds(&bezier_bounds, &quadratics[k].p0,
+                                &quadratics[k].control, &quadratics[k].p2);
+                        d2d_rect_union(bounds, &bezier_bounds);
+                    }
+                    p = cubic[3];
                     break;
 
                 default:
@@ -4021,13 +5975,304 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetBounds(ID2D1PathGeometry1 
     return S_OK;
 }
 
+/* Conservative approximation of the widened bounding box.
+ *
+ * The real widened bounds enclose the stroke outline, which can exceed the fill
+ * outline by up to half the stroke width — and, for miter joins at sharp
+ * corners, by up to miter_limit * half_width. Callers use widened bounds for
+ * invalidation regions and clipping, where a slightly large rectangle is
+ * correct and safe; a too-small one would drop dirty pixels. The previous stub
+ * returned no bounds at all (E_NOTIMPL), so this approximation is never a
+ * regression. */
+static void d2d_geometry_widen_bounds(const D2D1_RECT_F *fill_bounds, float stroke_width,
+        ID2D1StrokeStyle *stroke_style, D2D1_RECT_F *bounds)
+{
+    float half_width = stroke_width * 0.5f;
+    float expand = half_width;
+
+    if (stroke_style)
+    {
+        D2D1_LINE_JOIN join = ID2D1StrokeStyle_GetLineJoin(stroke_style);
+        if (join == D2D1_LINE_JOIN_MITER || join == D2D1_LINE_JOIN_MITER_OR_BEVEL)
+        {
+            float miter_limit = ID2D1StrokeStyle_GetMiterLimit(stroke_style);
+            if (miter_limit > 1.0f && half_width * miter_limit > expand)
+                expand = half_width * miter_limit;
+        }
+    }
+
+    bounds->left = fill_bounds->left - expand;
+    bounds->top = fill_bounds->top - expand;
+    bounds->right = fill_bounds->right + expand;
+    bounds->bottom = fill_bounds->bottom + expand;
+}
+
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_GetWidenedBounds(ID2D1PathGeometry1 *iface, float stroke_width,
         ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform, float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1PathGeometry1_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
+}
+
+/* Dashed strokes only cover part of the path, so a point sitting in a gap is
+ * not on the stroke. The dash pattern is measured in multiples of the stroke
+ * width along the path, which means the work happens in geometry space, before
+ * the transformation. */
+#define D2D_MAX_DASHES 32
+
+struct d2d_dash_pattern
+{
+    float dashes[D2D_MAX_DASHES];
+    unsigned int count;
+    float period;
+    float offset;
+    float cap_extend;
+};
+
+static BOOL d2d_dash_pattern_init(struct d2d_dash_pattern *pattern, ID2D1StrokeStyle *stroke_style,
+        float stroke_width)
+{
+    D2D1_CAP_STYLE dash_cap;
+    unsigned int i, count;
+
+    if (!stroke_style || ID2D1StrokeStyle_GetDashStyle(stroke_style) == D2D1_DASH_STYLE_SOLID)
+        return FALSE;
+
+    if (!(count = ID2D1StrokeStyle_GetDashesCount(stroke_style)) || count > D2D_MAX_DASHES)
+    {
+        if (count)
+            FIXME("Ignoring dash pattern with %u entries.\n", count);
+        return FALSE;
+    }
+
+    ID2D1StrokeStyle_GetDashes(stroke_style, pattern->dashes, count);
+    pattern->count = count;
+
+    /* The pattern alternates dash, gap, dash, …; an odd entry count means the
+     * sequence repeats shifted, which is handled by doubling it. */
+    if (count & 1)
+    {
+        if (count * 2 > D2D_MAX_DASHES)
+            return FALSE;
+        memcpy(&pattern->dashes[count], pattern->dashes, count * sizeof(*pattern->dashes));
+        pattern->count = count * 2;
+    }
+
+    pattern->period = 0.0f;
+    for (i = 0; i < pattern->count; ++i)
+    {
+        /* Dash lengths are multiples of the stroke width. */
+        pattern->dashes[i] *= stroke_width;
+        pattern->period += pattern->dashes[i];
+    }
+
+    if (pattern->period <= 0.0f)
+        return FALSE;
+
+    pattern->offset = ID2D1StrokeStyle_GetDashOffset(stroke_style) * stroke_width;
+    pattern->offset = fmodf(pattern->offset, pattern->period);
+    if (pattern->offset < 0.0f)
+        pattern->offset += pattern->period;
+
+    /* A flat dash cap ends the dash exactly; square and round caps extend it by
+     * half the stroke width. Round caps are approximated by that extension,
+     * which is a superset of the half disc — the difference is confined to the
+     * corners. */
+    dash_cap = ID2D1StrokeStyle_GetDashCap(stroke_style);
+    pattern->cap_extend = dash_cap == D2D1_CAP_STYLE_FLAT ? 0.0f : stroke_width * 0.5f;
+
+    return TRUE;
+}
+
+/* Test the part of [start, end] that the dash pattern actually paints. The
+ * segment covers the path from arc length "pos" onwards. */
+static BOOL d2d_dash_pattern_test_segment(const struct d2d_dash_pattern *pattern,
+        const D2D1_POINT_2F *q, const D2D1_POINT_2F *start, const D2D1_POINT_2F *end,
+        const D2D1_MATRIX_3X2_F *transform, float stroke_width, float tolerance, float *pos)
+{
+    float length, covered, dash_start, dash_end;
+    D2D1_POINT_2F dir, p0, p1;
+    unsigned int i;
+
+    d2d_point_subtract(&dir, end, start);
+    if ((length = d2d_point_length(&dir)) == 0.0f)
+        return FALSE;
+    d2d_point_scale(&dir, 1.0f / length);
+
+    /* Walk the pattern from where this segment starts. */
+    covered = -fmodf(*pos + pattern->offset, pattern->period);
+    i = 0;
+    while (covered + pattern->dashes[i] <= 0.0f)
+    {
+        covered += pattern->dashes[i];
+        i = (i + 1) % pattern->count;
+    }
+
+    for (; covered < length; i = (i + 1) % pattern->count)
+    {
+        float next = covered + pattern->dashes[i];
+
+        /* Even entries are dashes, odd ones gaps. */
+        if (!(i & 1))
+        {
+            dash_start = covered - pattern->cap_extend;
+            dash_end = next + pattern->cap_extend;
+
+            if (dash_start < 0.0f)
+                dash_start = 0.0f;
+            if (dash_end > length)
+                dash_end = length;
+
+            if (dash_end > dash_start)
+            {
+                p0.x = start->x + dir.x * dash_start;
+                p0.y = start->y + dir.y * dash_start;
+                p1.x = start->x + dir.x * dash_end;
+                p1.y = start->y + dir.y * dash_end;
+
+                if (d2d_point_on_line_segment(q, &p0, &p1, transform, stroke_width * 0.5f, tolerance))
+                {
+                    *pos += length;
+                    return TRUE;
+                }
+            }
+        }
+
+        covered = next;
+    }
+
+    *pos += length;
+    return FALSE;
+}
+
+/* Flatten a Bézier segment into line segments and run the dash test on each of
+ * them, so that the arc length keeps accumulating across the curve. */
+static BOOL d2d_dash_pattern_test_bezier(const struct d2d_dash_pattern *pattern,
+        const D2D1_POINT_2F *q, const D2D1_POINT_2F *p0, const D2D1_BEZIER_SEGMENT *b,
+        const D2D1_MATRIX_3X2_F *transform, float stroke_width, float tolerance, float *pos,
+        unsigned int depth)
+{
+    D2D1_BEZIER_SEGMENT b0, b1;
+    D2D1_POINT_2F m;
+    float d;
+
+    /* Same deviation estimate and subdivision as d2d_geometry_flatten_cubic().
+     * The depth limit keeps pathological curves bounded. */
+    d2d_point_lerp(&m, p0, &b->point2, 0.5f);
+    d2d_point_subtract(&m, &b->point1, &m);
+    d = fabsf(m.x) + fabsf(m.y);
+    d2d_point_lerp(&m, &b->point1, &b->point3, 0.5f);
+    d2d_point_subtract(&m, &b->point2, &m);
+    d += fabsf(m.x) + fabsf(m.y);
+
+    if (depth >= 16 || d < tolerance)
+        return d2d_dash_pattern_test_segment(pattern, q, p0, &b->point3, transform,
+                stroke_width, tolerance, pos);
+
+    d2d_point_lerp(&m, &b->point1, &b->point2, 0.5f);
+
+    b1.point3 = b->point3;
+    d2d_point_lerp(&b1.point2, &b1.point3, &b->point2, 0.5f);
+    d2d_point_lerp(&b1.point1, &b1.point2, &m, 0.5f);
+
+    d2d_point_lerp(&b0.point1, p0, &b->point1, 0.5f);
+    d2d_point_lerp(&b0.point2, &b0.point1, &m, 0.5f);
+    d2d_point_lerp(&b0.point3, &b0.point2, &b1.point1, 0.5f);
+
+    if (d2d_dash_pattern_test_bezier(pattern, q, p0, &b0, transform, stroke_width,
+            tolerance, pos, depth + 1))
+        return TRUE;
+    return d2d_dash_pattern_test_bezier(pattern, q, &b0.point3, &b1, transform, stroke_width,
+            tolerance, pos, depth + 1);
+}
+
+static BOOL d2d_path_geometry_dashed_stroke_contains_point(const struct d2d_geometry *geometry,
+        const D2D1_POINT_2F *q, const struct d2d_dash_pattern *pattern, float stroke_width,
+        const D2D1_MATRIX_3X2_F *transform, float tolerance)
+{
+    enum d2d_vertex_type type;
+    unsigned int i, j, bezier_idx;
+    D2D1_BEZIER_SEGMENT b;
+    D2D1_POINT_2F p, p1;
+    float pos;
+
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        const struct d2d_figure *figure = &geometry->u.path.figures[i];
+
+        type = D2D_VERTEX_TYPE_NONE;
+        for (j = 0; j < figure->vertex_count; ++j)
+        {
+            if (figure->vertex_types[j] == D2D_VERTEX_TYPE_NONE)
+                continue;
+
+            p = figure->vertices[j];
+            type = figure->vertex_types[j];
+            break;
+        }
+
+        /* Each figure restarts the dash pattern. */
+        pos = 0.0f;
+
+        for (bezier_idx = 0, ++j; j < figure->vertex_count; ++j)
+        {
+            enum d2d_vertex_type next_type;
+
+            if ((next_type = figure->vertex_types[j]) == D2D_VERTEX_TYPE_NONE
+                    || d2d_vertex_type_is_split_bezier(next_type))
+                continue;
+
+            switch (type)
+            {
+                case D2D_VERTEX_TYPE_LINE:
+                    p1 = figure->vertices[j];
+                    if (d2d_dash_pattern_test_segment(pattern, q, &p, &p1, transform,
+                            stroke_width, tolerance, &pos))
+                        return TRUE;
+                    p = p1;
+                    break;
+
+                case D2D_VERTEX_TYPE_BEZIER:
+                    b.point1 = figure->original_bezier_controls[bezier_idx++];
+                    b.point2 = figure->original_bezier_controls[bezier_idx++];
+                    b.point3 = figure->vertices[j];
+                    if (d2d_dash_pattern_test_bezier(pattern, q, &p, &b, transform,
+                            stroke_width, tolerance, &pos, 0))
+                        return TRUE;
+                    p = b.point3;
+                    break;
+
+                default:
+                    FIXME("Unhandled vertex type %#x.\n", type);
+                    p = figure->vertices[j];
+                    break;
+            }
+            type = next_type;
+        }
+
+        if (type == D2D_VERTEX_TYPE_LINE && figure->flags & D2D_FIGURE_FLAG_CLOSED)
+        {
+            p1 = figure->vertices[0];
+            if (d2d_dash_pattern_test_segment(pattern, q, &p, &p1, transform,
+                    stroke_width, tolerance, &pos))
+                return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_StrokeContainsPoint(ID2D1PathGeometry1 *iface,
@@ -4036,6 +6281,7 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_StrokeContainsPoint(ID2D1Path
 {
     struct d2d_geometry *geometry = impl_from_ID2D1PathGeometry1(iface);
     enum d2d_vertex_type type = D2D_VERTEX_TYPE_NONE;
+    struct d2d_dash_pattern dash_pattern;
     unsigned int i, j, bezier_idx;
     D2D1_BEZIER_SEGMENT b;
     D2D1_POINT_2F p, p1;
@@ -4043,14 +6289,22 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_StrokeContainsPoint(ID2D1Path
     TRACE("iface %p, point %s, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, contains %p.\n",
             iface, debug_d2d_point_2f(&point), stroke_width, stroke_style, transform, tolerance, contains);
 
-    if (stroke_style)
-        FIXME("Ignoring stroke style %p.\n", stroke_style);
-
     if (!transform)
         transform = &identity;
 
     if (tolerance <= 0.0f)
         tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    /* A dashed stroke only covers part of the path. Solid strokes keep taking
+     * the plain path below, so the common case is unaffected. Line joins and
+     * the caps at the ends of a figure are still not taken into account. */
+    if (d2d_dash_pattern_init(&dash_pattern, stroke_style, stroke_width))
+    {
+        *contains = d2d_path_geometry_dashed_stroke_contains_point(geometry, &point,
+                &dash_pattern, stroke_width, transform, tolerance);
+        TRACE("-> %#x.\n", *contains);
+        return S_OK;
+    }
 
     *contains = FALSE;
     for (i = 0; i < geometry->u.path.figure_count; ++i)
@@ -4326,6 +6580,1194 @@ static HRESULT d2d_geometry_get_simplified(ID2D1Geometry *geometry, const D2D1_M
 
     return hr;
 }
+/* Boolean geometry combination.
+ *
+ * Both operands are normalised into polygon sets first. ID2D1Geometry::Simplify()
+ * with D2D1_GEOMETRY_SIMPLIFICATION_OPTION_LINES flattens curves to line segments
+ * using the supplied tolerance and applies a transform on the way, and it is
+ * implemented for every geometry type, so the code below only ever deals with
+ * polygons. Two strategies are then available:
+ *
+ *   - When every contour on both sides is an axis-aligned rectangle, a scanline
+ *     pass over the horizontal bands spanned by both operands computes all four
+ *     combine modes exactly. This covers rectangles, transformed rectangles as
+ *     long as the transform keeps them axis-aligned, and the multi-rectangle
+ *     clip lists GUI toolkits build for partial repaints.
+ *
+ *   - Otherwise, for D2D1_COMBINE_MODE_INTERSECT with a convex operand, the other
+ *     operand is clipped against it using the Sutherland-Hodgman algorithm. An
+ *     affine transform maps a rectangle to a parallelogram, which is convex, so
+ *     this covers clip masks under a rotating or skewing transform as well.
+ *
+ * The general boolean case - non-convex operands, or curves that need to be
+ * preserved in the output rather than flattened - is not implemented. */
+
+struct d2d_combine_contour
+{
+    D2D1_POINT_2F *points;
+    size_t count;
+    size_t size;
+};
+
+struct d2d_combine_shape
+{
+    struct d2d_combine_contour *contours;
+    size_t count;
+    size_t size;
+
+    D2D1_FILL_MODE fill_mode;
+    BOOL has_curves;
+    BOOL failed;
+};
+
+struct d2d_combine_sink
+{
+    ID2D1SimplifiedGeometrySink ID2D1SimplifiedGeometrySink_iface;
+    struct d2d_combine_shape *shape;
+};
+
+static void d2d_combine_shape_cleanup(struct d2d_combine_shape *shape)
+{
+    for (size_t i = 0; i < shape->count; ++i)
+        free(shape->contours[i].points);
+    free(shape->contours);
+    memset(shape, 0, sizeof(*shape));
+}
+
+static struct d2d_combine_contour *d2d_combine_shape_add_contour(struct d2d_combine_shape *shape)
+{
+    struct d2d_combine_contour *contour;
+
+    if (!d2d_array_reserve((void **)&shape->contours, &shape->size, shape->count + 1, sizeof(*shape->contours)))
+    {
+        shape->failed = TRUE;
+        return NULL;
+    }
+
+    contour = &shape->contours[shape->count++];
+    memset(contour, 0, sizeof(*contour));
+    return contour;
+}
+
+static BOOL d2d_combine_contour_add_point(struct d2d_combine_contour *contour, const D2D1_POINT_2F *point)
+{
+    if (!d2d_array_reserve((void **)&contour->points, &contour->size, contour->count + 1, sizeof(*contour->points)))
+        return FALSE;
+
+    contour->points[contour->count++] = *point;
+    return TRUE;
+}
+
+static inline struct d2d_combine_sink *impl_from_ID2D1SimplifiedGeometrySink(ID2D1SimplifiedGeometrySink *iface)
+{
+    return CONTAINING_RECORD(iface, struct d2d_combine_sink, ID2D1SimplifiedGeometrySink_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_combine_sink_QueryInterface(ID2D1SimplifiedGeometrySink *iface,
+        REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_ID2D1SimplifiedGeometrySink)
+            || IsEqualGUID(iid, &IID_IUnknown))
+    {
+        ID2D1SimplifiedGeometrySink_AddRef(iface);
+        *out = iface;
+        return S_OK;
+    }
+
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE d2d_combine_sink_AddRef(ID2D1SimplifiedGeometrySink *iface)
+{
+    return 2;
+}
+
+static ULONG STDMETHODCALLTYPE d2d_combine_sink_Release(ID2D1SimplifiedGeometrySink *iface)
+{
+    return 1;
+}
+
+static void STDMETHODCALLTYPE d2d_combine_sink_SetFillMode(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_FILL_MODE mode)
+{
+    impl_from_ID2D1SimplifiedGeometrySink(iface)->shape->fill_mode = mode;
+}
+
+static void STDMETHODCALLTYPE d2d_combine_sink_SetSegmentFlags(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_PATH_SEGMENT flags)
+{
+}
+
+static void STDMETHODCALLTYPE d2d_combine_sink_BeginFigure(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_POINT_2F start_point, D2D1_FIGURE_BEGIN figure_begin)
+{
+    struct d2d_combine_shape *shape = impl_from_ID2D1SimplifiedGeometrySink(iface)->shape;
+    struct d2d_combine_contour *contour;
+
+    /* Hollow figures do not contribute to the filled area. Add an empty contour
+     * to keep EndFigure() and AddLines() in step, and drop it later. */
+    if (!(contour = d2d_combine_shape_add_contour(shape)))
+        return;
+    if (figure_begin == D2D1_FIGURE_BEGIN_HOLLOW)
+        return;
+
+    if (!d2d_combine_contour_add_point(contour, &start_point))
+        shape->failed = TRUE;
+}
+
+static void STDMETHODCALLTYPE d2d_combine_sink_AddLines(ID2D1SimplifiedGeometrySink *iface,
+        const D2D1_POINT_2F *points, UINT32 count)
+{
+    struct d2d_combine_shape *shape = impl_from_ID2D1SimplifiedGeometrySink(iface)->shape;
+    struct d2d_combine_contour *contour;
+
+    if (!shape->count)
+        return;
+    contour = &shape->contours[shape->count - 1];
+    if (!contour->count)
+        return;
+
+    for (UINT32 i = 0; i < count; ++i)
+    {
+        if (!d2d_combine_contour_add_point(contour, &points[i]))
+        {
+            shape->failed = TRUE;
+            return;
+        }
+    }
+}
+
+static void STDMETHODCALLTYPE d2d_combine_sink_AddBeziers(ID2D1SimplifiedGeometrySink *iface,
+        const D2D1_BEZIER_SEGMENT *beziers, UINT32 count)
+{
+    /* Simplify() was asked for lines only, so this should not happen. */
+    impl_from_ID2D1SimplifiedGeometrySink(iface)->shape->has_curves = TRUE;
+}
+
+static void STDMETHODCALLTYPE d2d_combine_sink_EndFigure(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_FIGURE_END figure_end)
+{
+    struct d2d_combine_shape *shape = impl_from_ID2D1SimplifiedGeometrySink(iface)->shape;
+    struct d2d_combine_contour *contour;
+
+    if (!shape->count)
+        return;
+    contour = &shape->contours[shape->count - 1];
+
+    /* Drop the repeated start point, and contours that enclose no area. */
+    if (contour->count > 1 && !memcmp(&contour->points[0], &contour->points[contour->count - 1],
+            sizeof(*contour->points)))
+        --contour->count;
+
+    if (contour->count < 3)
+    {
+        free(contour->points);
+        --shape->count;
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_combine_sink_Close(ID2D1SimplifiedGeometrySink *iface)
+{
+    return S_OK;
+}
+
+static const struct ID2D1SimplifiedGeometrySinkVtbl d2d_combine_sink_vtbl =
+{
+    d2d_combine_sink_QueryInterface,
+    d2d_combine_sink_AddRef,
+    d2d_combine_sink_Release,
+    d2d_combine_sink_SetFillMode,
+    d2d_combine_sink_SetSegmentFlags,
+    d2d_combine_sink_BeginFigure,
+    d2d_combine_sink_AddLines,
+    d2d_combine_sink_AddBeziers,
+    d2d_combine_sink_EndFigure,
+    d2d_combine_sink_Close,
+};
+
+static HRESULT d2d_combine_shape_init(struct d2d_combine_shape *shape, ID2D1Geometry *geometry,
+        const D2D1_MATRIX_3X2_F *transform, float tolerance)
+{
+    struct d2d_combine_sink sink =
+    {
+        .ID2D1SimplifiedGeometrySink_iface.lpVtbl = &d2d_combine_sink_vtbl,
+        .shape = shape,
+    };
+    HRESULT hr;
+
+    memset(shape, 0, sizeof(*shape));
+    /* Simplify() only emits SetFillMode() for path and rectangle geometries. */
+    shape->fill_mode = D2D1_FILL_MODE_ALTERNATE;
+
+    if (FAILED(hr = ID2D1Geometry_Simplify(geometry, D2D1_GEOMETRY_SIMPLIFICATION_OPTION_LINES,
+            transform, tolerance, &sink.ID2D1SimplifiedGeometrySink_iface)))
+        return hr;
+
+    if (shape->failed)
+        return E_OUTOFMEMORY;
+
+    return S_OK;
+}
+
+/* A non-horizontal polygon edge, stored top-down together with the winding it
+ * contributes when crossed left to right. Horizontal edges carry no winding
+ * and are dropped; their endpoints still bound the sweep bands through the
+ * edges that meet them. */
+struct d2d_combine_edge
+{
+    D2D1_POINT_2F top, bottom;
+    int winding;
+    unsigned int side;
+};
+
+struct d2d_combine_edges
+{
+    struct d2d_combine_edge *edges;
+    size_t count;
+    size_t size;
+};
+
+static BOOL d2d_combine_edges_add_shape(struct d2d_combine_edges *edges,
+        const struct d2d_combine_shape *shape, unsigned int side)
+{
+    for (size_t i = 0; i < shape->count; ++i)
+    {
+        const struct d2d_combine_contour *contour = &shape->contours[i];
+
+        for (size_t j = 0, k = contour->count - 1; j < contour->count; k = j++)
+        {
+            const D2D1_POINT_2F *p0 = &contour->points[k], *p1 = &contour->points[j];
+            struct d2d_combine_edge *edge;
+
+            if (p0->y == p1->y)
+                continue;
+
+            if (!d2d_array_reserve((void **)&edges->edges, &edges->size,
+                    edges->count + 1, sizeof(*edges->edges)))
+                return FALSE;
+
+            edge = &edges->edges[edges->count++];
+            if (p0->y < p1->y)
+            {
+                edge->top = *p0;
+                edge->bottom = *p1;
+                edge->winding = 1;
+            }
+            else
+            {
+                edge->top = *p1;
+                edge->bottom = *p0;
+                edge->winding = -1;
+            }
+            edge->side = side;
+        }
+    }
+
+    return TRUE;
+}
+
+/* Evaluating an edge at a band boundary has to be exact at the endpoints and
+ * reproducible in between: the bands on either side of a boundary evaluate
+ * the same edge at the same y, and have to arrive at the same point for the
+ * outline tracing to chain their trapezoids back together. */
+static double d2d_combine_edge_x_at(const struct d2d_combine_edge *edge, float y)
+{
+    double t;
+
+    if (y == edge->top.y)
+        return edge->top.x;
+    if (y == edge->bottom.y)
+        return edge->bottom.x;
+
+    t = ((double)y - edge->top.y) / ((double)edge->bottom.y - edge->top.y);
+    return edge->top.x + t * ((double)edge->bottom.x - edge->top.x);
+}
+
+/* An edge crossed by the scanline, with the winding it contributes. */
+struct d2d_combine_event
+{
+    double x;
+    const struct d2d_combine_edge *edge;
+};
+
+static int __cdecl d2d_combine_event_compare(const void *a, const void *b)
+{
+    const struct d2d_combine_event *p = a, *q = b;
+
+    if (p->x < q->x)
+        return -1;
+    if (p->x > q->x)
+        return 1;
+    return 0;
+}
+
+static BOOL d2d_combine_inside(D2D1_FILL_MODE fill_mode, int winding, unsigned int crossings)
+{
+    if (fill_mode == D2D1_FILL_MODE_ALTERNATE)
+        return crossings & 1;
+    return winding != 0;
+}
+
+static BOOL d2d_combine_op(D2D1_COMBINE_MODE mode, BOOL a, BOOL b)
+{
+    switch (mode)
+    {
+        case D2D1_COMBINE_MODE_UNION:
+            return a || b;
+        case D2D1_COMBINE_MODE_INTERSECT:
+            return a && b;
+        case D2D1_COMBINE_MODE_XOR:
+            return a != b;
+        case D2D1_COMBINE_MODE_EXCLUDE:
+            return a && !b;
+        default:
+            return FALSE;
+    }
+}
+
+static int __cdecl d2d_combine_float_compare(const void *a, const void *b)
+{
+    const float *p = a, *q = b;
+
+    if (*p < *q)
+        return -1;
+    if (*p > *q)
+        return 1;
+    return 0;
+}
+
+/* The output of the sweep: a trapezoid with horizontal top and bottom edges,
+ * cut from one band. The source edges are kept so the outline tracing can
+ * recognise segments of the same edge in adjacent bands as collinear. */
+struct d2d_combine_trapezoid
+{
+    float top, bottom;
+    float l0, r0;
+    float l1, r1;
+    size_t left, right;
+};
+
+/* Band boundaries: every edge endpoint y, plus the y of every edge-edge
+ * crossing. Within the resulting bands no edge crosses another and every edge
+ * that enters a band spans it completely, so sorting the edges once per band
+ * is enough for a single pass to evaluate the combination exactly. */
+static BOOL d2d_combine_edges_bands(const struct d2d_combine_edges *edges, float **out, size_t *out_count)
+{
+    size_t count = 0, size = 0;
+    float *bands = NULL;
+
+    *out = NULL;
+    *out_count = 0;
+
+    if (!d2d_array_reserve((void **)&bands, &size, 2 * edges->count, sizeof(*bands)))
+        return FALSE;
+    for (size_t i = 0; i < edges->count; ++i)
+    {
+        bands[count++] = edges->edges[i].top.y;
+        bands[count++] = edges->edges[i].bottom.y;
+    }
+
+    for (size_t i = 0; i < edges->count; ++i)
+    {
+        const struct d2d_combine_edge *a = &edges->edges[i];
+        double ax = (double)a->bottom.x - a->top.x, ay = (double)a->bottom.y - a->top.y;
+
+        for (size_t j = i + 1; j < edges->count; ++j)
+        {
+            const struct d2d_combine_edge *b = &edges->edges[j];
+            double bx = (double)b->bottom.x - b->top.x, by = (double)b->bottom.y - b->top.y;
+            double denom = ax * by - ay * bx;
+            double ex, ey, s, t;
+
+            /* Parallel or collinear edges do not change the left-to-right
+             * order, so they contribute no boundary. */
+            if (denom == 0.0)
+                continue;
+
+            ex = (double)b->top.x - a->top.x;
+            ey = (double)b->top.y - a->top.y;
+            t = (ex * by - ey * bx) / denom;
+            s = (ex * ay - ey * ax) / denom;
+            if (t < 0.0 || t > 1.0 || s < 0.0 || s > 1.0)
+                continue;
+
+            if (!d2d_array_reserve((void **)&bands, &size, count + 1, sizeof(*bands)))
+            {
+                free(bands);
+                return FALSE;
+            }
+            bands[count++] = a->top.y + t * ay;
+        }
+    }
+
+    qsort(bands, count, sizeof(*bands), d2d_combine_float_compare);
+    for (size_t i = 0, j = 0; i < count; ++i)
+    {
+        if (j && bands[j - 1] == bands[i])
+            continue;
+        bands[j++] = bands[i];
+        *out_count = j;
+    }
+
+    *out = bands;
+    return TRUE;
+}
+
+/* Combine the two operands by sweeping the horizontal bands their edges span.
+ * Within a band the coverage of either operand only changes at an edge, and
+ * the edges do not cross, so a single pass over the edges in their order at
+ * the middle of the band yields the result exactly, as one trapezoid per
+ * covered interval. */
+static HRESULT d2d_combine_edges_op(const struct d2d_combine_edges *edges,
+        D2D1_FILL_MODE fill_mode0, D2D1_FILL_MODE fill_mode1, D2D1_COMBINE_MODE mode,
+        struct d2d_combine_trapezoid **out, size_t *out_count)
+{
+    struct d2d_combine_trapezoid *traps = NULL;
+    struct d2d_combine_event *events = NULL;
+    size_t traps_size = 0, count = 0;
+    size_t band_count = 0;
+    size_t events_size = 0;
+    float *bands = NULL;
+    HRESULT hr = S_OK;
+
+    *out = NULL;
+    *out_count = 0;
+
+    if (!d2d_combine_edges_bands(edges, &bands, &band_count))
+        return E_OUTOFMEMORY;
+
+    if (!d2d_array_reserve((void **)&events, &events_size, edges->count, sizeof(*events)))
+    {
+        free(bands);
+        return E_OUTOFMEMORY;
+    }
+
+    for (size_t band = 0; band + 1 < band_count; ++band)
+    {
+        float top = bands[band], bottom = bands[band + 1];
+        const struct d2d_combine_edge *left = NULL;
+        unsigned int crossings[2] = {0};
+        BOOL inside[2] = {FALSE};
+        int winding[2] = {0};
+        size_t event_count = 0;
+
+        if (!(bottom > top))
+            continue;
+
+        for (size_t i = 0; i < edges->count; ++i)
+        {
+            const struct d2d_combine_edge *edge = &edges->edges[i];
+
+            if (edge->top.y > top || edge->bottom.y < bottom)
+                continue;
+            events[event_count].x = d2d_combine_edge_x_at(edge, top)
+                    + d2d_combine_edge_x_at(edge, bottom);
+            events[event_count++].edge = edge;
+        }
+
+        qsort(events, event_count, sizeof(*events), d2d_combine_event_compare);
+
+        for (size_t i = 0; i < event_count; )
+        {
+            BOOL was_inside = d2d_combine_op(mode, inside[0], inside[1]);
+            const struct d2d_combine_edge *last = NULL;
+            double x = events[i].x;
+
+            while (i < event_count && events[i].x == x)
+            {
+                const struct d2d_combine_edge *edge = events[i].edge;
+
+                winding[edge->side] += edge->winding;
+                ++crossings[edge->side];
+                last = edge;
+                ++i;
+            }
+
+            inside[0] = d2d_combine_inside(fill_mode0, winding[0], crossings[0]);
+            inside[1] = d2d_combine_inside(fill_mode1, winding[1], crossings[1]);
+
+            if (!was_inside && d2d_combine_op(mode, inside[0], inside[1]))
+            {
+                left = last;
+            }
+            else if (was_inside && !d2d_combine_op(mode, inside[0], inside[1]) && left)
+            {
+                struct d2d_combine_trapezoid t;
+
+                t.top = top;
+                t.bottom = bottom;
+                t.l0 = d2d_combine_edge_x_at(left, top);
+                t.l1 = d2d_combine_edge_x_at(left, bottom);
+                t.r0 = d2d_combine_edge_x_at(last, top);
+                t.r1 = d2d_combine_edge_x_at(last, bottom);
+                t.left = left - edges->edges;
+                t.right = last - edges->edges;
+
+                if (t.l0 < t.r0 || t.l1 < t.r1)
+                {
+                    if (!d2d_array_reserve((void **)&traps, &traps_size, count + 1, sizeof(*traps)))
+                    {
+                        hr = E_OUTOFMEMORY;
+                        goto done;
+                    }
+                    traps[count++] = t;
+                }
+            }
+        }
+    }
+
+    *out = traps;
+    *out_count = count;
+    traps = NULL;
+
+done:
+    free(traps);
+    free(events);
+    free(bands);
+    return hr;
+}
+
+/* Outline tracing over the trapezoids of the sweep.
+ *
+ * Writing one closed figure per trapezoid leaves interior edges in the result:
+ * where two trapezoids meet along a band boundary, the shared edge is present
+ * twice, and both the outline and any consumer that walks the figures see a
+ * boundary that is not one. Cancelling those edges out turns the trapezoid
+ * decomposition back into the outline of the combination, which is what a
+ * boolean operation is supposed to produce.
+ *
+ * Every trapezoid contributes four directed edges, wound clockwise in a y-down
+ * coordinate system. Trapezoids within one band are separated by uncovered
+ * intervals, so only the horizontal edges along the band boundaries are ever
+ * shared, and a shared interval is contributed once in each direction: summing
+ * the directions over each elementary interval and keeping only the intervals
+ * with a non-zero sum leaves exactly the boundary. The surviving edges are
+ * then chained into closed contours. */
+struct d2d_combine_span
+{
+    float pos;
+    float a, b;
+    int dir;
+};
+
+struct d2d_combine_outline_edge
+{
+    D2D1_POINT_2F p0, p1;
+    size_t source;
+    BOOL used;
+};
+
+static int __cdecl d2d_combine_span_compare(const void *a, const void *b)
+{
+    const struct d2d_combine_span *p = a, *q = b;
+
+    if (p->pos != q->pos)
+        return p->pos < q->pos ? -1 : 1;
+    if (p->a != q->a)
+        return p->a < q->a ? -1 : 1;
+    return 0;
+}
+
+static BOOL d2d_combine_outline_add_edge(struct d2d_combine_outline_edge **edges, size_t *count,
+        size_t *size, const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1, size_t source)
+{
+    if (!d2d_array_reserve((void **)edges, size, *count + 1, sizeof(**edges)))
+        return FALSE;
+
+    (*edges)[*count].p0 = *p0;
+    (*edges)[*count].p1 = *p1;
+    (*edges)[*count].source = source;
+    (*edges)[(*count)++].used = FALSE;
+    return TRUE;
+}
+
+/* Reduce the group of horizontal spans at each band boundary to the intervals
+ * that are on the boundary, and emit those as directed edges. */
+static BOOL d2d_combine_outline_trace_spans(struct d2d_combine_span *spans, size_t count,
+        struct d2d_combine_outline_edge **edges, size_t *edge_count, size_t *edge_size)
+{
+    float *coords = NULL;
+    size_t coords_size = 0;
+    BOOL ret = FALSE;
+
+    qsort(spans, count, sizeof(*spans), d2d_combine_span_compare);
+
+    for (size_t i = 0; i < count; )
+    {
+        size_t group_end = i, coord_count = 0;
+        float pos = spans[i].pos;
+
+        while (group_end < count && spans[group_end].pos == pos)
+            ++group_end;
+
+        if (!d2d_array_reserve((void **)&coords, &coords_size, 2 * (group_end - i), sizeof(*coords)))
+            goto done;
+        for (size_t j = i; j < group_end; ++j)
+        {
+            coords[coord_count++] = spans[j].a;
+            coords[coord_count++] = spans[j].b;
+        }
+        qsort(coords, coord_count, sizeof(*coords), d2d_combine_float_compare);
+
+        for (size_t k = 0; k + 1 < coord_count; ++k)
+        {
+            float lo = coords[k], hi = coords[k + 1], mid;
+            D2D1_POINT_2F p0, p1;
+            int winding = 0;
+
+            if (!(hi > lo))
+                continue;
+            mid = lo + (hi - lo) * 0.5f;
+
+            for (size_t j = i; j < group_end; ++j)
+            {
+                if (spans[j].a <= mid && mid <= spans[j].b)
+                    winding += spans[j].dir;
+            }
+            if (!winding)
+                continue;
+
+            /* A positive winding is a top edge, running right; a negative one
+             * is a bottom edge, running left. */
+            d2d_point_set(&p0, winding > 0 ? lo : hi, pos);
+            d2d_point_set(&p1, winding > 0 ? hi : lo, pos);
+
+            if (!d2d_combine_outline_add_edge(edges, edge_count, edge_size, &p0, &p1, SIZE_MAX))
+                goto done;
+        }
+
+        i = group_end;
+    }
+
+    ret = TRUE;
+
+done:
+    free(coords);
+    return ret;
+}
+
+/* Pick the continuation that turns as far clockwise as possible. At a point
+ * where two parts of the boundary touch this keeps the outer contour connected
+ * instead of cutting across the touch. Clockwise in a y-down system means a
+ * positive cross product, and turning back is ranked below everything else. */
+static size_t d2d_combine_outline_next(const struct d2d_combine_outline_edge *edges, size_t count,
+        const struct d2d_combine_outline_edge *incoming)
+{
+    double dx = (double)incoming->p1.x - incoming->p0.x, dy = (double)incoming->p1.y - incoming->p0.y;
+    const D2D1_POINT_2F *point = &incoming->p1;
+    double best_angle = 0.0;
+    size_t best = count;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        double ex, ey, cross, dot, angle;
+
+        if (edges[i].used || edges[i].p0.x != point->x || edges[i].p0.y != point->y)
+            continue;
+
+        ex = (double)edges[i].p1.x - edges[i].p0.x;
+        ey = (double)edges[i].p1.y - edges[i].p0.y;
+        cross = dx * ey - dy * ex;
+        dot = dx * ex + dy * ey;
+        if (cross == 0.0 && dot < 0.0)
+            angle = -M_PI;
+        else
+            angle = atan2(cross, dot);
+
+        if (best == count || angle > best_angle)
+        {
+            best_angle = angle;
+            best = i;
+        }
+    }
+
+    return best;
+}
+
+/* Whether two consecutive boundary edges continue the same straight line, so
+ * that the vertex between them is redundant. Segments cut from the same sweep
+ * edge are collinear by construction as long as they run the same way, and
+ * horizontal segments compare by direction; oblique segments from different
+ * sweep edges keep their vertex. */
+static BOOL d2d_combine_outline_edge_continues(const struct d2d_combine_outline_edge *prev,
+        const struct d2d_combine_outline_edge *next)
+{
+    if (prev->source != SIZE_MAX && prev->source == next->source)
+        return (prev->p1.y > prev->p0.y) == (next->p1.y > next->p0.y);
+    if (prev->p0.y == prev->p1.y && next->p0.y == next->p1.y)
+        return (prev->p1.x > prev->p0.x) == (next->p1.x > next->p0.x);
+    if (prev->p0.x == prev->p1.x && next->p0.x == next->p1.x)
+        return (prev->p1.y > prev->p0.y) == (next->p1.y > next->p0.y);
+    return FALSE;
+}
+
+/* Build the boundary of the trapezoid decomposition as closed contours.
+ * Returns FALSE if the boundary could not be traced, in which case the caller
+ * falls back to writing the trapezoids individually. Nothing is written to the
+ * sink here, so that fallback stays safe. */
+static BOOL d2d_combine_trapezoids_to_outline(const struct d2d_combine_trapezoid *traps, size_t count,
+        struct d2d_combine_shape *out)
+{
+    struct d2d_combine_outline_edge *edges = NULL;
+    size_t edge_count = 0, edge_size = 0;
+    struct d2d_combine_span *spans = NULL;
+    size_t span_count = 0, spans_size = 0;
+    BOOL ret = FALSE;
+
+    memset(out, 0, sizeof(*out));
+    out->fill_mode = D2D1_FILL_MODE_WINDING;
+
+    if (!count)
+        return FALSE;
+
+    if (!d2d_array_reserve((void **)&spans, &spans_size, 2 * count, sizeof(*spans)))
+        goto done;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (traps[i].l0 < traps[i].r0)
+        {
+            spans[span_count].pos = traps[i].top;
+            spans[span_count].a = traps[i].l0;
+            spans[span_count].b = traps[i].r0;
+            spans[span_count++].dir = 1;
+        }
+        if (traps[i].l1 < traps[i].r1)
+        {
+            spans[span_count].pos = traps[i].bottom;
+            spans[span_count].a = traps[i].l1;
+            spans[span_count].b = traps[i].r1;
+            spans[span_count++].dir = -1;
+        }
+    }
+    if (!d2d_combine_outline_trace_spans(spans, span_count, &edges, &edge_count, &edge_size))
+        goto done;
+
+    /* The oblique edges are never shared - within a band, trapezoids are
+     * separated by uncovered intervals - so they go in as they are: the right
+     * edge runs down, the left edge runs up. */
+    for (size_t i = 0; i < count; ++i)
+    {
+        D2D1_POINT_2F p0, p1;
+
+        d2d_point_set(&p0, traps[i].r0, traps[i].top);
+        d2d_point_set(&p1, traps[i].r1, traps[i].bottom);
+        if (!d2d_combine_outline_add_edge(&edges, &edge_count, &edge_size, &p0, &p1, traps[i].right))
+            goto done;
+
+        d2d_point_set(&p0, traps[i].l1, traps[i].bottom);
+        d2d_point_set(&p1, traps[i].l0, traps[i].top);
+        if (!d2d_combine_outline_add_edge(&edges, &edge_count, &edge_size, &p0, &p1, traps[i].left))
+            goto done;
+    }
+
+    for (size_t i = 0; i < edge_count; ++i)
+    {
+        struct d2d_combine_contour *contour;
+        size_t next, prev, first;
+        D2D1_POINT_2F start;
+
+        if (edges[i].used)
+            continue;
+
+        if (!(contour = d2d_combine_shape_add_contour(out)))
+            goto done;
+
+        start = edges[i].p0;
+        first = next = i;
+        prev = edge_count;
+        do
+        {
+            const struct d2d_combine_outline_edge *e = &edges[next];
+
+            /* Skip the vertex when the edge continues the previous one, so
+             * that the segments collapse back into full edges. */
+            if ((prev >= edge_count || !d2d_combine_outline_edge_continues(&edges[prev], e))
+                    && !d2d_combine_contour_add_point(contour, &e->p0))
+                goto done;
+
+            edges[next].used = TRUE;
+            prev = next;
+
+            if (e->p1.x == start.x && e->p1.y == start.y)
+                break;
+
+            next = d2d_combine_outline_next(edges, edge_count, e);
+        } while (next < edge_count);
+
+        /* An unclosed contour means the edges did not cancel out as expected;
+         * do not use a partial result. */
+        if (next >= edge_count || contour->count < 3)
+            goto done;
+
+        /* If the traversal started in the middle of a straight edge, the first
+         * vertex continues the closing edge and is redundant. */
+        if (contour->count > 3 && d2d_combine_outline_edge_continues(&edges[prev], &edges[first]))
+        {
+            memmove(contour->points, contour->points + 1, (contour->count - 1) * sizeof(*contour->points));
+            --contour->count;
+        }
+    }
+
+    ret = TRUE;
+
+done:
+    free(edges);
+    free(spans);
+    if (!ret)
+        d2d_combine_shape_cleanup(out);
+    return ret;
+}
+
+static void d2d_combine_write_trapezoids(ID2D1SimplifiedGeometrySink *sink,
+        const struct d2d_combine_trapezoid *traps, size_t count)
+{
+    ID2D1SimplifiedGeometrySink_SetFillMode(sink, D2D1_FILL_MODE_WINDING);
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        D2D1_POINT_2F p[4];
+        UINT32 n = 0;
+
+        d2d_point_set(&p[n++], traps[i].l0, traps[i].top);
+        if (traps[i].r0 > traps[i].l0)
+            d2d_point_set(&p[n++], traps[i].r0, traps[i].top);
+        d2d_point_set(&p[n++], traps[i].r1, traps[i].bottom);
+        if (traps[i].l1 < traps[i].r1)
+            d2d_point_set(&p[n++], traps[i].l1, traps[i].bottom);
+
+        ID2D1SimplifiedGeometrySink_BeginFigure(sink, p[0], D2D1_FIGURE_BEGIN_FILLED);
+        ID2D1SimplifiedGeometrySink_AddLines(sink, &p[1], n - 1);
+        ID2D1SimplifiedGeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    }
+}
+
+static void d2d_combine_write_shape(ID2D1SimplifiedGeometrySink *sink, const struct d2d_combine_shape *shape)
+{
+    ID2D1SimplifiedGeometrySink_SetFillMode(sink, shape->fill_mode);
+
+    for (size_t i = 0; i < shape->count; ++i)
+    {
+        const struct d2d_combine_contour *contour = &shape->contours[i];
+
+        ID2D1SimplifiedGeometrySink_BeginFigure(sink, contour->points[0], D2D1_FIGURE_BEGIN_FILLED);
+        ID2D1SimplifiedGeometrySink_AddLines(sink, &contour->points[1], contour->count - 1);
+        ID2D1SimplifiedGeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+    }
+}
+
+static HRESULT d2d_geometry_combine(ID2D1Geometry *geometry, ID2D1Geometry *geometry2,
+        D2D1_COMBINE_MODE combine_mode, const D2D1_MATRIX_3X2_F *transform, float tolerance,
+        ID2D1SimplifiedGeometrySink *sink)
+{
+    struct d2d_combine_trapezoid *traps = NULL;
+    struct d2d_combine_shape shape1, shape2;
+    struct d2d_combine_edges edges = {0};
+    size_t trap_count = 0;
+    HRESULT hr;
+
+    if (!geometry2 || !sink)
+        return E_INVALIDARG;
+
+    if (combine_mode > D2D1_COMBINE_MODE_EXCLUDE)
+        return E_INVALIDARG;
+
+    if (FAILED(hr = d2d_combine_shape_init(&shape1, geometry, NULL, tolerance)))
+        return hr;
+    if (FAILED(hr = d2d_combine_shape_init(&shape2, geometry2, transform, tolerance)))
+    {
+        d2d_combine_shape_cleanup(&shape1);
+        return hr;
+    }
+
+    if (shape1.has_curves || shape2.has_curves)
+    {
+        FIXME("Curves are not handled, ignoring.\n");
+        hr = E_NOTIMPL;
+        goto done;
+    }
+
+    if (!d2d_combine_edges_add_shape(&edges, &shape1, 0)
+            || !d2d_combine_edges_add_shape(&edges, &shape2, 1))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+
+    if (SUCCEEDED(hr = d2d_combine_edges_op(&edges, shape1.fill_mode, shape2.fill_mode,
+            combine_mode, &traps, &trap_count)))
+    {
+        struct d2d_combine_shape outline;
+
+        /* Prefer the outline over the individual trapezoids: the band
+         * decomposition is an artefact of the algorithm, not a property of
+         * the result, and interior edges have no business showing up in a
+         * boolean operation's output. */
+        if (d2d_combine_trapezoids_to_outline(traps, trap_count, &outline))
+        {
+            d2d_combine_write_shape(sink, &outline);
+            d2d_combine_shape_cleanup(&outline);
+        }
+        else
+        {
+            d2d_combine_write_trapezoids(sink, traps, trap_count);
+        }
+        free(traps);
+    }
+
+done:
+    free(edges.edges);
+    d2d_combine_shape_cleanup(&shape1);
+    d2d_combine_shape_cleanup(&shape2);
+    return hr;
+}
+
+/* Passes a geometry's figures on to the caller's sink as they are, but
+ * announces nonzero winding whatever the geometry's own fill mode is: for a
+ * single figure that does not cross itself the two fill the same region, and
+ * Outline() promises nonzero winding. */
+struct d2d_outline_sink
+{
+    ID2D1SimplifiedGeometrySink ID2D1SimplifiedGeometrySink_iface;
+    ID2D1SimplifiedGeometrySink *sink;
+};
+
+static inline struct d2d_outline_sink *impl_from_outline_sink(ID2D1SimplifiedGeometrySink *iface)
+{
+    return CONTAINING_RECORD(iface, struct d2d_outline_sink, ID2D1SimplifiedGeometrySink_iface);
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_outline_sink_QueryInterface(ID2D1SimplifiedGeometrySink *iface,
+        REFIID iid, void **out)
+{
+    if (IsEqualGUID(iid, &IID_ID2D1SimplifiedGeometrySink)
+            || IsEqualGUID(iid, &IID_IUnknown))
+    {
+        ID2D1SimplifiedGeometrySink_AddRef(iface);
+        *out = iface;
+        return S_OK;
+    }
+
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE d2d_outline_sink_AddRef(ID2D1SimplifiedGeometrySink *iface)
+{
+    return 2;
+}
+
+static ULONG STDMETHODCALLTYPE d2d_outline_sink_Release(ID2D1SimplifiedGeometrySink *iface)
+{
+    return 1;
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_SetFillMode(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_FILL_MODE mode)
+{
+    ID2D1SimplifiedGeometrySink_SetFillMode(impl_from_outline_sink(iface)->sink, D2D1_FILL_MODE_WINDING);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_SetSegmentFlags(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_PATH_SEGMENT flags)
+{
+    ID2D1SimplifiedGeometrySink_SetSegmentFlags(impl_from_outline_sink(iface)->sink, flags);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_BeginFigure(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_POINT_2F start_point, D2D1_FIGURE_BEGIN figure_begin)
+{
+    ID2D1SimplifiedGeometrySink_BeginFigure(impl_from_outline_sink(iface)->sink, start_point,
+            D2D1_FIGURE_BEGIN_FILLED);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_AddLines(ID2D1SimplifiedGeometrySink *iface,
+        const D2D1_POINT_2F *points, UINT32 count)
+{
+    ID2D1SimplifiedGeometrySink_AddLines(impl_from_outline_sink(iface)->sink, points, count);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_AddBeziers(ID2D1SimplifiedGeometrySink *iface,
+        const D2D1_BEZIER_SEGMENT *beziers, UINT32 count)
+{
+    ID2D1SimplifiedGeometrySink_AddBeziers(impl_from_outline_sink(iface)->sink, beziers, count);
+}
+
+static void STDMETHODCALLTYPE d2d_outline_sink_EndFigure(ID2D1SimplifiedGeometrySink *iface,
+        D2D1_FIGURE_END figure_end)
+{
+    ID2D1SimplifiedGeometrySink_EndFigure(impl_from_outline_sink(iface)->sink, D2D1_FIGURE_END_CLOSED);
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_outline_sink_Close(ID2D1SimplifiedGeometrySink *iface)
+{
+    return S_OK;
+}
+
+static const struct ID2D1SimplifiedGeometrySinkVtbl d2d_outline_sink_vtbl =
+{
+    d2d_outline_sink_QueryInterface,
+    d2d_outline_sink_AddRef,
+    d2d_outline_sink_Release,
+    d2d_outline_sink_SetFillMode,
+    d2d_outline_sink_SetSegmentFlags,
+    d2d_outline_sink_BeginFigure,
+    d2d_outline_sink_AddLines,
+    d2d_outline_sink_AddBeziers,
+    d2d_outline_sink_EndFigure,
+    d2d_outline_sink_Close,
+};
+
+static float d2d_outline_turn(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b, const D2D1_POINT_2F *c)
+{
+    return (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+}
+
+/* A proper crossing of the segments ab and cd.  Touching at a point or
+ * overlapping along a line does not count: a contour that touches itself
+ * still encloses one region. */
+static BOOL d2d_outline_segments_cross(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b,
+        const D2D1_POINT_2F *c, const D2D1_POINT_2F *d)
+{
+    float d1 = d2d_outline_turn(c, d, a), d2 = d2d_outline_turn(c, d, b);
+    float d3 = d2d_outline_turn(a, b, c), d4 = d2d_outline_turn(a, b, d);
+
+    return ((d1 > 0.0f && d2 < 0.0f) || (d1 < 0.0f && d2 > 0.0f))
+            && ((d3 > 0.0f && d4 < 0.0f) || (d3 < 0.0f && d4 > 0.0f));
+}
+
+/* Does this closed contour cross itself?  One that turns the same way at
+ * every vertex and comes round exactly once is convex and cannot; the same
+ * turning over two revolutions is a star that overlaps itself.  Anything
+ * else is tested edge against edge, up to a size where that stops being
+ * cheap and the sweep is the better answer anyway. */
+static BOOL d2d_outline_contour_is_simple(const struct d2d_combine_contour *contour)
+{
+    const D2D1_POINT_2F *p = contour->points;
+    size_t n = contour->count, i, j;
+    double turning = 0.0;
+    BOOL convex = TRUE;
+    int sign = 0;
+
+    for (i = 0; i < n; ++i)
+    {
+        const D2D1_POINT_2F *a = &p[i], *b = &p[(i + 1) % n], *c = &p[(i + 2) % n];
+        float cross = d2d_outline_turn(a, b, c);
+        float dot = (b->x - a->x) * (c->x - b->x) + (b->y - a->y) * (c->y - b->y);
+
+        turning += atan2(cross, dot);
+        if (cross == 0.0f)
+            continue;
+        if (!sign)
+            sign = cross > 0.0f ? 1 : -1;
+        else if ((cross > 0.0f) != (sign > 0))
+            convex = FALSE;
+    }
+    if (convex)
+        return fabs(turning) < 3.0 * M_PI;
+
+    if (n > 1024)
+        return FALSE;
+    for (i = 0; i < n; ++i)
+    {
+        for (j = i + 2; j < n; ++j)
+        {
+            if (i == 0 && j == n - 1)
+                continue;   /* neighbours through the closing edge */
+            if (d2d_outline_segments_cross(&p[i], &p[(i + 1) % n], &p[j], &p[(j + 1) % n]))
+                return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* ID2D1Geometry::Outline(): the boundary of what the geometry fills, free of
+ * self-intersections and with nonzero winding, covering the same region the
+ * geometry covers under its own fill mode.
+ *
+ * A single figure that does not cross itself is its own outline, and goes on
+ * with its curves intact: Windows keeps them too, and a wide stroke over the
+ * flattened polygon shows every vertex of the flattening -- measured on the
+ * 10 px frame Cubase draws around its splash, which left single transparent
+ * pixels at the joins.
+ *
+ * Everything else is the boolean union of the geometry with nothing, so it
+ * takes the sweep CombineWithGeometry() runs, with the geometry as the only
+ * operand: the trapezoids the sweep leaves are exactly the filled region, and
+ * tracing their outline cancels the interior edges.  A second, identical
+ * operand would only put coincident edges into the sweep.  Curves come back
+ * flattened to the tolerance there, which the contract allows.
+ *
+ * Cubase 15 draws the rounded corners of its start-up splash by clearing the
+ * four corner squares and stroking the outline of a rounded-rectangle path it
+ * builds itself, 10 px wide in the background colour; on E_NOTIMPL it skipped
+ * that stroke and the corners stayed transparent (issue 335).  Measured over
+ * a start-up: 103 calls, all on path geometries. */
+static HRESULT d2d_geometry_outline(ID2D1Geometry *geometry, const D2D1_MATRIX_3X2_F *transform,
+        float tolerance, ID2D1SimplifiedGeometrySink *sink)
+{
+    struct d2d_combine_trapezoid *traps = NULL;
+    struct d2d_combine_edges edges = {0};
+    struct d2d_combine_shape shape;
+    size_t trap_count = 0;
+    HRESULT hr;
+
+    if (!sink)
+        return E_INVALIDARG;
+
+    if (FAILED(hr = d2d_combine_shape_init(&shape, geometry, transform, tolerance)))
+        return hr;
+
+    if (shape.count == 1 && d2d_outline_contour_is_simple(&shape.contours[0]))
+    {
+        struct d2d_outline_sink wrap =
+        {
+            .ID2D1SimplifiedGeometrySink_iface.lpVtbl = &d2d_outline_sink_vtbl,
+            .sink = sink,
+        };
+
+        TRACE("Single simple figure, passing it on with its curves.\n");
+        hr = ID2D1Geometry_Simplify(geometry, D2D1_GEOMETRY_SIMPLIFICATION_OPTION_CUBICS_AND_LINES,
+                transform, tolerance, &wrap.ID2D1SimplifiedGeometrySink_iface);
+        goto done;
+    }
+
+    if (shape.has_curves)
+    {
+        FIXME("Curves are not handled, ignoring.\n");
+        hr = E_NOTIMPL;
+        goto done;
+    }
+
+    if (!d2d_combine_edges_add_shape(&edges, &shape, 0))
+    {
+        hr = E_OUTOFMEMORY;
+        goto done;
+    }
+
+    if (SUCCEEDED(hr = d2d_combine_edges_op(&edges, shape.fill_mode, D2D1_FILL_MODE_ALTERNATE,
+            D2D1_COMBINE_MODE_UNION, &traps, &trap_count)))
+    {
+        struct d2d_combine_shape outline;
+
+        if (d2d_combine_trapezoids_to_outline(traps, trap_count, &outline))
+        {
+            d2d_combine_write_shape(sink, &outline);
+            d2d_combine_shape_cleanup(&outline);
+        }
+        else
+        {
+            d2d_combine_write_trapezoids(sink, traps, trap_count);
+        }
+        free(traps);
+    }
+
+done:
+    free(edges.edges);
+    d2d_combine_shape_cleanup(&shape);
+    return hr;
+}
 
 static HRESULT d2d_geometry_tessellate(ID2D1Geometry *geometry, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, ID2D1TessellationSink *sink)
@@ -4411,18 +7853,23 @@ static HRESULT STDMETHODCALLTYPE d2d_path_geometry_CombineWithGeometry(ID2D1Path
         ID2D1Geometry *geometry, D2D1_COMBINE_MODE combine_mode, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p stub!\n",
+    struct d2d_geometry *g = impl_from_ID2D1PathGeometry1(iface);
+
+    TRACE("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p.\n",
             iface, geometry, combine_mode, transform, tolerance, sink);
 
-    return E_NOTIMPL;
+    return d2d_geometry_combine(&g->ID2D1Geometry_iface, geometry, combine_mode, transform,
+            tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_Outline(ID2D1PathGeometry1 *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1PathGeometry1(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_path_geometry_ComputeArea(ID2D1PathGeometry1 *iface,
@@ -4808,10 +8255,21 @@ static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_GetWidenedBounds(ID2D1Elli
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1EllipseGeometry_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_StrokeContainsPoint(ID2D1EllipseGeometry *iface,
@@ -4930,18 +8388,23 @@ static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_CombineWithGeometry(ID2D1E
         ID2D1Geometry *geometry, D2D1_COMBINE_MODE combine_mode, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p stub!\n",
+    struct d2d_geometry *g = impl_from_ID2D1EllipseGeometry(iface);
+
+    TRACE("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p.\n",
             iface, geometry, combine_mode, transform, tolerance, sink);
 
-    return E_NOTIMPL;
+    return d2d_geometry_combine(&g->ID2D1Geometry_iface, geometry, combine_mode, transform,
+            tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_Outline(ID2D1EllipseGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1EllipseGeometry(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_ellipse_geometry_ComputeArea(ID2D1EllipseGeometry *iface,
@@ -5214,10 +8677,21 @@ static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_GetWidenedBounds(ID2D1Re
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1RectangleGeometry_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_StrokeContainsPoint(ID2D1RectangleGeometry *iface,
@@ -5381,18 +8855,23 @@ static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_CombineWithGeometry(ID2D
         ID2D1Geometry *geometry, D2D1_COMBINE_MODE combine_mode, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p stub!\n",
+    struct d2d_geometry *g = impl_from_ID2D1RectangleGeometry(iface);
+
+    TRACE("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p.\n",
             iface, geometry, combine_mode, transform, tolerance, sink);
 
-    return E_NOTIMPL;
+    return d2d_geometry_combine(&g->ID2D1Geometry_iface, geometry, combine_mode, transform,
+            tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_Outline(ID2D1RectangleGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1RectangleGeometry(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rectangle_geometry_ComputeArea(ID2D1RectangleGeometry *iface,
@@ -5591,6 +9070,78 @@ fail:
     return E_OUTOFMEMORY;
 }
 
+/* Session 6 (C1): Re-initialize a rectangle geometry for a new rect, reusing
+ * the existing fill/outline arrays instead of freeing + reallocating. The
+ * arrays are already sized for 4 vertices + 8 outline verts + 8 joins after
+ * the first FillRectangle call, so d2d_array_reserve becomes a no-op on every
+ * subsequent call. Caller must ensure the geometry was previously initialised
+ * as a rectangle geometry (so vtable, factory, transform, and arrays match). */
+void d2d_rectangle_geometry_reinit(struct d2d_geometry *geometry, const D2D1_RECT_F *rect)
+{
+    static const D2D1_POINT_2F prev[] =
+    {
+        { 1.0f,  0.0f},
+        { 0.0f, -1.0f},
+        {-1.0f,  0.0f},
+        { 0.0f,  1.0f},
+    };
+    static const D2D1_POINT_2F next[] =
+    {
+        { 0.0f,  1.0f},
+        { 1.0f,  0.0f},
+        { 0.0f, -1.0f},
+        {-1.0f,  0.0f},
+    };
+    D2D1_POINT_2F *v;
+    struct d2d_face *f;
+    float l, r, t, b;
+
+    /* Reset counts — arrays stay allocated. */
+    geometry->fill.vertex_count = 0;
+    geometry->fill.face_count = 0;
+    geometry->fill.bezier_vertex_count = 0;
+    geometry->fill.arc_vertex_count = 0;
+    geometry->outline.vertex_count = 0;
+    geometry->outline.face_count = 0;
+    geometry->outline.bezier_count = 0;
+    geometry->outline.bezier_face_count = 0;
+    geometry->outline.arc_count = 0;
+    geometry->outline.arc_face_count = 0;
+
+    geometry->u.rectangle.rect = *rect;
+
+    l = min(rect->left, rect->right);
+    r = max(rect->left, rect->right);
+    t = min(rect->top, rect->bottom);
+    b = max(rect->top, rect->bottom);
+
+    /* fill.vertices already allocated (4 slots) on first init — reuse. */
+    v = geometry->fill.vertices;
+    d2d_point_set(&v[0], l, t);
+    d2d_point_set(&v[1], l, b);
+    d2d_point_set(&v[2], r, b);
+    d2d_point_set(&v[3], r, t);
+    geometry->fill.vertex_count = 4;
+
+    f = geometry->fill.faces;
+    d2d_face_set(&f[0], 1, 2, 0);
+    d2d_face_set(&f[1], 0, 2, 3);
+    geometry->fill.face_count = 2;
+
+    /* Outline tessellation — d2d_array_reserve is a no-op because arrays are
+     * already sized from the first init (or a previous reinit with larger
+     * rect). These calls just write into the existing buffers. */
+    d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1]);
+    d2d_geometry_outline_add_line_segment(geometry, &v[1], &v[2]);
+    d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3]);
+    d2d_geometry_outline_add_line_segment(geometry, &v[3], &v[0]);
+
+    d2d_geometry_outline_add_join(geometry, &prev[0], &v[0], &next[0]);
+    d2d_geometry_outline_add_join(geometry, &prev[1], &v[1], &next[1]);
+    d2d_geometry_outline_add_join(geometry, &prev[2], &v[2], &next[2]);
+    d2d_geometry_outline_add_join(geometry, &prev[3], &v[3], &next[3]);
+}
+
 static inline struct d2d_geometry *impl_from_ID2D1RoundedRectangleGeometry(ID2D1RoundedRectangleGeometry *iface)
 {
     return CONTAINING_RECORD(iface, struct d2d_geometry, ID2D1Geometry_iface);
@@ -5665,10 +9216,21 @@ static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_GetWidenedBounds
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1RoundedRectangleGeometry_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_StrokeContainsPoint(
@@ -5734,25 +9296,25 @@ static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_Simplify(ID2D1Ro
 
     d2d_ellipse_to_segments(&ellipse, &start_point, segments);
 
-    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.bottom + r->radiusY);
+    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.top + r->radiusY);
     d2d_point_translate(&start_point, p.x, p.y);
     d2d_bezier_segment_translate(&segments[0], p.x, p.y);
-    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.bottom + r->radiusY);
+    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.top + r->radiusY);
     d2d_bezier_segment_translate(&segments[1], p.x, p.y);
-    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.top - r->radiusY);
+    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.bottom - r->radiusY);
     d2d_bezier_segment_translate(&segments[2], p.x, p.y);
-    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.top - r->radiusY);
+    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.bottom - r->radiusY);
     d2d_bezier_segment_translate(&segments[3], p.x, p.y);
 
     ret = d2d_figure_begin(&figure, start_point, D2D1_FIGURE_BEGIN_FILLED);
     ret = ret && d2d_figure_add_beziers(&figure, &segments[0], 1);
-    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.bottom);
+    d2d_point_set(&p, r->rect.right - r->radiusX, r->rect.top);
     ret = ret && d2d_figure_add_lines(&figure, &p, 1);
     ret = ret && d2d_figure_add_beziers(&figure, &segments[1], 1);
-    d2d_point_set(&p, r->rect.right, r->rect.top - r->radiusY);
+    d2d_point_set(&p, r->rect.right, r->rect.bottom - r->radiusY);
     ret = ret && d2d_figure_add_lines(&figure, &p, 1);
     ret = ret && d2d_figure_add_beziers(&figure, &segments[2], 1);
-    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.top);
+    d2d_point_set(&p, r->rect.left + r->radiusX, r->rect.bottom);
     ret = ret && d2d_figure_add_lines(&figure, &p, 1);
     ret = ret && d2d_figure_add_beziers(&figure, &segments[3], 1);
     if (!ret)
@@ -5783,18 +9345,23 @@ static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_CombineWithGeome
         ID2D1RoundedRectangleGeometry *iface, ID2D1Geometry *geometry, D2D1_COMBINE_MODE combine_mode,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p stub!\n",
+    struct d2d_geometry *g = impl_from_ID2D1RoundedRectangleGeometry(iface);
+
+    TRACE("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p.\n",
             iface, geometry, combine_mode, transform, tolerance, sink);
 
-    return E_NOTIMPL;
+    return d2d_geometry_combine(&g->ID2D1Geometry_iface, geometry, combine_mode, transform,
+            tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_Outline(ID2D1RoundedRectangleGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1RoundedRectangleGeometry(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_rounded_rectangle_geometry_ComputeArea(ID2D1RoundedRectangleGeometry *iface,
@@ -5920,23 +9487,23 @@ static const struct d2d_geometry_ops d2d_rounded_rectangle_geometry_ops =
     .stream = d2d_rounded_rectangle_geometry_stream,
 };
 
-HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
-        ID2D1Factory *factory, const D2D1_ROUNDED_RECT *rounded_rect)
+/* The fill of a rounded rectangle: eight vertices on the straight edges, six
+ * faces between them and an arc triangle per corner. The fill arrays are
+ * reused when they are already there, which is what the reinit below relies
+ * on. v1..v4 receive the corners, the outline tessellation needs them too. */
+static BOOL d2d_rounded_rectangle_geometry_fill(struct d2d_geometry *geometry,
+        const D2D1_ROUNDED_RECT *rounded_rect, D2D1_POINT_2F *corners)
 {
-    D2D1_POINT_2F *v, v1, v2, v3, v4;
+    D2D1_POINT_2F *v, *v1 = &corners[0], *v2 = &corners[1], *v3 = &corners[2], *v4 = &corners[3];
     struct d2d_face *f;
     float l, r, t, b;
     float rx, ry;
 
-    d2d_geometry_init(geometry, factory, &identity, (ID2D1GeometryVtbl *)&d2d_rounded_rectangle_geometry_vtbl,
-            &d2d_rounded_rectangle_geometry_ops);
-    geometry->u.rounded_rectangle.rounded_rect = *rounded_rect;
-
-    if (!(geometry->fill.vertices = malloc(8 * sizeof(*geometry->fill.vertices))))
-        goto fail;
+    if (!geometry->fill.vertices && !(geometry->fill.vertices = malloc(8 * sizeof(*geometry->fill.vertices))))
+        return FALSE;
     if (!d2d_array_reserve((void **)&geometry->fill.faces,
             &geometry->fill.faces_size, 6, sizeof(*geometry->fill.faces)))
-        goto fail;
+        return FALSE;
 
     l = min(rounded_rect->rect.left, rounded_rect->rect.right);
     r = max(rounded_rect->rect.left, rounded_rect->rect.right);
@@ -5946,10 +9513,10 @@ HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
     rx = min(rounded_rect->radiusX, 0.5f * (r - l));
     ry = min(rounded_rect->radiusY, 0.5f * (b - t));
 
-    d2d_point_set(&v1, r, t);
-    d2d_point_set(&v2, r, b);
-    d2d_point_set(&v3, l, b);
-    d2d_point_set(&v4, l, t);
+    d2d_point_set(v1, r, t);
+    d2d_point_set(v2, r, b);
+    d2d_point_set(v3, l, b);
+    d2d_point_set(v4, l, t);
 
     v = geometry->fill.vertices;
     d2d_point_set(&v[0], l + rx, t);
@@ -5971,30 +9538,73 @@ HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
     d2d_face_set(&f[5], 1, 3, 2);
     geometry->fill.face_count = 6;
 
-    if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[1], &v1, &v[2]))
+    if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[1], v1, &v[2]))
+        return FALSE;
+    if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[3], v2, &v[4]))
+        return FALSE;
+    if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[5], v3, &v[6]))
+        return FALSE;
+    if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[7], v4, &v[0]))
+        return FALSE;
+
+    return TRUE;
+}
+
+/* Re-initialises a rounded rectangle geometry for another rounded rectangle,
+ * fill only: the outline is left empty, so the geometry can only be filled.
+ * FillRoundedRectangle() keeps one such geometry per device context instead
+ * of building a factory object, with its outline tessellation, for every call
+ * (Cymatics Hotline draws its LCD dot matrix as 1931 rounded rectangles per
+ * frame). The geometry has to have been initialised as a rounded rectangle. */
+void d2d_rounded_rectangle_geometry_reinit_fill(struct d2d_geometry *geometry,
+        const D2D1_ROUNDED_RECT *rounded_rect)
+{
+    D2D1_POINT_2F corners[4];
+
+    geometry->fill.vertex_count = 0;
+    geometry->fill.face_count = 0;
+    geometry->fill.bezier_vertex_count = 0;
+    geometry->fill.arc_vertex_count = 0;
+    geometry->outline.vertex_count = 0;
+    geometry->outline.face_count = 0;
+    geometry->outline.bezier_count = 0;
+    geometry->outline.bezier_face_count = 0;
+    geometry->outline.arc_count = 0;
+    geometry->outline.arc_face_count = 0;
+
+    geometry->u.rounded_rectangle.rounded_rect = *rounded_rect;
+    /* The arrays are sized from the first initialisation, so this cannot fail. */
+    d2d_rounded_rectangle_geometry_fill(geometry, rounded_rect, corners);
+}
+
+HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
+        ID2D1Factory *factory, const D2D1_ROUNDED_RECT *rounded_rect)
+{
+    D2D1_POINT_2F *v, corners[4], *v1 = &corners[0], *v2 = &corners[1], *v3 = &corners[2], *v4 = &corners[3];
+
+    d2d_geometry_init(geometry, factory, &identity, (ID2D1GeometryVtbl *)&d2d_rounded_rectangle_geometry_vtbl,
+            &d2d_rounded_rectangle_geometry_ops);
+    geometry->u.rounded_rectangle.rounded_rect = *rounded_rect;
+
+    if (!d2d_rounded_rectangle_geometry_fill(geometry, rounded_rect, corners))
         goto fail;
-    if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[3], &v2, &v[4]))
-        goto fail;
-    if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[5], &v3, &v[6]))
-        goto fail;
-    if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[7], &v4, &v[0]))
-        goto fail;
+    v = geometry->fill.vertices;
 
     if (!d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1]))
         goto fail;
-    if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[1], &v1, &v[2]))
+    if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[1], v1, &v[2]))
         goto fail;
     if (!d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3]))
         goto fail;
-    if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[3], &v2, &v[4]))
+    if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[3], v2, &v[4]))
         goto fail;
     if (!d2d_geometry_outline_add_line_segment(geometry, &v[4], &v[5]))
         goto fail;
-    if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[5], &v3, &v[6]))
+    if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[5], v3, &v[6]))
         goto fail;
     if (!d2d_geometry_outline_add_line_segment(geometry, &v[6], &v[7]))
         goto fail;
-    if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[7], &v4, &v[0]))
+    if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[7], v4, &v[0]))
         goto fail;
 
     return S_OK;
@@ -6096,10 +9706,21 @@ static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_GetWidenedBounds(ID2D1
         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, D2D1_RECT_F *bounds)
 {
-    FIXME("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p stub!\n",
+    D2D1_RECT_F fill_bounds;
+    HRESULT hr;
+
+    TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
             iface, stroke_width, stroke_style, transform, tolerance, bounds);
 
-    return E_NOTIMPL;
+    if (tolerance <= 0.0f)
+        tolerance = D2D1_DEFAULT_FLATTENING_TOLERANCE;
+
+    if (FAILED(hr = ID2D1TransformedGeometry_GetBounds(iface, transform, &fill_bounds)))
+        return hr;
+
+    d2d_geometry_widen_bounds(&fill_bounds, stroke_width, stroke_style, bounds);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_StrokeContainsPoint(ID2D1TransformedGeometry *iface,
@@ -6185,18 +9806,23 @@ static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_CombineWithGeometry(ID
         ID2D1Geometry *geometry, D2D1_COMBINE_MODE combine_mode, const D2D1_MATRIX_3X2_F *transform,
         float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p stub!\n",
+    struct d2d_geometry *g = impl_from_ID2D1TransformedGeometry(iface);
+
+    TRACE("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p.\n",
             iface, geometry, combine_mode, transform, tolerance, sink);
 
-    return E_NOTIMPL;
+    return d2d_geometry_combine(&g->ID2D1Geometry_iface, geometry, combine_mode, transform,
+            tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_Outline(ID2D1TransformedGeometry *iface,
         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
 {
-    FIXME("iface %p, transform %p, tolerance %.8e, sink %p stub!\n", iface, transform, tolerance, sink);
+    struct d2d_geometry *geometry = impl_from_ID2D1TransformedGeometry(iface);
 
-    return E_NOTIMPL;
+    TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+
+    return d2d_geometry_outline(&geometry->ID2D1Geometry_iface, transform, tolerance, sink);
 }
 
 static HRESULT STDMETHODCALLTYPE d2d_transformed_geometry_ComputeArea(ID2D1TransformedGeometry *iface,

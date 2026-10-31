@@ -112,6 +112,7 @@ typedef struct _WINE_ACMNOTIFYWND
 
 /* From internal.c */
 extern HANDLE MSACM_hHeap;
+extern CRITICAL_SECTION MSACM_cs;
 extern PWINE_ACMDRIVERID MSACM_pFirstACMDriverID;
 extern PWINE_ACMDRIVERID MSACM_RegisterDriver(LPCWSTR pszDriverAlias, LPCWSTR pszFileName,
                                               PWINE_ACMLOCALDRIVER pLocalDriver);

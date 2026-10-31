@@ -154,7 +154,7 @@ static void free_buffer( const struct opengl_funcs *funcs, struct buffer *buffer
 {
     if (buffer->vk_memory)
     {
-        if (buffer->map_ptr) unmap_vk_buffer( buffer );
+        if (buffer->host_ptr) unmap_vk_buffer( buffer );
         buffer->vk_device->p_vkFreeMemory( buffer->vk_device->vk_device, buffer->vk_memory, NULL );
     }
     if (buffer->gl_memory && funcs) funcs->p_glDeleteMemoryObjectsEXT( 1, &buffer->gl_memory );
@@ -306,9 +306,10 @@ static BOOL initialize_vk_device( TEB *teb, const struct opengl_context *ctx )
         };
         VkApplicationInfo app_info =
         {
-            .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
             .pEngineName = "Wine WGL",
             .engineVersion = 1,
+            .apiVersion = VK_API_VERSION_1_0,
         };
         VkInstanceCreateInfo create_info =
         {
@@ -1630,6 +1631,17 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
         VkResult vr;
         struct vk_device *vk_device = buffers.vk_device;
 
+        /* The Vulkan mapping is kept across GL map/unmap cycles and only released
+         * together with the buffer: wined3d maps and unmaps its allocator chunks
+         * around every upload, and on some drivers (NVIDIA) each placed map/unmap
+         * is a full mmap/munmap of the whole allocation. */
+        if (buffer->host_ptr)
+        {
+            buffer->map_ptr = (char *)buffer->host_ptr + offset;
+            TRACE( "reusing vk mapping %p\n", buffer->map_ptr );
+            return buffer->map_ptr;
+        }
+
         if (!buffer_vm_alloc( teb, buffer, buffer->size )) return NULL;
         placed_info.pPlacedAddress = buffer->vm_ptr;
         vr = vk_device->p_vkMapMemory2KHR( vk_device->vk_device, &map_info, &buffer->host_ptr );
@@ -1862,7 +1874,9 @@ static BOOL wow64_unmap_buffer( TEB *teb, struct buffer *buffer )
             set_gl_error( teb, GL_INVALID_OPERATION );
             return FALSE;
         }
-        unmap_vk_buffer( buffer );
+        /* end the GL mapping but keep the Vulkan mapping, see wow64_map_buffer() */
+        buffer->map_ptr = NULL;
+        return TRUE;
     }
 
     if (buffer->copy_length)

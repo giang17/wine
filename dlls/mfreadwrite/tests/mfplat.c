@@ -356,6 +356,8 @@ static HRESULT WINAPI test_media_stream_GetStreamDescriptor(IMFMediaStream *ifac
 }
 
 static BOOL fail_request_sample;
+/* test decoder fills its NV12 output with a bright top half and a dark bottom half */
+static BOOL test_decoder_fill_rows;
 
 static HRESULT WINAPI test_media_stream_RequestSample(IMFMediaStream *iface, IUnknown *token)
 {
@@ -3357,6 +3359,38 @@ static HRESULT WINAPI test_decoder_ProcessOutput(IMFTransform *iface, DWORD flag
         decoder->next_output = MF_E_TRANSFORM_NEED_MORE_INPUT;
         hr = IMFSample_SetSampleTime(data->pSample, 0);
         ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+        if (test_decoder_fill_rows)
+        {
+            UINT64 frame_size = (UINT64)96 << 32 | 96;
+            DWORD max_length, length;
+            UINT32 width, height;
+            BYTE *data_ptr;
+
+            if (decoder->output_type)
+                IMFMediaType_GetUINT64(decoder->output_type, &MF_MT_FRAME_SIZE, &frame_size);
+            width = frame_size >> 32;
+            height = (UINT32)frame_size;
+            length = width * height * 3 / 2;
+
+            hr = IMFSample_GetBufferByIndex(data->pSample, 0, &buffer);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            hr = IMFMediaBuffer_Lock(buffer, &data_ptr, &max_length, NULL);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            ok(max_length >= length, "got max_length %lu, expected at least %lu.\n", max_length, length);
+            if (SUCCEEDED(hr) && max_length >= length)
+            {
+                memset(data_ptr, 235, width * height / 2);
+                memset(data_ptr + width * height / 2, 16, width * height / 2);
+                memset(data_ptr + width * height, 128, width * height / 2);
+            }
+            hr = IMFMediaBuffer_Unlock(buffer);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            hr = IMFMediaBuffer_SetCurrentLength(buffer, length);
+            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+            IMFMediaBuffer_Release(buffer);
+        }
+
         return S_OK;
     }
 
@@ -3616,6 +3650,216 @@ static void test_source_reader_transform_stream_change(void)
     fail_request_sample = TRUE;
 
     IMFTransform_Release(test_decoder);
+
+skip_tests:
+    IMFSourceReader_Release(reader);
+
+    hr = MFTUnregisterLocal(&factory);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+}
+
+#define check_sample_row_order(a, b, c) check_sample_row_order_(__LINE__, a, b, c)
+static void check_sample_row_order_(unsigned int line, IMFSample *sample, UINT32 width, UINT32 height)
+{
+    DWORD length, top, bottom;
+    IMFMediaBuffer *buffer;
+    BYTE *data;
+    HRESULT hr;
+
+    hr = IMFSample_ConvertToContiguousBuffer(sample, &buffer);
+    ok_(__FILE__, line)(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFMediaBuffer_Lock(buffer, &data, NULL, &length);
+    ok_(__FILE__, line)(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok_(__FILE__, line)(length == width * height * 4, "got length %lu.\n", length);
+    if (SUCCEEDED(hr) && length == width * height * 4)
+    {
+        /* RGB32 as the reader delivers it is top-down: the bright half of the
+         * decoder's NV12 frame comes first, the dark half last */
+        top = *(DWORD *)(data + (width / 2) * 4) & 0xffffff;
+        bottom = *(DWORD *)(data + ((height - 1) * width + width / 2) * 4) & 0xffffff;
+        ok_(__FILE__, line)((top & 0xff) > 0x80 && ((top >> 8) & 0xff) > 0x80 && ((top >> 16) & 0xff) > 0x80,
+                "got top row pixel %#lx, expected bright.\n", top);
+        ok_(__FILE__, line)((bottom & 0xff) < 0x80 && ((bottom >> 8) & 0xff) < 0x80 && ((bottom >> 16) & 0xff) < 0x80,
+                "got bottom row pixel %#lx, expected dark.\n", bottom);
+    }
+    IMFMediaBuffer_Unlock(buffer);
+    IMFMediaBuffer_Release(buffer);
+}
+
+/* The video processor picks its row order from MF_MT_DEFAULT_STRIDE on its output type whenever
+ * it (re)creates its conversion pipeline. The reader pins the stride on the type it hands over,
+ * keeps it off the type it reports, and the samples have to stay top-down after the processor is
+ * re-negotiated: through an upstream stream change, and through the exposed transform itself. */
+static void test_source_reader_processor_row_order(void)
+{
+    static const struct attribute_desc test_stream_type_desc[] =
+    {
+        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
+        ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_TEST),
+        ATTR_RATIO(MF_MT_FRAME_SIZE, 96, 96),
+        {0},
+    };
+    static const struct attribute_desc rgb32_stream_type_desc[] =
+    {
+        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
+        ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32),
+        {0},
+    };
+    static const struct attribute_desc rgb32_expect_desc[] =
+    {
+        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
+        ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32),
+        ATTR_RATIO(MF_MT_FRAME_SIZE, 96, 96),
+        ATTR_UINT32(MF_MT_DEFAULT_STRIDE, 96 * 4, .not_present = TRUE),
+        {0},
+    };
+    const MFT_REGISTER_TYPE_INFO output_info[] =
+    {
+        {MFMediaType_Video, MFVideoFormat_NV12},
+        {MFMediaType_Video, MFVideoFormat_YUY2},
+    };
+    const MFT_REGISTER_TYPE_INFO input_info[] =
+    {
+        {MFMediaType_Video, MFVideoFormat_TEST},
+    };
+    MFVIDEOFORMAT output_format = {.dwSize = sizeof(output_format)};
+    IClassFactory factory = {.lpVtbl = &test_mft_factory_vtbl};
+    IMFTransform *test_decoder, *video_processor;
+    IMFStreamDescriptor *video_stream;
+    IMFSourceReaderEx *reader_ex;
+    IMFAttributes *attributes;
+    IMFMediaType *media_type;
+    IMFSourceReader *reader;
+    IMFMediaSource *source;
+    LONGLONG timestamp;
+    DWORD index, flags;
+    IMFSample *sample;
+    HRESULT hr;
+
+    hr = MFTRegisterLocal(&factory, &MFT_CATEGORY_VIDEO_DECODER, L"Test Decoder", 0,
+            ARRAY_SIZE(input_info), input_info, ARRAY_SIZE(output_info), output_info);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = MFCreateAttributes(&attributes, 1);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFAttributes_SetUINT32(attributes, &MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    hr = MFCreateMediaType(&media_type);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    init_media_type(media_type, test_stream_type_desc, -1);
+    hr = MFCreateStreamDescriptor(0, 1, &media_type, &video_stream);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    IMFMediaType_Release(media_type);
+
+    source = create_test_source(&video_stream, 1);
+    ok(!!source, "Failed to create test source.\n");
+    IMFStreamDescriptor_Release(video_stream);
+
+    hr = MFCreateSourceReaderFromMediaSource(source, attributes, &reader);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    IMFMediaSource_Release(source);
+    IMFAttributes_Release(attributes);
+
+    hr = IMFSourceReader_QueryInterface(reader, &IID_IMFSourceReaderEx, (void **)&reader_ex);
+    ok(hr == S_OK || broken(hr == E_NOINTERFACE) /* Win7 */, "Unexpected hr %#lx.\n", hr);
+    if (broken(hr == E_NOINTERFACE))
+    {
+        win_skip("missing IMFSourceReaderEx interface, skipping tests on Win7\n");
+        goto skip_tests;
+    }
+
+    hr = IMFSourceReader_SetStreamSelection(reader, 0, TRUE);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    /* test decoder (TEST -> NV12) followed by the video processor (NV12 -> RGB32) */
+    hr = MFCreateMediaType(&media_type);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    init_media_type(media_type, rgb32_stream_type_desc, -1);
+    hr = IMFSourceReader_SetCurrentMediaType(reader, 0, NULL, media_type);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    IMFMediaType_Release(media_type);
+
+    hr = IMFSourceReader_GetCurrentMediaType(reader, 0, &media_type);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    check_media_type(media_type, rgb32_expect_desc, -1);
+    IMFMediaType_Release(media_type);
+
+    hr = IMFSourceReaderEx_GetTransformForStream(reader_ex, 0, 0, NULL, &test_decoder);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(test_decoder->lpVtbl == &test_decoder_vtbl, "got unexpected transform\n");
+    hr = IMFSourceReaderEx_GetTransformForStream(reader_ex, 0, 1, NULL, &video_processor);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(video_processor->lpVtbl != &test_decoder_vtbl, "got unexpected transform\n");
+
+    fail_request_sample = FALSE;
+    test_decoder_fill_rows = TRUE;
+
+    /* freshly negotiated */
+    test_decoder_set_next_output(test_decoder, S_OK);
+    sample = (void *)0xdeadbeef;
+    index = flags = timestamp = 0xdeadbeef;
+    hr = IMFSourceReader_ReadSample(reader, 0, 0, &index, &flags, &timestamp, &sample);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(index == 0, "got %lu.\n", index);
+    ok(flags == 0, "got %lu.\n", flags);
+    ok(sample != (void *)0xdeadbeef, "got %p.\n", sample);
+    if (sample != (void *)0xdeadbeef)
+    {
+        check_sample_row_order(sample, 96, 96);
+        IMFSample_Release(sample);
+    }
+
+    /* re-negotiated after a stream change of the decoder, which sets a new input type on the
+     * processor; the processor absorbs it and the type reported to the caller stays the same */
+    test_decoder_set_next_output(test_decoder, MF_E_TRANSFORM_STREAM_CHANGE);
+    output_format.videoInfo.dwWidth = 96;
+    output_format.videoInfo.dwHeight = 96;
+    test_decoder_set_output_format(test_decoder, &output_format);
+    sample = (void *)0xdeadbeef;
+    index = flags = timestamp = 0xdeadbeef;
+    hr = IMFSourceReader_ReadSample(reader, 0, 0, &index, &flags, &timestamp, &sample);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(index == 0, "got %lu.\n", index);
+    ok(flags == 0, "got %lu.\n", flags);
+    ok(sample != (void *)0xdeadbeef, "got %p.\n", sample);
+    if (sample != (void *)0xdeadbeef)
+    {
+        check_sample_row_order(sample, 96, 96);
+        IMFSample_Release(sample);
+    }
+
+    hr = IMFSourceReader_GetCurrentMediaType(reader, 0, &media_type);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    check_media_type(media_type, rgb32_expect_desc, -1);
+    IMFMediaType_Release(media_type);
+
+    /* re-negotiated by the caller through the exposed transform */
+    hr = IMFTransform_GetInputCurrentType(video_processor, 0, &media_type);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    hr = IMFTransform_SetInputType(video_processor, 0, media_type, 0);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    IMFMediaType_Release(media_type);
+
+    test_decoder_set_next_output(test_decoder, S_OK);
+    sample = (void *)0xdeadbeef;
+    index = flags = timestamp = 0xdeadbeef;
+    hr = IMFSourceReader_ReadSample(reader, 0, 0, &index, &flags, &timestamp, &sample);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(flags == 0, "got %lu.\n", flags);
+    ok(sample != (void *)0xdeadbeef, "got %p.\n", sample);
+    if (sample != (void *)0xdeadbeef)
+    {
+        check_sample_row_order(sample, 96, 96);
+        IMFSample_Release(sample);
+    }
+
+    test_decoder_fill_rows = FALSE;
+    fail_request_sample = TRUE;
+
+    IMFTransform_Release(video_processor);
+    IMFTransform_Release(test_decoder);
+    IMFSourceReaderEx_Release(reader_ex);
 
 skip_tests:
     IMFSourceReader_Release(reader);
@@ -4243,6 +4487,7 @@ START_TEST(mfplat)
     test_source_reader_transforms(TRUE, FALSE);
     test_source_reader_transforms(FALSE, TRUE);
     test_source_reader_transform_stream_change();
+    test_source_reader_processor_row_order();
     test_source_reader_transforms_d3d9();
     test_source_reader_transforms_d3d11();
     test_source_reader_release();

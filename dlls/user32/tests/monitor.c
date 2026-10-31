@@ -1981,6 +1981,7 @@ static void test_QueryDisplayConfig_result(UINT32 flags,
     DISPLAYCONFIG_TARGET_PREFERRED_MODE preferred_mode;
     DISPLAYCONFIG_ADAPTER_NAME adapter_name;
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color_info;
+    DISPLAYCONFIG_SDR_WHITE_LEVEL white_level;
     const DISPLAYCONFIG_DESKTOP_IMAGE_INFO *di;
 
     for (i = 0; i < paths; i++)
@@ -2039,6 +2040,18 @@ static void test_QueryDisplayConfig_result(UINT32 flags,
         ret = pDisplayConfigGetDeviceInfo(&color_info.header);
         ok(!ret || broken(ret == ERROR_INVALID_PARAMETER) /* before Win10 1709 */,
                 "Expected 0, got %ld\n", ret);
+
+        white_level.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white_level.header.size = sizeof(white_level);
+        white_level.header.adapterId = pi[i].targetInfo.adapterId;
+        white_level.header.id = pi[i].targetInfo.id;
+        white_level.SDRWhiteLevel = 0;
+        ret = pDisplayConfigGetDeviceInfo(&white_level.header);
+        ok(!ret || broken(ret == ERROR_INVALID_PARAMETER) /* before Win10 1709 */,
+                "Expected 0, got %ld\n", ret);
+        if (!ret)
+            ok(white_level.SDRWhiteLevel >= 1000, "Expected SDR white level >= 1000, got %lu\n",
+                    white_level.SDRWhiteLevel);
 
         /* Check corresponding modes */
         if (flags & QDC_VIRTUAL_MODE_AWARE)
@@ -2295,6 +2308,7 @@ static void test_DisplayConfigGetDeviceInfo(void)
     DISPLAYCONFIG_TARGET_PREFERRED_MODE preferred_mode;
     DISPLAYCONFIG_ADAPTER_NAME adapter_name;
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color_info;
+    DISPLAYCONFIG_SDR_WHITE_LEVEL white_level;
 
     ret = pDisplayConfigGetDeviceInfo(NULL);
     ok(ret == ERROR_GEN_FAILURE, "got %ld\n", ret);
@@ -2385,6 +2399,18 @@ static void test_DisplayConfigGetDeviceInfo(void)
     color_info.header.adapterId.LowPart = 0xFFFF;
     color_info.header.adapterId.HighPart = 0xFFFF;
     ret = pDisplayConfigGetDeviceInfo(&color_info.header);
+    ok(ret == ERROR_GEN_FAILURE || ret == ERROR_INVALID_PARAMETER || ret == ERROR_NOT_SUPPORTED, "got %ld\n", ret);
+
+    white_level.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+    white_level.header.size = sizeof(white_level) - 1;
+    ret = pDisplayConfigGetDeviceInfo(&white_level.header);
+    ok(ret == ERROR_INVALID_PARAMETER, "got %ld\n", ret);
+
+    white_level.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+    white_level.header.size = sizeof(white_level);
+    white_level.header.adapterId.LowPart = 0xFFFF;
+    white_level.header.adapterId.HighPart = 0xFFFF;
+    ret = pDisplayConfigGetDeviceInfo(&white_level.header);
     ok(ret == ERROR_GEN_FAILURE || ret == ERROR_INVALID_PARAMETER || ret == ERROR_NOT_SUPPORTED, "got %ld\n", ret);
 }
 

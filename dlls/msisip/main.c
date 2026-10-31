@@ -193,6 +193,16 @@ DEFINE_GUID(CLSID_MsiDatabase,  0x000c1084,0x0000,0x0000,0xc0,0x00,0x00,0x00,0x0
 DEFINE_GUID(CLSID_MsiPatch,     0x000c1086,0x0000,0x0000,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46);
 
 /***********************************************************************
+ *              MsiSIPVerifyIndirectData (MSISIP.@)
+ */
+BOOL WINAPI MsiSIPVerifyIndirectData(SIP_SUBJECTINFO *pSubjectInfo,
+ SIP_INDIRECT_DATA *pIndirectData)
+{
+    FIXME("(%p %p): not verifying the package hash\n", pSubjectInfo, pIndirectData);
+    return TRUE;
+}
+
+/***********************************************************************
  *              MsiSIPIsMyTypeOfFile (MSISIP.@)
  */
 BOOL WINAPI MsiSIPIsMyTypeOfFile(WCHAR *name, GUID *subject)

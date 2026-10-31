@@ -1184,6 +1184,26 @@ static void adapter_vk_flush_bo_address(struct wined3d_context *context,
     flush_bo_range(context_vk, wined3d_bo_vk(bo), (uintptr_t)data->addr, size);
 }
 
+struct wined3d_bo_vk_destroy_ctx
+{
+    struct wined3d_device *device;
+    struct wined3d_bo_vk *bo_vk;
+};
+
+static void wined3d_bo_vk_destroy_object(void *object)
+{
+    struct wined3d_bo_vk_destroy_ctx *ctx = object;
+    struct wined3d_context *context;
+
+    TRACE("ctx %p.\n", ctx);
+
+    context = context_acquire(ctx->device, NULL, 0);
+    wined3d_context_vk_destroy_bo(wined3d_context_vk(context), ctx->bo_vk);
+    context_release(context);
+    free(ctx->bo_vk);
+    free(ctx);
+}
+
 static bool adapter_vk_alloc_bo(struct wined3d_device *device, struct wined3d_resource *resource,
         unsigned int sub_resource_idx, struct wined3d_bo_address *addr)
 {
@@ -1212,6 +1232,15 @@ static bool adapter_vk_alloc_bo(struct wined3d_device *device, struct wined3d_re
         size = texture->sub_resources[sub_resource_idx].size;
     }
 
+    /* The caller writes through the mapping right away. A buffer the CPU
+     * does not access lives in device-local memory, which need not be host
+     * visible; let the caller upload through system memory instead. */
+    if (!(memory_type & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+    {
+        TRACE("Not allocating a BO for resource %p without host-visible memory.\n", resource);
+        return false;
+    }
+
     if (!(bo_vk = malloc(sizeof(*bo_vk))))
         return false;
 
@@ -1222,10 +1251,19 @@ static bool adapter_vk_alloc_bo(struct wined3d_device *device, struct wined3d_re
         return false;
     }
 
-    if (!bo_vk->b.map_ptr)
+    if (!bo_vk->b.map_ptr && !wined3d_bo_vk_map(bo_vk, context_vk))
     {
-        if (!wined3d_bo_vk_map(bo_vk, context_vk))
-            ERR("Failed to map bo.\n");
+        struct wined3d_bo_vk_destroy_ctx *ctx;
+
+        ERR("Failed to map bo.\n");
+        /* The context belongs to the CS thread; destroy the BO there. */
+        if ((ctx = malloc(sizeof(*ctx))))
+        {
+            ctx->device = device;
+            ctx->bo_vk = bo_vk;
+            wined3d_cs_destroy_object(device->cs, wined3d_bo_vk_destroy_object, ctx);
+        }
+        return false;
     }
 
     addr->buffer_object = &bo_vk->b;

@@ -649,6 +649,10 @@ enum wine_internal_message
     WM_WINE_LAST_DRIVER_MSG = 0x80001fff
 };
 
+/* Wine-internal SetWindowPos flag: the window manager raised the window, re-apply the win32
+ * Z-order to the native stacking even if win32u sees no Z-order change (winex11) */
+#define SWP_WINE_ZORDER_SYNC 0x00100000
+
 /* internal IME message */
 #define WM_IME_INTERNAL 0x287
 #define IME_INTERNAL_ACTIVATE   0x17
@@ -1423,12 +1427,22 @@ enum
     NtUserCallHwndParam_SetRawWindowPos,
     NtUserCallHwndParam_GetPrivateData,
     NtUserCallHwndParam_SetPrivateData,
+    NtUserCallHwndParam_GetMinMaxTrack,  /* Wine-specific: cached WM_GETMINMAXINFO track sizes for the display driver */
 };
 
 struct get_window_rects_params
 {
     RECT *rect;
     UINT dpi;
+};
+
+/* NtUserCallHwndParam_GetMinMaxTrack: the ptMinTrackSize/ptMaxTrackSize a window last answered to
+ * WM_GETMINMAXINFO, in raw pixels of the window rect; max_track is 0 when the application set no
+ * limit.  Read from the cache win32u keeps, no message is sent. */
+struct get_min_max_track_params
+{
+    POINT min_track;
+    POINT max_track;
 };
 
 static inline BOOL NtUserClientToScreen( HWND hwnd, POINT *pt )
@@ -1646,6 +1660,11 @@ static inline UINT NtUserGetWinMonitorDpi( HWND hwnd, MONITOR_DPI_TYPE type )
     return NtUserCallHwndParam( hwnd, type, NtUserCallHwndParam_GetWinMonitorDpi );
 }
 
+static inline BOOL NtUserGetMinMaxTrack( HWND hwnd, struct get_min_max_track_params *params )
+{
+    return NtUserCallHwndParam( hwnd, (UINT_PTR)params, NtUserCallHwndParam_GetMinMaxTrack );
+}
+
 struct set_raw_window_pos_params
 {
     RECT rect;
@@ -1683,5 +1702,40 @@ static inline LONG_PTR NtUserSetPrivateData( HWND hwnd, UINT offset, UINT size, 
     struct set_private_data_params params = { .offset = offset, .size = size, .value = value };
     return NtUserCallHwndParam( hwnd, (UINT_PTR)&params, NtUserCallHwndParam_SetPrivateData );
 }
+
+/* undocumented messages sent to the owner of a menu bar to draw and measure it,
+ * part of the non-client theming */
+#define WM_UAHDRAWMENU        0x0091
+#define WM_UAHDRAWMENUITEM    0x0092
+#define WM_UAHINITMENU        0x0093
+#define WM_UAHMEASUREMENUITEM 0x0094
+
+struct uah_menu
+{
+    HMENU hmenu;
+    HDC   hdc;
+    DWORD flags;
+};
+
+struct uah_menu_item
+{
+    int   pos;
+    DWORD metrics[8];
+    DWORD popup_metrics[5];
+};
+
+struct uah_measure_menu_item
+{
+    MEASUREITEMSTRUCT    mis;
+    struct uah_menu      menu;
+    struct uah_menu_item item;
+};
+
+struct uah_draw_menu_item
+{
+    DRAWITEMSTRUCT       dis;
+    struct uah_menu      menu;
+    struct uah_menu_item item;
+};
 
 #endif /* _NTUSER_ */

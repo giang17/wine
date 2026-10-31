@@ -235,8 +235,11 @@ static inline int point_in_rect( const struct rectangle *rect, int x, int y )
 static inline int scale_dpi( int val, struct ratio dpi_from, struct ratio dpi_to )
 {
     unsigned int num = dpi_to.num * dpi_from.den, den = dpi_from.num * dpi_to.den;
-    if (val >= 0) return (val * num + (den / 2)) / den;
-    return (val * num - (den / 2)) / den;
+    /* the cast keeps the multiplication signed: with int * unsigned a negative coordinate (a
+     * monitor left of or above the primary) wrapped around, and every hit test or rect mapping
+     * at negative coordinates failed (upstream merge request 12210) */
+    if (val >= 0) return ((__int64)val * num + (den / 2)) / den;
+    return ((__int64)val * num - (den / 2)) / den;
 }
 
 static inline void scale_dpi_rect( struct rectangle *rect, struct ratio dpi_from, struct ratio dpi_to )

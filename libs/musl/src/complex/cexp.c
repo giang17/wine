@@ -44,6 +44,10 @@ static double cexp_callback( int type, const char *name, double arg1, double arg
         case _OVERFLOW:
             errno = ERANGE;
             break;
+        case _UNDERFLOW:
+            /* only a result that underflowed to zero, not a subnormal one */
+            if (retval == 0) errno = ERANGE;
+            break;
     }
     return retval;
 }
@@ -99,7 +103,7 @@ _Dcomplex __cdecl cexp(_Dcomplex z)
 		 * overflow in exp(x).
 		 */
 		r =  __ldexp_cexp(z, 0);
-		if (isinf(r._Val[0])) errno = ERANGE;
+		if (isinf(r._Val[0]) || isinf(r._Val[1])) errno = ERANGE;
 		return r;
 	} else {
 		/*

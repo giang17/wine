@@ -226,6 +226,11 @@ HRESULT d2d_stroke_style_init(struct d2d_stroke_style *style, ID2D1Factory *fact
     style->ID2D1StrokeStyle1_iface.lpVtbl = &d2d_stroke_style_vtbl;
     style->refcount = 1;
 
+    TRACE("stroke_style %p, start_cap %#x, end_cap %#x, dash_cap %#x, line_join %#x, miter_limit %.8e, "
+            "dash_style %#x, dash_offset %.8e, transform_type %#x, dash_count %u.\n",
+            &style->ID2D1StrokeStyle1_iface, desc->startCap, desc->endCap, desc->dashCap, desc->lineJoin,
+            desc->miterLimit, desc->dashStyle, desc->dashOffset, desc->transformType, dash_count);
+
     if (desc->dashStyle == D2D1_DASH_STYLE_CUSTOM)
     {
         if (!dashes || !dash_count)

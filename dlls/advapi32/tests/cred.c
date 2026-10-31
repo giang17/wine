@@ -318,6 +318,153 @@ static void test_generic(void)
     ok(ret, "CredDeleteA failed with error %ld\n", GetLastError());
 }
 
+static void test_attributes(void)
+{
+    static const BYTE value1[] = { 0x01, 0x02, 0x03 };
+    static const BYTE value2[] = { 'v', 'a', 'l', 'u', 'e', '2' };
+    CREDENTIAL_ATTRIBUTEW attributes[2];
+    CREDENTIAL_ATTRIBUTEA attribute_a;
+    CREDENTIALW new_cred, *cred;
+    CREDENTIALA new_cred_a, *cred_a, **creds_a;
+    DWORD count, i;
+    BOOL ret, found = FALSE;
+
+    attributes[0].Keyword = (WCHAR *)L"WineTest_attr1";
+    attributes[0].Flags = 0;
+    attributes[0].ValueSize = sizeof(value1);
+    attributes[0].Value = (BYTE *)value1;
+    attributes[1].Keyword = (WCHAR *)L"WineTest_attr2";
+    attributes[1].Flags = 0;
+    attributes[1].ValueSize = sizeof(value2);
+    attributes[1].Value = (BYTE *)value2;
+
+    memset(&new_cred, 0, sizeof(new_cred));
+    new_cred.Type = CRED_TYPE_GENERIC;
+    new_cred.TargetName = (WCHAR *)L"" TEST_TARGET_NAME;
+    new_cred.CredentialBlobSize = sizeof(TEST_PASSWORD);
+    new_cred.CredentialBlob = (BYTE *)TEST_PASSWORD;
+    new_cred.Persist = CRED_PERSIST_ENTERPRISE;
+    new_cred.UserName = (WCHAR *)L"winetest";
+    new_cred.AttributeCount = ARRAY_SIZE(attributes);
+    new_cred.Attributes = attributes;
+
+    ret = CredWriteW(&new_cred, 0);
+    ok(ret || broken(GetLastError() == ERROR_NO_SUCH_LOGON_SESSION),
+       "CredWriteW failed with error %ld\n", GetLastError());
+    if (!ret)
+    {
+        skip("couldn't write generic credentials, skipping attribute tests\n");
+        return;
+    }
+
+    ret = CredReadW(L"" TEST_TARGET_NAME, CRED_TYPE_GENERIC, 0, &cred);
+    ok(ret, "CredReadW failed with error %ld\n", GetLastError());
+    if (ret)
+    {
+        ok(cred->AttributeCount == ARRAY_SIZE(attributes), "got AttributeCount %lu\n", cred->AttributeCount);
+        ok(cred->Attributes && !((ULONG_PTR)cred->Attributes & (sizeof(void *) - 1)),
+           "got Attributes %p\n", cred->Attributes);
+        for (i = 0; i < cred->AttributeCount && i < ARRAY_SIZE(attributes); i++)
+        {
+            ok(!wcscmp(cred->Attributes[i].Keyword, attributes[i].Keyword), "%lu: got Keyword %s\n",
+               i, wine_dbgstr_w(cred->Attributes[i].Keyword));
+            ok(!cred->Attributes[i].Flags, "%lu: got Flags %#lx\n", i, cred->Attributes[i].Flags);
+            ok(cred->Attributes[i].ValueSize == attributes[i].ValueSize, "%lu: got ValueSize %lu\n",
+               i, cred->Attributes[i].ValueSize);
+            if (cred->Attributes[i].ValueSize == attributes[i].ValueSize)
+                ok(!memcmp(cred->Attributes[i].Value, attributes[i].Value, attributes[i].ValueSize),
+                   "%lu: wrong Value\n", i);
+        }
+        ok(cred->CredentialBlobSize == sizeof(TEST_PASSWORD), "got CredentialBlobSize %lu\n",
+           cred->CredentialBlobSize);
+        ok(!wcscmp(cred->UserName, L"winetest"), "got UserName %s\n", wine_dbgstr_w(cred->UserName));
+        CredFree(cred);
+    }
+
+    ret = pCredReadA(TEST_TARGET_NAME, CRED_TYPE_GENERIC, 0, &cred_a);
+    ok(ret, "CredReadA failed with error %ld\n", GetLastError());
+    if (ret)
+    {
+        ok(cred_a->AttributeCount == ARRAY_SIZE(attributes), "got AttributeCount %lu\n", cred_a->AttributeCount);
+        if (cred_a->AttributeCount == ARRAY_SIZE(attributes))
+        {
+            ok(!strcmp(cred_a->Attributes[0].Keyword, "WineTest_attr1"), "got Keyword %s\n",
+               cred_a->Attributes[0].Keyword);
+            ok(cred_a->Attributes[0].ValueSize == sizeof(value1), "got ValueSize %lu\n",
+               cred_a->Attributes[0].ValueSize);
+            ok(!memcmp(cred_a->Attributes[0].Value, value1, sizeof(value1)), "wrong Value\n");
+            ok(!strcmp(cred_a->Attributes[1].Keyword, "WineTest_attr2"), "got Keyword %s\n",
+               cred_a->Attributes[1].Keyword);
+        }
+        pCredFree(cred_a);
+    }
+
+    ret = pCredEnumerateA(NULL, 0, &count, &creds_a);
+    ok(ret, "CredEnumerateA failed with error %ld\n", GetLastError());
+    for (i = 0; ret && i < count; i++)
+    {
+        if (!creds_a[i]->TargetName || strcmp(creds_a[i]->TargetName, TEST_TARGET_NAME)) continue;
+        ok(creds_a[i]->AttributeCount == ARRAY_SIZE(attributes), "got AttributeCount %lu\n",
+           creds_a[i]->AttributeCount);
+        if (creds_a[i]->AttributeCount == ARRAY_SIZE(attributes))
+        {
+            ok(creds_a[i]->Attributes[1].ValueSize == sizeof(value2), "got ValueSize %lu\n",
+               creds_a[i]->Attributes[1].ValueSize);
+            ok(!memcmp(creds_a[i]->Attributes[1].Value, value2, sizeof(value2)), "wrong Value\n");
+        }
+        found = TRUE;
+    }
+    if (ret) pCredFree(creds_a);
+    ok(found, "credentials not found\n");
+
+    /* writing the credential again replaces its attributes */
+    new_cred.AttributeCount = 0;
+    new_cred.Attributes = NULL;
+    ret = CredWriteW(&new_cred, 0);
+    ok(ret, "CredWriteW failed with error %ld\n", GetLastError());
+    ret = CredReadW(L"" TEST_TARGET_NAME, CRED_TYPE_GENERIC, 0, &cred);
+    ok(ret, "CredReadW failed with error %ld\n", GetLastError());
+    if (ret)
+    {
+        ok(!cred->AttributeCount, "got AttributeCount %lu\n", cred->AttributeCount);
+        CredFree(cred);
+    }
+
+    attribute_a.Keyword = (char *)"WineTest_attr3";
+    attribute_a.Flags = 0;
+    attribute_a.ValueSize = sizeof(value2);
+    attribute_a.Value = (BYTE *)value2;
+    memset(&new_cred_a, 0, sizeof(new_cred_a));
+    new_cred_a.Type = CRED_TYPE_GENERIC;
+    new_cred_a.TargetName = (char *)TEST_TARGET_NAME;
+    new_cred_a.CredentialBlobSize = sizeof(TEST_PASSWORD);
+    new_cred_a.CredentialBlob = (BYTE *)TEST_PASSWORD;
+    new_cred_a.Persist = CRED_PERSIST_ENTERPRISE;
+    new_cred_a.UserName = (char *)"winetest";
+    new_cred_a.AttributeCount = 1;
+    new_cred_a.Attributes = &attribute_a;
+    ret = pCredWriteA(&new_cred_a, 0);
+    ok(ret, "CredWriteA failed with error %ld\n", GetLastError());
+    ret = CredReadW(L"" TEST_TARGET_NAME, CRED_TYPE_GENERIC, 0, &cred);
+    ok(ret, "CredReadW failed with error %ld\n", GetLastError());
+    if (ret)
+    {
+        ok(cred->AttributeCount == 1, "got AttributeCount %lu\n", cred->AttributeCount);
+        if (cred->AttributeCount == 1)
+        {
+            ok(!wcscmp(cred->Attributes[0].Keyword, L"WineTest_attr3"), "got Keyword %s\n",
+               wine_dbgstr_w(cred->Attributes[0].Keyword));
+            ok(cred->Attributes[0].ValueSize == sizeof(value2), "got ValueSize %lu\n",
+               cred->Attributes[0].ValueSize);
+            ok(!memcmp(cred->Attributes[0].Value, value2, sizeof(value2)), "wrong Value\n");
+        }
+        CredFree(cred);
+    }
+
+    ret = CredDeleteW(L"" TEST_TARGET_NAME, CRED_TYPE_GENERIC, 0);
+    ok(ret, "CredDeleteW failed with error %ld\n", GetLastError());
+}
+
 static void test_domain_password(DWORD cred_type)
 {
     BOOL ret;
@@ -801,7 +948,10 @@ START_TEST(cred)
     if (persists[CRED_TYPE_GENERIC] == CRED_PERSIST_NONE)
         skip("CRED_TYPE_GENERIC credentials are not supported or are disabled. Skipping\n");
     else
+    {
         test_generic();
+        test_attributes();
+    }
 
     trace("domain password:\n");
     if (persists[CRED_TYPE_DOMAIN_PASSWORD] == CRED_PERSIST_NONE)

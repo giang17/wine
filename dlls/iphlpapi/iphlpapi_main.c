@@ -633,10 +633,20 @@ DWORD WINAPI GetAdaptersInfo( IP_ADAPTER_INFO *info, ULONG *size )
                                   NULL, 0, NULL, 0, &uni_count, 0 );
     if (err) goto err;
 
-    /* Slightly overestimate the needed size by assuming that all
-       unicast addresses require a separate IP_ADDR_STRING. */
+    /* Each IP_ADAPTER_INFO holds its adapter's first address; like Windows, only the
+       further addresses of an adapter need a separate IP_ADDR_STRING. Applications
+       size their buffer as a whole number of IP_ADAPTER_INFO structures. */
 
-    needed = if_num * sizeof(*info) + uni_count * sizeof(IP_ADDR_STRING);
+    needed = if_num * sizeof(*info);
+    for (i = 0; i < if_count; i++)
+    {
+        DWORD addrs = 0;
+
+        if (if_stat[i].type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (uni = 0; uni < uni_count; uni++)
+            if (uni_keys[uni].luid.Value == if_keys[i].Value) addrs++;
+        if (addrs > 1) needed += (addrs - 1) * sizeof(IP_ADDR_STRING);
+    }
     if (!info || *size < needed)
     {
         *size = needed;

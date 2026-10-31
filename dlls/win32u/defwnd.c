@@ -1864,11 +1864,13 @@ static LRESULT handle_nc_activate( HWND hwnd, WPARAM wparam, LPARAM lparam )
 
 static void handle_nc_calc_size( HWND hwnd, WPARAM wparam, RECT *win_rect )
 {
-    RECT rect = { 0, 0, 0, 0 };
+    RECT rect = { 0, 0, 0, 0 }, orig;
     DWORD style = get_window_long( hwnd, GWL_STYLE );
     DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
+    WND *win;
 
     if (!win_rect) return;
+    orig = *win_rect;
 
     if (!(style & WS_MINIMIZE))
     {
@@ -1919,6 +1921,16 @@ static void handle_nc_calc_size( HWND hwnd, WPARAM wparam, RECT *win_rect )
     {
         win_rect->right = win_rect->left;
         win_rect->bottom = win_rect->top;
+    }
+
+    /* Remember where the standard non-client area puts the client, so that the visible rect of
+     * set_window_pos() can tell this client rect from one the application computed itself. */
+    if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+    {
+        SetRect( &win->nc_insets, win_rect->left - orig.left, win_rect->top - orig.top,
+                 orig.right - win_rect->right, orig.bottom - win_rect->bottom );
+        win->nc_insets_valid = TRUE;
+        release_win_ptr( win );
     }
 }
 
@@ -2446,6 +2458,18 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
             pt.y = (short)HIWORD( lparam );
             return handle_nc_hit_test( hwnd, pt );
         }
+
+    case WM_UAHMEASUREMENUITEM:
+        measure_uah_menu_item( hwnd, (struct uah_measure_menu_item *)lparam );
+        break;
+
+    case WM_UAHDRAWMENU:
+        draw_menu_bar_background( hwnd, (struct uah_menu *)lparam );
+        break;
+
+    case WM_UAHDRAWMENUITEM:
+        draw_menu_bar_item( hwnd, (struct uah_draw_menu_item *)lparam );
+        break;
 
     case WM_NCPAINT:
         return handle_nc_paint( hwnd, (HRGN)wparam );

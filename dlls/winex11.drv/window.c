@@ -102,8 +102,47 @@ static const WCHAR whole_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','w','h','o','l','e','_','w','i','n','d','o','w',0};
 static const WCHAR clip_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
+/* visual id of whole_window, published next to it for X11DRV_GetDC in other processes */
+static const WCHAR visual_id_prop[] =
+    {'_','_','w','i','n','e','_','x','1','1','_','v','i','s','u','a','l','_','i','d',0};
 static const WCHAR focus_time_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','f','o','c','u','s','_','t','i','m','e',0};
+static const WCHAR dcomp_swapchain_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','s','w','a','p','c','h','a','i','n',0};
+static const WCHAR *dcomp_swapchain_prop = dcomp_swapchain_propW;
+static const WCHAR dcomp_popup_parent_propW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','o','p','u','p','_','p','a','r','e','n','t',0};
+static const WCHAR *dcomp_popup_parent_prop = dcomp_popup_parent_propW;
+/* Set on the desktop window by dxgi while a DComp plugin GUI is hosted in THIS
+ * process.  Used to mark embedded ownerless TOOLWINDOW popups as DROPDOWN_MENU
+ * (see set_style_hints) — they anchor to the host window, so the per-window
+ * dcomp discriminators below cannot see they belong to a DComp plugin.
+ * The name is per-process, __wine_dcomp_active_<pid:08x> (issue 74): under a
+ * session-wide name the flag also mis-typed borderless tool popups of
+ * unrelated non-DComp processes.  set_style_hints runs in the process that
+ * owns the window, so building the name from the current pid asks exactly
+ * "does the popup's own process host a DComp GUI".  Lazy init is safe: callers
+ * hold the win_data lock, and rebuilding writes identical bytes anyway. */
+static const WCHAR dcomp_active_prop_prefixW[] =
+    {'_','_','w','i','n','e','_','d','c','o','m','p','_','a','c','t','i','v','e','_',0};
+
+static const WCHAR *dcomp_active_prop(void)
+{
+    static WCHAR name[ARRAY_SIZE(dcomp_active_prop_prefixW) + 8];
+
+    if (!name[0])
+    {
+        static const char hex[] = "0123456789abcdef";
+        DWORD pid = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
+        WCHAR *p = name + ARRAY_SIZE(dcomp_active_prop_prefixW) - 1;
+        int i;
+
+        memcpy( name, dcomp_active_prop_prefixW, sizeof(dcomp_active_prop_prefixW) );
+        for (i = 28; i >= 0; i -= 4) *p++ = hex[(pid >> i) & 0xf];
+        *p = 0;
+    }
+    return name;
+}
 
 static const char *debugstr_mwm_hints( const MwmHints *hints )
 {
@@ -461,6 +500,21 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
     /* application windows are managed */
     ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
     if (ex_style & WS_EX_APPWINDOW) return TRUE;
+    /* Ownerless layered popups that never take the focus and are neither
+     * click-through nor topmost live as long as the application window they
+     * decorate: Codejock draws the drop shadow of its frames into one
+     * (XTPFrameShadow, WineHQ bug 60187). Unmanaged, the window manager keeps
+     * them above every window and on every desktop. Menus, tooltips and drag
+     * images are topmost or click-through and stay unmanaged; JUCE's shadow
+     * windows around them are layered tool windows too, but topmost and
+     * without WS_EX_NOACTIVATE. */
+    if ((style & WS_POPUP) && !NtUserGetWindowRelative( hwnd, GW_OWNER ) &&
+        (ex_style & (WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOPMOST)) ==
+        (WS_EX_LAYERED | WS_EX_NOACTIVATE))
+    {
+        TRACE( "%p: ownerless layered popup %08x/%08x is managed\n", hwnd, style, ex_style );
+        return TRUE;
+    }
     /* windows that own popups are managed */
     if (has_owned_popups( hwnd )) return TRUE;
     /* default: not managed */
@@ -487,8 +541,21 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style 
 {
     unsigned long ret = 0;
 
-    if (ex_style & WS_EX_TOOLWINDOW) return 0;
     if (ex_style & WS_EX_LAYERED) return 0;
+
+    if (ex_style & WS_EX_TOOLWINDOW)
+    {
+        /* A titled tool window (REAPER's floating FX chains) gets its frame from
+         * the window manager like any other titled window; untitled tool popups
+         * (menus, tooltips, shadows) stay undecorated, and windows drawing their
+         * own non-client area are caught by the window == visible check in
+         * get_mwm_decorations().  Tool window captions have no minimize or
+         * maximize button on Windows. */
+        if (!decorate_tool_windows || (style & WS_CAPTION) != WS_CAPTION) return 0;
+        ret = MWM_DECOR_TITLE | MWM_DECOR_BORDER;
+        if (style & WS_SYSMENU) ret |= MWM_DECOR_MENU;
+        return ret;
+    }
 
     if ((style & WS_CAPTION) == WS_CAPTION)
     {
@@ -525,13 +592,70 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
     attr->bit_gravity       = NorthWestGravity;
     attr->backing_store     = NotUseful;
     attr->border_pixel      = 0;
-    attr->background_pixel  = 0;
     attr->event_mask        = (ExposureMask | KeyPressMask | KeyReleaseMask |
-                               FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask);
+                               FocusChangeMask | KeymapStateMask | StructureNotifyMask | PropertyChangeMask |
+                               VisibilityChangeMask);
     /* for transparent windows, exclude mouse events to allow mouse pass-through */
     if (!(ex_style & WS_EX_TRANSPARENT)) attr->event_mask |= (PointerMotionMask | ButtonPressMask |
-                                                              ButtonReleaseMask | EnterWindowMask);
+                                                              ButtonReleaseMask | EnterWindowMask |
+                                                              LeaveWindowMask);
 
+    /* DComp windows: use None background_pixmap to avoid black flash on map.
+     * Without this, XMapWindow shows background_pixel=0 (black) for 1 frame
+     * before the first surface_flush writes content. With None, the X server
+     * does not paint any background, so the parent content shows through.
+     *
+     * Also enable backing_store = Always so the X server saves window content
+     * written via surface_flush (XPutImage).  When a popup/tooltip above this
+     * window is unmapped, the X server uses the saved backing store to repaint
+     * the exposed area immediately, avoiding a 1-frame flash of undefined
+     * content (garbage, terminal, white) that occurs with NotUseful because
+     * the client has not yet processed the Expose event. */
+    if (NtUserGetProp( data->hwnd, dcomp_swapchain_prop ))
+    {
+        TRACE( "using None background_pixmap + Always backing_store for DComp window %p\n", data->hwnd );
+        attr->background_pixmap = None;
+        attr->backing_store = Always;
+        data->black_expose_bg = 0;
+        return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixmap |
+                CWEventMask | CWBitGravity | CWBackingStore);
+    }
+
+    /* Issue 55: WS_EX_LAYERED windows render their own content; how to handle the
+     * X expose background depends on the window's visual:
+     *
+     * - Per-pixel-alpha layered windows (UpdateLayeredWindow/ULW_ALPHA, ARGB32
+     *   visual, data->use_alpha) such as JUCE's DropShadower use a 32-bit ARGB
+     *   visual where background_pixel = 0 means fully TRANSPARENT (alpha 0).  That
+     *   is exactly what the unpainted shadow border needs, so keep background_pixel
+     *   = 0.  Using background_pixmap = None here leaves the ARGB buffer
+     *   uninitialised, which a compositor shows as an opaque/milky border (issue
+     *   55 follow-up: KORG LegacyCell audio-device dropdown shadow).
+     *
+     * - Constant-alpha / colour-key layered windows (SetLayeredWindowAttributes,
+     *   default RGB visual, !data->use_alpha) such as the VSTGUI Win32DragBitmap
+     *   have background_pixel = 0 == opaque BLACK, which flashes black on every
+     *   move expose.  For those paint NO expose background (None) instead.  NO
+     *   backing_store = Always — that froze a black frame for a moving window. */
+    if (ex_style & WS_EX_LAYERED)
+    {
+        TRACE( "layered window %p use_alpha=%u layered=%u\n",
+               data->hwnd, data->use_alpha, data->layered );
+        if (data->use_alpha)
+        {
+            attr->background_pixel = 0;  /* ARGB32: pixel 0 == transparent */
+            data->black_expose_bg = 0;
+            return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
+                    CWEventMask | CWBitGravity | CWBackingStore);
+        }
+        attr->background_pixmap = None;
+        data->black_expose_bg = 0;
+        return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixmap |
+                CWEventMask | CWBitGravity | CWBackingStore);
+    }
+
+    attr->background_pixel  = 0;
+    data->black_expose_bg = 1;
     return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
             CWEventMask | CWBitGravity | CWBackingStore);
 }
@@ -946,6 +1070,34 @@ static void set_size_hints( struct x11drv_win_data *data, DWORD style )
             size_hints->min_height = size_hints->max_height;
             size_hints->flags |= PMinSize | PMaxSize;
         }
+        else
+        {
+            /* A resizable window gets the application's WM_GETMINMAXINFO limits.  Without
+             * PMinSize the window manager shrinks it below ptMinTrackSize during an interactive
+             * resize, win32 clamps every step back from WM_WINDOWPOSCHANGING, and after the
+             * release the X window stays small while win32 keeps the minimum (vatSys VSCS).
+             * win32u caches the sizes in raw pixels for the window rect; the hints describe the
+             * visible rect, so the frame win32 draws itself comes off. */
+            struct get_min_max_track_params track;
+
+            if (NtUserGetMinMaxTrack( data->hwnd, &track ))
+            {
+                int frame_w = (data->rects.window.right - data->rects.window.left)
+                              - (data->rects.visible.right - data->rects.visible.left);
+                int frame_h = (data->rects.window.bottom - data->rects.window.top)
+                              - (data->rects.visible.bottom - data->rects.visible.top);
+
+                size_hints->min_width = max( track.min_track.x - frame_w, 1 );
+                size_hints->min_height = max( track.min_track.y - frame_h, 1 );
+                size_hints->flags |= PMinSize;
+                if (track.max_track.x && track.max_track.y)
+                {
+                    size_hints->max_width = max( track.max_track.x - frame_w, size_hints->min_width );
+                    size_hints->max_height = max( track.max_track.y - frame_h, size_hints->min_height );
+                    size_hints->flags |= PMaxSize;
+                }
+            }
+        }
     }
 
     window_set_wm_normal_hints( data, size_hints );
@@ -1003,12 +1155,33 @@ static void window_set_mwm_hints( struct x11drv_win_data *data, const MwmHints *
 
     if (data->pending_state.wm_state == IconicState) return; /* window is iconic and may be mapped or not, don't update its state now */
 
+    if (old_hints->decorations != new_hints->decorations) data->wm_frame_changed = TRUE;
     data->pending_state.mwm_hints = *new_hints;
     data->mwm_hints_serial = NextRequest( data->display );
     TRACE( "window %p/%lx, requesting _MOTIF_WM_HINTS %s serial %lu\n", data->hwnd, data->whole_window,
            debugstr_mwm_hints(&data->pending_state.mwm_hints), data->mwm_hints_serial );
     XChangeProperty( data->display, data->whole_window, x11drv_atom(_MOTIF_WM_HINTS), x11drv_atom(_MOTIF_WM_HINTS),
                      32, PropModeReplace, (unsigned char *)new_hints, sizeof(*new_hints) / sizeof(long) );
+}
+
+
+/***********************************************************************
+ *              is_close_enabled
+ *
+ * Whether the caption close button of the window is enabled: the same test as
+ * handle_wm_protocols() applies to WM_DELETE_WINDOW and as win32u uses to draw
+ * the button grayed, so that the window manager does not offer a close button
+ * that a click would then be discarded for.
+ */
+static BOOL is_close_enabled( HWND hwnd )
+{
+    HMENU sys_menu;
+    UINT state;
+
+    if (NtUserGetClassLongW( hwnd, GCL_STYLE ) & CS_NOCLOSE) return FALSE;
+    if (!(sys_menu = NtUserGetSystemMenu( hwnd, FALSE ))) return TRUE;
+    state = NtUserThunkedMenuItemInfo( sys_menu, SC_CLOSE, MF_BYCOMMAND, NtUserGetMenuState, NULL, NULL );
+    return state != 0xffffffff && !(state & (MF_DISABLED | MF_GRAYED));
 }
 
 
@@ -1036,7 +1209,7 @@ static void set_mwm_hints( struct x11drv_win_data *data, UINT style, UINT ex_sty
         if (is_window_resizable( data, style )) mwm_hints.functions |= MWM_FUNC_RESIZE;
         if (!(style & WS_DISABLED))
         {
-            mwm_hints.functions |= MWM_FUNC_CLOSE;
+            if (is_close_enabled( data->hwnd )) mwm_hints.functions |= MWM_FUNC_CLOSE;
             if (style & WS_MINIMIZEBOX) mwm_hints.functions |= MWM_FUNC_MINIMIZE;
             if (style & WS_MAXIMIZEBOX) mwm_hints.functions |= MWM_FUNC_MAXIMIZE;
 
@@ -1108,6 +1281,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
     Window group_leader = data->whole_window;
     HWND owner = NtUserGetWindowRelative( data->hwnd, GW_OWNER );
     Window owner_win = 0;
+    BOOL owner_from_heuristic = FALSE, anchor_is_dcomp = FALSE;
     XWMHints *wm_hints;
 
     if (owner)
@@ -1116,10 +1290,109 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
         owner_win = X11DRV_get_whole_window( owner );
     }
 
+    /* DComp popup-stack transient anchor (set by the dxgi SET_TARGET handler):
+     * the previously-opened popup/main target. This is a STABLE anchor that
+     * yields the correct nested hierarchy (main <- settings <- dropdown), unlike
+     * get_active_window() which drifts to the GL-presenting main window and pulls
+     * every popup behind it (Trinity standalone z-order regression). Read here
+     * before the TOOLWINDOW heuristic so it also covers the settings target
+     * (NORMAL/WS_CAPTION, which never enters the TOOLWINDOW branch). Windows
+     * without this property (e.g. embedded VST3 popups) fall through to the
+     * unchanged get_active_window() path below. */
+    if (!owner_win)
+    {
+        HWND popup_parent = NtUserGetProp( data->hwnd, dcomp_popup_parent_prop );
+        if (popup_parent && popup_parent != data->hwnd)
+        {
+            Window parent_win = X11DRV_get_whole_window( NtUserGetAncestor( popup_parent, GA_ROOT ) );
+            if (parent_win)
+            {
+                owner_win = parent_win;
+                group_leader = parent_win;
+            }
+        }
+    }
+
+    /* For ownerless WS_POPUP|WS_EX_TOOLWINDOW windows (e.g. JUCE popup menus in
+     * embedded VST3 plugins), use the active window as implicit transient parent.
+     * Without transient_for, the window manager has no stacking context and may
+     * place the popup behind the application window.
+     *
+     * Exclude windows that carry WS_CAPTION: a titled WS_EX_TOOLWINDOW is a
+     * decorated top-level app window (e.g. FL Studio's invisible 1x1 container,
+     * style 0x94ca0000 = WS_POPUP|WS_CAPTION|WS_SYSMENU), not a borderless popup
+     * menu.  Such windows must stay out of the popup heuristic — see the matching
+     * WS_CAPTION guard on the UTILITY branch below (issue 50). */
+    if (!owner_win && (style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW)
+            && !(style & WS_CAPTION))
+    {
+        HWND active = get_active_window();
+        if (active && active != data->hwnd)
+        {
+            HWND active_root = NtUserGetAncestor( active, GA_ROOT );
+            Window active_win = X11DRV_get_whole_window( active_root );
+            if (active_win)
+            {
+                /* Issue 81 + 82: do NOT set WM_TRANSIENT_FOR and do NOT fold
+                 * this window into the active window's WM_HINTS window_group.
+                 * KWin propagates _NET_WM_STATE_DEMANDS_ATTENTION both via
+                 * window_group (issue 81: persistent frame) AND via the
+                 * transient-parent (issue 82: frame while a menu popup is
+                 * open).  Vanilla sets neither on ownerless TOOLWINDOWs and has
+                 * neither problem; matching that here.  DComp popups still get
+                 * their anchor via the dcomp_popup_parent_prop path above. */
+                owner_from_heuristic = TRUE;
+            }
+            /* If the anchor (active window) is itself a DComp composition-swapchain
+             * window — the continuously GL-presenting main window, e.g. KORG Trinity
+             * standalone — this ownerless TOOLWINDOW is an in-plugin popup sitting
+             * over it.  Mark it so the type logic below uses DROPDOWN_MENU instead
+             * of UTILITY: the main window's present-driven self-reactivation steals
+             * _NET_ACTIVE_WINDOW from an activatable (UTILITY) popup → focus fight →
+             * flicker (same class as the #2 settings-popup regression, but these
+             * popups carry no __wine_dcomp_popup_parent property).  Embedded plugin
+             * GUIs anchor to the host window, which is NOT a DComp swapchain target,
+             * so they stay UTILITY → unchanged (no embedded regression). */
+            if (active_root && NtUserGetProp( active_root, dcomp_swapchain_prop ))
+                anchor_is_dcomp = TRUE;
+        }
+    }
+
+    /* An owned WS_EX_APPWINDOW window has its own taskbar button on Windows.  Task
+     * managers do not list a window that is transient for another one (KDE's
+     * libtaskmanager, Plasma 5 X11 model and the Plasma 6 Wayland model through KWin's
+     * parent window), but they do list a window that is transient for the root window:
+     * a group transient (NETWM 7.3), which the window manager keeps above every window
+     * of its group mapped before it -- the owner, which is made the group leader.  So
+     * the window manager enforces the owner order itself, and never raises an owner
+     * it was told to activate or that was clicked above the windows it owns.  Without
+     * any transient hint (wine-dev issue 531) the driver could only restack the owner
+     * after the window manager had raised it, visible as a flicker under KWin on
+     * Wayland and leaving an owned window behind a maximised owner while it was being
+     * moved (wine-dev issue 538).  Known cost: a group transient also stays above the
+     * owned windows mapped before it, so an older sibling cannot be raised above a
+     * younger one.
+     *
+     * KWin makes a group transient transient only for the group members it managed before
+     * it (X11Window::checkGroup), never for a member that joins the group later.  An owned
+     * window shown before its owner -- vatSys shows VSCS and ATIS behind its splash screen
+     * and the main window after it -- would stay unrelated to the owner, which the window
+     * manager then raises above it on every click (giang17/wine issue 29).  So while the
+     * owner is hidden the window forms its own group, and it joins the owner's group when
+     * the owner is shown (refresh_owned_group_hints): the changed WM_HINTS group makes KWin
+     * regroup the window behind its owner, and the owner order holds from then on. */
+    if (owner_win && owner && (ex_style & WS_EX_APPWINDOW))
+    {
+        if (NtUserGetWindowLongW( owner, GWL_STYLE ) & WS_VISIBLE) group_leader = owner_win;
+        owner_win = root_window;
+    }
+
     if (owner_win)
     {
         XSetTransientForHint( data->display, data->whole_window, owner_win );
-        group_leader = owner_win;
+        if (!owner_from_heuristic && owner_win != root_window) group_leader = owner_win;
+        TRACE( "window %p/%lx, requesting WM_TRANSIENT_FOR %lx (owner %p, group %lx)\n", data->hwnd, data->whole_window,
+               owner_win, owner, group_leader );
     }
 
     /* Only use dialog type for owned popups. Metacity allows making fullscreen
@@ -1128,6 +1401,57 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
      */
     if (((style & WS_POPUP) || (ex_style & WS_EX_DLGMODALFRAME)) && owner)
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DIALOG );
+    else if ((style & WS_POPUP) && (ex_style & WS_EX_TOOLWINDOW) && !owner
+            && !(style & WS_CAPTION))
+    {
+        /* The WS_CAPTION guard above keeps decorated app windows out of this
+         * branch: FL Studio's ownerless WS_POPUP|WS_EX_TOOLWINDOW main container
+         * (style 0x94ca0000) was wrongly tagged UTILITY here, which KDE treats as
+         * an activation-coupled tool window and minimizes on every _NET_ACTIVE_-
+         * WINDOW change → _NET_WM_STATE_HIDDEN → taskbar click no longer raises it
+         * (issue 50).  Vanilla has no UTILITY branch and leaves it NORMAL; with
+         * the guard such windows now fall through to NORMAL below, matching vanilla.
+         * Only borderless popup menus (no WS_CAPTION) reach the UTILITY/DROPDOWN
+         * logic this branch was written for.
+         *
+         * DComp dropdown popups (carry the popup-parent property from the dxgi
+         * popup stack): use DROPDOWN_MENU so the WM treats them as transient,
+         * non-activatable menus. UTILITY is an activatable window, which made KDE
+         * pull each popup into the focus/stacking rotation → _NET_ACTIVE_WINDOW
+         * conflicts → front/back restack loop (the dropdown "blink"). DROPDOWN_MENU
+         * stays managed (no override_redirect → embedded-safe) but is excluded
+         * from focus rotation.
+         *
+         * Third discriminator (embedded, per-process): THIS process hosts a DComp
+         * plugin GUI (dxgi published __wine_dcomp_active_<pid> on the desktop).
+         * In the embedded case (plugin in a Windows host under Wine) the in-plugin
+         * popups anchor to the host window, not to a DComp swapchain — so neither
+         * the popup-parent property nor anchor_is_dcomp fires, and they stayed
+         * UTILITY → the same focus war among themselves (Trinity IFX list
+         * flicker). This flag catches them: the in-plugin popups live in the same
+         * process as the plugin GUI. Originally the name was session-wide
+         * ("deliberately broad") and mis-typed borderless tool popups of unrelated
+         * non-DComp processes as DROPDOWN_MENU while any DComp GUI was open
+         * elsewhere — issue 74, repro scripts/repro-74-mixed-popup.sh. */
+        if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ) || anchor_is_dcomp
+                || NtUserGetProp( NtUserGetDesktopWindow(), dcomp_active_prop() ))
+            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
+        else
+            /* Issue 84: ownerless TOOLWINDOW popups of non-DComp apps (KM88
+             * Editor, other pure-D2D/JUCE standalone editors) use NORMAL, not
+             * UTILITY.  After the issue 82 fix these windows carry no
+             * WM_TRANSIENT_FOR, so a UTILITY type gives KWin no stacking anchor
+             * and the WM holds the window above normal windows → popups stay
+             * topmost over unrelated focused windows.  Vanilla upstream has no
+             * UTILITY branch here and leaves them NORMAL (no symptom).  Verified
+             * xprop custom-vs-vanilla on KM88: across all ownerless TOOLWINDOW
+             * children only _NET_WM_WINDOW_TYPE differs (UTILITY vs NORMAL);
+             * transient_for, window_group and _NET_WM_STATE are identical.
+             * DComp apps (Trinity standalone via anchor_is_dcomp, embedded IFX
+             * popups via the desktop dcomp_active flag) still take DROPDOWN_MENU
+             * above, so issue 2 / popup-flicker coverage is unchanged. */
+            window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
+    }
     else
         window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_NORMAL );
 
@@ -1238,16 +1562,55 @@ static void set_wm_hints( struct x11drv_win_data *data )
 
 
 /***********************************************************************
+ *              refresh_owned_group_hints
+ *
+ * The owner of group-transient WS_EX_APPWINDOW windows was shown or hidden: rebuild the
+ * WM_HINTS of the owned windows this thread has mapped, so that they join the owner's
+ * window group behind it (or leave it while the owner is hidden), see set_style_hints().
+ * Bottom-up in the win32 Z-order, so that the join order keeps the sibling order the
+ * window manager derives from it.
+ */
+static void refresh_owned_group_hints( HWND owner )
+{
+    HWND hwnd = NtUserGetWindowRelative( NtUserGetDesktopWindow(), GW_CHILD );
+
+    if (hwnd) hwnd = NtUserGetWindowRelative( hwnd, GW_HWNDLAST );
+    for (; hwnd; hwnd = NtUserGetWindowRelative( hwnd, GW_HWNDPREV ))
+    {
+        struct x11drv_win_data *data;
+
+        if (NtUserGetWindowRelative( hwnd, GW_OWNER ) != owner) continue;
+        if (!(NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_APPWINDOW)) continue;
+        if (!(NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE)) continue;
+        if (NtUserGetWindowThread( hwnd, NULL ) != GetCurrentThreadId()) continue; /* the hints go through the thread's display */
+        if (!(data = get_win_data( hwnd ))) continue;
+        if (data->whole_window && data->managed && !data->embedded && data->desired_state.wm_state != WithdrawnState)
+        {
+            TRACE( "owner %p shown or hidden, rebuilding the hints of owned window %p/%lx\n", owner, hwnd, data->whole_window );
+            set_wm_hints( data );
+        }
+        release_win_data( data );
+    }
+}
+
+
+/***********************************************************************
  *     init_clip_window
  */
 Window init_clip_window(void)
 {
     struct x11drv_thread_data *data = x11drv_init_thread_data();
+    Window clip_window = (Window)NtUserGetProp( NtUserGetDesktopWindow(), clip_window_prop );
 
-    if (!data->clip_window &&
-        (data->clip_window = (Window)NtUserGetProp( NtUserGetDesktopWindow(), clip_window_prop )))
+    /* Follow the property instead of caching its first value for good: the
+     * desktop window that carries it can be torn down and replaced -- switching
+     * desktops in virtual desktop mode does exactly that -- and keeping the old
+     * id would leave us grabbing and unmapping a window the server has already
+     * destroyed, which is a fatal BadWindow. */
+    if (clip_window && clip_window != data->clip_window)
     {
-        XSelectInput( data->display, data->clip_window, StructureNotifyMask );
+        data->clip_window = clip_window;
+        XSelectInput( data->display, clip_window, StructureNotifyMask );
     }
     return data->clip_window;
 }
@@ -1264,6 +1627,13 @@ void window_set_user_time( struct x11drv_win_data *data, Time time, BOOL init )
     if (init && !data->user_time == !time) return;
     if (!init && data->user_time == time) return;
     data->user_time = time;
+
+    /* A window can legitimately have no X window of its own, the desktop window
+     * in virtual desktop mode among them.  Setting a property on window 0 is a
+     * BadWindow that none of the ignore_error() cases covers, so it reaches the
+     * default handler and takes the whole process down -- a click on the desktop
+     * background was enough to end the session. */
+    if (!data->whole_window) return;
 
     TRACE( "window %p/%lx, requesting _NET_WM_USER_TIME %ld serial %lu\n", data->hwnd, data->whole_window,
            data->user_time, NextRequest( data->display ) );
@@ -1362,6 +1732,7 @@ static void window_set_net_wm_state( struct x11drv_win_data *data, UINT new_stat
         }
 
         data->pending_state.net_wm_state = new_state;
+        data->wm_frame_changed = TRUE;
         data->net_wm_state_serial = NextRequest( data->display );
         TRACE( "window %p/%lx, requesting _NET_WM_STATE %#x serial %lu\n", data->hwnd, data->whole_window,
                data->pending_state.net_wm_state, data->net_wm_state_serial );
@@ -1393,6 +1764,8 @@ static void window_set_net_wm_state( struct x11drv_win_data *data, UINT new_stat
                                      x11drv_atom(_NET_WM_STATE_MAXIMIZED_HORZ) : 0);
 
             data->pending_state.net_wm_state ^= (1 << i);
+            data->wm_frame_changed = TRUE;
+            if (i == NET_WM_STATE_MAXIMIZED) data->unmaximize_retry = !(new_state & (1 << i));
             data->net_wm_state_serial = NextRequest( data->display );
             TRACE( "window %p/%lx, requesting _NET_WM_STATE %#x serial %lu\n", data->hwnd, data->whole_window,
                    data->pending_state.net_wm_state, data->net_wm_state_serial );
@@ -1465,6 +1838,9 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     data->pending_state.rect = *new_rect;
     data->pending_state.above = above;
     data->configure_serial = NextRequest( data->display );
+    data->configure_retry = data->wm_frame_changed;
+    data->wm_frame_changed = FALSE;
+    data->unmaximize_retry = FALSE;
     TRACE( "window %p/%lx, requesting config %s mask %#x above %u, serial %lu\n", data->hwnd, data->whole_window,
            wine_dbgstr_rect(new_rect), mask, above, data->configure_serial );
     XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen, mask, &changes );
@@ -1496,6 +1872,13 @@ static void update_net_wm_states( struct x11drv_win_data *data )
     }
     else if (style & WS_MAXIMIZE)
         new_state |= (1 << NET_WM_STATE_MAXIMIZED);
+
+    /* A fullscreen state the window manager set on its own (KWin's fullscreen action on a
+     * maximized window) has no win32 counterpart: the window stays maximized with its caption,
+     * and the request above would ask for MAXIMIZED alone as soon as the fullscreen config is
+     * applied, taking the window out of fullscreen again. Keep it while the window is maximized. */
+    if (data->wm_fullscreen && (style & (WS_MAXIMIZE | WS_MINIMIZE)) == WS_MAXIMIZE && (style & WS_CAPTION) == WS_CAPTION)
+        new_state |= (1 << NET_WM_STATE_FULLSCREEN);
 
     ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
     if (ex_style & WS_EX_TOPMOST)
@@ -1566,6 +1949,16 @@ static void set_xembed_flags( struct x11drv_win_data *data, unsigned long flags 
                      x11drv_atom(_XEMBED_INFO), 32, PropModeReplace, (unsigned char*)info, 2 );
 }
 
+static HWND get_visible_predecessor( HWND hwnd );
+static void window_restack_below( struct x11drv_win_data *data, Window sibling );
+
+/* whether set_style_hints() makes hwnd a group transient (WM_TRANSIENT_FOR = root) instead of transient for its owner */
+static BOOL is_owned_appwindow( HWND hwnd )
+{
+    if (!NtUserGetWindowRelative( hwnd, GW_OWNER )) return FALSE;
+    return (NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_APPWINDOW) != 0;
+}
+
 static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, BOOL activate )
 {
     UINT old_state = data->pending_state.wm_state;
@@ -1616,12 +2009,53 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     if (new_state == NormalState)
     {
         /* try forcing activation if the window is supposed to be foreground or if it is fullscreen */
+        BOOL allow_focus;
         if (data->hwnd == foreground || data->is_fullscreen) activate = TRUE;
-        window_set_user_time( data, activate ? -1 : 0, TRUE );
+        allow_focus = activate;
+        /* A decorated, ownerless top-level that is not itself the foreground window is
+         * otherwise mapped with _NET_WM_USER_TIME=0 (the freedesktop "do not focus on
+         * map" hint), which strands it behind on the WM stack.  When the foreground
+         * window belongs to the SAME process the application is already in front and
+         * this is just its taskbar/main frame whose visible child holds the foreground
+         * (e.g. FL Studio's 1x1 WS_CAPTION container with a transient content child).
+         * Clear only the "do not focus" hint so the WM may bring the app forward on
+         * startup (issue 52) -- but do NOT set 'activate': that would additionally
+         * request a Win32 activation for the container and fight the foreground content
+         * child, producing a server-side activation ping-pong that hangs the app.
+         * Restricted to managed, non-embedded, ownerless, captioned windows so it never
+         * affects embedded VST3/DComp plugin frames, tool/popup windows, or splash
+         * screens (no WS_CAPTION). */
+        if (!allow_focus && foreground && data->managed && !data->embedded
+                 && (NtUserGetWindowLongW( data->hwnd, GWL_STYLE ) & WS_CAPTION)
+                 && !NtUserGetWindowRelative( data->hwnd, GW_OWNER ))
+        {
+            DWORD pid = 0, fg_pid = 0;
+            NtUserGetWindowThread( data->hwnd, &pid );
+            NtUserGetWindowThread( foreground, &fg_pid );
+            if (pid && pid == fg_pid) allow_focus = TRUE;
+        }
+        window_set_user_time( data, allow_focus ? -1 : 0, TRUE );
     }
 
     data->pending_state.wm_state = new_state;
     data->pending_state.activate = activate;
+    if (new_state == NormalState && old_state == WithdrawnState && is_owned_appwindow( data->hwnd ))
+    {
+        /* the win32 place to restore once the window manager has mapped the window */
+        HWND prev = get_visible_predecessor( data->hwnd );
+        data->map_predecessor = prev ? X11DRV_get_whole_window( prev ) : 0;
+    }
+    if (new_state == NormalState)
+    {
+        /* Windows flashes a taskbar button only when another process keeps the foreground */
+        DWORD pid = 0, fg_pid = 0;
+        if (foreground)
+        {
+            NtUserGetWindowThread( data->hwnd, &pid );
+            NtUserGetWindowThread( foreground, &fg_pid );
+        }
+        data->noactivate_map = !activate || (pid && pid == fg_pid);
+    }
     data->wm_state_serial = NextRequest( data->display );
     TRACE( "window %p/%lx, requesting WM_STATE %#x -> %#x serial %lu, foreground %p, activate %u\n", data->hwnd, data->whole_window,
            old_state, new_state, data->wm_state_serial, NtUserGetForegroundWindow(), activate );
@@ -1637,7 +2071,30 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
     case MAKELONG(NormalState, WithdrawnState):
     case MAKELONG(IconicState, WithdrawnState):
         if (data->embedded) set_xembed_flags( data, 0 );
-        else if (!data->managed) XUnmapWindow( data->display, data->whole_window );
+        else if (!data->managed)
+        {
+            /* Sync gdi_display before unmapping so any pending surface flush
+             * (XPutImage on gdi_display) from sibling DComp windows is
+             * completed by the X server before it processes the unmap.
+             * Without this, the X server may show stale backing-store content
+             * for the exposed area beneath the unmapped window, producing a
+             * 1-frame flash visible as popup/tooltip close flicker.
+             * (Same pattern as destroy_whole_window which does XSync before
+             * XDestroyWindow.)
+             *
+             * Intentionally unconditional for the unmanaged (override-redirect)
+             * unmap path rather than gated on a DComp marker: the flush we are
+             * waiting on belongs to *sibling* DComp windows, so a per-window
+             * gate on the window being unmapped would miss the common case (a
+             * plain tooltip/popup closing over a DComp plugin underneath) and
+             * reintroduce the flash.  A correct gate would need a global
+             * "DComp window mapped" indicator, which winex11 does not track; the
+             * cost here is a single local X server round-trip on popup close,
+             * which is not perceptible — not worth that machinery + regression
+             * risk for a hot-path that is already limited to unmanaged unmaps. */
+            XSync( gdi_display, False );
+            XUnmapWindow( data->display, data->whole_window );
+        }
         else XWithdrawWindow( data->display, data->whole_window, data->vis.screen );
         break;
     case MAKELONG(NormalState, IconicState):
@@ -1660,6 +2117,30 @@ static void window_set_managed( struct x11drv_win_data *data, BOOL new_managed )
     if (!new_managed)
     {
         ERR( "Changing window to unmanaged is not supported\n" );
+        return;
+    }
+
+    /* Flipping to managed can only go through a WM_STATE unmap/remap round-trip,
+     * which yanks a mapped window off the screen and hands it to the window manager
+     * mid-use.  An app that pokes its open dropdown with an activating no-op
+     * SetWindowPos (NOSIZE|NOMOVE|NOZORDER without NOACTIVATE, a no-op on Windows)
+     * thereby turns the popup into a WM-managed dialog under the pointer: it flashes,
+     * eats the first click, and grows WM decorations.  The managed decision belongs to
+     * map time — a mapped window keeps its mode until it is withdrawn, and the next
+     * map re-evaluates it.
+     *
+     * data->managed deliberately stays FALSE, so a later WindowPosChanged on the same
+     * mapped window asks again and is refused again; that is cheaper than the
+     * unmap/remap round-trip it replaces.
+     *
+     * The legitimate flip paths are unaffected: make_window_embedded withdraws
+     * explicitly before flipping, and create_desktop_win_data runs on freshly
+     * allocated data — only X11DRV_WindowPosChanged reaches this with a mapped window.
+     *
+     * From shibco/ableton-linux patch 0039, written by shibco. */
+    if (data->desired_state.wm_state != WithdrawnState)
+    {
+        WARN( "window %p/%lx is mapped, refusing to make it managed\n", data->hwnd, data->whole_window );
         return;
     }
 
@@ -1742,14 +2223,32 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
     RECT rect, old_rect = data->rects.window, new_rect;
     unsigned long old_generation, generation;
     long old_monitors[4], monitors[4];
+    BOOL was_moved, covers_monitor;
     UINT flags;
 
     if (!data->managed) return 0; /* unmanaged windows are managed by the Win32 side */
     if (is_virtual_desktop()) return 0; /* ignore window manager config changes in virtual desktop mode */
     if (data->desired_state.wm_state != NormalState) return 0; /* ignore config changes on invisible/minimized windows */
 
+    /* A window manager moves a fullscreen window to the monitor origin, whatever position we
+     * requested. An application that asks for a fullscreen rect sticking out of the monitor, to
+     * keep its own non-client area off-screen, then ends up with win32 rects that no longer match
+     * the X window: it is drawn where the window manager put it, but hit testing still uses the
+     * position we recorded, and everything the application draws relative to its window origin is
+     * offset by the difference (e.g. Ableton Live 12's menu bar is visible but not clickable). */
+    /* Only once the window manager has made the window cover a monitor: until then its config is
+     * the geometry from before the fullscreen request, not a move to the monitor origin. */
+    covers_monitor = xinerama_get_fullscreen_monitors( &data->current_state.rect, &generation, monitors );
+    was_moved = data->is_fullscreen && covers_monitor &&
+                (data->current_state.rect.left != data->rects.visible.left ||
+                 data->current_state.rect.top != data->rects.visible.top);
+
     if (data->wm_state_serial) return 0; /* another WM_STATE update is pending, wait for it to complete */
-    if (data->net_wm_state_serial) return 0; /* another _NET_WM_STATE update is pending, wait for it to complete */
+    /* A window manager may keep _NET_WM_STATE bits we asked it to clear: KWin keeps
+     * _NET_WM_STATE_MAXIMIZED_VERT/HORZ set on a fullscreen window, so the request is never
+     * acknowledged and its serial would block config updates for as long as the window stays
+     * fullscreen. A move the window manager has already performed is final, apply it regardless. */
+    if (data->net_wm_state_serial && !was_moved) return 0; /* another _NET_WM_STATE update is pending, wait for it to complete */
     if (data->mwm_hints_serial) return 0; /* another MWM_HINT update is pending, wait for it to complete */
     if (data->configure_serial) return 0; /* another config update is pending, wait for it to complete */
 
@@ -1757,9 +2256,15 @@ static UINT window_update_client_config( struct x11drv_win_data *data )
      * adding __NET_WM_STATE_FULLSCREEN will make WMs move the window to cover exactly the monitor
      * rect. If the application sets a visible rect slightly larger than the monitor rect and insists
      * on changing to the rect that it previously set when the rect is changed by the WM, then the
-     * window rect will be repeatedly changed by the WM and the application, causing a flickering effect */
-    if (data->is_fullscreen)
+     * window rect will be repeatedly changed by the WM and the application, causing a flickering effect.
+     * Only the size may differ that way: a window the window manager has moved needs to be synced,
+     * or the win32 rects keep an origin the X window doesn't have. */
+    if (data->is_fullscreen && !was_moved)
     {
+        /* The window manager acknowledges _NET_WM_STATE_FULLSCREEN before it reconfigures the
+         * window. In between all requests are complete and the current config is still the old
+         * one; applying it would take the window out of fullscreen on the win32 side. */
+        if (!covers_monitor && (data->current_state.net_wm_state & (1 << NET_WM_STATE_FULLSCREEN))) return 0;
         if (xinerama_get_fullscreen_monitors( &data->rects.visible, &old_generation, old_monitors )
             && xinerama_get_fullscreen_monitors( &data->current_state.rect, &generation, monitors )
             && !memcmp( old_monitors, monitors, sizeof(monitors) ))
@@ -1802,7 +2307,8 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
 {
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
     struct x11drv_win_data *data;
-    HWND old_foreground;
+    HWND old_foreground, anchor;
+    POINT stale_pt;
 
     if (!state_cmd)
     {
@@ -1818,9 +2324,15 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
     *state_cmd = *swp_flags = 0;
     *foreground = 0;
 
-    if (!(old_foreground = NtUserGetForegroundWindow())) old_foreground = NtUserGetDesktopWindow();
-    if (!is_virtual_desktop() && NtUserGetWindowThread( old_foreground, NULL ) == GetCurrentThreadId() &&
-        !window_has_pending_wm_state( old_foreground, NormalState ) && !window_is_reparenting( old_foreground ) &&
+    /* With no foreground window the desktop owner thread is responsible for the
+     * sync (net_active_window_notify posts here in that case), but the change
+     * comparison below must use the real (null) foreground: masking it with the
+     * desktop makes a switch to a non-Wine window look like a no-op and the
+     * foreground then never leaves the null state. */
+    old_foreground = NtUserGetForegroundWindow();
+    if (!(anchor = old_foreground)) anchor = NtUserGetDesktopWindow();
+    if (!is_virtual_desktop() && NtUserGetWindowThread( anchor, NULL ) == GetCurrentThreadId() &&
+        !window_has_pending_wm_state( anchor, NormalState ) && !window_is_reparenting( anchor ) &&
         !thread_data->net_active_window_serial)
     {
         *foreground = hwnd_from_window( thread_data->display, thread_data->current_state.net_active_window );
@@ -1829,11 +2341,31 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
 
     if ((data = get_win_data( hwnd )))
     {
+        BOOL follow;
+
         if (!data->state_locks++) TRACE( "Locked window %p/%lx state\n", data->hwnd, data->whole_window );
         *state_cmd = window_update_client_state( data );
         *swp_flags = window_update_client_config( data );
         *rect = window_rect_from_visible( &data->rects, data->current_state.rect );
+        /* the pointer left this window onto a decoration the X server cannot see (X11DRV_LeaveNotify)
+         * and the window manager is moving the window under it: move the stale pointer position
+         * along, so that the WM_MOUSEMOVE the server synthesizes after the move stays outside */
+        if ((follow = *swp_flags && thread_data->stale_leave_hwnd == hwnd))
+        {
+            stale_pt.x = data->current_state.rect.left + thread_data->stale_leave_rel.x;
+            stale_pt.y = data->current_state.rect.top + thread_data->stale_leave_rel.y;
+        }
         release_win_data( data );
+        if (follow)
+        {
+            INPUT input = {.type = INPUT_MOUSE};
+
+            input.mi.dx = stale_pt.x;
+            input.mi.dy = stale_pt.y;
+            input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+            TRACE( "hwnd %p moved by the window manager, stale pointer kept at %s\n", hwnd, wine_dbgstr_point(&stale_pt) );
+            NtUserSendHardwareInput( 0, 0, &input, 0 );
+        }
     }
 
     if (!*state_cmd && !*swp_flags && !*foreground) return FALSE;
@@ -1875,6 +2407,7 @@ void window_wm_state_notify( struct x11drv_win_data *data, unsigned long serial,
     UINT *desired = &data->desired_state.wm_state, *pending = &data->pending_state.wm_state, *current = &data->current_state.wm_state;
     unsigned long *expect_serial = &data->wm_state_serial;
     const char *reason = NULL, *expected, *received, *prefix;
+    UINT old_state = *current;
 
     prefix = wine_dbg_sprintf( "window %p/%lx ", data->hwnd, data->whole_window );
     received = wine_dbg_sprintf( "WM_STATE %#x/%lu", value, serial );
@@ -1887,6 +2420,36 @@ void window_wm_state_notify( struct x11drv_win_data *data, unsigned long serial,
         return;
     data->current_state.activate = data->pending_state.activate;
     data->reparenting = 0;
+    data->unmaximize_retry = FALSE;
+
+    /* An owned WS_EX_APPWINDOW window has no WM_TRANSIENT_FOR (set_style_hints), so a
+     * window manager that maps it without activation stacks it below the active window
+     * (KWin: restackWindowUnderActive).  Put it back at its win32 place, then the owner
+     * below it. */
+    if (old_state == WithdrawnState && *current == NormalState && data->managed && is_owned_appwindow( data->hwnd ))
+    {
+        HWND owner = NtUserGetAncestor( NtUserGetWindowRelative( data->hwnd, GW_OWNER ), GA_ROOT );
+        Window owner_win = owner ? X11DRV_get_whole_window( owner ) : 0;
+
+        if (data->map_predecessor && data->map_predecessor != owner_win)
+            window_restack_below( data, data->map_predecessor );
+        if (owner_win && (NtUserGetWindowLongW( owner, GWL_STYLE ) & WS_VISIBLE))
+        {
+            XEvent xev = {0};
+
+            TRACE( "window %p/%lx mapped, restacking owner %p/%lx below it\n", data->hwnd, data->whole_window, owner, owner_win );
+            xev.xclient.type = ClientMessage;
+            xev.xclient.window = owner_win;
+            xev.xclient.message_type = x11drv_atom(_NET_RESTACK_WINDOW);
+            xev.xclient.send_event = True;
+            xev.xclient.display = data->display;
+            xev.xclient.format = 32;
+            xev.xclient.data.l[0] = 1; /* source indication: normal application */
+            xev.xclient.data.l[1] = data->whole_window;
+            xev.xclient.data.l[2] = Below;
+            XSendEvent( data->display, root_window, False, SubstructureRedirectMask | SubstructureNotifyMask, &xev );
+        }
+    }
 
     /* send any pending changes from the desired state */
     window_request_desired_state( data );
@@ -1899,6 +2462,7 @@ void window_net_wm_state_notify( struct x11drv_win_data *data, unsigned long ser
 {
     UINT *desired = &data->desired_state.net_wm_state, *pending = &data->pending_state.net_wm_state, *current = &data->current_state.net_wm_state;
     unsigned long *expect_serial = &data->net_wm_state_serial;
+    UINT requested = *expect_serial ? *pending : *current;
     const char *expected, *received, *prefix;
 
     prefix = wine_dbg_sprintf( "window %p/%lx ", data->hwnd, data->whole_window );
@@ -1908,6 +2472,14 @@ void window_net_wm_state_notify( struct x11drv_win_data *data, unsigned long ser
     if (!handle_state_change( serial, expect_serial, sizeof(value), &value, desired, pending,
                               current, expected, prefix, received, NULL ))
         return;
+    if (value & (1 << NET_WM_STATE_MAXIMIZED)) data->unmaximize_retry = FALSE;
+    /* a fullscreen state we did not ask for is the window manager's own, remember it until it is gone */
+    if (!(value & (1 << NET_WM_STATE_FULLSCREEN))) data->wm_fullscreen = FALSE;
+    else if (!(requested & (1 << NET_WM_STATE_FULLSCREEN)))
+    {
+        TRACE( "window %p/%lx fullscreen set by the window manager\n", data->hwnd, data->whole_window );
+        data->wm_fullscreen = TRUE;
+    }
 
     /* send any pending changes from the desired state */
     window_request_desired_state( data );
@@ -1969,6 +2541,46 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
     received = wine_dbg_sprintf( "config %s/%lu", wine_dbgstr_rect(value), serial );
     expected = *expect_serial ? wine_dbg_sprintf( ", expected %s/%lu", wine_dbgstr_rect(pending), *expect_serial ) : "";
 
+    /* A window manager reconfigures the window on its own terms when the decorations or the
+     * fullscreen state change. That event carries the serial of our configure request as soon
+     * as the server has received the request, whether or not the window manager has processed
+     * it, and would be taken for its answer. Ask once more instead of adopting it. */
+    if (*expect_serial && serial >= *expect_serial && data->configure_retry && !EqualRect( value, pending ))
+    {
+        RECT rect = data->desired_state.rect;
+
+        WARN( "%sconfig %s/%lu follows a frame change%s, requesting %s again\n", prefix,
+              wine_dbgstr_rect(value), serial, expected, wine_dbgstr_rect(&rect) );
+        data->configure_retry = FALSE;
+        *current = *pending = *value;
+        *expect_serial = 0;
+        window_set_config( data, rect, FALSE );
+        return;
+    }
+
+    /* An application that leaves the maximized state but keeps its window rect leaves nothing to
+     * request, and the window manager then restores the size it remembers from before the
+     * maximize (Dorico 5 re-applies a geometry it captured while maximized on every switch to
+     * Engrave mode). Windows keeps the rect the application set. Ask for it once instead of
+     * adopting the window manager's; the next config is adopted as before. A config that only
+     * moves the window is the user dragging it, not the window manager restoring a size. */
+    if (data->unmaximize_retry)
+    {
+        data->unmaximize_retry = FALSE;
+        if (!*expect_serial && !data->is_fullscreen &&
+            (value->right - value->left != desired->right - desired->left ||
+             value->bottom - value->top != desired->bottom - desired->top))
+        {
+            RECT rect = *desired;
+
+            WARN( "%sconfig %s/%lu follows an unmaximize, requesting %s again\n", prefix,
+                  wine_dbgstr_rect(value), serial, wine_dbgstr_rect(&rect) );
+            *current = *pending = *value;
+            window_set_config( data, rect, FALSE );
+            return;
+        }
+    }
+
     /* if we've delayed some config we want to continue with it, make sure handle_state_change doesn't overwrite it */
     if ((*expect_serial || window_needs_config_change_delay( data )) &&
         serial >= *expect_serial && !EqualRect( desired, pending ))
@@ -1980,6 +2592,7 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
     if (!handle_state_change( serial, expect_serial, sizeof(*value), value, desired, pending,
                               current, expected, prefix, received, NULL ))
         return;
+    data->configure_retry = FALSE;
     data->pending_state.above = FALSE; /* allow requesting it again */
 
     /* send any pending changes from the desired state */
@@ -1992,7 +2605,7 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
     Window *desired = &data->desired_state.net_active_window, *pending = &data->pending_state.net_active_window, *current = &data->current_state.net_active_window;
     unsigned long *expect_serial = &data->net_active_window_serial;
     const char *expected, *received;
-    HWND current_hwnd, pending_hwnd;
+    HWND current_hwnd, pending_hwnd, foreground;
 
     current_hwnd = hwnd_from_window( data->display, value );
     pending_hwnd = hwnd_from_window( data->display, *pending );
@@ -2003,7 +2616,102 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
                               current, expected, "", received, NULL ))
         return;
 
-    NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
+    /* When there is no foreground window this would become a thread message to
+     * whichever x11drv thread noticed the change, where the ownership check in
+     * X11DRV_GetWindowStateUpdates can never pass, so the foreground would stay
+     * out of sync with X for good.  Post to the desktop window instead: its
+     * owner thread passes that check through the same desktop fallback. */
+    if (!(foreground = NtUserGetForegroundWindow())) foreground = NtUserGetDesktopWindow();
+    NtUserPostMessage( foreground, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
+
+    /* The window manager may restack before it confirms an activation we asked for (one
+     * without NETWM group transients raises an activated owner over the owned windows);
+     * the stacking check skips while X and win32 disagree on the active window, so repeat
+     * it now that they agree. */
+    net_client_list_stacking_notify();
+}
+
+/* whether hwnd is owned by owner, directly or through a chain of owners */
+static BOOL is_owned_by( HWND hwnd, HWND owner )
+{
+    while ((hwnd = NtUserGetWindowRelative( hwnd, GW_OWNER )))
+        if (hwnd == owner) return TRUE;
+    return FALSE;
+}
+
+/***********************************************************************
+ *     get_visible_predecessor
+ *
+ * The visible window above hwnd in the win32 Z-order, not counting the popups
+ * hwnd owns: win32 keeps them above their owner, and the window manager does
+ * the same through WM_TRANSIENT_FOR, so they are no sibling to restack a
+ * managed window below.  Owned WS_EX_APPWINDOW windows count: they are group
+ * transients (set_style_hints), which only a window manager implementing NETWM
+ * group transients keeps above the owner.  Same rule as get_visible_predecessor()
+ * in win32u.
+ */
+static HWND get_visible_predecessor( HWND hwnd )
+{
+    HWND prev = NtUserGetWindowRelative( hwnd, GW_HWNDPREV );
+    while (prev && (!(NtUserGetWindowLongW( prev, GWL_STYLE ) & WS_VISIBLE) ||
+                    (is_owned_by( prev, hwnd ) && !is_owned_appwindow( prev ))))
+        prev = NtUserGetWindowRelative( prev, GW_HWNDPREV );
+    return prev;
+}
+
+/***********************************************************************
+ *     net_client_list_stacking_notify
+ *
+ * The window manager restacked something.  Clicking an already active window
+ * raises it under KWin without any activation Wine would hear about, so check
+ * the foreground window of this thread against the win32 Z-order: if win32 keeps
+ * it below a visible sibling (an application doing so from WM_WINDOWPOSCHANGING
+ * never produces a Z-order change win32u could forward), ask for that order back.
+ */
+void net_client_list_stacking_notify(void)
+{
+    struct x11drv_win_data *data;
+    unsigned long i, count, remaining, idx_window = ~0ul, idx_sibling = ~0ul;
+    Window sibling, *list = NULL;
+    HWND foreground, prev;
+    Display *display;
+    int format;
+    Atom type;
+
+    if (is_virtual_desktop()) return;
+    if (!(foreground = NtUserGetForegroundWindow())) return;
+    if (NtUserGetWindowThread( foreground, NULL ) != GetCurrentThreadId()) return;
+
+    prev = get_visible_predecessor( foreground );
+    if (!prev || !(sibling = X11DRV_get_whole_window( prev ))) return;
+
+    if (!(data = get_win_data( foreground ))) return;
+    if (!data->whole_window || !data->managed || data->embedded || sibling == data->whole_window) goto done;
+    /* only when X and win32 agree on the active window: right after a click the win32
+     * foreground still lags behind, the activation path takes care of that case */
+    if (x11drv_thread_data()->current_state.net_active_window != data->whole_window) goto done;
+
+    display = data->display;
+    if (XGetWindowProperty( display, DefaultRootWindow( display ), x11drv_atom(_NET_CLIENT_LIST_STACKING), 0,
+                            65536 / sizeof(Window), False, XA_WINDOW, &type, &format, &count,
+                            &remaining, (unsigned char **)&list ))
+        goto done;
+    if (type == XA_WINDOW && format == 32)
+    {
+        for (i = 0; i < count; i++) /* bottom-to-top */
+        {
+            if (list[i] == data->whole_window) idx_window = i;
+            else if (list[i] == sibling) idx_sibling = i;
+        }
+    }
+    XFree( list );
+    if (idx_window == ~0ul || idx_sibling == ~0ul || idx_window < idx_sibling) goto done;
+
+    TRACE( "window %p/%lx stacked above win32 predecessor %p/%lx, restacking\n", foreground, data->whole_window, prev, sibling );
+    window_restack_below( data, sibling );
+
+done:
+    release_win_data( data );
 }
 
 Window get_net_active_window( Display *display )
@@ -2052,9 +2760,21 @@ void set_net_active_window( HWND hwnd, HWND previous )
     BOOL withdrawn = FALSE;
     Window window;
     XEvent xev;
+    Time time = CurrentTime;
 
     if (!is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) )) return;
     if (!(window = X11DRV_get_whole_window( hwnd ))) return;
+
+    /* Send an approximate timestamp of the last processed message instead of 0:
+     * mutter's focus-stealing prevention silently drops activation requests with
+     * timestamp 0 (GNOME 50), which deadlocked the request state machine for the
+     * rest of the session.  KWin does not filter on the timestamp, so this is
+     * neutral there.  (The upstream patch additionally relaxes the early-return
+     * to retry on a newer timestamp, but that triggers an activation ping-pong
+     * under KWin that leaves windows unmovable, so the retry is omitted here.) */
+    if (EVENT_x11_time_to_win32_time( 0 ))
+        time = NtUserGetThreadState( UserThreadStateMessageTime ) - EVENT_x11_time_to_win32_time( 0 );
+
     if (data->pending_state.net_active_window == window) return;
     if (window_set_pending_activate( hwnd, &withdrawn )) return;
 
@@ -2066,7 +2786,7 @@ void set_net_active_window( HWND hwnd, HWND previous )
     xev.xclient.send_event = True;
     xev.xclient.format = 32;
     xev.xclient.data.l[0] = 2; /* source: pager */
-    xev.xclient.data.l[1] = 0; /* timestamp */
+    xev.xclient.data.l[1] = time;
     xev.xclient.data.l[2] = X11DRV_get_whole_window( previous ); /* current active */
     xev.xclient.data.l[3] = 0;
     xev.xclient.data.l[4] = 0;
@@ -2082,7 +2802,7 @@ void set_net_active_window( HWND hwnd, HWND previous )
     }
     data->pending_state.net_active_window = window;
 
-    TRACE( "requesting _NET_ACTIVE_WINDOW %p/%lx serial %lu\n", hwnd, window, data->net_active_window_serial );
+    TRACE( "requesting _NET_ACTIVE_WINDOW %p/%lx serial %lu time %lu\n", hwnd, window, data->net_active_window_serial, time );
     XSendEvent( data->display, DefaultRootWindow( data->display ), False,
                 SubstructureRedirectMask | SubstructureNotifyMask, &xev );
 }
@@ -2133,6 +2853,40 @@ void make_window_embedded( struct x11drv_win_data *data )
 
 
 /***********************************************************************
+ *     window_restack_below
+ *
+ * Ask the window manager to stack a managed window directly below one of its
+ * siblings.  A ConfigureWindow request with CWSibling is refused with BadMatch
+ * once the window manager has reparented both windows into their own frames,
+ * so the only way to express a sibling-relative Z-order is the EWMH
+ * _NET_RESTACK_WINDOW client message.  Nothing is tracked here: the window
+ * manager may or may not restack, and it does not have to answer.
+ */
+static void window_restack_below( struct x11drv_win_data *data, Window sibling )
+{
+    XEvent xev = {0};
+
+    if (!data->whole_window || !data->managed || data->embedded) return;
+    if (data->pending_state.wm_state == WithdrawnState) return; /* the window manager doesn't know the window yet */
+    if (sibling == data->whole_window) return;
+
+    xev.xclient.type = ClientMessage;
+    xev.xclient.window = data->whole_window;
+    xev.xclient.message_type = x11drv_atom(_NET_RESTACK_WINDOW);
+    xev.xclient.serial = 0;
+    xev.xclient.display = data->display;
+    xev.xclient.send_event = True;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = 1; /* source indication: normal application */
+    xev.xclient.data.l[1] = sibling;
+    xev.xclient.data.l[2] = Below;
+
+    TRACE( "window %p/%lx, requesting restack below %lx\n", data->hwnd, data->whole_window, sibling );
+    XSendEvent( data->display, root_window, False, SubstructureRedirectMask | SubstructureNotifyMask, &xev );
+}
+
+
+/***********************************************************************
  *		sync_window_position
  *
  * Synchronize the X window position with the Windows one
@@ -2143,10 +2897,11 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
     DWORD ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
     RECT new_rect, window_rect;
     BOOL above = FALSE;
+    Window sibling = 0;
 
     if (data->managed && ((style & WS_MINIMIZE) || data->desired_state.wm_state == IconicState)) return;
 
-    if (!(swp_flags & SWP_NOZORDER) || (swp_flags & SWP_SHOWWINDOW))
+    if (!(swp_flags & SWP_NOZORDER) || (swp_flags & (SWP_SHOWWINDOW | SWP_WINE_ZORDER_SYNC)))
     {
         /* find window that this one must be after */
         HWND prev = NtUserGetWindowRelative( data->hwnd, GW_HWNDPREV );
@@ -2155,6 +2910,11 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
         if (!prev) above = TRUE;  /* top child */
         /* should use stack_mode Below but most window managers don't get it right */
         /* and Above with a sibling doesn't work so well either, so we ignore it */
+        /* for managed windows the sibling-relative order goes out as _NET_RESTACK_WINDOW instead;
+         * the window's own popups are no sibling there, the window manager keeps them above
+         * (an unmanaged window must not be raised over them, so they still count for "top") */
+        else if (data->managed && (prev = get_visible_predecessor( data->hwnd )))
+            sibling = X11DRV_get_whole_window( prev );
     }
 
     set_size_hints( data, style );
@@ -2163,12 +2923,25 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
 
     new_rect = data->rects.visible;
 
+    /* For WS_CHILD windows with forced whole_window (non-desktop parent),
+     * data->rects.visible is parent-relative but window_set_config passes
+     * it through virtual_screen_to_root which expects screen coordinates.
+     * Convert to screen coords so the X11 window position is correct. */
+    if ((style & WS_CHILD) && data->whole_window)
+    {
+        HWND parent = NtUserGetAncestor( data->hwnd, GA_PARENT );
+        if (parent && parent != NtUserGetDesktopWindow())
+            NtUserMapWindowPoints( parent, 0, (POINT *)&new_rect, 2,
+                    NtUserGetWinMonitorDpi( data->hwnd, MDT_RAW_DPI ) );
+    }
+
     /* if the window has been moved offscreen by the window manager, we didn't tell the Win32 side about it */
     window_rect = window_rect_from_visible( old_rects, data->desired_state.rect );
     if (data->is_offscreen) OffsetRect( &new_rect, window_rect.left - old_rects->window.left,
                                         window_rect.top - old_rects->window.top );
 
     window_set_config( data, new_rect, above );
+    if (sibling) window_restack_below( data, sibling );
 }
 
 
@@ -2301,6 +3074,42 @@ static void client_window_events_disable( struct x11drv_win_data *data, Window c
 }
 
 /**********************************************************************
+ *		set_expose_background_suppressed
+ *
+ * Temporarily stop the X server from painting the window background over
+ * areas that get exposed in a top-level's X window.
+ *
+ * Windows taking the default path in get_window_attributes() have
+ * background_pixel = 0, i.e. opaque black, and the server fills any exposed
+ * area with it before the client can repaint.  Taking a client window off the
+ * screen exposes everything it covered - for a GL/D3D top-level that is the
+ * entire client area - so the whole window flashes black for a frame until the
+ * new content arrives.  Callers wrap the requests that do this, so that the
+ * server leaves the previously drawn content in place instead.
+ *
+ * This must stay a short bracket around those requests, never a permanent
+ * state: the background is what keeps a window that is being resized larger
+ * from showing stale screen content in the newly revealed area.
+ */
+void set_expose_background_suppressed( HWND hwnd, BOOL suppress )
+{
+    struct x11drv_win_data *data;
+
+    if (!(data = get_win_data( hwnd ))) return;
+
+    if (data->whole_window && data->black_expose_bg)
+    {
+        TRACE( "%p/%lx %s expose background\n", hwnd, data->whole_window,
+               suppress ? "suppressing" : "restoring" );
+        if (suppress) XSetWindowBackgroundPixmap( gdi_display, data->whole_window, None );
+        else XSetWindowBackground( gdi_display, data->whole_window, 0 );
+    }
+
+    release_win_data( data );
+}
+
+
+/**********************************************************************
  *		detach_client_window
  */
 void detach_client_window( struct x11drv_win_data *data, Window client_window )
@@ -2312,7 +3121,20 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
     if (data->whole_window)
     {
         client_window_events_disable( data, client_window );
+
+        /* Reparenting the client window away exposes its rectangle in whole_window,
+         * and the server fills the exposed area with the black window background
+         * before anybody repaints it.  Drop the background for this request so it
+         * leaves the previously drawn content in place instead, and restore it right
+         * after - a window resized larger needs the background, its newly revealed
+         * area has never held any content.
+         *
+         * client_surface_update_offscreen() already brackets its whole transition,
+         * but that bracket alone measurably does not cover this reparent, so keep
+         * this one: without it the black frame comes back (issue 128). */
+        if (data->black_expose_bg) XSetWindowBackgroundPixmap( gdi_display, data->whole_window, None );
         XReparentWindow( gdi_display, client_window, get_dummy_parent(), 0, 0 );
+        if (data->black_expose_bg) XSetWindowBackground( gdi_display, data->whole_window, 0 );
     }
 
     data->client_window = 0;
@@ -2367,16 +3189,33 @@ void destroy_client_window( HWND hwnd, Window client_window )
 /**********************************************************************
  *		create_client_window
  */
-Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap )
+Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap,
+                             BOOL offscreen )
 {
     struct x11drv_win_data *data = get_win_data( hwnd ), dummy = {0};
     XSetWindowAttributes attr;
-    Window ret;
+    Window parent, ret;
     int x, y, cx, cy;
 
     if (!data) data = &dummy; /* use a dummy window data for HWND_MESSAGE and foreign windows, to create an offscreen client window */
 
-    detach_client_window( data, data->client_window );
+    /* A client window that is going to render offscreen never belongs under the
+     * whole window: client_surface_update_offscreen() reparents it away as soon
+     * as it looks at it.  Until then it sits attached, and an attached client
+     * window is what makes X11DRV_CreateWindowSurface() hand the top-level over
+     * to direct drawing - the window surface is dropped, and with it the surface
+     * region that keeps the parent's background erase out of the client rects of
+     * its pixel-format children.  Detaching the window then exposes the area it
+     * covered, and the repaint of the whole tree that follows goes straight to
+     * the X window, erase included: the children lose their content until they
+     * present again (SynthEdit's MDI canvases while WPF recreates its D3D9
+     * swapchain during a resize).  Create the window where it is going to stay. */
+    if (offscreen) parent = get_dummy_parent();
+    else
+    {
+        detach_client_window( data, data->client_window );
+        parent = data->whole_window ? data->whole_window : get_dummy_parent();
+    }
 
     attr.colormap = colormap;
     attr.bit_gravity = NorthWestGravity;
@@ -2390,26 +3229,32 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
     cy = min( max( 1, client_rect.bottom - client_rect.top ), 65535 );
 
     XSync( gdi_display, False ); /* make sure whole_window is known from gdi_display */
-    ret = data->client_window = XCreateWindow( gdi_display,
-                                               data->whole_window ? data->whole_window : get_dummy_parent(),
-                                               x, y, cx, cy, 0, visual->depth, InputOutput,
-                                               visual->visual, CWBitGravity | CWWinGravity |
-                                               CWBackingStore | CWColormap | CWBorderPixel, &attr );
-    if (data->client_window)
+    ret = XCreateWindow( gdi_display, parent, x, y, cx, cy, 0, visual->depth, InputOutput,
+                         visual->visual, CWBitGravity | CWWinGravity |
+                         CWBackingStore | CWColormap | CWBorderPixel, &attr );
+    if (ret)
     {
-        XMapWindow( gdi_display, data->client_window );
-        if (data->whole_window)
+        XMapWindow( gdi_display, ret );
+        if (!offscreen)
         {
-            XFlush( gdi_display ); /* make sure client_window is created for XSelectInput */
-            client_window_events_enable( data, data->client_window );
+            data->client_window = ret;
+            if (data->whole_window)
+            {
+                XFlush( gdi_display ); /* make sure client_window is created for XSelectInput */
+                client_window_events_enable( data, ret );
+            }
         }
-        TRACE( "%p xwin %lx/%lx\n", data->hwnd, data->whole_window, data->client_window );
+        TRACE( "%p xwin %lx/%lx offscreen %u\n", data->hwnd, data->whole_window, ret, offscreen );
     }
 
     if (data != &dummy) release_win_data( data );
     return ret;
 }
 
+
+/* dwmapi records DwmExtendFrameIntoClientArea( margins = -1 ) as this property,
+ * see update_window_argb_visual(). */
+static const WCHAR dwm_glass_prop[] = {'_','_','w','i','n','e','_','d','w','m','_','g','l','a','s','s',0};
 
 /**********************************************************************
  *		create_whole_window
@@ -2434,6 +3279,23 @@ static void create_whole_window( struct x11drv_win_data *data )
         win_rgn = 0;
     }
     data->shaped = (win_rgn != 0);
+
+    /* Pick the alpha capable visual up front when the window has already asked for
+     * glass.  update_window_argb_visual() would otherwise do it later, and
+     * set_window_visual() implements that by destroying and re-creating the X
+     * window.  Landing in the middle of a drag, that leaves the window gone for
+     * over a second - measured 27 of 80 samples without a drag window at all,
+     * which is what the remaining flicker of issue 250 turned out to be.  The end
+     * state is the same visual either way; deciding here only skips the
+     * transition. */
+    if (!data->embedded && !data->wants_argb && argb_visual.visualid
+            && NtUserGetProp( data->hwnd, dwm_glass_prop ))
+    {
+        TRACE( "window %p asked for DWM glass before creation, using an ARGB visual\n", data->hwnd );
+        data->wants_argb = 1;
+        data->vis = argb_visual;
+        data->use_alpha = TRUE;
+    }
 
     if (data->vis.visualid != default_visual.visualid)
         data->whole_colormap = XCreateColormap( data->display, root_window, data->vis.visual, AllocNone );
@@ -2462,6 +3324,7 @@ static void create_whole_window( struct x11drv_win_data *data )
 
     XSaveContext( data->display, data->whole_window, winContext, (char *)data->hwnd );
     NtUserSetProp( data->hwnd, whole_window_prop, (HANDLE)data->whole_window );
+    NtUserSetProp( data->hwnd, visual_id_prop, (HANDLE)(ULONG_PTR)data->vis.visualid );
 
     /* set the window text */
     if (!NtUserInternalGetWindowText( data->hwnd, text, ARRAY_SIZE( text ))) text[0] = 0;
@@ -2475,6 +3338,12 @@ static void create_whole_window( struct x11drv_win_data *data )
     if (!NtUserGetLayeredWindowAttributes( data->hwnd, &key, &alpha, &layered_flags )) layered_flags = 0;
     sync_window_opacity( data->display, data->whole_window, alpha, layered_flags );
     sync_window_input_shape( data );
+
+    /* give the window a visible default arrow cursor so that windows which
+       never set a cursor of their own (e.g. cross-process embedded WebView2
+       surfaces) don't end up blank once WM reparenting breaks the X11 cursor
+       inheritance to the owner window */
+    XDefineCursor( data->display, data->whole_window, get_default_cursor() );
 
     XFlush( data->display );  /* make sure the window exists before we start painting to it */
 
@@ -2517,10 +3386,12 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     memset( &data->current_state, 0, sizeof(data->current_state) );
     data->wm_state_serial = 0;
     data->net_wm_state_serial = 0;
+    data->wm_hints_serial = 0;
     data->mwm_hints_serial = 0;
     data->wm_normal_hints_serial = 0;
     data->configure_serial = 0;
     data->net_wm_icon_serial = 0;
+    data->wm_fullscreen = FALSE;
     data->reparenting = 0;
 
     if (data->xic)
@@ -2532,6 +3403,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     /* Outlook stops processing messages after destroying a dialog, so we need an explicit flush */
     XFlush( data->display );
     NtUserRemoveProp( data->hwnd, whole_window_prop );
+    NtUserRemoveProp( data->hwnd, visual_id_prop );
 
     /* It's possible that we are in a different thread, when called from
      * set_window_visual, and about to recreate the window. In this case
@@ -2569,6 +3441,34 @@ void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BO
     create_whole_window( data );
     /* attach the client back to the re-created whole_window */
     attach_client_window( data, client_window );
+}
+
+
+/**********************************************************************
+ *              update_window_argb_visual
+ *
+ * Alpha capability is a property of the WINDOW, not a side effect of the last
+ * API call that touched it.  DwmExtendFrameIntoClientArea( margins = -1 ) asks
+ * for full glass, which on Windows makes the client area per-pixel alpha
+ * capable and combines with an LWA_ALPHA constant opacity.  dwmapi records the
+ * request as a window property; pick it up here and remember it in the window
+ * data, so a later SetLayeredWindowAttributes cannot drop it again.
+ *
+ * The transition is one-way on purpose: set_window_visual() destroys and
+ * re-creates the X window, which must not happen repeatedly while the window
+ * is being dragged.  The bit is cleared in SetWindowStyle when WS_EX_LAYERED
+ * changes, which is where layered attributes are reset anyway.
+ */
+void update_window_argb_visual( struct x11drv_win_data *data )
+{
+    if (!data->wants_argb)
+    {
+        if (!NtUserGetProp( data->hwnd, dwm_glass_prop )) return;
+        TRACE( "window %p requested DWM glass, using an ARGB visual\n", data->hwnd );
+        data->wants_argb = 1;
+    }
+
+    if (!data->embedded && argb_visual.visualid) set_window_visual( data, &argb_visual, TRUE );
 }
 
 
@@ -2614,6 +3514,8 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
         if (changed & WS_EX_LAYERED) /* changing WS_EX_LAYERED resets attributes */
         {
             data->layered = FALSE;
+            data->wants_argb = 0;
+            data->ulw_surface = 0;
             set_window_visual( data, &default_visual, FALSE );
             sync_window_opacity( data->display, data->whole_window, 0, 0 );
         }
@@ -2709,6 +3611,13 @@ void X11DRV_SetDesktopWindow( HWND hwnd )
     {
         RECT rect = NtUserGetVirtualScreenRect( MDT_DEFAULT );
 
+        /* Other processes use a non-empty desktop size as the signal that the
+         * desktop window is ready, and then look up the X11 window on the
+         * property. Publish the property first, or a process starting in
+         * between would see the size without the property and silently keep
+         * using the root window, ending up outside of the virtual desktop. */
+        if (is_virtual_desktop()) NtUserSetProp( hwnd, whole_window_prop, (HANDLE)root_window );
+
         SERVER_START_REQ( set_window_pos )
         {
             req->handle        = wine_server_user_handle( hwnd );
@@ -2724,6 +3633,7 @@ void X11DRV_SetDesktopWindow( HWND hwnd )
         if (!create_desktop_win_data( root_window, hwnd ))
         {
             ERR( "Failed to create virtual desktop window data\n" );
+            NtUserRemoveProp( hwnd, whole_window_prop );
             root_window = DefaultRootWindow( gdi_display );
         }
     }
@@ -2798,6 +3708,8 @@ BOOL X11DRV_CreateWindow( HWND hwnd )
  *		get_win_data
  *
  * Lock and return the X11 data structure associated with a window.
+ * This takes the global win_data_mutex; despite the get/release naming
+ * there is no per-window refcounting.
  */
 struct x11drv_win_data *get_win_data( HWND hwnd )
 {
@@ -3056,8 +3968,35 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     }
     else
     {
+        /* The top level belongs to another process; its X window was published
+         * on whole_window_prop together with the id of the visual it was created
+         * with.  Resolve that id instead of assuming the default visual: the
+         * xrender picture format follows the DC's visual, and a format whose
+         * depth differs from the drawable's makes XRenderCreatePicture fail with
+         * BadMatch, a fatal X error.  WebView2's GPU process presents a
+         * DirectComposition swapchain into its "Intermediate D3D Window", a
+         * child of the browser process's tooltip top level, and that top level
+         * carries a depth-32 ARGB visual (WS_EX_NOREDIRECTIONBITMAP); with the
+         * depth-24 default format the GDI present's StretchBlt killed the GPU
+         * process on the first tooltip.  XGetVisualInfo on a visual id is a
+         * client-side lookup, no round trip. */
+        VisualID visualid = (VisualID)(ULONG_PTR)NtUserGetProp( top, visual_id_prop );
+
         escape.drawable = X11DRV_get_whole_window( top );
-        escape.visual = default_visual; /* FIXME: use the right visual for other process window */
+        escape.visual = default_visual;
+        if (visualid && visualid != default_visual.visualid)
+        {
+            XVisualInfo template = { .visualid = visualid };
+            XVisualInfo *info;
+            int count;
+
+            if ((info = XGetVisualInfo( gdi_display, VisualIDMask, &template, &count )))
+            {
+                escape.visual = *info;
+                XFree( info );
+            }
+            else WARN( "visual %lx of foreign top level %p not found, using the default\n", visualid, top );
+        }
     }
 
     if (!escape.drawable) return; /* don't create a GC for foreign windows */
@@ -3077,6 +4016,13 @@ void X11DRV_ReleaseDC( HWND hwnd, HDC hdc )
     escape.mode = IncludeInferiors;
     escape.dc_rect = NtUserGetVirtualScreenRect( MDT_DEFAULT );
     OffsetRect( &escape.dc_rect, -2 * escape.dc_rect.left, -2 * escape.dc_rect.top );
+    /* The DC is parked on the root window, which uses the default (depth-24)
+     * visual.  Set it explicitly: escape.visual is otherwise left uninitialized
+     * (stack garbage), and xrenderdrv_ExtEscape treats a non-NULL visual as a
+     * real format to match.  Garbage that still matches the previous (possibly
+     * depth-32) format would make the next XRenderCreatePicture on the root
+     * drawable fail with BadMatch, a fatal X error. */
+    escape.visual = default_visual;
     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
 }
 
@@ -3121,6 +4067,7 @@ BOOL X11DRV_ScrollDC( HDC hdc, INT dx, INT dy, HRGN update )
  */
 void X11DRV_SetCapture( HWND hwnd, UINT flags, HWND previous )
 {
+    struct x11drv_thread_data *thread_data = x11drv_thread_data();
     struct x11drv_win_data *data;
 
     TRACE( "hwnd %p, flags %#x, previous %p\n", hwnd, flags, previous );
@@ -3136,11 +4083,13 @@ void X11DRV_SetCapture( HWND hwnd, UINT flags, HWND previous )
                           PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
                           GrabModeAsync, GrabModeAsync, None, None, CurrentTime );
             XFlush( data->display );
+            thread_data->grab_hwnd = data->hwnd;
         }
         release_win_data( data );
     }
     else if (previous)  /* release capture */
     {
+        thread_data->grab_hwnd = NULL;
         if (!(data = get_win_data( previous ))) return;
         XUngrabPointer( data->display, CurrentTime );
         XFlush( data->display );
@@ -3237,7 +4186,12 @@ BOOL X11DRV_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *sty
     }
 
     *style_mask = *ex_style_mask = 0;
-    if (decor & MWM_DECOR_TITLE) *style_mask |= WS_CAPTION;
+    if (decor & MWM_DECOR_TITLE)
+    {
+        *style_mask |= WS_CAPTION;
+        /* tool windows have the smaller caption, strip that one */
+        *ex_style_mask |= WS_EX_TOOLWINDOW;
+    }
     if (decor & MWM_DECOR_BORDER)
     {
         *style_mask |= WS_DLGFRAME | WS_THICKFRAME;
@@ -3283,6 +4237,26 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     TRACE( "win %p/%lx new_rects %s style %08x flags %08x\n", hwnd, data->whole_window,
            debugstr_window_rects(new_rects), new_style, swp_flags );
+
+    /* A window manager is free to silently ignore a _NET_WM_STATE request: KWin
+     * for instance keeps _NET_WM_STATE_MAXIMIZED_VERT/HORZ set while a window is
+     * fullscreen, so the request to remove it that we send when entering
+     * fullscreen never changes the property and no PropertyNotify is generated.
+     * The request then stays pending forever and net_wm_state_serial blocks every
+     * later _NET_WM_STATE, config and _MOTIF_WM_HINTS update, leaving the window
+     * fullscreen-sized and undecorated when the application leaves fullscreen
+     * again (e.g. Ableton Live 12 on the second F11).  A fullscreen transition
+     * makes the pending request obsolete, so drop it and resync from the state
+     * the window manager actually reports. */
+    if (data->net_wm_state_serial && was_fullscreen != data->is_fullscreen &&
+        data->pending_state.net_wm_state != data->current_state.net_wm_state)
+    {
+        WARN( "win %p/%lx dropping unacknowledged _NET_WM_STATE %#x/%lu, resyncing to %#x\n",
+              hwnd, data->whole_window, data->pending_state.net_wm_state,
+              data->net_wm_state_serial, data->current_state.net_wm_state );
+        data->net_wm_state_serial = 0;
+        data->pending_state.net_wm_state = data->current_state.net_wm_state;
+    }
 
     /* visible windows are only hidden after SWP_HIDEWINDOW is used */
     if (data->desired_state.wm_state != WithdrawnState && !(new_style & WS_VISIBLE) &&
@@ -3342,6 +4316,11 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     release_win_data( data );
 
     if (was_fullscreen) NtUserClipCursor( NULL );
+
+    /* owned group transients join the group of a shown owner behind it, and leave it when the owner hides */
+    if ((swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) && !(new_style & WS_CHILD) &&
+        NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow())
+        refresh_owned_group_hints( hwnd );
 }
 
 /* check if the window icon should be hidden (i.e. moved off-screen) */
@@ -3457,7 +4436,11 @@ void X11DRV_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWO
 
     if (data)
     {
-        set_window_visual( data, &default_visual, FALSE );
+        /* LWA_ALPHA is a constant opacity and says nothing about per-pixel
+         * alpha; it must not undo the alpha capability the window already has.
+         * sync_window_opacity() below is this call's actual job. */
+        update_window_argb_visual( data );
+        if (!data->wants_argb) set_window_visual( data, &default_visual, FALSE );
 
         if (data->whole_window)
         {
@@ -3676,6 +4659,53 @@ failed:
     return -1;
 }
 
+/***********************************************************************
+ *     window_drop_wm_demands_attention
+ *
+ * KWin flags every normal window it does not activate on map as demanding
+ * attention (X11Window::manage).  A window that win32 showed without activation,
+ * or that another window of the foreground process took the activation from,
+ * does not flash on Windows, so take the state back once per map, unless
+ * FlashWindowEx() asked for it.  wine-dev issue 532.
+ */
+void window_drop_wm_demands_attention( struct x11drv_win_data *data, Display *display, Window window )
+{
+    unsigned long i, count, remaining;
+    BOOL found = FALSE;
+    Atom type, *state;
+    int format;
+    XEvent xev;
+
+    if (!data->noactivate_map || data->flashing || !data->managed) return;
+
+    if (!XGetWindowProperty( display, window, x11drv_atom(_NET_WM_STATE), 0, 65536 / sizeof(CARD32), False,
+                             XA_ATOM, &type, &format, &count, &remaining, (unsigned char **)&state ))
+    {
+        if (type == XA_ATOM && format == 32)
+            for (i = 0; i < count; i++) if (state[i] == x11drv_atom(_NET_WM_STATE_DEMANDS_ATTENTION)) found = TRUE;
+        XFree( state );
+    }
+    if (!found) return;
+
+    TRACE( "window %p/%lx mapped without activation, dropping the window manager's demands-attention\n",
+           data->hwnd, data->whole_window );
+    data->noactivate_map = FALSE;
+    xev.type = ClientMessage;
+    xev.xclient.window = data->whole_window;
+    xev.xclient.message_type = x11drv_atom( _NET_WM_STATE );
+    xev.xclient.serial = 0;
+    xev.xclient.display = data->display;
+    xev.xclient.send_event = True;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = _NET_WM_STATE_REMOVE;
+    xev.xclient.data.l[1] = x11drv_atom( _NET_WM_STATE_DEMANDS_ATTENTION );
+    xev.xclient.data.l[2] = 0;
+    xev.xclient.data.l[3] = 1;
+    xev.xclient.data.l[4] = 0;
+    XSendEvent( data->display, DefaultRootWindow( data->display ), False,
+                SubstructureRedirectMask | SubstructureNotifyMask, &xev );
+}
+
 void X11DRV_FlashWindowEx( FLASHWINFO *pfinfo )
 {
     struct x11drv_win_data *data = get_win_data( pfinfo->hwnd );
@@ -3693,6 +4723,7 @@ void X11DRV_FlashWindowEx( FLASHWINFO *pfinfo )
         xev.xclient.display = data->display;
         xev.xclient.send_event = True;
         xev.xclient.format = 32;
+        data->flashing = !!pfinfo->dwFlags;
         xev.xclient.data.l[0] = pfinfo->dwFlags ?  _NET_WM_STATE_ADD : _NET_WM_STATE_REMOVE;
         xev.xclient.data.l[1] = x11drv_atom( _NET_WM_STATE_DEMANDS_ATTENTION );
         xev.xclient.data.l[2] = 0;

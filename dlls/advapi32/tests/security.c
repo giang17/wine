@@ -81,6 +81,7 @@ static DWORD (WINAPI *pRtlAdjustPrivilege)(ULONG,BOOLEAN,BOOLEAN,PBOOLEAN);
 static NTSTATUS (WINAPI *pNtAccessCheck)(PSECURITY_DESCRIPTOR, HANDLE, ACCESS_MASK, PGENERIC_MAPPING,
                                          PPRIVILEGE_SET, PULONG, PULONG, NTSTATUS*);
 static BOOL     (WINAPI *pRtlDosPathNameToNtPathName_U)(LPCWSTR,PUNICODE_STRING,PWSTR*,CURDIR*);
+static BOOL     (WINAPI *pImpersonateAnonymousToken)(HANDLE);
 
 static HMODULE hmod;
 static int     myARGC;
@@ -120,6 +121,7 @@ static void init(void)
 
     hmod = GetModuleHandleA("advapi32.dll");
     pAddMandatoryAce = (void *)GetProcAddress(hmod, "AddMandatoryAce");
+    pImpersonateAnonymousToken = (void *)GetProcAddress(hmod, "ImpersonateAnonymousToken");
 
     myARGC = winetest_get_mainargs( &myARGV );
 }
@@ -3234,6 +3236,78 @@ static void test_impersonation_level(void)
     CloseHandle(ProcessToken);
 
     free(PrivilegeSet);
+}
+
+static void test_ImpersonateAnonymousToken(void)
+{
+    SID_IDENTIFIER_AUTHORITY nt_authority = { SECURITY_NT_AUTHORITY };
+    SECURITY_IMPERSONATION_LEVEL level;
+    TOKEN_PRIVILEGES *privs;
+    TOKEN_USER *user;
+    TOKEN_TYPE type;
+    PSID anonymous;
+    HANDLE token;
+    char buffer[256], name[256];
+    DWORD size;
+    BOOL ret;
+
+    if (!pImpersonateAnonymousToken)
+    {
+        win_skip("ImpersonateAnonymousToken is not available\n");
+        return;
+    }
+    AllocateAndInitializeSid(&nt_authority, 1, SECURITY_ANONYMOUS_LOGON_RID, 0, 0, 0, 0, 0, 0, 0, &anonymous);
+
+    SetLastError(0xdeadbeef);
+    ret = pImpersonateAnonymousToken(NULL);
+    ok(!ret, "ImpersonateAnonymousToken succeeded\n");
+    ok(GetLastError() == ERROR_INVALID_HANDLE, "got error %lu\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = pImpersonateAnonymousToken(GetCurrentThread());
+    ok(ret, "ImpersonateAnonymousToken failed, error %lu\n", GetLastError());
+    ok(GetLastError() == 0xdeadbeef, "got error %lu\n", GetLastError());
+
+    ret = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token);
+    ok(ret, "OpenThreadToken failed, error %lu\n", GetLastError());
+
+    ret = GetTokenInformation(token, TokenType, &type, sizeof(type), &size);
+    ok(ret, "GetTokenInformation failed, error %lu\n", GetLastError());
+    ok(type == TokenImpersonation, "got type %d\n", type);
+
+    ret = GetTokenInformation(token, TokenImpersonationLevel, &level, sizeof(level), &size);
+    ok(ret, "GetTokenInformation failed, error %lu\n", GetLastError());
+    ok(level == SecurityImpersonation, "got level %d\n", level);
+
+    user = (TOKEN_USER *)buffer;
+    ret = GetTokenInformation(token, TokenUser, buffer, sizeof(buffer), &size);
+    ok(ret, "GetTokenInformation failed, error %lu\n", GetLastError());
+    ok(EqualSid(user->User.Sid, anonymous), "got user %s\n", debugstr_sid(user->User.Sid));
+
+    privs = (TOKEN_PRIVILEGES *)buffer;
+    ret = GetTokenInformation(token, TokenPrivileges, buffer, sizeof(buffer), &size);
+    ok(ret, "GetTokenInformation failed, error %lu\n", GetLastError());
+    ok(!privs->PrivilegeCount, "got %lu privileges\n", privs->PrivilegeCount);
+    CloseHandle(token);
+
+    size = sizeof(name);
+    SetLastError(0xdeadbeef);
+    ret = GetUserNameA(name, &size);
+    todo_wine ok(!ret, "GetUserNameA succeeded\n");
+    todo_wine ok(GetLastError() == ERROR_NO_SUCH_LOGON_SESSION, "got error %lu\n", GetLastError());
+
+    SetLastError(0xdeadbeef);
+    ret = pImpersonateAnonymousToken(GetCurrentThread());
+    ok(ret, "second ImpersonateAnonymousToken failed, error %lu\n", GetLastError());
+
+    ret = RevertToSelf();
+    ok(ret, "RevertToSelf failed, error %lu\n", GetLastError());
+    SetLastError(0xdeadbeef);
+    ret = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token);
+    ok(!ret, "OpenThreadToken succeeded\n");
+    ok(GetLastError() == ERROR_NO_TOKEN, "got error %lu\n", GetLastError());
+
+    FreeSid(anonymous);
 }
 
 static void test_SetEntriesInAclW(void)
@@ -8860,6 +8934,7 @@ START_TEST(security)
     test_security_descriptor();
     test_process_security();
     test_impersonation_level();
+    test_ImpersonateAnonymousToken();
     test_SetEntriesInAclW();
     test_SetEntriesInAclA();
     test_CreateDirectoryA();

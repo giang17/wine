@@ -129,6 +129,11 @@
 #define IDC_RES_TRACKBAR                1107
 #define IDC_RES_DPIEDIT                 1108
 #define IDC_RES_FONT_PREVIEW            1109
+#define IDC_TEXT_CONTRAST               1110
+#define IDC_TEXT_CONTRAST_OFF           1111
+#define IDC_TEXT_CONTRAST_MEDIUM        1112
+#define IDC_TEXT_CONTRAST_STRONG        1113
+#define IDC_TEXT_CONTRAST_CUSTOM        1114
 
 /* applications tab */
 #define IDC_APP_LISTVIEW                1200

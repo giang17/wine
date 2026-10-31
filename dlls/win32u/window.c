@@ -318,6 +318,28 @@ static void client_surface_release_locked( struct client_surface *surface )
     }
 }
 
+/* Remember whether a client surface presents into the child hwnd by copying an
+ * offscreen client window, see update_visible_region().  Called with surfaces_lock
+ * held, which is ordered before the user lock (client_surface_present() also takes
+ * a DC under it), so the flag lives in the WND where the DC code can read it
+ * without that lock. */
+static void set_window_present_offscreen( HWND hwnd, BOOL offscreen )
+{
+    WND *win;
+
+    if (NtUserGetAncestor( hwnd, GA_ROOT ) == hwnd) offscreen = FALSE;
+    win = get_win_ptr( hwnd );
+    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    if (win->present_offscreen != offscreen)
+    {
+        TRACE( "hwnd %p presents %s\n", hwnd, offscreen ? "offscreen" : "attached" );
+        win->present_offscreen = offscreen;
+        /* the DCs of the window pick their drawable again, see update_visible_region() */
+        invalidate_dce( win, NULL );
+    }
+    release_win_ptr( win );
+}
+
 void detach_client_surfaces( HWND hwnd )
 {
     struct client_surface *surface, *next;
@@ -330,6 +352,8 @@ void detach_client_surfaces( HWND hwnd )
         if (surface->hwnd == hwnd) client_surface_release_locked( surface );
 
     pthread_mutex_unlock( &surfaces_lock );
+
+    set_window_present_offscreen( hwnd, FALSE );
 }
 
 static RECT get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *monitor_rect )
@@ -439,8 +463,16 @@ void client_surface_present( struct client_surface *surface )
         if (surface->offscreen) hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE );
         surface->funcs->present( surface, hdc );
         if (hdc) NtUserReleaseDC( hwnd, hdc );
+        set_window_present_offscreen( hwnd, surface->offscreen && hdc );
     }
     pthread_mutex_unlock( &surfaces_lock );
+}
+
+/* see client_surface_funcs.wait; the caller holds a reference to the surface */
+void client_surface_wait( struct client_surface *surface, BOOL presented )
+{
+    if (surface->funcs->wait && InterlockedCompareExchange( &surface->offscreen, 0, 0 ))
+        surface->funcs->wait( surface, presented );
 }
 
 void client_surface_update( struct client_surface *surface )
@@ -1746,7 +1778,16 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
         return FALSE;
     }
     if (!internal) win->pixel_format = format;
-    if (format && !win->clip_clients) changed = win->clip_clients = TRUE;
+    if (format && !win->clip_clients)
+    {
+        changed = win->clip_clients = TRUE;
+        /* A DC of this window that already exists is bound to an ancestor's
+         * window surface, while from now on that surface's region excludes
+         * this window's client area (window_clips_clients()).  Everything
+         * painted through such a DC would land in surface bits the flush no
+         * longer copies.  Make those DCs recompute their visible region. */
+        invalidate_dce( win, NULL );
+    }
     release_win_ptr( win );
 
     if (changed) update_window_state( hwnd );
@@ -2165,6 +2206,27 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     if (rects->client.top < visible_rect.top || rects->client.left < visible_rect.left ||
         rects->client.bottom > visible_rect.bottom || rects->client.right > visible_rect.right)
         visible_rect = rects->window;
+    /* A captioned window whose client top is not where DefWindowProc's WM_NCCALCSIZE put it, or
+     * whose client DefWindowProc never computed, draws its own title bar inside the standard
+     * frame: the window manager's title bar would cover it, and the window rect the manager
+     * then moves the window to leaves the application's strip outside the window (a vatSys
+     * ASD window keeps a 30 px strip above an inset client while maximised). */
+    else if ((style & WS_CAPTION) == WS_CAPTION && (style_mask & WS_CAPTION) == WS_CAPTION)
+    {
+        int top = rects->client.top - rects->window.top, standard = -1;
+        WND *win;
+
+        if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+        {
+            if (win->nc_insets_valid) standard = win->nc_insets.top;
+            release_win_ptr( win );
+        }
+        if (top != standard)
+        {
+            TRACE( "hwnd %p draws its own frame: client top %d, DefWindowProc %d\n", hwnd, top, standard );
+            visible_rect = rects->window;
+        }
+    }
 
     TRACE( "hwnd %p, rects %s, style %#x, ex_style %#x -> visible_rect %s\n", hwnd,
            debugstr_window_rects( rects ), style, ex_style, wine_dbgstr_rect( &visible_rect ) );
@@ -2334,6 +2396,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     struct window_rects old_rects;
     RECT extra_rects[3];
     struct window_surface *old_surface;
+    RECT surface_rects[2], *surface_copy = NULL;
     HICON icon, icon_small;
     ICONINFO ii, ii_small;
 
@@ -2346,6 +2409,29 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     get_window_rects( hwnd, COORDS_PARENT, &old_rects, dpi );
     if (IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
+
+    /* A window class that asks for a full redraw on resize (CS_HREDRAW/CS_VREDRAW)
+     * makes WM_NCCALCSIZE return WVR_REDRAW, which clears the valid rects.  That is
+     * the right answer for the application - it will repaint everything - but it
+     * also stops the pixels of the old window surface from being carried over when
+     * the surface object itself is replaced.  The successor then starts out as the
+     * plain fill colour, and the expose events the resize generates flush it before
+     * the repaint arrives: one frame of the whole window in that colour.  Keep a
+     * copy rectangle of our own for that case - stale pixels for one frame are
+     * better than none, and the pending repaint overwrites them anyway. */
+    if (!is_layered)
+    {
+        int cx, cy;
+        surface_rects[0] = new_rects->client;
+        surface_rects[1] = old_rects.client;
+        cx = min( surface_rects[0].right - surface_rects[0].left, surface_rects[1].right - surface_rects[1].left );
+        cy = min( surface_rects[0].bottom - surface_rects[0].top, surface_rects[1].bottom - surface_rects[1].top );
+        surface_rects[0].right = surface_rects[0].left + cx;
+        surface_rects[0].bottom = surface_rects[0].top + cy;
+        surface_rects[1].right = surface_rects[1].left + cx;
+        surface_rects[1].bottom = surface_rects[1].top + cy;
+        if (cx > 0 && cy > 0) surface_copy = surface_rects;
+    }
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
     old_surface = win->surface;
@@ -2407,6 +2493,28 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     if (ret)
     {
         update_surface_region( surface_win );
+        /* A child drawn by another process is subtracted from its top-level's
+         * surface region (server, clip_pixel_format_children), so the owner's
+         * flush keeps off the pixels the child paints into the shared drawable.
+         * That region is only recomputed by the owner, and update_surface_region()
+         * above cannot reach a surface window of another process -- so the owner
+         * never learns that a foreign child was shown, moved or resized after its
+         * surface region was taken.  Creation and destruction already prod the
+         * top-level (NtUserCreateWindowEx, destroy_window); do the same here.
+         * Seen in FL Studio 2026: the Browser window is open at start, Chromium's
+         * WebView2 child grows into it later, and FL's repaint storm after an
+         * activation change then flushed its untouched (black) surface over the
+         * page for ~0.5 s -- until the window was hidden and shown again, which
+         * made FL recompute the region with the child in it. */
+        if (is_child && surface_win && surface_win != hwnd
+            && ((swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW))
+                || !EqualRect( &old_rects.client, &new_rects->client )))
+        {
+            WND *top = get_win_ptr( surface_win );
+
+            if (top == WND_OTHER_PROCESS) update_window_state( surface_win );
+            else if (top && top != WND_DESKTOP) release_win_ptr( top );
+        }
         if (((swp_flags & SWP_AGG_NOPOSCHANGE) != SWP_AGG_NOPOSCHANGE) ||
             (swp_flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW | SWP_STATECHANGED | SWP_FRAMECHANGED)))
             invalidate_dce( win, &old_rects.window );
@@ -2458,6 +2566,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
                     move_window_bits( hwnd, new_rects, valid_rects );
                 }
             }
+            else if (surface_copy && old_surface != new_surface && old_surface != &dummy_surface &&
+                     new_surface && new_surface != &dummy_surface)
+                inherit_window_surface_bits( hwnd, &new_rects->window, old_surface, &old_rects.visible, surface_copy );
             window_surface_release( old_surface );
         }
         else if (valid_rects)
@@ -2490,6 +2601,17 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
                 move_window_bits( hwnd, new_rects, valid_rects );
             }
         }
+
+        /* A window that was drawing straight to the driver window and now gets a
+         * window surface again starts out with a blank surface: the pixels it is
+         * supposed to own live on the driver window, and nothing copies them back
+         * (X11DRV_MoveWindowBits copies within the same window, source == target).
+         * The valid rects still claim the client area is intact, so no repaint is
+         * asked for either, and everything that does not redraw itself of its own
+         * accord stays at the surface fill colour.  Ask for one. */
+        if (!old_surface && new_surface && new_surface != &dummy_surface &&
+            (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
+            NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
 
         if (need_icons && (icon = get_window_icon_info( hwnd, ICON_BIG, icon, &ii )))
         {
@@ -2757,7 +2879,9 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         swp_flags &= ~SWP_NOSIZE;
     }
 
-    TRACE( "window %p new_rects %s\n", hwnd, debugstr_window_rects( &new_rects ) );
+    TRACE( "window %p new_rects %s, dirty %s, pts_src %s, flags %#x, hdc_src %p\n", hwnd,
+           debugstr_window_rects( &new_rects ), wine_dbgstr_rect( dirty ),
+           pts_src ? wine_dbgstr_point( pts_src ) : "(null)", (int)flags, hdc_src );
 
     surface = get_window_surface( hwnd, swp_flags, TRUE, &new_rects, &surface_rect );
     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
@@ -2797,6 +2921,13 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         window_surface_unlock( surface );
 
         if (!(flags & ULW_COLORKEY)) key = CLR_INVALID;
+        /* Windows keys nothing with a PALETTEINDEX key here.  Measured on
+         * Windows 10 with an 8 bpp source whose logical palette and colour
+         * table both name the key colour, only one of them, or neither: the
+         * colour stays, and so do black pixels.  get_color_key() would turn the
+         * key into black and cut those away instead (issue 434; Microsoft
+         * Agent 2.0 passes PALETTEINDEX keys, WineHQ bug 60180). */
+        else if ((key & 0xff000000) == 0x01000000) key = CLR_INVALID;
         window_surface_set_layered( surface, key, -1, 0xff000000 );
 
         user_driver->pUpdateLayeredWindow( hwnd, source_alpha, flags );
@@ -3932,6 +4063,30 @@ static UINT calc_ncsize( WINDOWPOS *winpos, const struct window_rects *old_rects
     return wvr_flags;
 }
 
+/* whether a top-level window owned by hwnd lies below it in the Z-order */
+static BOOL has_owned_window_below( HWND hwnd )
+{
+    HWND next;
+
+    if (get_window_long( hwnd, GWL_STYLE ) & WS_CHILD) return FALSE;
+    for (next = get_window_relative( hwnd, GW_HWNDNEXT ); next; next = get_window_relative( next, GW_HWNDNEXT ))
+        if (get_window_relative( next, GW_OWNER ) == hwnd) return TRUE;
+    return FALSE;
+}
+
+/* whether any top-level window is owned by hwnd */
+static BOOL owns_windows( HWND hwnd )
+{
+    HWND *list;
+    BOOL ret = FALSE;
+    int i;
+
+    if (!(list = list_window_children( 0 ))) return FALSE;
+    for (i = 0; list[i] && !ret; i++) ret = get_window_relative( list[i], GW_OWNER ) == hwnd;
+    free( list );
+    return ret;
+}
+
 /* fix redundant flags and values in the WINDOWPOS structure */
 static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int parent_x, int parent_y )
 {
@@ -3990,7 +4145,9 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
 
     if (winpos->hwndInsertAfter == HWND_TOP)
     {
-        if (get_window_relative( winpos->hwnd, GW_HWNDFIRST ) == winpos->hwnd)
+        /* still a Z-order change while an owned window lies below: swp_owner_popups() lifts it */
+        if (get_window_relative( winpos->hwnd, GW_HWNDFIRST ) == winpos->hwnd &&
+            !has_owned_window_below( winpos->hwnd ))
             winpos->flags |= SWP_NOZORDER;
     }
     else if (winpos->hwndInsertAfter == HWND_BOTTOM)
@@ -4027,11 +4184,13 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
  * fix Z order taking into account owned popups -
  * basically we need to maintain them above the window that owns them
  *
- * FIXME: hide/show owned popups when owner visibility changes.
+ * For HWND_TOP this includes owned windows that lie below the owner (an
+ * owner set with GWLP_HWNDPARENT after creation), as measured on Windows 10
+ * (wine-dev issue 531).  The topmost band keeps the rules test_topmost covers.
  */
 static HWND swp_owner_popups( HWND hwnd, HWND after )
 {
-    HWND owner, *list = NULL;
+    HWND owner, *list = NULL, orig_after = after;
     unsigned int i;
 
     TRACE( "(%p) after = %p\n", hwnd, after );
@@ -4091,7 +4250,11 @@ static HWND swp_owner_popups( HWND hwnd, HWND after )
 
     for ( ; list[i]; i++)
     {
-        if (list[i] == hwnd) break;
+        if (list[i] == hwnd)
+        {
+            if (orig_after == HWND_TOP) continue;
+            break;
+        }
         if (get_window_relative( list[i], GW_OWNER ) != hwnd) continue;
         TRACE( "moving %p owned by %p after %p\n", list[i], hwnd, after );
         NtUserSetWindowPos( list[i], after, 0, 0, 0, 0,
@@ -4102,6 +4265,73 @@ static HWND swp_owner_popups( HWND hwnd, HWND after )
 done:
     free( list );
     return after;
+}
+
+/* whether hwnd is owned by owner, directly or through a chain of owners */
+static BOOL is_owned_by( HWND hwnd, HWND owner )
+{
+    while ((hwnd = get_window_relative( hwnd, GW_OWNER )))
+        if (hwnd == owner) return TRUE;
+    return FALSE;
+}
+
+/***********************************************************************
+ *           get_visible_predecessor
+ *
+ * The visible window above hwnd in the win32 Z-order, not counting the popups
+ * hwnd owns: Windows keeps them above their owner (swp_owner_popups), and so
+ * does the window manager through WM_TRANSIENT_FOR, so there is no order to
+ * restore for them.  Owned WS_EX_APPWINDOW windows count: winex11 makes them group
+ * transients (transient for the root window), which keeps their taskbar button and
+ * which only a window manager implementing NETWM group transients keeps above the
+ * owner.  winex11 applies the same rule.
+ */
+static HWND get_visible_predecessor( HWND hwnd )
+{
+    HWND prev = get_window_relative( hwnd, GW_HWNDPREV );
+    while (prev && (!(get_window_long( prev, GWL_STYLE ) & WS_VISIBLE) ||
+                    (is_owned_by( prev, hwnd ) && !(get_window_long( prev, GWL_EXSTYLE ) & WS_EX_APPWINDOW))))
+        prev = get_window_relative( prev, GW_HWNDPREV );
+    return prev;
+}
+
+/***********************************************************************
+ *           sync_zorder_after_wm_raise
+ *
+ * The window manager raised and activated a top-level window on its own (a
+ * click under X11).  Windows brings an activated window to the top of its
+ * band, so request that here, letting the application rewrite the insert
+ * position from WM_WINDOWPOSCHANGING as it would on Windows.  The flag tells
+ * the driver to re-apply whatever win32 Z-order results to the native
+ * stacking, since the native side moved without any win32 change.
+ */
+void sync_zorder_after_wm_raise( HWND hwnd, BOOL activated )
+{
+    HWND prev;
+
+    if (!hwnd || hwnd == get_desktop_window() || is_iconic( hwnd )) return;
+    if ((get_window_long( hwnd, GWL_STYLE ) & (WS_CHILD | WS_POPUP)) == WS_CHILD) return;
+    /* only for windows of this thread: a SetWindowPos on another thread's window sends
+     * WM_WINDOWPOSCHANGING synchronously to a thread that may not be pumping messages */
+    if (!is_current_thread_window( hwnd )) return;
+
+    /* already on top of everything but its own popups: nothing the native side could disagree with */
+    if (!(prev = get_visible_predecessor( hwnd ))) return;
+
+    TRACE( "hwnd %p raised by the window manager, win32 predecessor %p, activated %u\n", hwnd, prev, activated );
+    if (activated) /* Windows brings an activated window to the top of its band */
+        NtUserSetWindowPos( hwnd, HWND_TOP, 0, 0, 0, 0,
+                            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_WINE_ZORDER_SYNC );
+    /* An already active window keeps its win32 place: a no-op for win32, the driver re-applies it
+     * (sync_window_position() works the X sibling out of the win32 order for SWP_WINE_ZORDER_SYNC).
+     * SWP_NOZORDER says so explicitly: prev is the nearest *visible* predecessor, and with hidden
+     * windows between it and hwnd - vatSys owns several that are never shown - nothing would turn
+     * the insert-after into a no-op, the call would move hwnd above them, run swp_owner_popups()
+     * and invalidate the whole window on every click into it (wine-dev issue 552, found by the
+     * reporter of giang17/wine issue 29). */
+    else
+        NtUserSetWindowPos( hwnd, prev, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
+                            SWP_NOSENDCHANGING | SWP_WINE_ZORDER_SYNC );
 }
 
 /* NtUserSetWindowPos implementation */
@@ -4179,6 +4409,53 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
         goto done;
     }
     if (surface) window_surface_release( surface );
+
+    /* After apply_window_pos, the window's content may have been BitBlt'd from the
+     * old position. During batch processing (EndDeferWindowPos), sibling expose_window
+     * calls can set update regions that cause DCX_EXCLUDERGN to skip parts of the
+     * BitBlt, leaving stale content. Force a full invalidation so WM_PAINT repaints
+     * everything correctly on top of the BitBlt'd content.
+     *
+     * Nothing was BitBlt'd when nothing moved, though, and SWP_AGG_NOGEOMETRYCHANGE
+     * does not cover the move bits: masking with SWP_AGG_STATUSFLAGS keeps
+     * SWP_NOMOVE|SWP_NOCLIENTMOVE in the result, so a SetWindowPos that changes
+     * nothing at all (flags 0x5917 -> masked 0x1807) never compares equal to
+     * SWP_AGG_NOGEOMETRYCHANGE (0x805) and invalidates the whole window with
+     * RDW_ERASE.  Applications that re-assert their layout on every mouse move get
+     * a full erase per motion event, and the erase reaches the screen on its own
+     * because window surfaces are flushed when the message loop goes idle - one
+     * flush shows the erased window, the next one the repainted one (issue 253:
+     * SynthEdit's canvas frames flickering while the mouse is over the menu bar).
+     *
+     * Skip that case, but compare against the *full* status mask rather than just
+     * the position bits: SWP_FRAMECHANGED asks for a non-client repaint and is a
+     * reason to invalidate even when nothing moved.  Dropping it as well leaves
+     * SynthEdit's canvas background unpainted at startup (blackcheck 18.6 %). */
+    /* SWP_AGG_NOGEOMETRYCHANGE must not be a second exemption here.  It covers size
+     * and z-order but not the move bits, so a window that moves without resizing
+     * masks to exactly SWP_AGG_NOGEOMETRYCHANGE (0x805) and gets skipped - which is
+     * precisely the case move_window_bits BitBlts, and therefore the one this
+     * invalidation was written for (issue 260: dragging SynthEdit's MDI canvas by
+     * its title bar leaves the MDI client stale until something else repaints it).
+     * Only "nothing changed at all" stays exempt.
+     *
+     * That plain-move case is a child's, though: only a child window has its bits
+     * inside an ancestor's surface for move_window_bits to BitBlt.  A top-level
+     * window that moves without resizing has its own X window, which carries its
+     * pixels along - there is nothing to repaint, but the erase this invalidation
+     * queues paints the MDI client over its children once per motion event, and a
+     * window-manager drag delivers one such SetWindowPos per motion event (issue
+     * 281: SynthEdit's canvas captions flicker while the main window is dragged;
+     * 40 moves -> 40 invalidations -> 8 frames showing the 0x404040 erase).  So a
+     * plain move invalidates child windows only. */
+    if (!(winpos->flags & (SWP_NOREDRAW | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) &&
+        (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE &&
+        ((winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOGEOMETRYCHANGE ||
+         (get_window_long( winpos->hwnd, GWL_STYLE ) & WS_CHILD)))
+    {
+        TRACE( "hwnd %p: post-move invalidation (flags %08x)\n", winpos->hwnd, (int)winpos->flags );
+        NtUserRedrawWindow( winpos->hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
+    }
 
     if (winpos->flags & SWP_HIDEWINDOW)
     {
@@ -4579,6 +4856,8 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     RECT rc_max, rc_primary;
     DWORD adjusted_style;
     MINMAXINFO minmax;
+    POINT pos, default_max;
+    BOOL app_max;
     INT xinc, yinc;
     RECT rc;
     WND *win;
@@ -4590,6 +4869,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     get_window_rect( hwnd, &rc, get_thread_dpi() );
     minmax.ptReserved.x = rc.left;
     minmax.ptReserved.y = rc.top;
+    pos = minmax.ptReserved;
 
     if ((style & WS_CAPTION) == WS_CAPTION)
         adjusted_style = style & ~WS_BORDER; /* WS_CAPTION = WS_DLGFRAME | WS_BORDER */
@@ -4616,6 +4896,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     }
     minmax.ptMaxTrackSize.x = get_system_metrics( SM_CXMAXTRACK );
     minmax.ptMaxTrackSize.y = get_system_metrics( SM_CYMAXTRACK );
+    default_max = minmax.ptMaxTrackSize;
     minmax.ptMaxPosition.x = -xinc;
     minmax.ptMaxPosition.y = -yinc;
 
@@ -4626,6 +4907,7 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     }
 
     send_message( hwnd, WM_GETMINMAXINFO, 0, (LPARAM)&minmax );
+    app_max = minmax.ptMaxTrackSize.x != default_max.x || minmax.ptMaxTrackSize.y != default_max.y;
 
     /* if the app didn't change the values, adapt them for the current monitor */
 
@@ -4654,8 +4936,62 @@ MINMAXINFO get_min_max_info( HWND hwnd )
     minmax.ptMaxTrackSize.x = max( minmax.ptMaxTrackSize.x, minmax.ptMinTrackSize.x );
     minmax.ptMaxTrackSize.y = max( minmax.ptMaxTrackSize.y, minmax.ptMinTrackSize.y );
 
+    /* keep the track sizes for the display driver, which hands them to the window manager as
+     * size hints (winex11 set_size_hints): only win32u can ask the application, and the driver
+     * updates its hints under its own lock, where it must not send messages */
+    if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+    {
+        win->track_pos = pos;
+        win->min_track = minmax.ptMinTrackSize;
+        if (app_max) win->max_track = minmax.ptMaxTrackSize;
+        else win->max_track.x = win->max_track.y = 0;
+        win->track_dpi = get_thread_dpi();
+        win->track_valid = TRUE;
+        release_win_ptr( win );
+    }
+
     set_thread_dpi_awareness_context( context );
     return minmax;
+}
+
+/***********************************************************************
+ *           get_min_max_track
+ *
+ * The track sizes a window last answered to WM_GETMINMAXINFO, in raw pixels
+ * of the window rect, for the display driver (no message is sent).
+ */
+static BOOL get_min_max_track( HWND hwnd, struct get_min_max_track_params *params )
+{
+    POINT pos, min_track, max_track;
+    struct ratio dpi;
+    RECT rect;
+    WND *win;
+
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+    if (!win->track_valid)
+    {
+        release_win_ptr( win );
+        return FALSE;
+    }
+    pos = win->track_pos;
+    min_track = win->min_track;
+    max_track = win->max_track;
+    dpi = win->track_dpi;
+    release_win_ptr( win );
+
+    SetRect( &rect, pos.x, pos.y, pos.x + min_track.x, pos.y + min_track.y );
+    rect = map_rect_virt_to_raw( rect, dpi );
+    params->min_track.x = rect.right - rect.left;
+    params->min_track.y = rect.bottom - rect.top;
+    params->max_track.x = params->max_track.y = 0;
+    if (max_track.x || max_track.y)
+    {
+        SetRect( &rect, pos.x, pos.y, pos.x + max_track.x, pos.y + max_track.y );
+        rect = map_rect_virt_to_raw( rect, dpi );
+        params->max_track.x = rect.right - rect.left;
+        params->max_track.y = rect.bottom - rect.top;
+    }
+    return TRUE;
 }
 
 static POINT get_first_minimized_child_pos( const RECT *parent, const MINIMIZEDMETRICS *mm,
@@ -4975,6 +5311,34 @@ void update_window_state( HWND hwnd )
 }
 
 /***********************************************************************
+ *              show_owned_windows
+ *
+ * Hide or show the top-level windows owned by owner, topmost first, as
+ * ShowWindow does on Windows when the owner is minimised or leaves the
+ * minimised state: SW_PARENTCLOSING before the owner changes, SW_PARENTOPENING
+ * after it, both handled by DefWindowProc.
+ */
+static void show_owned_windows( HWND owner, BOOL show )
+{
+    HWND *list;
+    int i;
+
+    if (!(list = list_window_children( 0 ))) return;
+    for (i = 0; list[i]; i++)
+    {
+        if (get_window_relative( list[i], GW_OWNER ) != owner) continue;
+        if (show)
+        {
+            if (win_get_flags( list[i] ) & WIN_NEEDS_SHOW_OWNEDPOPUP)
+                send_message( list[i], WM_SHOWWINDOW, SW_SHOWNORMAL, SW_PARENTOPENING );
+        }
+        else if (get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE)
+            send_message( list[i], WM_SHOWWINDOW, SW_HIDE, SW_PARENTCLOSING );
+    }
+    free( list );
+}
+
+/***********************************************************************
  *              show_window
  *
  * Implementation of ShowWindow and ShowWindowAsync.
@@ -5012,6 +5376,9 @@ static BOOL show_window( HWND hwnd, INT cmd )
         show_flag = FALSE;
         swp |= SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOMOVE;
         if (style & WS_CHILD) swp |= SWP_NOACTIVATE | SWP_NOZORDER;
+        /* Windows keeps the Z-order place of a hidden top-level window (wine-dev issue 531);
+         * hiding the active window or an owner moves it, as test_hide_window covers */
+        else if (hwnd != get_active_window() && !owns_windows( hwnd )) swp |= SWP_NOZORDER;
         break;
 
     case SW_SHOWMINNOACTIVE:
@@ -5068,6 +5435,10 @@ static BOOL show_window( HWND hwnd, INT cmd )
         goto done;
     }
 
+    if ((swp & SWP_STATECHANGED) && !(style & (WS_MINIMIZE | WS_CHILD)) &&
+        (cmd == SW_MINIMIZE || cmd == SW_SHOWMINNOACTIVE || cmd == SW_FORCEMINIMIZE || cmd == SW_SHOWMINIMIZED))
+        show_owned_windows( hwnd, FALSE );
+
     if ((show_flag != was_visible || cmd == SW_SHOWNA) && cmd != SW_SHOWMAXIMIZED && !(swp & SWP_STATECHANGED))
     {
         send_message( hwnd, WM_SHOWWINDOW, show_flag, 0 );
@@ -5099,6 +5470,8 @@ static BOOL show_window( HWND hwnd, INT cmd )
                             newPos.right - newPos.left, newPos.bottom - newPos.top, swp );
 
     new_style = get_window_long( hwnd, GWL_STYLE );
+    if ((style & WS_MINIMIZE) && !(new_style & WS_MINIMIZE) && !(style & WS_CHILD))
+        show_owned_windows( hwnd, TRUE );
     if (((style ^ new_style) & WS_MINIMIZE) != 0)
     {
         if ((new_style & WS_MINIMIZE) != 0)
@@ -5748,6 +6121,9 @@ static WND *create_window_handle( HWND parent, HWND owner, UNICODE_STRING *name,
         if (parent && parent != get_desktop_window()) dpi = get_win_monitor_dpi( parent, &raw_dpi );
         else dpi = monitor_dpi_from_rect( rect, get_thread_dpi(), &raw_dpi );
     }
+
+    /* while the process DPI awareness is unset, the window takes the awareness once it is set */
+    if (process_dpi_awareness_unset()) dpi_context |= NTUSER_DPI_CONTEXT_FLAG_PROCESS;
 
     SERVER_START_REQ( create_window )
     {
@@ -6417,6 +6793,9 @@ ULONG_PTR WINAPI NtUserCallHwndParam( HWND hwnd, DWORD_PTR param, DWORD code )
         struct ratio dpi = {params->dpi, 1};
         return get_present_rect( hwnd, params->rect, dpi );
     }
+
+    case NtUserCallHwndParam_GetMinMaxTrack:
+        return get_min_max_track( hwnd, (void *)param );
 
     case NtUserCallHwndParam_GetWindowRelative:
         return HandleToUlong( get_window_relative( hwnd, param ));

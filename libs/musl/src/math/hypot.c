@@ -20,7 +20,7 @@ static void sq(double_t *hi, double_t *lo, double x)
 	*lo = xh*xh - *hi + 2*xh*xl + xl*xl;
 }
 
-double __cdecl _hypot(double x, double y)
+static double hypot_nocheck(double x, double y)
 {
 	union {double f; uint64_t i;} ux = {x}, uy = {y}, ut;
 	int ex, ey;
@@ -65,4 +65,29 @@ double __cdecl _hypot(double x, double y)
 	sq(&hx, &lx, x);
 	sq(&hy, &ly, y);
 	return z*sqrt(ly+lx+hy+hx);
+}
+
+/* Windows (ucrtbase and msvcrt.dll, Windows 10) reports an overflow through
+ * _matherr and errno on both architectures and, on i386 only, an underflow
+ * through _matherr for every subnormal result, an exact one included.  The
+ * _matherr record carries the magnitudes scaled the way the C runtime scales
+ * them before it squares: by 2^-600 on x86_64, by the larger one on i386.
+ * Inf and NaN arguments are not reported. */
+double __cdecl _hypot(double x, double y)
+{
+	/* round to double before testing: on i386 the x87 keeps the finite
+	 * 2^700 * sqrt(...) product in the register, where it is not inf yet */
+	double ax = fabs(x), ay = fabs(y), r = fp_barrier(hypot_nocheck(x, y));
+#ifdef __i386__
+	double m = ax > ay ? ax : ay;
+
+	if (r == INFINITY && isfinite(ax) && isfinite(ay))
+		return math_error(_OVERFLOW, "_hypot", ax / m, ay / m, r);
+	if (r && r < DBL_MIN)
+		return math_error(_UNDERFLOW, "_hypot", ax / m, ay / m, r);
+#else
+	if (r == INFINITY && isfinite(ax) && isfinite(ay))
+		return math_error(_OVERFLOW, "_hypot", ax * 0x1p-600, ay * 0x1p-600, r);
+#endif
+	return r;
 }

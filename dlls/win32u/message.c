@@ -1725,6 +1725,16 @@ size_t user_message_size( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
     case WM_MEASUREITEM:
         size = sizeof(MEASUREITEMSTRUCT);
         break;
+    case WM_UAHMEASUREMENUITEM:
+        size = sizeof(struct uah_measure_menu_item);
+        break;
+    case WM_UAHDRAWMENU:
+    case WM_UAHINITMENU:
+        size = sizeof(struct uah_menu);
+        break;
+    case WM_UAHDRAWMENUITEM:
+        size = sizeof(struct uah_draw_menu_item);
+        break;
     case WM_DELETEITEM:
         size = sizeof(DELETEITEMSTRUCT);
         break;
@@ -2034,6 +2044,9 @@ static void copy_user_result( void *buffer, size_t size, LRESULT result, UINT me
     case WM_MEASUREITEM:
         copy_size = sizeof(MEASUREITEMSTRUCT);
         break;
+    case WM_UAHMEASUREMENUITEM:
+        copy_size = sizeof(struct uah_measure_menu_item);
+        break;
     case WM_WINDOWPOSCHANGING:
         copy_size = sizeof(WINDOWPOS);
         break;
@@ -2238,7 +2251,13 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         if (!user_driver->pGetWindowStateUpdates( hwnd, &state_cmd, &swp_flags, &window_rect, &foreground )) goto unlock;
         window_rect = map_rect_raw_to_virt( window_rect, get_thread_dpi() );
 
-        if (foreground) set_foreground_window( foreground, FALSE, TRUE );
+        if (state_cmd || swp_flags) cancel_capture_for_wm_change( hwnd );
+
+        if (foreground)
+        {
+            sync_zorder_after_wm_raise( foreground, TRUE );
+            set_foreground_window( foreground, FALSE, TRUE );
+        }
         switch (LOWORD(state_cmd))
         {
         case SC_RESTORE:
@@ -2250,6 +2269,16 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
             /* fallthrough */
         default:
             send_message( hwnd, WM_SYSCOMMAND, LOWORD(state_cmd), 0 );
+            /* A window manager may deliver the maximized state and the geometry it chose for the
+             * maximized window in one event batch; the driver then reports a config change together
+             * with the state command. SC_MAXIMIZE has placed the window with the win32 idea of the
+             * maximized rects, which need not match where the window manager put the X window (a
+             * title bar taller than the win32 caption offsets everything painted against everything
+             * hit-tested). Apply the window manager's geometry on top, the same as when its configure
+             * arrives in a later batch. */
+            if (LOWORD(state_cmd) == SC_MAXIMIZE && swp_flags)
+                NtUserSetWindowPos( hwnd, 0, window_rect.left, window_rect.top, window_rect.right - window_rect.left,
+                                    window_rect.bottom - window_rect.top, swp_flags );
             break;
         case 0:
             if (!swp_flags) break;
@@ -2833,7 +2862,13 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
 
         /* Activate the window if needed */
 
-        if (msg->hwnd != info.hwndActive)
+        if (msg->hwnd == info.hwndActive)
+        {
+            /* already active: a window manager still raises it on the click,
+             * re-apply the win32 Z-order the application may be maintaining */
+            sync_zorder_after_wm_raise( NtUserGetAncestor( msg->hwnd, GA_ROOT ), FALSE );
+        }
+        else
         {
             HWND hwndTop = NtUserGetAncestor( msg->hwnd, GA_ROOT );
 
@@ -2854,6 +2889,9 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
                 case MA_ACTIVATE:
                 case 0:
                     if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
+                    /* a click into a child of the already active window activates nothing, and Windows
+                     * leaves the Z-order alone: only re-apply it, as for a click into the window itself */
+                    else sync_zorder_after_wm_raise( hwndTop, hwndTop != info.hwndActive );
                     break;
                 default:
                     WARN( "unknown WM_MOUSEACTIVATE code %d\n", ret );

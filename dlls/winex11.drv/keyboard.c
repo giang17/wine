@@ -236,6 +236,9 @@ static WORD keyc2scan( unsigned int keycode, unsigned int state )
 }
 
 static int NumLockMask, ScrollLockMask, AltGrMask; /* mask in the XKeyEvent state */
+static int Level3ShiftMask; /* mask of the ISO_Level3_Shift (AltGr) modifier, from the modifier map */
+static BYTE Level3ShiftVkeys[8]; /* virtual keys of every keycode whose keysym is ISO_Level3_Shift / Mode_switch */
+static unsigned int Level3ShiftVkeyCount;
 
 static pthread_mutex_t kbd_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct list xkb_layouts = LIST_INIT( xkb_layouts );
@@ -1323,6 +1326,33 @@ static void X11DRV_send_keyboard_input( HWND hwnd, WORD vkey, WORD scan, UINT fl
 
 
 /***********************************************************************
+ *           x11drv_send_raw_key
+ *
+ * Send a key X reported as XI_RawKeyPress/Release while no Wine window is active, see
+ * X11DRV_RawKeyEvent().  A raw event carries no modifier state, so the key is mapped
+ * as X11DRV_KeyEvent() maps it with an empty state.
+ */
+static BOOL scan_is_extended( WORD scan );
+
+void x11drv_send_raw_key( unsigned int keycode, BOOL release, DWORD time )
+{
+    WORD vkey, scan;
+    UINT flags = 0;
+
+    if (keycode >= ARRAY_SIZE(keyc2vkey)) return;
+    pthread_mutex_lock( &kbd_mutex );
+    vkey = keyc2vkey[keycode];
+    scan = keyc2scan( keycode, 0 );
+    pthread_mutex_unlock( &kbd_mutex );
+    if (!vkey) return;
+
+    if (release) flags |= KEYEVENTF_KEYUP;
+    if (scan_is_extended( scan )) flags |= KEYEVENTF_EXTENDEDKEY;
+    X11DRV_send_keyboard_input( 0, vkey & 0xff, scan & 0xff, flags, time );
+}
+
+
+/***********************************************************************
  *           set_async_key_state
  */
 static void set_async_key_state( const BYTE state[256] )
@@ -1454,29 +1484,17 @@ BOOL X11DRV_KeymapNotify( HWND hwnd, XEvent *event )
     return TRUE;
 }
 
-static void adjust_lock_state( BYTE *keystate, HWND hwnd, WORD vkey, WORD scan, DWORD flags, DWORD time )
-{
-    BYTE prev_state = keystate[vkey] & 0x01;
-
-    X11DRV_send_keyboard_input( hwnd, vkey, scan, flags, time );
-    X11DRV_send_keyboard_input( hwnd, vkey, scan, flags ^ KEYEVENTF_KEYUP, time );
-
-    /* Keyboard hooks may have blocked processing lock keys causing our state
-     * to be different than state on X server side. Although Windows allows hooks
-     * to block changing state, we can't prevent it on X server side. Having
-     * different states would cause us to try to adjust it again on the next
-     * key event. We prevent that by overriding hooks and setting key states here. */
-    if (NtUserGetAsyncKeyboardState( keystate ) && (keystate[vkey] & 0x01) == prev_state)
-    {
-        WARN("keystate %x not changed (%#.2x), probably blocked by hooks\n", vkey, keystate[vkey]);
-        keystate[vkey] ^= 0x01;
-        set_async_key_state( keystate );
-    }
-}
-
-static void update_lock_state( HWND hwnd, WORD vkey, UINT state, UINT time )
+/* Set the lock key toggle states directly instead of sending lock key events.
+ * Windows never generates a lock key event for a state that changed outside of
+ * it, and synthetic events reach low-level hooks, raw input and the window:
+ * DirectInput reported a NumLock press before the first key of an application
+ * started with NumLock on. With a low-level hook installed, the server also
+ * commits the state of such an event only after the hook returns, so checking
+ * it right after sending could not tell a blocked event from a delayed one. */
+static void update_lock_state( WORD vkey, UINT state )
 {
     BYTE keystate[256];
+    BOOL changed = FALSE;
 
     /* Note: X sets the below states on key down and clears them on key up.
        Windows triggers them on key down. */
@@ -1486,29 +1504,28 @@ static void update_lock_state( HWND hwnd, WORD vkey, UINT state, UINT time )
     /* Adjust the CAPSLOCK state if it has been changed outside wine */
     if (!(keystate[VK_CAPITAL] & 0x01) != !(state & LockMask) && vkey != VK_CAPITAL)
     {
-        DWORD flags = 0;
-        if (keystate[VK_CAPITAL] & 0x80) flags ^= KEYEVENTF_KEYUP;
         TRACE("Adjusting CapsLock state (%#.2x)\n", keystate[VK_CAPITAL]);
-        adjust_lock_state( keystate, hwnd, VK_CAPITAL, 0x3a, flags, time );
+        keystate[VK_CAPITAL] ^= 0x01;
+        changed = TRUE;
     }
 
     /* Adjust the NUMLOCK state if it has been changed outside wine */
     if (!(keystate[VK_NUMLOCK] & 0x01) != !(state & NumLockMask) && (vkey & 0xff) != VK_NUMLOCK)
     {
-        DWORD flags = KEYEVENTF_EXTENDEDKEY;
-        if (keystate[VK_NUMLOCK] & 0x80) flags ^= KEYEVENTF_KEYUP;
         TRACE("Adjusting NumLock state (%#.2x)\n", keystate[VK_NUMLOCK]);
-        adjust_lock_state( keystate, hwnd, VK_NUMLOCK, 0x45, flags, time );
+        keystate[VK_NUMLOCK] ^= 0x01;
+        changed = TRUE;
     }
 
     /* Adjust the SCROLLLOCK state if it has been changed outside wine */
     if (!(keystate[VK_SCROLL] & 0x01) != !(state & ScrollLockMask) && vkey != VK_SCROLL)
     {
-        DWORD flags = 0;
-        if (keystate[VK_SCROLL] & 0x80) flags ^= KEYEVENTF_KEYUP;
         TRACE("Adjusting ScrLock state (%#.2x)\n", keystate[VK_SCROLL]);
-        adjust_lock_state( keystate, hwnd, VK_SCROLL, 0x46, flags, time );
+        keystate[VK_SCROLL] ^= 0x01;
+        changed = TRUE;
     }
+
+    if (changed) set_async_key_state( keystate );
 }
 
 /***********************************************************************
@@ -1602,7 +1619,7 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
     if ( event->type == KeyRelease ) dwFlags |= KEYEVENTF_KEYUP;
     if (scan_is_extended( scan )) dwFlags |= KEYEVENTF_EXTENDEDKEY;
 
-    update_lock_state( hwnd, vkey, event->state, event_time );
+    update_lock_state( vkey, event->state );
 
     X11DRV_send_keyboard_input( hwnd, vkey & 0xff, scan & 0xff, dwFlags, event_time );
     return TRUE;
@@ -2155,7 +2172,9 @@ void init_keyboard_layouts( Display *display )
     LANGID xkb_lang = 0;
     Status status;
     KeyCode *kcp;
+    KeySym keysym;
     int count;
+    int keyc;
 
     pthread_mutex_lock( &kbd_mutex );
     XDisplayKeycodes( display, &min_keycode, &max_keycode );
@@ -2178,6 +2197,12 @@ void init_keyboard_layouts( Display *display )
                 {
                     ScrollLockMask = 1 << i;
                     TRACE_(key)( "ScrollLockMask is %x\n", ScrollLockMask );
+                }
+                else if (XkbKeycodeToKeysym( display, *kcp, 0, k ) == XK_ISO_Level3_Shift ||
+                         XkbKeycodeToKeysym( display, *kcp, 0, k ) == XK_Mode_switch)
+                {
+                    Level3ShiftMask = 1 << i;
+                    TRACE_(key)( "Level3ShiftMask is %x, keycode %u\n", Level3ShiftMask, *kcp );
                 }
             }
         }
@@ -2234,6 +2259,30 @@ void init_keyboard_layouts( Display *display )
               xkb_lang, main_key_tab[kbd_layout].lcid );
 
     init_keycode_mappings( display );
+
+    /* The physical AltGr key does not have to be the keycode listed in the
+     * modifier map: XKB layouts commonly map the modifier through a virtual
+     * key (e.g. keycode 92) while the key actually pressed is a different one
+     * (e.g. keycode 108), and each may translate to a different virtual key.
+     * Collect the vkeys of every keycode whose keysym is ISO_Level3_Shift or
+     * Mode_switch, so the key-state check below matches whichever carries the
+     * pressed bit.
+     */
+    Level3ShiftVkeyCount = 0;
+    for (keyc = min_keycode; keyc <= max_keycode; keyc++)
+    {
+        WORD vkey = keyc2vkey[keyc] & 0xff;
+        unsigned int i;
+
+        keysym = XkbKeycodeToKeysym( display, keyc, 0, 0 );
+        if (keysym != XK_ISO_Level3_Shift && keysym != XK_Mode_switch) continue;
+        if (!vkey) continue;
+        for (i = 0; i < Level3ShiftVkeyCount; i++) if (Level3ShiftVkeys[i] == vkey) break;
+        if (i < Level3ShiftVkeyCount) continue;
+        if (Level3ShiftVkeyCount == sizeof(Level3ShiftVkeys)) break;
+        TRACE_(key)("Level3Shift keycode %u vkey %04X\n", keyc, vkey);
+        Level3ShiftVkeys[Level3ShiftVkeyCount++] = vkey;
+    }
 
     pthread_mutex_unlock( &kbd_mutex );
 }
@@ -2834,6 +2883,25 @@ INT X11DRV_ToUnicodeEx( UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
     /* Restore saved AltGr state */
     TRACE_(key)("AltGrMask = %04x\n", AltGrMask);
     e.state |= AltGrMask;
+
+    /* AltGrMask only reflects the last X11 key event this process handled. A
+     * process that translates keys for a window owned by another process never
+     * sees one, so it would always miss the AltGr level. The key state we are
+     * given is maintained across the thread input family and does carry the
+     * modifier, so derive the mask from it as well.
+     */
+    if (Level3ShiftMask)
+    {
+        unsigned int i;
+
+        for (i = 0; i < Level3ShiftVkeyCount; i++)
+        {
+            if (!(lpKeyState[Level3ShiftVkeys[i]] & 0x80)) continue;
+            TRACE_(key)("Level3ShiftMask = %04x (vkey %02X down)\n", Level3ShiftMask, Level3ShiftVkeys[i]);
+            e.state |= Level3ShiftMask;
+            break;
+        }
+    }
 
     TRACE_(key)("(%04X, %04X) : faked state = 0x%04x\n",
 		virtKey, scanCode, e.state);

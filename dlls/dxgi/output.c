@@ -366,11 +366,10 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_WaitForVBlank(IDXGIOutput6 *iface)
     static BOOL once = FALSE;
 
     if (!once++)
-        FIXME("iface %p stub!\n", iface);
-    else
-        TRACE("iface %p stub!\n", iface);
+        FIXME("iface %p semi-stub, sleeping 16ms.\n", iface);
 
-    return E_NOTIMPL;
+    Sleep(16);
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE dxgi_output_TakeOwnership(IDXGIOutput6 *iface, IUnknown *device, BOOL exclusive)

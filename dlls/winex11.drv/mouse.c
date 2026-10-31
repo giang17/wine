@@ -65,6 +65,7 @@ MAKE_FUNCPTR(XcursorLibraryLoadCursor);
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(cursor);
+WINE_DECLARE_DEBUG_CHANNEL(key);
 
 /**********************************************************************/
 
@@ -198,6 +199,32 @@ static Cursor get_empty_cursor(void)
                 XFreeCursor( gdi_display, new );
             XFreePixmap( gdi_display, pixmap );
         }
+    }
+    return cursor;
+}
+
+/***********************************************************************
+ *		get_default_cursor
+ *
+ * Return a shared visible arrow cursor used as the initial cursor for newly
+ * created windows.  Without it a window keeps the X11 default of inheriting
+ * its parent's cursor; this breaks for cross-process embedded surfaces (e.g.
+ * WebView2/Chromium content windows) which never call SetCursor and whose
+ * inheritance chain to the owner window is severed once the window manager
+ * reparents the toplevel into a frame, leaving the cursor blank.
+ */
+Cursor get_default_cursor(void)
+{
+    static Cursor cursor;
+
+    if (!cursor)
+    {
+        Cursor new = XCreateFontCursor( gdi_display, XC_left_ptr );
+        /* flush so the cursor is known to the server before another display
+           connection (create_whole_window uses data->display) references it */
+        XFlush( gdi_display );
+        if (InterlockedCompareExchangePointer( (void **)&cursor, (void *)new, 0 ))
+            XFreeCursor( gdi_display, new );
     }
     return cursor;
 }
@@ -382,6 +409,39 @@ void x11drv_xinput2_disable( Display *display, Window window )
 
 
 /***********************************************************************
+ *              X11DRV_SetRawKeyboardSink
+ *
+ * The process registered the keyboard with RIDEV_INPUTSINK (dinput does that for
+ * DISCL_BACKGROUND), or dropped it.  X sends core key events only to the client with the
+ * input focus, so select raw key events on the root window of this thread's display while
+ * the sink exists: they arrive whichever client has the focus.  Selecting them only on
+ * request keeps processes that never asked for background keys from seeing them.
+ */
+void X11DRV_SetRawKeyboardSink( BOOL enable )
+{
+    struct x11drv_thread_data *data;
+
+    if (!xinput2_available) return;
+    if (!(data = enable ? x11drv_init_thread_data() : x11drv_thread_data()) || data->raw_keyboard_sink == enable) return;
+
+    TRACE( "%s raw keyboard sink on display %p\n", enable ? "enabling" : "disabling", data->display );
+    data->raw_keyboard_sink = enable;
+    if (enable)
+    {
+        XISetMask( data->root_mask, XI_RawKeyPress );
+        XISetMask( data->root_mask, XI_RawKeyRelease );
+    }
+    else
+    {
+        XIClearMask( data->root_mask, XI_RawKeyPress );
+        XIClearMask( data->root_mask, XI_RawKeyRelease );
+    }
+    pXISelectEvents( data->display, DefaultRootWindow( data->display ), &data->root_events, 1 );
+    XFlush( data->display );
+}
+
+
+/***********************************************************************
  *              x11drv_xinput_init
  */
 void x11drv_xinput2_init( struct x11drv_thread_data *data )
@@ -429,6 +489,10 @@ void x11drv_xinput2_disable( Display *display, Window window )
 {
 }
 
+void X11DRV_SetRawKeyboardSink( BOOL enable )
+{
+}
+
 void x11drv_xinput2_init( struct x11drv_thread_data *data )
 {
 }
@@ -440,6 +504,11 @@ void x11drv_xinput2_init( struct x11drv_thread_data *data )
  *
  * Start a pointer grab on the clip window.
  */
+static int clip_window_error( Display *display, XErrorEvent *event, void *arg )
+{
+    return (event->error_code == BadWindow);
+}
+
 static BOOL grab_clipping_window( const RECT *clip )
 {
 #ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
@@ -476,11 +545,20 @@ static BOOL grab_clipping_window( const RECT *clip )
 
     TRACE( "clipping to %s win %lx\n", wine_dbgstr_rect(clip), clip_window );
 
+    /* as in ungrab_clipping_window: the clip window can be destroyed under us
+     * when its desktop goes away, and an unhandled BadWindow would be fatal */
+    X11DRV_expect_error( data->display, clip_window_error, NULL );
     if (!data->clipping_cursor) XUnmapWindow( data->display, clip_window );
     pos = virtual_screen_to_root( clip->left, clip->top );
     XMoveResizeWindow( data->display, clip_window, pos.x, pos.y,
                        max( 1, clip->right - clip->left ), max( 1, clip->bottom - clip->top ) );
     XMapWindow( data->display, clip_window );
+    XSync( data->display, False );
+    if (X11DRV_check_error())
+    {
+        WARN( "clipping window %lx already destroyed\n", clip_window );
+        return FALSE;
+    }
 
     /* if the rectangle is shrinking we may get a pointer warp */
     if (!data->clipping_cursor || clip->left > clip_rect.left || clip->top > clip_rect.top ||
@@ -526,7 +604,13 @@ void ungrab_clipping_window(void)
     if (!clip_window) return;
 
     TRACE( "no longer clipping\n" );
+    /* the clip window belongs to the desktop window and can already be gone
+     * when a desktop is torn down (virtual desktop switch), and an unhandled
+     * BadWindow here would be fatal */
+    X11DRV_expect_error( data->display, clip_window_error, NULL );
     XUnmapWindow( data->display, clip_window );
+    XSync( data->display, False );
+    if (X11DRV_check_error()) WARN( "clipping window %lx already destroyed\n", clip_window );
     if (clipping_cursor) XUngrabPointer( data->display, CurrentTime );
     clipping_cursor = FALSE;
     data->clipping_cursor = FALSE;
@@ -1534,6 +1618,17 @@ void move_resize_window( HWND hwnd, int dir, POINT pos )
     if (!button--) return;
     send_message( hwnd, WM_ENTERSIZEMOVE, 0, 0 );
 
+    /* The window manager moves the window now and has the pointer grabbed, so our
+     * cursor position stays where the drag started.  Every step of the move makes
+     * the server queue a mouse move at that position (update_cursor_pos), and
+     * without a capture it reaches whatever window the moved window now has under
+     * it: a WebView2 title bar saw the pointer sweep across its buttons and lit them
+     * up one after the other (Power BI Desktop).  The move loop of win32u holds the
+     * capture on the moved window for the whole move, as Windows does; do the same.
+     * A plain capture: with GUI_INMOVESIZE the driver would grab the pointer, which
+     * belongs to the window manager until the button is released. */
+    NtUserSetCapture( hwnd );
+
     for (;;)
     {
         MSG msg;
@@ -1548,6 +1643,9 @@ void move_resize_window( HWND hwnd, int dir, POINT pos )
 
         while (NtUserPeekMessage( &msg, 0, 0, 0, PM_REMOVE ))
         {
+            /* The move loop consumes the mouse, as on Windows: the window does not
+             * see the captured moves nor the button release that ends the move. */
+            if (msg.message >= WM_MOUSEFIRST && msg.message <= WM_MOUSELAST) continue;
             if (!NtUserCallMsgFilter( &msg, MSGF_SIZE ))
             {
                 NtUserTranslateMessage( &msg, 0 );
@@ -1560,6 +1658,7 @@ void move_resize_window( HWND hwnd, int dir, POINT pos )
     }
 
     TRACE( "hwnd %p/%lx done\n", hwnd, win );
+    NtUserReleaseCapture();
     send_message( hwnd, WM_EXITSIZEMOVE, 0, 0 );
 }
 
@@ -1573,6 +1672,8 @@ BOOL X11DRV_ButtonPress( HWND hwnd, XEvent *xev )
     UINT button = event->button - 1, flags, time = EVENT_x11_time_to_win32_time( event->time );
     POINT pt = { event->x, event->y }, root = { event->x_root, event->y_root };
     struct x11drv_win_data *data;
+
+    x11drv_thread_data()->stale_leave_hwnd = 0; /* the pointer is seen again */
 
     if (button >= NB_BUTTONS) return FALSE;
     flags = button_down_flags[button];
@@ -1600,6 +1701,7 @@ BOOL X11DRV_ButtonRelease( HWND hwnd, XEvent *xev )
     UINT button = event->button - 1, flags, time = EVENT_x11_time_to_win32_time( event->time );
     POINT pt = { event->x, event->y }, root = { event->x_root, event->y_root };
 
+    x11drv_thread_data()->stale_leave_hwnd = 0; /* the pointer is seen again */
     if (button >= NB_BUTTONS || !(flags = button_up_flags[button])) return FALSE;
 
     TRACE( "hwnd %p/%lx button %u pos %s\n", hwnd, event->window, button, wine_dbgstr_point( &pt ) );
@@ -1621,6 +1723,7 @@ BOOL X11DRV_MotionNotify( HWND hwnd, XEvent *xev )
 
     TRACE( "hwnd %p/%lx pos %s is_hint %d serial %lu\n", hwnd, event->window, wine_dbgstr_point( &pt ),
            event->is_hint, event->serial );
+    x11drv_thread_data()->stale_leave_hwnd = 0; /* the pointer is seen again */
 
     if (is_old_motion_event( event->serial ))
     {
@@ -1631,6 +1734,18 @@ BOOL X11DRV_MotionNotify( HWND hwnd, XEvent *xev )
     pt = map_event_coords( hwnd, event->window, event->root, root, pt );
     send_mouse_input( hwnd, pt, MOUSEEVENTF_ABSOLUTE, 0, time, NULL );
     return TRUE;
+}
+
+
+/* whether the X server is Xwayland: it stops seeing the pointer once that is on a decoration the
+ * compositor draws, and reports the last position inside the window instead */
+static BOOL is_xwayland(void)
+{
+    static int cached = -1;
+    int opcode, event, error;
+
+    if (cached < 0) cached = XQueryExtension( gdi_display, "XWAYLAND", &opcode, &event, &error );
+    return cached;
 }
 
 
@@ -1646,8 +1761,9 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
     TRACE( "hwnd %p/%lx pos %s detail %d\n", hwnd, event->window, wine_dbgstr_point( &pt ), event->detail );
 
     x11drv_thread_data()->keymapnotify_hwnd = hwnd;
+    x11drv_thread_data()->stale_leave_hwnd = 0; /* the pointer is seen again */
 
-    if (hwnd == NtUserGetAncestor( get_capture_window(), GA_ROOT )) return FALSE;
+    if (is_capture_or_grab_window( hwnd )) return FALSE;
 
     if (is_old_motion_event( event->serial ))
     {
@@ -1657,6 +1773,106 @@ BOOL X11DRV_EnterNotify( HWND hwnd, XEvent *xev )
 
     pt = map_event_coords( hwnd, event->window, event->root, root, pt );
     send_mouse_input( hwnd, pt, MOUSEEVENTF_ABSOLUTE, 0, time, NULL );
+    return TRUE;
+}
+
+
+/***********************************************************************
+ *           X11DRV_LeaveNotify
+ *
+ * The pointer left one of our windows for a window that is not ours, such
+ * as the frame the window manager draws around it, or another client's
+ * grab took it away. No motion event follows while it stays there, so the
+ * position the server holds would stay where the pointer was last seen
+ * inside the window. After every window move the server synthesizes a
+ * WM_MOUSEMOVE at that position, and a stale one shows up as hover
+ * feedback wandering across the window while the window manager drags it.
+ *
+ * Report where the pointer is now, not where the event says it was: a
+ * crossing caused by another window being mapped over ours is queued
+ * before a warp by another process, and reporting the event position
+ * then would move the pointer back. Like a button event on a foreign
+ * window, leave the window under the position to the server: the pointer
+ * is no longer in this one, so it must not claim the point the way
+ * send_mouse_input() does for the z-order.
+ */
+BOOL X11DRV_LeaveNotify( HWND hwnd, XEvent *xev )
+{
+    struct x11drv_thread_data *thread_data = x11drv_thread_data();
+    XCrossingEvent *event = &xev->xcrossing;
+    struct x11drv_win_data *data;
+    Window root, child;
+    int root_x, root_y, win_x, win_y;
+    unsigned int state;
+    BOOL stale = FALSE;
+    INPUT input;
+    POINT pt;
+
+    TRACE( "hwnd %p/%lx pos %d,%d detail %d mode %d\n",
+           hwnd, event->window, event->x, event->y, event->detail, event->mode );
+
+    if (!hwnd) return FALSE;
+    /* the pointer went into a child of ours, it did not leave the window */
+    if (event->detail == NotifyInferior) return FALSE;
+    if (is_capture_or_grab_window( hwnd )) return FALSE;
+
+    if (is_old_motion_event( event->serial ))
+    {
+        TRACE( "pos %d,%d old serial %lu, ignoring\n", event->x, event->y, event->serial );
+        return FALSE;
+    }
+
+    /* Xwayland does not see the pointer once it is on a decoration the compositor draws (KWin
+     * on Wayland): the crossing to the ancestor arrives with a position still inside the window,
+     * where the pointer was last seen, and XQueryPointer() repeats that point.  The server then
+     * puts every WM_MOUSEMOVE it synthesizes after a window move at that stale point, which
+     * wanders across the window while the window manager drags it (vatSys's menu bar lit up
+     * item by item).  A leave to the ancestor from a point inside the window is impossible
+     * otherwise, so put the pointer just outside the edge it left through, and keep it there
+     * relative to the window while the window manager moves it (X11DRV_GetWindowStateUpdates). */
+    if (event->mode == NotifyNormal && (event->detail == NotifyAncestor || event->detail == NotifyVirtual) &&
+        is_xwayland() && (data = get_win_data( hwnd )))
+    {
+        int x = event->x, y = event->y, w = data->rects.visible.right - data->rects.visible.left,
+            h = data->rects.visible.bottom - data->rects.visible.top;
+
+        if (event->window == data->whole_window && data->pending_state.wm_state == NormalState &&
+            x >= 0 && x < w && y >= 0 && y < h)
+        {
+            int dl = x, dr = w - 1 - x, dt = y, db = h - 1 - y;
+
+            if (dt <= dl && dt <= dr && dt <= db) y = -1;
+            else if (db <= dl && db <= dr) y = h;
+            else if (dl <= dr) x = -1;
+            else x = w;
+            thread_data->stale_leave_hwnd = hwnd;
+            thread_data->stale_leave_rel.x = x;
+            thread_data->stale_leave_rel.y = y;
+            pt = root_to_virtual_screen( event->x_root + x - event->x, event->y_root + y - event->y );
+            TRACE( "stale leave inside %p/%lx (%dx%d) at %d,%d, pointer kept at %d,%d -> %s\n", hwnd, event->window,
+                   w, h, event->x, event->y, x, y, wine_dbgstr_point(&pt) );
+            stale = TRUE;
+        }
+        release_win_data( data );
+    }
+
+    if (!stale)
+    {
+        thread_data->stale_leave_hwnd = 0;
+        if (!XQueryPointer( event->display, root_window, &root, &child, &root_x, &root_y, &win_x, &win_y, &state ))
+            return FALSE;
+        pt = root_to_virtual_screen( win_x, win_y );
+        TRACE( "pointer now at %s\n", wine_dbgstr_point(&pt) );
+    }
+
+    input.type           = INPUT_MOUSE;
+    input.mi.dx          = pt.x;
+    input.mi.dy          = pt.y;
+    input.mi.mouseData   = 0;
+    input.mi.dwFlags     = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    input.mi.time        = EVENT_x11_time_to_win32_time( event->time );
+    input.mi.dwExtraInfo = 0;
+    NtUserSendHardwareInput( 0, 0, &input, 0 );
     return TRUE;
 }
 
@@ -1804,6 +2020,26 @@ static BOOL X11DRV_RawButtonEvent( XGenericEventCookie *cookie )
     return TRUE;
 }
 
+/***********************************************************************
+ *           X11DRV_RawKeyEvent
+ */
+static BOOL X11DRV_RawKeyEvent( XGenericEventCookie *xev )
+{
+    XIRawEvent *event = xev->data;
+    HWND foreground = NtUserGetForegroundWindow();
+
+    if (!x11drv_thread_data()->raw_keyboard_sink) return FALSE;
+    /* While a Wine window is active its core KeyPress events carry the key, in this or in
+     * another Wine process; the raw event would send it twice.  With another X client active
+     * the foreground is the desktop window (focus_out(), _NET_ACTIVE_WINDOW handling), and the
+     * server then hands the key to keyboard sinks as RIM_INPUTSINK. */
+    if (foreground && foreground != NtUserGetDesktopWindow()) return FALSE;
+
+    TRACE_(key)( "raw key %s keycode %u\n", xev->evtype == XI_RawKeyRelease ? "release" : "press", event->detail );
+    x11drv_send_raw_key( event->detail, xev->evtype == XI_RawKeyRelease, EVENT_x11_time_to_win32_time( event->time ) );
+    return TRUE;
+}
+
 static BOOL X11DRV_TouchEvent( HWND hwnd, XGenericEventCookie *xev )
 {
     RECT virtual = NtUserGetVirtualScreenRect( MDT_RAW_DPI );
@@ -1912,6 +2148,11 @@ BOOL X11DRV_GenericEvent( HWND hwnd, XEvent *xev )
     case XI_RawButtonRelease:
         ret = X11DRV_RawButtonEvent( event );
         break;
+    case XI_RawKeyPress:
+    case XI_RawKeyRelease:
+        ret = X11DRV_RawKeyEvent( event );
+        break;
+
     case XI_TouchBegin:
     case XI_TouchUpdate:
     case XI_TouchEnd:
