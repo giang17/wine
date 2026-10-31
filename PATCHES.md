@@ -1201,6 +1201,23 @@ This is the recommended branch. What it changes, by subsystem:
   window's geometry is built on (Live's main window grows to the maximal height without
   it). Ableton Live's dark bar therefore needs a visual style enabled in winecfg; its
   window geometry does not.
+- **win32u**: backport of the Wine 11.21 series for menu bars that are rebuilt while a menu
+  opens (Wine bug 10845, the application menu of Propellerhead Reason; five commits by Rémi
+  Bernon plus the six test commits of the series, cherry-picked with their origin). A bar
+  whose height an item change invalidated is laid out again before it is used: by
+  `GetMenuItemRect()` and `MenuItemFromPoint()` (before: an empty item rectangle, no item
+  under the pointer), by the item selection of menu tracking and by `HiliteMenuItem()`,
+  which now selects the item even when it already has the focus; `get_menu_bar_height()`
+  takes the height from `NtUserDrawMenuBarTemp()`. An application that rebuilds its bar in
+  `WM_INITMENU` gets a valid rectangle for the selected item and no extra
+  `WM_NCCALCSIZE`. Two additions of the fork on top: laying out the bar sends the measure
+  and init messages above to the owner, which must not happen while the menu is locked, so
+  `GetMenuItemRect()` and `MenuItemFromPoint()` lay out an invalid bar before they lock the
+  menu (with the series alone the user32 menu test aborted with `BUG: holding USER lock`);
+  and the height is laid out again when the window width changes, where the series did so
+  only when the items changed (Ableton Live 12, started maximised, had its bar on five
+  lines, window top to client 141 px instead of 53). Checked with the user32 menu test in
+  both architectures and the menus of Live 12, FL Studio 2026 and Cubase 15
 - **wineserver**: a top-level's surface flush no longer overwrites child windows that
   belong to a *different process*. Such a child draws straight into the top-level's
   drawable while the owner flushes its own surface over it with a delay — a black
