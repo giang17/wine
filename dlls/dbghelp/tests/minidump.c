@@ -775,7 +775,8 @@ static void test_scan_memory(void)
 {
     struct scan_cb_info cb_info;
     MINIDUMP_CALLBACK_INFORMATION cbi = {.CallbackRoutine = test_scan_memory_cb, .CallbackParam = &cb_info};
-    MINIDUMP_MODULE_LIST *module_list;
+    MINIDUMP_MODULE_LIST *module_list, *elf_list;
+    unsigned num_in_dump;
     void *data;
     BOOL ret;
 
@@ -807,8 +808,12 @@ static void test_scan_memory(void)
     data = minidump_open_for_read("foo.mdmp");
     ret = MiniDumpReadDumpStream(data, ModuleListStream, NULL, (void**)&module_list, NULL);
     ok(ret && module_list, "Couldn't find module-list stream\n");
-    ok(module_list->NumberOfModules == cb_info.num_referenced, "Unexpected number of modules %u (%u)\n",
-       module_list->NumberOfModules, cb_info.num_referenced);
+    num_in_dump = module_list->NumberOfModules;
+    /* Wine reports its ELF modules to the callback as well and lists them in a stream of its own */
+    if (MiniDumpReadDumpStream(data, 0xfff0, NULL, (void**)&elf_list, NULL) && elf_list)
+        num_in_dump += elf_list->NumberOfModules;
+    ok(num_in_dump == cb_info.num_referenced, "Unexpected number of modules %u (%u)\n",
+       num_in_dump, cb_info.num_referenced);
     ok(minidump_has_module(data, (DWORD_PTR)GetModuleHandleW(NULL)), "Main module missing from the dump\n");
     ok(minidump_has_module(data, (DWORD_PTR)GetModuleHandleW(L"ntdll.dll")), "ntdll missing from the dump\n");
     minidump_close_for_read(data);
