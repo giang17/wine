@@ -879,6 +879,7 @@ NTSTATUS WINAPI NtImpersonateAnonymousToken( HANDLE thread )
     OBJECT_ATTRIBUTES attr;
     TOKEN_USER user;
     TOKEN_GROUPS groups;
+    TOKEN_OWNER owner;
     TOKEN_PRIMARY_GROUP group;
     TOKEN_PRIVILEGES privs;
     LARGE_INTEGER expire;
@@ -888,13 +889,15 @@ NTSTATUS WINAPI NtImpersonateAnonymousToken( HANDLE thread )
 
     TRACE( "(%p)\n", thread );
 
-    /* The server takes the primary group from the group list, so the anonymous logon SID is
-     * both user and only group; Windows lists the untrusted mandatory label instead. */
+    /* The anonymous logon SID is user, owner, primary group and only group; Windows lists the
+     * untrusted mandatory label as the only group instead. NtCreateToken() reads the owner
+     * unconditionally, so it has to be passed. */
     user.User.Sid = (SID *)&anonymous_sid;
     user.User.Attributes = 0;
     groups.GroupCount = 1;
     groups.Groups[0].Sid = (SID *)&anonymous_sid;
     groups.Groups[0].Attributes = SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED;
+    owner.Owner = (SID *)&anonymous_sid;
     group.PrimaryGroup = (SID *)&anonymous_sid;
     privs.PrivilegeCount = 0;
     expire.QuadPart = MAXLONGLONG;
@@ -903,7 +906,7 @@ NTSTATUS WINAPI NtImpersonateAnonymousToken( HANDLE thread )
 
     if ((status = NtAllocateLocallyUniqueId( &id ))) return status;
     if ((status = NtCreateToken( &token, TOKEN_IMPERSONATE | TOKEN_QUERY, &attr, TokenImpersonation, &id,
-                                 &expire, &user, &groups, &privs, NULL, &group, NULL, NULL )))
+                                 &expire, &user, &groups, &privs, &owner, &group, NULL, NULL )))
         return status;
     status = NtSetInformationThread( thread, ThreadImpersonationToken, &token, sizeof(token) );
     NtClose( token );
