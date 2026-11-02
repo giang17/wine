@@ -1904,11 +1904,16 @@ when the compiler cannot link `-static-pie`, `configure` falls back to linking t
 at a fixed address with `-Wl,-Ttext=0x7d7d00000000`. With `--rosegment` that linker puts the
 read-only data in front of the code at its default base address, out of reach of the code's
 PC-relative references, and the link fails with `relocation truncated to fit: R_X86_64_PC32
-against '.rodata'` (WineHQ bug 60552, binutils bug 34714). `configure` adds
+against '.rodata'` (WineHQ bug 60552, binutils bug 34714). On i386 (`-Ttext=0x7d400000`)
+the link succeeds, but `.rodata` then lies at 0x08048000, inside the low memory area the
+preloader reserves, and the preloader crashes right after reserving it. `configure` adds
 `-Wl,--no-rosegment` to these fixed-address links when the linker is GNU ld and accepts the
-option, so no change to `loader/Makefile.in` is needed; with GNU ld 2.46 the preloader comes
-out byte-identical. A `-static-pie` link, the usual case and the one this branch is built
-with, is not affected.
+option, so no change to `loader/Makefile.in` is needed. Measured with GNU ld 2.47 built with
+`--enable-rosegment`: the x86_64 fallback build fails without the option, and with it `cmd`
+and the six system processes of a prefix run through the preloader; the i386 preloader
+crashes without it and gets past the reservation with it; with the option both come out
+byte-identical to a GNU ld 2.46 link. A `-static-pie` link, the usual case and the one this
+branch is built with, is not affected: it links and runs with GNU ld 2.47 as well.
 
 **DXVK**: not a hard conflict, but the two do not combine inside one application — in a
 prefix DXVK replaces `dxgi.dll` and `d3d11.dll`, while this branch's composition-swapchain
