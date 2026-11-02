@@ -178,16 +178,19 @@ Two differences from a build of this repository are worth knowing:
 
 - **It follows the rolling branch**, not `d2d1-dcomp-11.0`, and is synced with it as new
   commits land, so it can lag behind the newest devel tag.
-- **It is built on wine-staging.** The staging patchsets that overlap with this fork —
-  DirectComposition, AF_UNIX, two wined3d sets, `ntdll-Hide_Wine_Exports` and
-  `user32-recursive-activation`, which edits the same `set_active_window()` this fork
-  changes — are left out in favour of the fork's own handling, and the stack is applied on
-  top of the remaining staging patchsets. Nothing is lost by that: the fork carries its own
-  version of the recursive-activation fix (Wine bug 46274). A report from this package
-  should say so.
+- **It is built on wine-staging.** The fork's stack is applied first and the staging
+  patchsets on top of it, without the eight that change the same files as this fork:
+  DirectComposition, AF_UNIX, two wined3d sets, `ntdll-Hide_Wine_Exports`,
+  `user32-recursive-activation`, `winex11-Window_Style` and
+  `sapi-ISpObjectToken-CreateInstance`. For `user32-recursive-activation`, which edits the
+  same `set_active_window()` this fork changes, the fork carries its own version of the fix
+  (Wine bug 46274). The last two have no counterpart in this fork, so two staging fixes are
+  missing from the package: the window attributes of layered windows that are also
+  `WS_EX_COMPOSITED` (Wine bug 37876) and `ISpObjectToken::CreateInstance()` for `ISpAudio`
+  (Wine bug 49641). A report from this package should say so.
 
 The same repository carries yabridge, pipewire-wineasio, pipeasio and winetricks. Builds
-are for Fedora 44 x86_64.
+are for Fedora 44 and Fedora 45, x86_64.
 
 ### Packages for Arch Linux and CachyOS
 
