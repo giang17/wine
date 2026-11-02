@@ -1053,6 +1053,16 @@ case $host_os in
                             [AS_VAR_APPEND([WINEPRELOADER_LDFLAGS],[" -static -Wl,-Ttext=0x7d7d00000000"])])
             ;;
         esac
+        dnl GNU ld 2.47 places the read-only data before the code with --rosegment (the default
+        dnl on Fedora 45), at the default base address instead of next to the -Ttext address.
+        dnl Not for lld, where --no-rosegment merges the read-only data into the code segment.
+        case $WINEPRELOADER_LDFLAGS in
+          *-Ttext=*)
+            if $CC $CFLAGS $LDFLAGS -Wl,--version 2>/dev/null | grep "^GNU ld" >/dev/null
+            then
+                WINE_TRY_CFLAGS([-Wl,--no-rosegment],[AS_VAR_APPEND([WINEPRELOADER_LDFLAGS],[" -Wl,--no-rosegment"])])
+            fi ;;
+        esac
         ;;
       *)
         case $HOST_ARCH in
