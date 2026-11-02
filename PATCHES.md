@@ -1899,6 +1899,17 @@ NT synchronisation then runs in the kernel instead of through the wineserver, an
 audio thread keeps up at 64 samples / 48 kHz without xruns (measured here with Serum 2 and
 FL Studio).
 
+**GNU ld 2.47 and `--rosegment`** (the linker default on Fedora 45 and later): on x86_64,
+when the compiler cannot link `-static-pie`, `configure` falls back to linking the preloader
+at a fixed address with `-Wl,-Ttext=0x7d7d00000000`. With `--rosegment` that linker puts the
+read-only data in front of the code at its default base address, out of reach of the code's
+PC-relative references, and the link fails with `relocation truncated to fit: R_X86_64_PC32
+against '.rodata'` (WineHQ bug 60552, binutils bug 34714). `configure` adds
+`-Wl,--no-rosegment` to these fixed-address links when the linker is GNU ld and accepts the
+option, so no change to `loader/Makefile.in` is needed; with GNU ld 2.46 the preloader comes
+out byte-identical. A `-static-pie` link, the usual case and the one this branch is built
+with, is not affected.
+
 **DXVK**: not a hard conflict, but the two do not combine inside one application — in a
 prefix DXVK replaces `dxgi.dll` and `d3d11.dll`, while this branch's composition-swapchain
 and DComp popup handling live in `dxgi` (the GL present in `wined3d`). The simplest setup
