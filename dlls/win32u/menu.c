@@ -2381,13 +2381,7 @@ UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y )
 
     TRACE( "hwnd %p, width %d, at (%d, %d).\n", hwnd, width, org_x, org_y );
 
-    /* NtUserDrawMenuBarTemp() lays the bar out only while its height is invalid, and
-     * the height is invalidated only when the items change. The bar wraps by width:
-     * a height laid out for another width is invalid too, and so is one from the other
-     * way of measuring the items, when the window got or lost WS_CAPTION since. */
-    if ((menu = unsafe_menu_ptr( get_menu( hwnd ) )) &&
-        (menu->Width != width || menu->themed != menu_bar_is_themed( menu, hwnd )))
-        menu->Height = 0;
+    if ((menu = unsafe_menu_ptr( get_menu( hwnd )))) menu->Height = 0; /* force size recalculate */
 
     hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_WINDOW );
     height = NtUserDrawMenuBarTemp( hwnd, hdc, &rect, 0, 0 );
