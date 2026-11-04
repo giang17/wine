@@ -1420,9 +1420,26 @@ static BOOL is_unix_dir_symlink( const char *unix_name )
 }
 
 
-/* get the stat info and file attributes for a file (by file descriptor) */
+/* the creation time of a file where the file system records one, 0 otherwise.
+ * struct stat has no birth time on Linux, statx() reports it; without it the
+ * creation time falls back to the modification time (see get_file_times), which
+ * moves whenever an entry is added to a directory -- unlike on Windows */
+static ULONGLONG get_birth_time( int dirfd, const char *path, int flags )
+{
+#if defined(__linux__) && defined(STATX_BTIME)
+    struct statx stx;
+
+    if (!statx( dirfd, path, flags, STATX_BTIME, &stx ) && (stx.stx_mask & STATX_BTIME))
+        return ticks_from_time_t( stx.stx_btime.tv_sec ) + stx.stx_btime.tv_nsec / 100;
+#endif
+    return 0;
+}
+
+
+/* get the stat info and file attributes for a file (by file descriptor);
+ * birth (optional) receives the creation time, 0 if unknown */
 static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
-                             struct stat *st, ULONG *attr, ULONG *reparse_tag )
+                             struct stat *st, ULONG *attr, ULONG *reparse_tag, ULONGLONG *birth )
 {
     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
     char attr_data[65];
@@ -1431,6 +1448,7 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
     *attr = 0;
     ret = fstat( fd, st );
     if (ret == -1) return ret;
+    if (birth) *birth = get_birth_time( fd, "", AT_EMPTY_PATH );
     *attr |= get_file_attributes( st );
     if (reparse_tag) *reparse_tag = 0;
     /* a bound AF_UNIX socket is a reparse point on Windows */
@@ -1535,8 +1553,10 @@ static NTSTATUS fd_set_file_info( int fd, UINT attr, BOOL force_set_xattr )
 }
 
 
-/* get the stat info and file attributes for a file (by name) */
-static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG *reparse_tag )
+/* get the stat info and file attributes for a file (by name);
+ * birth (optional) receives the creation time, 0 if unknown */
+static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG *reparse_tag,
+                          ULONGLONG *birth )
 {
     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
     size_t len = strlen( path );
@@ -1548,6 +1568,8 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     ret = lstat( path, st );
     if (ret == -1) return ret;
     if (reparse_tag) *reparse_tag = 0;
+    /* the times are those of the link target when the link is followed below */
+    if (birth) *birth = get_birth_time( AT_FDCWD, path, S_ISLNK( st->st_mode ) ? 0 : AT_SYMLINK_NOFOLLOW );
     if (S_ISLNK( st->st_mode ))
     {
         ret = stat( path, st );
@@ -1713,8 +1735,8 @@ static NTSTATUS set_file_times( int fd, const LARGE_INTEGER *mtime, const LARGE_
 }
 
 
-static inline void get_file_times( const struct stat *st, LARGE_INTEGER *mtime, LARGE_INTEGER *ctime,
-                                   LARGE_INTEGER *atime, LARGE_INTEGER *creation )
+static inline void get_file_times( const struct stat *st, ULONGLONG birth, LARGE_INTEGER *mtime,
+                                   LARGE_INTEGER *ctime, LARGE_INTEGER *atime, LARGE_INTEGER *creation )
 {
     mtime->QuadPart = ticks_from_time_t( st->st_mtime );
     ctime->QuadPart = ticks_from_time_t( st->st_ctime );
@@ -1749,11 +1771,13 @@ static inline void get_file_times( const struct stat *st, LARGE_INTEGER *mtime, 
 #else
     *creation = *mtime;
 #endif
+    if (birth) creation->QuadPart = birth;
 }
 
 
-/* fill in the file information that depends on the stat and attribute info */
-static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
+/* fill in the file information that depends on the stat and attribute info;
+ * birth is the creation time from fd_get_file_info/get_file_info, 0 if unknown */
+static NTSTATUS fill_file_info( const struct stat *st, ULONGLONG birth, ULONG attr, void *ptr,
                                 FILE_INFORMATION_CLASS class )
 {
     switch (class)
@@ -1762,7 +1786,7 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
         {
             FILE_BASIC_INFORMATION *info = ptr;
 
-            get_file_times( st, &info->LastWriteTime, &info->ChangeTime,
+            get_file_times( st, birth, &info->LastWriteTime, &info->ChangeTime,
                             &info->LastAccessTime, &info->CreationTime );
             info->FileAttributes = attr;
         }
@@ -1800,15 +1824,15 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
     case FileAllInformation:
         {
             FILE_ALL_INFORMATION *info = ptr;
-            fill_file_info( st, attr, &info->BasicInformation, FileBasicInformation );
-            fill_file_info( st, attr, &info->StandardInformation, FileStandardInformation );
-            fill_file_info( st, attr, &info->InternalInformation, FileInternalInformation );
+            fill_file_info( st, birth, attr, &info->BasicInformation, FileBasicInformation );
+            fill_file_info( st, birth, attr, &info->StandardInformation, FileStandardInformation );
+            fill_file_info( st, birth, attr, &info->InternalInformation, FileInternalInformation );
         }
         break;
     case FileNetworkOpenInformation:
         {
             FILE_NETWORK_OPEN_INFORMATION *info = ptr;
-            get_file_times( st, &info->LastWriteTime, &info->ChangeTime,
+            get_file_times( st, birth, &info->LastWriteTime, &info->ChangeTime,
                             &info->LastAccessTime, &info->CreationTime );
             info->FileAttributes = attr;
             if (S_ISDIR(st->st_mode))
@@ -1830,7 +1854,7 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
         {
             FILE_DIRECTORY_INFORMATION *info = ptr;
 
-            get_file_times( st, &info->LastWriteTime, &info->ChangeTime,
+            get_file_times( st, birth, &info->LastWriteTime, &info->ChangeTime,
                             &info->LastAccessTime, &info->CreationTime );
             if (S_ISDIR(st->st_mode))
             {
@@ -1849,14 +1873,14 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
         {
             FILE_ID_FULL_DIRECTORY_INFORMATION *info = ptr;
             info->FileId.QuadPart = st->st_ino;
-            fill_file_info( st, attr, info, FileDirectoryInformation );
+            fill_file_info( st, birth, attr, info, FileDirectoryInformation );
         }
         break;
     case FileIdBothDirectoryInformation:
         {
             FILE_ID_BOTH_DIRECTORY_INFORMATION *info = ptr;
             info->FileId.QuadPart = st->st_ino;
-            fill_file_info( st, attr, info, FileDirectoryInformation );
+            fill_file_info( st, birth, attr, info, FileDirectoryInformation );
         }
         break;
     case FileIdExtdBothDirectoryInformation:
@@ -1864,14 +1888,14 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
             FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION *info = ptr;
             memset( &info->FileId, 0, sizeof(info->FileId) );
             *(ULONGLONG *)&info->FileId = st->st_ino;
-            fill_file_info( st, attr, info, FileDirectoryInformation );
+            fill_file_info( st, birth, attr, info, FileDirectoryInformation );
         }
         break;
     case FileIdGlobalTxDirectoryInformation:
         {
             FILE_ID_GLOBAL_TX_DIR_INFORMATION *info = ptr;
             info->FileId.QuadPart = st->st_ino;
-            fill_file_info( st, attr, info, FileDirectoryInformation );
+            fill_file_info( st, birth, attr, info, FileDirectoryInformation );
         }
         break;
 
@@ -2222,9 +2246,11 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     const struct dir_data_names *names = &dir_data->names[dir_data->pos];
     union file_directory_info *info;
     struct stat st;
+    ULONGLONG birth = 0;
     ULONG name_len, start, dir_size, attributes, reparse_tag;
 
-    if (get_file_info( names->unix_name, &st, &attributes, &reparse_tag ) == -1)
+    if (get_file_info( names->unix_name, &st, &attributes, &reparse_tag,
+                       class != FileNamesInformation ? &birth : NULL ) == -1)
     {
         TRACE( "file no longer exists %s\n", debugstr_a(names->unix_name) );
         return STATUS_SUCCESS;
@@ -2251,7 +2277,7 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     if (class != FileNamesInformation)
     {
         if (st.st_dev != dir_data->id.dev) st.st_ino = 0;  /* ignore inode if on a different device */
-        fill_file_info( &st, attributes, info, class );
+        fill_file_info( &st, birth, attributes, info, class );
     }
 
     switch (class)
@@ -4652,13 +4678,14 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     {
         ULONG attributes;
         struct stat st;
+        ULONGLONG birth;
 
-        if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
+        if (get_file_info( unix_name, &st, &attributes, NULL, &birth ) == -1)
             status = errno_to_status( errno );
         else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
-            fill_file_info( &st, attributes, info, FileNetworkOpenInformation );
+            fill_file_info( &st, birth, attributes, info, FileNetworkOpenInformation );
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
@@ -4681,13 +4708,14 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     {
         ULONG attributes;
         struct stat st;
+        ULONGLONG birth;
 
-        if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
+        if (get_file_info( unix_name, &st, &attributes, NULL, &birth ) == -1)
             status = errno_to_status( errno );
         else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
-            status = fill_file_info( &st, attributes, info, FileBasicInformation );
+            status = fill_file_info( &st, birth, attributes, info, FileBasicInformation );
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
@@ -4889,6 +4917,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     };
 
     struct stat st;
+    ULONGLONG birth = 0;
     int fd, needs_close = FALSE;
     ULONG attr;
     unsigned int reparse_tag;
@@ -4918,22 +4947,22 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     switch (class)
     {
     case FileBasicInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, &birth ) == -1)
             status = errno_to_status( errno );
         else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
-            fill_file_info( &st, attr, ptr, class );
+            fill_file_info( &st, birth, attr, ptr, class );
         break;
     case FileStandardInformation:
         {
             FILE_STANDARD_INFORMATION *info = ptr;
 
-            if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+            if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, NULL ) == -1)
                 status = errno_to_status( errno );
             else
             {
-                fill_file_info( &st, attr, info, class );
+                fill_file_info( &st, 0, attr, info, class );
                 info->DeletePending = FALSE; /* FIXME */
             }
         }
@@ -4947,10 +4976,10 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileInternalInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, NULL ) == -1)
             status = errno_to_status( errno );
         else
-            fill_file_info( &st, attr, ptr, class );
+            fill_file_info( &st, 0, attr, ptr, class );
         break;
     case FileEaInformation:
         {
@@ -4959,22 +4988,22 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileEndOfFileInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, NULL ) == -1)
             status = errno_to_status( errno );
         else
-            fill_file_info( &st, attr, ptr, class );
+            fill_file_info( &st, 0, attr, ptr, class );
         break;
     case FileAllInformation:
         {
             FILE_ALL_INFORMATION *info = ptr;
 
-            if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+            if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, &birth ) == -1)
                 status = errno_to_status( errno );
             else
             {
                 LONG name_len = len - FIELD_OFFSET(FILE_ALL_INFORMATION, NameInformation.FileName);
 
-                fill_file_info( &st, attr, info, FileAllInformation );
+                fill_file_info( &st, birth, attr, info, FileAllInformation );
                 info->StandardInformation.DeletePending = FALSE; /* FIXME */
                 info->EaInformation.EaSize = 0;
                 info->AccessInformation.AccessFlags = 0;  /* FIXME */
@@ -5000,13 +5029,13 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileNetworkOpenInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, &birth ) == -1)
             status = errno_to_status( errno );
         else
-            fill_file_info( &st, attr, ptr, FileNetworkOpenInformation );
+            fill_file_info( &st, birth, attr, ptr, FileNetworkOpenInformation );
         break;
     case FileIdInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, NULL ) == -1)
             status = errno_to_status( errno );
         else
         {
@@ -5021,7 +5050,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileAttributeTagInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag, NULL ) == -1)
             status = errno_to_status( errno );
         else
         {
@@ -5031,7 +5060,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileStatInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag, &birth ) == -1)
             status = errno_to_status( errno );
         else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
@@ -5041,8 +5070,8 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             FILE_BASIC_INFORMATION basic;
             FILE_STANDARD_INFORMATION std;
 
-            fill_file_info( &st, attr, &basic, FileBasicInformation );
-            fill_file_info( &st, attr, &std, FileStandardInformation );
+            fill_file_info( &st, birth, attr, &basic, FileBasicInformation );
+            fill_file_info( &st, birth, attr, &std, FileStandardInformation );
 
             info->FileId.QuadPart = st.st_ino;
             info->CreationTime   = basic.CreationTime;
