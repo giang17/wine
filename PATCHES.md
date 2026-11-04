@@ -554,10 +554,17 @@ This is the recommended branch. What it changes, by subsystem:
   under `AppData\Roaming\D16 Group` and write the key into that folder, so every activation
   invalidated itself: "Plug-in requires activation" on the next load (WineHQ bug 51870, cause
   WineHQ bug 36958). They now stay activated across re-insertion and host restarts; a key
-  created before this change needs one more activation. The creation time still cannot be
-  set (`SetFileTime` ignores it as before), so an application that sets creation and
-  modification time to the same value no longer reads that value back as creation time.
-  `ntdll:file` and `kernel32:file` pass with 0 failures
+  created before this change needs one more activation. A creation time set through
+  `SetFileTime`/`NtSetInformationFile` was ignored; Linux cannot set a birth time, so ntdll
+  now keeps it in the extended attribute `user.WINECREATIONTIME`, which takes precedence when
+  reading and moves with the file on a rename. kernelbase follows Windows for the two calls
+  that touch it: `CopyFileW` no longer hands the source's creation time to the copy, and
+  `ReplaceFileW` gives the result the creation time of the replaced file. Measured against
+  Windows 10 19045 with a probe program (ten cases): Wine now agrees
+  in all but one — NTFS name tunneling, where a file recreated under a deleted name within
+  seconds keeps the old creation time, is not emulated. `test_file_creation_time` in
+  `kernel32/tests/file.c` covers the rest; `ntdll:file` and `kernel32:file` pass on both
+  architectures with 0 failures
 - **Per-pixel alpha for GPU-painted layered windows**: `DwmExtendFrameIntoClientArea`
   with `margins = -1` asks for full glass, which on Windows makes the client area
   per-pixel alpha capable. Wine stubbed it, so a plugin dragging a bitmap around — Serum
