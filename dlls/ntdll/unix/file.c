@@ -184,6 +184,10 @@ typedef struct
 
 #define XATTR_REPARSE XATTR_USER_PREFIX "WINEREPARSE"
 
+/* a creation time set through NtSetInformationFile (a ULONGLONG in 100 ns units);
+ * Linux has no call to set the birth time of a file */
+#define XATTR_CREATION_TIME XATTR_USER_PREFIX "WINECREATIONTIME"
+
 struct file_identity
 {
     dev_t dev;
@@ -1730,16 +1734,24 @@ static BOOL is_unix_dir_symlink( const char *unix_name )
 }
 
 
-/* the creation time of a file where the file system records one, 0 otherwise.
- * struct stat has no birth time on Linux, statx() reports it; without it the
- * creation time falls back to the modification time (see get_file_times), which
- * moves whenever an entry is added to a directory -- unlike on Windows */
-static ULONGLONG get_birth_time( int dirfd, const char *path, int flags )
+/* the creation time of a file (by path, or by fd if path is NULL), 0 if unknown: a time
+ * set through NtSetInformationFile, else the birth time where the file system records
+ * one. struct stat has no birth time on Linux, statx() reports it; without either the
+ * creation time falls back to the modification time (see get_file_times), which moves
+ * whenever an entry is added to a directory -- unlike on Windows */
+static ULONGLONG get_creation_time( int fd, const char *path, BOOL follow )
 {
+    ULONGLONG time = 0;
 #if defined(__linux__) && defined(STATX_BTIME)
     struct statx stx;
+#endif
 
-    if (!statx( dirfd, path, flags, STATX_BTIME, &stx ) && (stx.stx_mask & STATX_BTIME))
+    if ((path ? xattr_get( path, XATTR_CREATION_TIME, &time, sizeof(time) )
+              : xattr_fget( fd, XATTR_CREATION_TIME, &time, sizeof(time) )) == sizeof(time) && time)
+        return time;
+#if defined(__linux__) && defined(STATX_BTIME)
+    if (!(path ? statx( AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW, STATX_BTIME, &stx )
+               : statx( fd, "", AT_EMPTY_PATH, STATX_BTIME, &stx )) && (stx.stx_mask & STATX_BTIME))
         return ticks_from_time_t( stx.stx_btime.tv_sec ) + stx.stx_btime.tv_nsec / 100;
 #endif
     return 0;
@@ -1758,7 +1770,7 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
     *attr = 0;
     ret = fstat( fd, st );
     if (ret == -1) return ret;
-    if (birth) *birth = get_birth_time( fd, "", AT_EMPTY_PATH );
+    if (birth) *birth = get_creation_time( fd, NULL, FALSE );
     *attr |= get_file_attributes( st );
     if (reparse_tag) *reparse_tag = 0;
     /* a bound AF_UNIX socket is a reparse point on Windows */
@@ -1878,7 +1890,7 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     ret = lstat( path, st );
     if (ret == -1) return ret;
     /* the times are those of the link target when the link is followed below */
-    if (birth) *birth = get_birth_time( AT_FDCWD, path, S_ISLNK( st->st_mode ) ? 0 : AT_SYMLINK_NOFOLLOW );
+    if (birth) *birth = get_creation_time( -1, path, S_ISLNK( st->st_mode ) );
     if (S_ISLNK( st->st_mode ))
     {
         ret = stat( path, st );
@@ -5399,6 +5411,13 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
             if (atime.QuadPart || mtime.QuadPart)
                 status = set_file_times( fd, &mtime, &atime );
+
+            /* 0 leaves the creation time unchanged, -1 and -2 only control automatic updates */
+            if (status == STATUS_SUCCESS && info->CreationTime.QuadPart > 0
+                && xattr_fset( fd, XATTR_CREATION_TIME, &info->CreationTime.QuadPart,
+                               sizeof(info->CreationTime.QuadPart) ) == -1 && errno != ENOTSUP)
+                WARN( "Failed to set extended attribute " XATTR_CREATION_TIME ". errno %d (%s)\n",
+                      errno, strerror( errno ) );
 
             if (status == STATUS_SUCCESS)
                 status = fd_set_file_info( fd, info->FileAttributes,
