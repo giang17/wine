@@ -503,16 +503,14 @@ static BOOL base64_to_cert( const char *str )
     return TRUE;
 }
 
-/* Reads the file fd, and imports any certificates in it into store. */
-static void import_certs_from_file( int fd )
+/* Reads the file fp, and imports any certificates in it into store. */
+static void import_certs_from_file( FILE *fp )
 {
-    FILE *fp = fdopen(fd, "r");
     char line[1024];
     BOOL in_cert = FALSE;
     struct DynamicBuffer saved_cert = { 0, 0, NULL };
     int num_certs = 0;
 
-    if (!fp) return;
     TRACE("\n");
     while (fgets(line, sizeof(line), fp))
     {
@@ -535,7 +533,6 @@ static void import_certs_from_file( int fd )
     }
     free( saved_cert.data );
     TRACE("Read %d certs\n", num_certs);
-    fclose(fp);
 }
 
 static void import_certs_from_path(LPCSTR path, BOOL allow_dir);
@@ -590,19 +587,19 @@ static void import_certs_from_dir( LPCSTR path )
  */
 static void import_certs_from_path(LPCSTR path, BOOL allow_dir)
 {
-    int fd;
+    FILE *fp;
 
     TRACE("(%s, %d)\n", debugstr_a(path), allow_dir);
 
-    fd = open(path, O_RDONLY);
-    if (fd != -1)
+    fp = fopen(path, "r");
+    if (fp)
     {
         struct stat st;
 
-        if (fstat(fd, &st) == 0)
+        if (fstat(fileno(fp), &st) == 0)
         {
             if (S_ISREG(st.st_mode))
-                import_certs_from_file(fd);
+                import_certs_from_file(fp);
             else if (S_ISDIR(st.st_mode))
             {
                 if (allow_dir)
@@ -614,7 +611,7 @@ static void import_certs_from_path(LPCSTR path, BOOL allow_dir)
             else
                 ERR("%s: invalid file type\n", path);
         }
-        close(fd);
+        fclose(fp);
     }
 }
 
