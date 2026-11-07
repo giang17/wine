@@ -441,6 +441,20 @@ This is the recommended branch. What it changes, by subsystem:
   bug 60677) — on 11.0 no draw path reads the render info of a custom effect's transform
   nodes, and the rework turns the creation failure for a node that is no draw transform into
   an effect created without render info
+- **dwrite text layout, backport of the layout rework from Wine 11.1/11.2 and of `HitTestPoint()`
+  from 11.21** (21 upstream commits by Nikolay Sivov, 14 for the code and 7 for the tests,
+  cherry-picked with their origin; `dlls/dwrite/layout.c` is now identical to upstream master
+  except for the fork's `dwrite_fontface_get_glyph_bbox()` arguments): the script and bidi level
+  analyzers run over the whole text, formatted and inline runs are kept in one list, lines come
+  from one helper, wrapping modes are supported better, runs are reordered for bidirectional
+  text, and `IDWriteTextLayout::HitTestTextPosition()` and `HitTestPoint()` are implemented
+  (partially, as upstream; `HitTestTextRange()` stays a stub, upstream too). Fender Studio Pro 8
+  called the `HitTestTextPosition()` stub 32 times while loading a song and about 12 000 times
+  in a session with heavy clicking; the same load-and-quit run now logs no hit-test message.
+  `dwrite_test layout` with the new tests fails once, the known `todo` success of the fork's
+  fallback table (`Noto Sans Symbols2`, U+25D4); the same test binary against the previous
+  `dwrite.dll` fails 347 times. Studio Pro's menus, toolbar, ruler and transport text and
+  `juce8-icon-test` render pixel-identical before and after (issue 567)
 - **wintypes**: `RoResolveNamespace()` looks up the `.winmd` files in `system32\WinMetadata`
   (backport of 5542cd8541f and 03d18c456aa from Wine 11.19, with their tests). The stub
   returned `RO_E_METADATA_NAME_NOT_FOUND` for every namespace, and the .NET Framework resolves
