@@ -776,6 +776,7 @@ extern void window_configure_notify( struct x11drv_win_data *data, unsigned long
 extern void set_net_active_window( HWND hwnd, HWND previous );
 extern Window get_net_active_window( Display *display );
 extern void net_client_list_stacking_notify(void);
+extern void sync_unmanaged_stacking( Display *display );
 extern void net_active_window_notify( unsigned long serial, Window window, Time time );
 extern void net_active_window_init( struct x11drv_thread_data *data );
 extern void net_supported_init( struct x11drv_thread_data *data );
