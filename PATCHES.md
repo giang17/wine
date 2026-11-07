@@ -418,6 +418,29 @@ This is the recommended branch. What it changes, by subsystem:
   into many more points than needed, while a curve with non-finite points or zero flatness no
   longer loops forever (gdiplus, Wine bug 60041). The test of the translated curve is taken
   without the warp-path tests next to it upstream, which came after 11.0
+- **Backports from Wine master after 11.21** (seven upstream commits, cherry-picked with their
+  origin): a thread terminated after it has sent its `init_thread` request but before the
+  server has read it no longer blocks forever in `read_reply_data()` with its pipes — the write
+  end of the reply pipe is closed right after it is sent to the server, so the read sees
+  end-of-file (ntdll, Wine bug 60663; adapted to the 11.0 `server_init_thread()`); a request
+  that takes an fd from the client no longer returns the `STATUS_INVALID_CID` that a stray fd
+  of an already terminated thread leaves behind, so `NtCreateThreadEx()` no longer reports a
+  thread it created as failed (wineserver, Wine bug 60672); `CreateCustomFontCollection()`
+  skips a file the font-set builder does not support instead of failing the whole collection
+  (dwrite, Wine bug 60626); `ID2D1TransformedGeometry::Tessellate()` applies the geometry's
+  own transform, which it computed and then dropped (d2d1); and three failure paths release
+  what they hold (d2d1: the shared bitmap, the factory reference of a gradient stop
+  collection, the effect vertex buffer). Measured with `scripts/repro-post-1121-backports.sh`:
+  eight threads that each create 500 suspended threads and terminate them right away lost
+  68–78 creations per run to `STATUS_INVALID_CID` (in one run already the creation of a worker
+  thread) and left 736–801 Unix threads and 6636–6909 fds behind in the process; now none of
+  either in three runs. A 10×10 rectangle geometry scaled by 3 tessellated to 10×10, now to
+  30×30; a custom collection of `win.ini` and `tahoma.ttf` failed with `DWRITE_E_FILEFORMAT`,
+  now it holds one family. `d2d1_test d2d1` (llvmpipe) and `dwrite_test layout` fail in the
+  same places before and after. Not taken: the transform-graph rework of the same week (Wine
+  bug 60677) — on 11.0 no draw path reads the render info of a custom effect's transform
+  nodes, and the rework turns the creation failure for a node that is no draw transform into
+  an effect created without render info
 - **wintypes**: `RoResolveNamespace()` looks up the `.winmd` files in `system32\WinMetadata`
   (backport of 5542cd8541f and 03d18c456aa from Wine 11.19, with their tests). The stub
   returned `RO_E_METADATA_NAME_NOT_FOUND` for every namespace, and the .NET Framework resolves
