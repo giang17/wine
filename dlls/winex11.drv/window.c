@@ -516,6 +516,21 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
         TRACE( "%p: ownerless layered popup %08x/%08x is managed\n", hwnd, style, ex_style );
         return TRUE;
     }
+    /* An owned popup that is an ordinary application window -- neither topmost nor a tool
+     * window, not layered, click-through or WS_EX_NOACTIVATE -- belongs to the window manager
+     * even when it is shown without activation.  Unmanaged, the window manager draws it above
+     * every managed window (KWin keeps override-redirect windows in a layer of their own,
+     * whatever their X stacking), so a topmost dialog of the application opens below it:
+     * Fender Studio Pro 8's video player and plug-in windows (CCLShadowWindowClass, style
+     * 0x9e000000, ex style 0) hid its save query that way (wine-dev issue 568).  Menus,
+     * tooltips, drop-down lists, drag images and the popups of JUCE, FL Studio, Ableton Live
+     * and WebView2 carry at least one of these extended styles and stay unmanaged. */
+    if ((style & WS_POPUP) && NtUserGetWindowRelative( hwnd, GW_OWNER ) &&
+        !(ex_style & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)))
+    {
+        TRACE( "%p: owned application popup %08x/%08x is managed\n", hwnd, style, ex_style );
+        return TRUE;
+    }
     /* windows that own popups are managed */
     if (has_owned_popups( hwnd )) return TRUE;
     /* default: not managed */
