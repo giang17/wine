@@ -1198,6 +1198,28 @@ This is the recommended branch. What it changes, by subsystem:
   binary used to die in `test_no_target()` with exit status 5 and no summary line (the tests
   queued after it on that thread went unrun); it now ends with 20,701 tests on x86_64 and 20,676
   on i386 and the same failures as before. 29 paths render hash-identically (issue 527).
+- **d2d1**: command list recording stores the variable-size fields of a command — the glyph indices,
+  advances, offsets and run description of `DrawGlyphRun()`, the rectangles and perspective
+  transform of `DrawBitmap()`, the offset and rectangle of `DrawImage()`, the rectangles of
+  `FillOpacityMask()` — as offsets into the recording buffer instead of pointers. The buffer grows
+  with `realloc()`, so every pointer stored before a move pointed into freed memory and `Stream()`
+  replayed whatever was there. Measured with `scripts/repro-566-command-list-realloc.c`
+  (`DrawBitmap()`, `DrawImage()` and `FillOpacityMask()` with known rectangles, then N
+  `FillRectangle()`, streamed into a checking sink): on x86_64 from N = 10, on i386 from N = 100 all
+  six rectangles were wrong, and with `WINEDEBUG=warn+heap` (freed blocks filled with `0xfeeefeee`)
+  on i386 already at N = 0, since the recorded commands themselves move the buffer; without the heap
+  fill `DrawImage()` received the colour of the brush a later `FillRectangle()` had copied into the
+  freed block. The replay into a bitmap target reported `S_OK` throughout — nothing crashed, the
+  wrong rectangles were drawn silently. Now all 24 runs (both architectures, N up to 10,000, with
+  and without the heap fill) replay the recorded values, and `d2d1_test d2d1` (llvmpipe) fails in
+  the same places before and after on x86_64 and i386. Backport of 02cfacf0d5b, 4334512575c and
+  84a272b472e from Wine 11.17 (an allocation failure while recording puts the list into the error
+  state instead of writing through a null pointer; the brush created for `FillGeometry()` is no
+  longer released early when its opacity brush cannot be created; a brush creation failure sets the
+  error state in one place) and of acc02fd6c89 from Wine master after 11.21, without the
+  `DrawSpriteBatch()` recording, which needs the sprite batches 11.0 does not have. None of the
+  measured applications (Serum 2, EPROM, Current, Studio Pro 8) records command lists; the change is
+  preventive (issue 566).
 - **win32u**: a window that loses its window surface for direct drawing no longer gets the
   surface's pixels copied over its client area when a pixel format is set on it. The switch
   happens in the first window position change after the client surface was attached, the
