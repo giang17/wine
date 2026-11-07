@@ -2679,7 +2679,6 @@ void net_client_list_stacking_notify(void)
     Atom type;
 
     if (is_virtual_desktop()) return;
-    sync_unmanaged_stacking( x11drv_thread_data()->display );
     if (!(foreground = NtUserGetForegroundWindow())) return;
     if (NtUserGetWindowThread( foreground, NULL ) != GetCurrentThreadId()) return;
 
@@ -2887,132 +2886,6 @@ static void window_restack_below( struct x11drv_win_data *data, Window sibling )
 }
 
 
-static int restack_error( Display *display, XErrorEvent *event, void *arg )
-{
-    /* the window or its sibling went away, or the sibling is no sibling (yet) */
-    return event->error_code == BadWindow || event->error_code == BadMatch;
-}
-
-/***********************************************************************
- *     get_root_child
- *
- * The child of the root window that holds the given window: the window
- * manager's frame of a reparented managed window, the window itself otherwise.
- * Top-level windows can only be stacked against siblings, so this is what an
- * unmanaged window has to be stacked against.
- */
-static Window get_root_child( Display *display, Window window )
-{
-    Window root, parent, *children, ret = 0;
-    unsigned int count, depth;
-
-    X11DRV_expect_error( display, restack_error, NULL );
-    for (depth = 0; window && depth < 8; depth++)
-    {
-        if (!XQueryTree( display, window, &root, &parent, &children, &count )) break;
-        if (children) XFree( children );
-        if (parent == root || parent == root_window)
-        {
-            ret = window;
-            break;
-        }
-        window = parent;
-    }
-    if (X11DRV_check_error()) ret = 0;
-    return ret;
-}
-
-/***********************************************************************
- *     restack_unmanaged
- *
- * Stack an unmanaged (override-redirect) top-level window directly below a
- * child of the root window, or on top when there is none.
- */
-static void restack_unmanaged( Display *display, HWND hwnd, Window window, Window sibling )
-{
-    XWindowChanges changes;
-
-    changes.sibling = sibling;
-    changes.stack_mode = sibling ? Below : Above;
-    TRACE( "window %p/%lx, stacking %s %lx\n", hwnd, window, sibling ? "below" : "on top", sibling );
-    X11DRV_expect_error( display, restack_error, NULL );
-    XConfigureWindow( display, window, sibling ? CWSibling | CWStackMode : CWStackMode, &changes );
-    if (X11DRV_check_error()) WARN( "window %p/%lx, restack against %lx failed\n", hwnd, window, sibling );
-}
-
-/***********************************************************************
- *     sync_unmanaged_stacking
- *
- * winex11 maps a popup that is shown without activation and has no caption,
- * frame, system menu or WS_EX_APPWINDOW as an override-redirect window
- * (is_window_managed).  The window manager does not stack such a window, so it
- * stays above every managed window that is mapped after it -- also above a
- * topmost window that win32 puts in front of it.  Fender Studio Pro 8 opens its
- * topmost save query below the video player that way and looks frozen
- * (wine-dev issue 568).
- *
- * Restack the visible unmanaged top-level windows of the calling thread in win32
- * order: each one directly below the root child (frame) of its visible win32
- * predecessor, on top when there is none -- as sync_window_position() does for
- * a single window.  Called whenever the window manager changes its stacking
- * (net_client_list_stacking_notify): a frame shows up, goes away or is raised,
- * and a raised frame lands above an unmanaged window that sits among the frames.
- */
-void sync_unmanaged_stacking( Display *display )
-{
-    Window prev = 0, prev_root_child = 0;
-    struct x11drv_win_data *data;
-    BOOL found = FALSE;
-    HWND *list;
-    UINT i;
-
-    if (!(list = build_hwnd_list())) return;
-    /* this runs in every thread on every restack: look for an own mapped unmanaged window
-     * first, get_win_data() needs no server call */
-    for (i = 0; !found && list[i] != HWND_BOTTOM; i++)
-    {
-        if (!(data = get_win_data( list[i] ))) continue;
-        found = data->whole_window && !data->managed && !data->embedded && data->display == display &&
-                data->pending_state.wm_state != WithdrawnState;
-        release_win_data( data );
-    }
-    if (!found)
-    {
-        free( list );
-        return;
-    }
-
-    for (i = 0; list[i] != HWND_BOTTOM; i++)
-    {
-        BOOL unmanaged = FALSE, own = FALSE;
-        Window window;
-
-        if (!(NtUserGetWindowLongW( list[i], GWL_STYLE ) & WS_VISIBLE)) continue;
-        if ((data = get_win_data( list[i] )))
-        {
-            window = data->whole_window;
-            unmanaged = window && !data->managed && !data->embedded;
-            own = unmanaged && data->display == display && data->pending_state.wm_state != WithdrawnState;
-            release_win_data( data );
-        }
-        else window = X11DRV_get_whole_window( list[i] ); /* window of another process */
-        if (!window) continue;
-
-        if (own)
-        {
-            /* looked up only here: without an unmanaged window of this thread nothing goes to the server */
-            if (prev && !prev_root_child && !(prev_root_child = get_root_child( display, prev )))
-                prev_root_child = prev;
-            restack_unmanaged( display, list[i], window, prev_root_child );
-        }
-        prev = window;
-        prev_root_child = unmanaged ? window : 0; /* an unmanaged window is a child of the root itself */
-    }
-    free( list );
-    XFlush( display );
-}
-
-
 /***********************************************************************
  *		sync_window_position
  *
@@ -3024,7 +2897,7 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
     DWORD ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
     RECT new_rect, window_rect;
     BOOL above = FALSE;
-    Window sibling = 0, unmanaged_sibling = 0;
+    Window sibling = 0;
 
     if (data->managed && ((style & WS_MINIMIZE) || data->desired_state.wm_state == IconicState)) return;
 
@@ -3042,11 +2915,6 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
          * (an unmanaged window must not be raised over them, so they still count for "top") */
         else if (data->managed && (prev = get_visible_predecessor( data->hwnd )))
             sibling = X11DRV_get_whole_window( prev );
-        /* an unmanaged window is stacked by us alone: directly below the root child (the
-         * frame, for a managed predecessor) of its visible predecessor, or a topmost window
-         * in front of it stays hidden behind it (sync_unmanaged_stacking, wine-dev issue 568) */
-        else if (!data->managed && !data->embedded)
-            unmanaged_sibling = get_root_child( data->display, X11DRV_get_whole_window( prev ) );
     }
 
     set_size_hints( data, style );
@@ -3074,8 +2942,6 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
 
     window_set_config( data, new_rect, above );
     if (sibling) window_restack_below( data, sibling );
-    else if (unmanaged_sibling && unmanaged_sibling != data->whole_window)
-        restack_unmanaged( data->display, data->hwnd, data->whole_window, unmanaged_sibling );
 }
 
 
