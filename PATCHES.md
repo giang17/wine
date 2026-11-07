@@ -921,27 +921,6 @@ This is the recommended branch. What it changes, by subsystem:
   Windows 10 19045 sends none of them with the same Z-order. vatSys map clicks: no
   `swp_owner_popups()`, no post-move invalidation; `repro-517` keeps the owned and the tool
   window above after 8 of 8 clicks.
-- **winex11**: unmanaged (override-redirect) windows are kept at their win32 place among the
-  window manager's frames. An owned popup shown without activation and without caption, frame,
-  system menu or `WS_EX_APPWINDOW` is mapped override-redirect (`is_window_managed()`, unchanged
-  upstream); the window manager does not stack it, so it stayed above every managed window
-  mapped after it — also above a topmost window that win32 puts in front of it. Fender Studio
-  Pro 8 opened its save query on quit (`#32770`, `WS_EX_TOPMOST`) entirely below its video
-  player (`CCLShadowWindowClass`, style `0x9e000000`, not topmost) and looked frozen until the
-  video player was closed (issue 568). Whenever the window manager changes
-  `_NET_CLIENT_LIST_STACKING`, each thread now restacks its visible unmanaged top-level windows
-  in win32 order, each one directly below the root child (the frame, for a managed window) of
-  its visible win32 predecessor and on top when there is none; `sync_window_position()` does
-  the same for one unmanaged window with a visible predecessor, a case it ignored so far. An
-  unmanaged popup thus also goes below other windows of the application that win32 puts in
-  front of it, as on Windows. Measured with `scripts/repro-568-unmanaged-stacking.sh` (main
-  window, an owned popup shown without activation, a topmost captioned window over it, then
-  that window destroyed; order of the root children on `:99` with kwin_x11, checked against
-  `_NET_CLIENT_LIST_STACKING`): the popup above the topmost window before, below it after in
-  3 of 3 runs, and back above the main window once the topmost window is gone. user32 `win`,
-  `input` and `msg` tests, run with the build before the early return for threads without
-  unmanaged windows: no new failure (`win` 9 and `msg` 115 before and after, `input` 1 before
-  and 0 after)
 - **win32u**: the palette messages of an activation are sent only on a palettized display.
   `set_active_window()` sent `WM_QUERYNEWPALETTE` to every newly active window and, when the
   window answered, broadcast `WM_PALETTEISCHANGING`. Wine's own user32 message tests, which
