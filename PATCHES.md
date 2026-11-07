@@ -921,6 +921,32 @@ This is the recommended branch. What it changes, by subsystem:
   Windows 10 19045 sends none of them with the same Z-order. vatSys map clicks: no
   `swp_owner_popups()`, no post-move invalidation; `repro-517` keeps the owned and the tool
   window above after 8 of 8 clicks.
+- **winex11**: an owned popup that is an ordinary application window — neither topmost nor a
+  tool window, not layered, click-through or `WS_EX_NOACTIVATE` — is managed by the window
+  manager even when it is shown without activation. Before, such a popup without caption,
+  frame, system menu or `WS_EX_APPWINDOW` was override-redirect, and KWin draws override-redirect
+  windows in a layer above every managed window, whatever their X stacking order
+  (`Workspace::updateXStackingOrder()`, kwin 5.27 and 6.7): Fender Studio Pro 8's save query on
+  quit (`#32770`, `WS_EX_TOPMOST`) opened below its video player and plug-in windows
+  (`CCLShadowWindowClass`, style `0x9e000000`, ex style `0`), and the application looked frozen
+  until the video player was closed (issue 568). The styles of all top-level windows were
+  recorded while Studio Pro 8, REAPER with a JUCE 8 plug-in, Ableton Live 12 and FL Studio were
+  operated (`scripts/window-style-census.sh`): every menu, tooltip, drop-down list, drag image
+  and framework popup carries at least one of these extended styles — Win32 menus and tooltips
+  `WS_EX_TOPMOST`, JUCE menus and WebView2 popups `WS_EX_TOOLWINDOW`, Studio Pro's small CCL
+  popups `WS_EX_LAYERED`, Live's popups `WS_EX_NOACTIVATE` — and stays override-redirect; FL
+  Studio's browser, channel rack and settings windows match the rule and were managed in the
+  recording already. Measured with `scripts/repro-568-unmanaged-stacking.sh` (an owned popup
+  shown without activation, a topmost captioned window over it, then destroyed; `:99` with
+  kwin_x11): the popup is managed and lies between the main window and the topmost window in
+  `_NET_CLIENT_LIST_STACKING` in 3 of 3 runs, and above the main window once the topmost window
+  is gone. In Studio Pro 8 the query shows above the video player and the plug-in window, and
+  Studio Pro, REAPER, Live 12 and FL Studio worked with their menus, drop-downs and tooltips
+  and quit cleanly (user check). user32 `win`, `input` and `msg` tests: no new failure (two
+  mouse-input failures in `win` and eight hotkey failures in `msg` came and went between runs
+  of the previous build as well). An earlier attempt that restacked the override-redirect
+  windows below the frames in X changed nothing on screen under KWin and is reverted
+  (`a8d19f0bb18`)
 - **win32u**: the palette messages of an activation are sent only on a palettized display.
   `set_active_window()` sent `WM_QUERYNEWPALETTE` to every newly active window and, when the
   window answered, broadcast `WM_PALETTEISCHANGING`. Wine's own user32 message tests, which
