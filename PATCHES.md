@@ -148,6 +148,17 @@ This is the recommended branch. What it changes, by subsystem:
   stroke width and stroke style; the flattening tolerance given at creation is not applied.
   `test_geometry_realization()` checks the pixels now (6 failures before, 0 after). No affected
   application is known — JUCE 8.0.0 to 8.0.15 never call the API
+- **winecfg (ProductName as in wine.inf)**: choosing a Windows version in winecfg wrote
+  `ProductName` under `HKLM\Software\Microsoft\Windows NT\CurrentVersion` as
+  `Microsoft Windows 10`, while wine.inf installs `Windows 10 Pro` and Windows 10 itself has
+  no "Microsoft" prefix there (`Windows 10 Education`, measured on 22H2; the prefixed form is
+  the WMI caption). Steinberg's setup bootstrapper (SetupBootstrapper 3.14.0.6526, shipped
+  with Cubase 13.0.55 and MediaBay 1.3.100) gets Windows 8 from `Environment.OSVersion` (no `supportedOS` in its
+  manifest) and lifts that to Windows 10 only if `ProductName` starts with "Windows 10" —
+  so in a prefix whose version had been set in winecfg it rejected the operating system.
+  winecfg now writes the wine.inf value for Windows 10 and no prefix from Vista on
+  (Windows 7, Windows 8.1, Windows 11); Windows XP and 2000 keep it. A prefix that already
+  carries the old value needs the version set once more in winecfg
 - **D2D1 layers on an opaque target**: a layer bitmap inherited the target's alpha mode,
   so on a render target created as `ALPHA_MODE_IGNORE` the layer's own coverage was thrown
   away and everything drawn inside it turned the background colour, usually black. All
