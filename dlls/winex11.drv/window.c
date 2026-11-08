@@ -2674,6 +2674,79 @@ static HWND get_visible_predecessor( HWND hwnd )
     return prev;
 }
 
+/* whether update_zorder_transient() may make hwnd transient for main: an ownerless,
+ * visible tool window of this process that sets no transient hint of its own and
+ * does not own main.  A tool window has no taskbar entry, so being a transient
+ * costs it none. */
+static BOOL can_be_zorder_transient( HWND hwnd, HWND main )
+{
+    DWORD style, ex_style, pid;
+
+    if (!hwnd || hwnd == main) return FALSE;
+    if (NtUserGetWindowRelative( hwnd, GW_OWNER )) return FALSE;
+    if (!NtUserGetWindowThread( hwnd, &pid ) || pid != GetCurrentProcessId()) return FALSE;
+    style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+    ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
+    if ((style & (WS_VISIBLE | WS_CHILD)) != WS_VISIBLE) return FALSE;
+    if ((ex_style & (WS_EX_TOOLWINDOW | WS_EX_APPWINDOW | WS_EX_TOPMOST)) != WS_EX_TOOLWINDOW) return FALSE;
+    if (NtUserGetProp( hwnd, dcomp_popup_parent_prop )) return FALSE;
+    if (is_owned_by( main, hwnd )) return FALSE;
+    return TRUE;
+}
+
+/***********************************************************************
+ *     update_zorder_transient
+ *
+ * An application can keep an ownerless tool window above its main window
+ * without WS_EX_TOPMOST, by placing the main window below it on every Z-order
+ * change (Cubase's "Always on Top" for its Audio Performance monitor).  The
+ * driver passes that order on as _NET_RESTACK_WINDOW, but KWin stacks the
+ * active fullscreen window in a layer of its own, which no restack request
+ * crosses, and the tool window ends up behind it.  A transient follows its main
+ * window into that layer, so while the win32 order keeps such a tool window
+ * directly above a managed window, make it transient for that window, and drop
+ * the hint again when the order changes or the window is hidden.  prev is the
+ * window's visible win32 predecessor, NULL when it has none or goes away.
+ */
+static void update_zorder_transient( struct x11drv_win_data *data, HWND prev )
+{
+    HWND old = data->zorder_transient_child, new = NULL;
+    struct x11drv_win_data *other;
+
+    if (prev && data->whole_window && data->managed && !data->embedded &&
+        can_be_zorder_transient( prev, data->hwnd ))
+        new = prev;
+
+    if (old && old != new && (other = get_win_data( old )))
+    {
+        /* it may have been made transient for another window since */
+        if (other->zorder_transient_for && other->zorder_transient_for == data->whole_window)
+        {
+            TRACE( "window %p/%lx, dropping WM_TRANSIENT_FOR %lx\n", old, other->whole_window, data->whole_window );
+            if (other->whole_window) XDeleteProperty( data->display, other->whole_window, XA_WM_TRANSIENT_FOR );
+            other->zorder_transient_for = 0;
+        }
+        release_win_data( other );
+    }
+    if (new)
+    {
+        if (!(other = get_win_data( new ))) new = NULL;
+        else
+        {
+            if (!other->whole_window || !other->managed) new = NULL;
+            else if (other->zorder_transient_for != data->whole_window)
+            {
+                TRACE( "window %p/%lx kept above %p/%lx, requesting WM_TRANSIENT_FOR\n", new, other->whole_window,
+                       data->hwnd, data->whole_window );
+                XSetTransientForHint( data->display, other->whole_window, data->whole_window );
+                other->zorder_transient_for = data->whole_window;
+            }
+            release_win_data( other );
+        }
+    }
+    data->zorder_transient_child = new;
+}
+
 /***********************************************************************
  *     net_client_list_stacking_notify
  *
@@ -2702,6 +2775,7 @@ void net_client_list_stacking_notify(void)
 
     if (!(data = get_win_data( foreground ))) return;
     if (!data->whole_window || !data->managed || data->embedded || sibling == data->whole_window) goto done;
+    update_zorder_transient( data, prev );
     /* only when X and win32 agree on the active window: right after a click the win32
      * foreground still lags behind, the activation path takes care of that case */
     if (x11drv_thread_data()->current_state.net_active_window != data->whole_window) goto done;
@@ -2930,6 +3004,7 @@ static void sync_window_position( struct x11drv_win_data *data, UINT swp_flags, 
          * (an unmanaged window must not be raised over them, so they still count for "top") */
         else if (data->managed && (prev = get_visible_predecessor( data->hwnd )))
             sibling = X11DRV_get_whole_window( prev );
+        update_zorder_transient( data, prev );
     }
 
     set_size_hints( data, style );
@@ -3554,6 +3629,7 @@ void X11DRV_DestroyWindow( HWND hwnd )
 
     if (!(data = get_win_data( hwnd ))) return;
 
+    update_zorder_transient( data, NULL );
     destroy_whole_window( data, FALSE );
     if (thread_data->last_focus == hwnd) thread_data->last_focus = 0;
     if (thread_data->last_xic_hwnd == hwnd) thread_data->last_xic_hwnd = 0;
@@ -4317,6 +4393,8 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 #endif
     }
 
+    /* a hidden window keeps no tool window transient for itself */
+    if (!(new_style & WS_VISIBLE)) update_zorder_transient( data, NULL );
     window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
     if (!data->wm_state_serial && data->pending_state.wm_state != WithdrawnState)
     {
