@@ -18556,7 +18556,10 @@ static void test_combine_geometry(BOOL d3d11)
 
     /* Two non-convex polygons: an L shape and the same shape mirrored through
      * the centre of its bounding box. Each arm of one crosses an arm of the
-     * other, so the intersection is two disconnected 10x10 squares. */
+     * other, so the intersection is two disconnected 10x10 squares. The mirror
+     * is a scale by -1, which keeps the matrix exact; rotate_matrix(M_PI) leaves
+     * sinf(M_PI) = -8.7e-8 in it, and the bounds would then depend on the
+     * precision the transform is evaluated in. */
     hr = ID2D1Factory_CreatePathGeometry(ctx.factory, &path);
     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
     hr = ID2D1PathGeometry_Open(path, &sink);
@@ -18575,7 +18578,7 @@ static void test_combine_geometry(BOOL d3d11)
     ID2D1GeometrySink_Release(sink);
 
     set_matrix_identity(&matrix);
-    rotate_matrix(&matrix, M_PI);
+    scale_matrix(&matrix, -1.0f, -1.0f);
     translate_matrix(&matrix, -30.0f, -50.0f);
     hr = ID2D1Factory_CreateTransformedGeometry(ctx.factory, (ID2D1Geometry *)path,
             &matrix, &transformed_geometry);
