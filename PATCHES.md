@@ -876,7 +876,17 @@ This is the recommended branch. What it changes, by subsystem:
   checked for the active window too, since a click on the frame never reaches Wine.
   Verified with Cubase's monitor against clicks into the inactive and the active project
   window, the monitor and the KWin title bar (12/12 keep the monitor above); the user32
-  window tests are unchanged.
+  window tests are unchanged. With the project window in KWin fullscreen that was not
+  enough: KWin stacks the active fullscreen window in a layer of its own, which no
+  `_NET_RESTACK_WINDOW` request crosses. While the win32 order keeps an ownerless, visible
+  tool window of the same process directly above a managed window, `winex11` therefore also
+  makes it transient for that window (`WM_TRANSIENT_FOR`), which KWin carries into the
+  fullscreen layer, and drops the hint again when the order changes or the window is hidden
+  or destroyed; a tool window has no taskbar entry to lose, and KWin minimises it together
+  with its main window. Measured with `scripts/repro-432-fullscreen-ontop.sh` (workspace) on
+  KWin X11: above the active fullscreen main window in 0 of 4 steps before, 6 of 6 after;
+  confirmed by the user in Cubase Pro 15.0.30. Cubase hides the monitor itself while another
+  application is active and shows it again on the next click into a Cubase window.
 - **win32u / winex11**: the Z-order resync after a window-manager raise no longer counts a
   window's own owned popups as predecessors. `sync_zorder_after_wm_raise()` looked for the
   first visible window above the clicked top-level and, if there was one, requested
