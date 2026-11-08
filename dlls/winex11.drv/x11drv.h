@@ -719,6 +719,8 @@ struct x11drv_win_data
     BOOL          unmaximize_retry;    /* _NET_WM_STATE_MAXIMIZED was cleared at our request, the first config the window manager sends on its own may be answered once */
     BOOL          wm_fullscreen;       /* _NET_WM_STATE_FULLSCREEN was set by the window manager on its own, not at our request */
     Window        map_predecessor;     /* owned WS_EX_APPWINDOW: X window of the win32 predecessor when the map was requested */
+    HWND          zorder_transient_child; /* ownerless tool window above this one that update_zorder_transient() made transient for it */
+    Window        zorder_transient_for;   /* X window update_zorder_transient() made this window transient for, 0 if none */
     BOOL          noactivate_map;      /* the last map did not ask for activation, a demands-attention state is the window manager's own */
     BOOL          flashing;            /* FlashWindowEx() asked for demands-attention */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
