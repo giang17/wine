@@ -630,8 +630,11 @@ static void video_presenter_check_queue(struct video_presenter *presenter,
             delta = pts - clocktime;
             if (delta > 3 * presenter->frame_time_threshold)
             {
-                /* Convert 100ns -> msec */
-                wait = (delta - 3 * presenter->frame_time_threshold) / 10000;
+                /* Convert 100ns -> msec, rounding up.  Rounded down, anything
+                 * under a millisecond becomes a zero wait, and the loop spins on
+                 * the sample that was just pushed back to the front of the queue
+                 * until the clock has moved on. */
+                wait = (delta - 3 * presenter->frame_time_threshold + 9999) / 10000;
                 present = FALSE;
             }
         }
