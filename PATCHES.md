@@ -1802,7 +1802,11 @@ This is the recommended branch. What it changes, by subsystem:
   Studio Pro 8. A presentation clock whose time source is replaced while it runs starts
   the new source at its current time, as Windows does (measured on Windows 10): Studio
   Pro installs its own time source right after each session start, and the video stayed
-  black from the clip start on and after a loop wrap because that source was never started
+  black from the clip start on and after a loop wrap because that source was never started.
+  The presenter rounds the wait for a sample that is not due yet up to whole milliseconds
+  instead of down: a remainder under 1 ms became a zero wait, and it examined the same
+  sample again and again until the clock moved on (18 000-181 000 passes for about 300
+  frames of a 30 fps clip, 2 500-7 700 with the change, frame rate unchanged)
 - **Source reader row order (mfreadwrite)**: with advanced video processing enabled, the
   source reader converts through the video processor MFT, which emits bottom-up RGB
   whenever its output type leaves `MF_MT_DEFAULT_STRIDE` open — correct for the standalone
