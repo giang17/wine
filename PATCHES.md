@@ -165,6 +165,25 @@ This is the recommended branch. What it changes, by subsystem:
   covers 11.3 px² like an inscribed octagon, radius 3 covers 27.4 of 28.3 — and the fork draws
   the disc, which is why round dots and dash ends come out 3–10 % brighter than on Windows
   (issue 571)
+- **D2D1 antialiasing ramp**: the shape pixel shader turned the signed pixel distance from a
+  pixel centre to an edge into coverage with `saturate(d + 0.5)`, which is the covered area only
+  for an edge parallel to a pixel side. Across a 45° edge the pixel's corners reach 1/√2 from its
+  centre, the area is quadratic near both ends of the ramp and below the line on both sides of
+  the edge: a 45° stroke of width 4 covered 5.76 instead of 5.66 per pixel row (0.38 and 1.00 at
+  0.12 px outside and 0.59 px inside the edge, where the area is 0.34 and 0.985 and Windows 10
+  draws 0.33 and 0.98). The coverage is now the area of the pixel inside the edge, from the
+  distance and the edge normal in pixel space (`edge_coverage()` in the shape pixel shader): the
+  screen derivatives of the across coordinate or of a line distance for straight segments and
+  for miter, bevel and square pieces, the offset from the centre for round joins and caps, the
+  gradient of the implicit form for curves, the gradients of the edge weights for fill edges;
+  the line across a flat end crosses the pixel grid at the side's angle and takes the side's
+  normal. Edges on the pixel grid render pixel-identical. The 45° zig-zag dash cells go from
+  RMS 0.008 to 0.005 against Windows with coverage sums within 0.7 of Windows (before +13 of
+  774); against the ideal box-filter coverage of `d2d1-curve-edge-aa` all 22 rings, discs and
+  strokes improve (rotated square 0.013 → 0.003, DrawEllipse stroke 0.012 → 0.003, hairline
+  ring of radius 40 0.017 → 0.005, round joins 0.007 → 0.004). Cells with round caps end up
+  0.001 further from Windows, which draws polygons there (issue 571); the d2d1 tests fail at the
+  same 30 places (issue 573)
 - **D2D1 geometry realizations**: `DrawGeometryRealization()` drew only into a command list;
   on a bitmap, DXGI surface or swap chain target it returned without drawing, so an application
   that uses `CreateFilledGeometryRealization()` / `CreateStrokedGeometryRealization()` lost the
