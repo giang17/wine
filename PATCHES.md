@@ -139,7 +139,17 @@ This is the recommended branch. What it changes, by subsystem:
   rest) instead of relying on the geometry. On the zig-zag of `projects/d2d1-curve-edge-aa`
   the round-joined stroke went from RMS 0.098 to 0.007 against the ideal coverage (Windows 10
   0.015), miter and bevel to 0.021 and 0.024 against Windows; 28 stroke figure checks in the
-  d2d1 suite pass that did not before (56 → 28 failures). Dashes are still ignored
+  d2d1 suite pass that did not before (56 → 28 failures). Dashed strokes (`dashStyle`,
+  `dashOffset`, `dashCap`, custom dash arrays) were drawn solid; the figures are now cut into
+  dashes along their arc length and the pieces drawn with the joins they cross, following
+  Windows 10 as measured in 42 cells of `projects/d2d1-dash-449` (workspace): dash ends at the
+  start or end of an open figure take `startCap`/`endCap`, all others `dashCap`; dashes of
+  length zero are only their caps; the start point of a closed figure ends the dashes there
+  with dash caps unless one dash runs all around; the pattern is measured in geometry space
+  for a normal stroke and on the device for fixed and hairline ones. A hairline stroke is one
+  pixel wide now (it was drawn with the transformed width). Every cell is within RMS 0.023 of
+  Windows (before: all solid); solid strokes render pixel-identical, the d2d1 tests fail at the
+  same places (issue 449)
 - **D2D1 geometry realizations**: `DrawGeometryRealization()` drew only into a command list;
   on a bitmap, DXGI surface or swap chain target it returned without drawing, so an application
   that uses `CreateFilledGeometryRealization()` / `CreateStrokedGeometryRealization()` lost the
