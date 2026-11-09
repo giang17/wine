@@ -1348,7 +1348,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
 
 static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
         const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit,
-        D2D1_LINE_JOIN line_join, D2D1_CAP_STYLE start_cap, D2D1_CAP_STYLE end_cap)
+        D2D1_LINE_JOIN line_join, D2D1_CAP_STYLE start_cap, D2D1_CAP_STYLE end_cap, D2D1_CAP_STYLE dash_cap)
 {
     D3D11_MAPPED_SUBRESOURCE map_desc;
     ID3D11DeviceContext *d3d_context;
@@ -1368,7 +1368,7 @@ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *contex
     new_cb.stroke_params.x = line_join;
     new_cb.stroke_params.y = start_cap;
     new_cb.stroke_params.z = end_cap;
-    new_cb.stroke_params.w = 0.0f;
+    new_cb.stroke_params.w = dash_cap;
 
     w = &context->drawing_state.transform;
 
@@ -1485,7 +1485,7 @@ static void d2d_device_context_render_mask_to_stencil(struct d2d_device_context 
 
     /* Bail on CB map failure rather than drawing the stencil mask with stale
      * constants, which would yield an undefined clip mask. */
-    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &mask_geo->transform, 0.0f, 0.0f, D2D1_LINE_JOIN_MITER, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT))
+    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &mask_geo->transform, 0.0f, 0.0f, D2D1_LINE_JOIN_MITER, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT))
             || FAILED(hr = d2d_device_context_update_ps_cb(context, NULL, NULL, FALSE, FALSE)))
     {
         WARN("Failed to update constant buffers, hr %#lx.\n", hr);
@@ -1552,7 +1552,7 @@ static void d2d_device_context_flush_lines(struct d2d_device_context *context)
     brush.opacity = batch->runs[0].opacity;
     brush.u.solid.color = batch->runs[0].colour;
 
-    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &identity, batch->stroke_width, batch->miter_limit, D2D1_LINE_JOIN_MITER, batch->start_cap, batch->end_cap)))
+    if (FAILED(hr = d2d_device_context_update_vs_cb(context, &identity, batch->stroke_width, batch->miter_limit, D2D1_LINE_JOIN_MITER, batch->start_cap, batch->end_cap, D2D1_CAP_STYLE_FLAT)))
     {
         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
         goto done;
@@ -1612,6 +1612,11 @@ static void d2d_device_context_flush_batches(struct d2d_device_context *context)
     d2d_device_context_flush_fills(context);
 }
 
+static BOOL d2d_stroke_style_is_dashed(const struct d2d_stroke_style *stroke_style)
+{
+    return stroke_style && stroke_style->desc.dashStyle != D2D1_DASH_STYLE_SOLID;
+}
+
 /* The stroke width in world units. A fixed stroke keeps its width on the
  * device, a hairline is one pixel wide whatever the width asked for. */
 static float d2d_device_context_stroke_width(const struct d2d_device_context *context,
@@ -1646,15 +1651,16 @@ static BOOL d2d_device_context_batch_line(struct d2d_device_context *context, co
     struct d2d_face *f;
     size_t base, extra;
 
+    /* A dashed line goes through DrawGeometry(), which cuts it into dashes. */
     if (!brush || brush->type != D2D_BRUSH_TYPE_SOLID
-            || context->target.type != D2D_TARGET_BITMAP || batch->flushing)
+            || context->target.type != D2D_TARGET_BITMAP || batch->flushing
+            || d2d_stroke_style_is_dashed(stroke_style_impl))
         return FALSE;
 
     /* Fills recorded before this line have to land underneath it. */
     d2d_device_context_flush_fills(context);
 
-    /* What DrawGeometry() takes from a stroke style for a two-point figure;
-     * dashes are ignored there as well. */
+    /* What DrawGeometry() takes from a stroke style for a two-point figure. */
     miter_limit = 10.0f;
     stroke_width = d2d_device_context_stroke_width(context, stroke_style_impl, stroke_width);
     if (stroke_style_impl)
@@ -1770,12 +1776,12 @@ static BOOL d2d_device_context_batch_line(struct d2d_device_context *context, co
 
 static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width, float miter_limit,
-        D2D1_LINE_JOIN line_join, D2D1_CAP_STYLE start_cap, D2D1_CAP_STYLE end_cap)
+        D2D1_LINE_JOIN line_join, D2D1_CAP_STYLE start_cap, D2D1_CAP_STYLE end_cap, D2D1_CAP_STYLE dash_cap)
 {
     ID3D11Buffer *ib, *vb;
     HRESULT hr;
 
-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width, miter_limit, line_join, start_cap, end_cap)))
+    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width, miter_limit, line_join, start_cap, end_cap, dash_cap)))
     {
         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
         return;
@@ -1898,18 +1904,10 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
         return;
     }
 
-    if (stroke_style)
-    {
-        static int once;
-        if (!once++)
-            FIXME("Ignoring stroke style %p.\n", stroke_style);
-    }
-
-    stroke_width = d2d_device_context_stroke_width(context, stroke_style_impl, stroke_width);
-
     {
         D2D1_CAP_STYLE start_cap = D2D1_CAP_STYLE_FLAT, end_cap = D2D1_CAP_STYLE_FLAT;
         D2D1_LINE_JOIN line_join = D2D1_LINE_JOIN_MITER;
+        struct d2d_geometry *dashed = NULL;
         float miter_limit = 10.0f;
 
         if (stroke_style_impl)
@@ -1919,8 +1917,35 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
             start_cap = stroke_style_impl->desc.startCap;
             end_cap = stroke_style_impl->desc.endCap;
         }
+
+        if (d2d_stroke_style_is_dashed(stroke_style_impl))
+        {
+            D2D1_MATRIX_3X2_F metric = {{{1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}}};
+            float unit = stroke_width;
+
+            /* The pattern is a multiple of the width the stroke has where it
+             * is laid out: in geometry space for a normal stroke, on the
+             * device for a fixed or hairline one. */
+            if (stroke_style_impl->desc.transformType != D2D1_STROKE_TRANSFORM_TYPE_NORMAL)
+            {
+                metric = context->drawing_state.transform;
+                if (stroke_style_impl->desc.transformType == D2D1_STROKE_TRANSFORM_TYPE_HAIRLINE)
+                    unit = 96.0f / context->desc.dpiX;
+            }
+            dashed = d2d_geometry_create_dashed_outline(geometry, stroke_style, unit, &metric);
+        }
+
+        stroke_width = d2d_device_context_stroke_width(context, stroke_style_impl, stroke_width);
+        if (dashed)
+        {
+            d2d_device_context_draw_geometry(context, dashed, brush_impl, stroke_width, miter_limit,
+                    line_join, start_cap, end_cap, stroke_style_impl->desc.dashCap);
+            d2d_geometry_destroy_dashed_outline(dashed);
+            return;
+        }
+
         d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width, miter_limit,
-                line_join, start_cap, end_cap);
+                line_join, start_cap, end_cap, D2D1_CAP_STYLE_FLAT);
     }
 }
 
@@ -2766,7 +2791,7 @@ static void d2d_device_context_flush_fills(struct d2d_device_context *context)
     brush.u.solid.color = batch->runs[0].colour;
 
     if (FAILED(hr = d2d_device_context_update_vs_cb(context, &batch->geometry_transform, 0.0f, 0.0f,
-            D2D1_LINE_JOIN_MITER, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT)))
+            D2D1_LINE_JOIN_MITER, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT)))
     {
         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
         goto done;
@@ -3001,7 +3026,7 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
      * draw() below, which would overwrite them with the batch's own. */
     d2d_device_context_flush_fills(render_target);
 
-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f, 0.0f, D2D1_LINE_JOIN_MITER, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT)))
+    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f, 0.0f, D2D1_LINE_JOIN_MITER, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT)))
     {
         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
         return;
@@ -9205,16 +9230,21 @@ static const char shape_vs_code_outline[] =
     "        float2 a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, n1 = 0.0f, n2 = 0.0f, n3 = 0.0f;\n"
     "        float s, cosh, limit, mlen, hw_px, expand, marker = 4.0f;\n"
     "        uint join, cap, role;\n"
-    "        bool hairpin, bevel, is_cap, start;\n"
+    "        bool hairpin, bevel, is_cap, start, dash;\n"
+    "        float cap_split;\n"
     "\n"
+    "        /* The end of a dash inside the figure carries 5/6 instead of 3/4 and\n"
+    "         * takes the dash cap (stroke_params.w). */\n"
     "        is_cap = max(length(prev), length(next)) > 2.5f;\n"
     "        start = length(next) > 2.5f;\n"
+    "        dash = max(length(prev), length(next)) > 4.5f;\n"
+    "        cap_split = dash ? 5.5f : 3.5f;\n"
     "        if (is_cap)\n"
-    "            role = (length(prev) > (start ? 1.5f : 3.5f) ? 2 : 0) + (length(next) > (start ? 3.5f : 1.5f) ? 1 : 0);\n"
+    "            role = (length(prev) > (start ? 1.5f : cap_split) ? 2 : 0) + (length(next) > (start ? cap_split : 1.5f) ? 1 : 0);\n"
     "        else\n"
     "            role = (length(prev) > 1.5f ? 2 : 0) + (length(next) > 1.5f ? 1 : 0);\n"
     "        join = (uint)stroke_params.x;\n"
-    "        cap = (uint)(start ? stroke_params.y : stroke_params.z);\n"
+    "        cap = (uint)(dash ? stroke_params.w : start ? stroke_params.y : stroke_params.z);\n"
     "        pp = float2(-q_prev.y, q_prev.x);\n"
     "        pn = float2(-q_next.y, q_next.x);\n"
     "        m0 = pp + pn;\n"
