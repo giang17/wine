@@ -811,6 +811,21 @@ struct d2d_face
     UINT16 v[3];
 };
 
+/* What the end of an outline piece meets: a join with the next piece, or a
+ * cap. The outline vertex shaders ramp the end of a piece that meets a flat
+ * cap, which draws nothing of its own. */
+enum d2d_outline_end
+{
+    D2D_OUTLINE_END_JOIN = 0,
+    D2D_OUTLINE_END_START_CAP = 1,
+    D2D_OUTLINE_END_END_CAP = 2,
+    D2D_OUTLINE_END_DASH_CAP = 3,
+};
+
+/* A straight segment carries the direction along it in prev, scaled by 8 plus
+ * a role code, and the far end point in next; a join or cap carries the two
+ * directions in and out of the corner, with the role in the lengths 1 to 6
+ * (d2d_outline_line_vertices() and d2d_outline_cap_vertices()). */
 struct d2d_outline_vertex
 {
     D2D1_POINT_2F position;
@@ -818,6 +833,8 @@ struct d2d_outline_vertex
     D2D1_POINT_2F next;
 };
 
+void d2d_outline_line_vertices(struct d2d_outline_vertex *v, const D2D1_POINT_2F *p0,
+        const D2D1_POINT_2F *p1, enum d2d_outline_end start, enum d2d_outline_end end);
 void d2d_outline_cap_vertices(struct d2d_outline_vertex *v, const D2D1_POINT_2F *p,
         float dx, float dy, BOOL start);
 
