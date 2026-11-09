@@ -324,7 +324,7 @@ static void d2d_curve_vertex_set(struct d2d_curve_vertex *b,
     b->texcoord.sign = sign;
 }
 
-static void d2d_face_set(struct d2d_face *f, UINT16 v0, UINT16 v1, UINT16 v2)
+static void d2d_face_set(struct d2d_face *f, UINT32 v0, UINT32 v1, UINT32 v2)
 {
     f->v[0] = v0;
     f->v[1] = v1;
