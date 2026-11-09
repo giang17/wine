@@ -1229,24 +1229,37 @@ This is the recommended branch. What it changes, by subsystem:
   in `Close()` in Serum: per million vertices 6.6 s before (5.4 s of it in the intersection
   search), 1.1 s after (0.09 s), the longest `Close()` 14.4 s before, 1.0 s after. What was
   left was the triangulation of the whole path, most of it outside the target, so the view
-  still stalled while MIDI played. A path of 65,536 vertices or more without curves is now
-  tessellated by its first fill instead of in `Close()`, the way Windows tessellates when it
-  draws: the figures are clipped (Sutherland-Hodgman) to the target of that fill mapped into
-  geometry space with a 4 px margin for the antialiasing ramps, and only that part goes
-  through the self-intersection pass and the triangulation; a later fill that shows a part
-  outside that clip tessellates again, a fill whose clip holds the whole path tessellates it
-  whole once. The figures of the path stay as the application built them (`Stream()`,
-  `FillContainsPoint()`, dashed strokes), transformed and group geometries reach the fill
-  through the path they wrap, `Tessellate()` and `ComputeArea()` take the whole path, and
-  `WINE_D2D_LAZY_FILL=0` restores the tessellation in `Close()` (issue 572).
-  `scripts/repro-572-close-collinear.c` (workspace): a wave of 2 x 400,000 points over
-  1,000,000 x 223 units filled into a 1024 x 256 target closes in 1.5 ms instead of 1,228 ms
-  and fills in 5-15 ms instead of 134-292 ms; 2 x 32,000 points with a collinear return close
-  in 35 ms instead of 185-316 ms. The clipped fill is also the correct one: the triangles of
-  the whole path, reaching 1,000,000 units out of view, rasterized the top edge of that wave a
-  pixel too low in places (kinks in a straight edge) and, with the view shifted by 500,000
-  units, not at all. The images of issues 444 and 449 are pixel-identical, the d2d1 tests
-  unchanged on x86_64 and i386.
+  still stalled while MIDI played; a probe in Serum then showed the second half of the stall in
+  `EndFigure()`, which built the stroke outline of the figure (four vertices and two faces per
+  segment: 722 ms and 480 MB for 5.25 million vertices per frame) for a path that is never
+  stroked. Both now follow what Windows does, tessellating when it draws: a figure of 16,384
+  vertices or more without curves leaves `EndFigure()` without an outline, and the outline of
+  the path is built when it is first stroked; a path of that many vertices without curves leaves
+  `Close()` without a fill, and its first fill clips the figures (Sutherland-Hodgman) to the
+  target of that fill mapped into geometry space with a 4 px margin for the antialiasing ramps
+  and runs the self-intersection pass and the triangulation on that part only. A later fill
+  that shows a part outside that clip tessellates again, a fill whose clip holds the whole path
+  tessellates it whole once. The figures of the path stay as the application built them
+  (`Stream()`, `FillContainsPoint()`, dashed strokes), transformed and group geometries reach
+  the fill and the outline through the path they wrap, `Tessellate()` and `ComputeArea()` take
+  the whole path, and `WINE_D2D_LAZY_GEOMETRY=0` restores the old order (issue 572). In Serum
+  at the strongest zoom the per-frame cost in d2d1 for 5.25 million vertices goes from about
+  900 ms (outline 722, replay of the segments 83, `Close()` 23, clipped fill up to 50) to about
+  160 ms, of which the clipped fill tessellates about 900 vertices; the mid-zoom paths of
+  46,000-58,000 vertices, which the 65,536 threshold of the first version still triangulated
+  whole in `Close()` at 50-63 ms per frame, are clipped too. `scripts/repro-572-close-collinear.c`
+  (workspace): a wave of 2 x 400,000 points over 1,000,000 x 223 units filled into a 1024 x 256
+  target closes in 1.5 ms instead of 1,228 ms and fills in 5-15 ms instead of 134-292 ms; 2 x
+  32,000 points with a collinear return close in 35 ms instead of 185-316 ms. The clipped fill
+  is also the correct one: the faces of a mesh index its vertices with 16 bits (`struct
+  d2d_face`, `DXGI_FORMAT_R16_UINT`, as upstream), so the whole-path tessellation of 800,000
+  vertices drew wrong triangles from the 65,537th vertex on, kinks along the top edge of that
+  wave and, with the view shifted by 500,000 units, nothing at all; the clipped fill stays below
+  the limit. Strokes of figures of 16,384 segments or more hit the same limit in their outline,
+  before and after this change (issue 575). Below the threshold nothing changes: the lazy
+  outline renders pixel-identical to the one built in `EndFigure()` (checked with the threshold
+  at 2,048 on strokes of 4,000 and 16,000 vertices), the images of issues 444 and 449 are
+  pixel-identical, the d2d1 tests unchanged on x86_64 and i386.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
