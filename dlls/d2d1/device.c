@@ -18,6 +18,7 @@
 
 #include "d2d1_private.h"
 #include <d3dcompiler.h>
+#include <float.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(d2d);
 
@@ -1070,6 +1071,8 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawRectangle(ID2D1DeviceContex
 /* Forward declaration for Session 6 (C1) rect-geometry cache in FillRectangle. */
 static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush);
+static void d2d_device_context_get_fill_clip(const struct d2d_device_context *context,
+        const struct d2d_geometry *geometry, D2D1_RECT_F *clip);
 
 /* Rectangle geometry shared by FillRectangle() and the glyph run paths.
  * Session 6 (C1): Serum2's GUI hits ~22k FillRectangle/s, each of which was
@@ -1469,11 +1472,11 @@ static void d2d_device_context_render_mask_to_stencil(struct d2d_device_context 
     const struct d2d_geometry *mask_geo;
     D2D1_MATRIX_3X2_F saved_transform;
     ID3D11Buffer *geo_ib, *geo_vb;
+    const struct d2d_fill *fill;
+    D2D1_RECT_F clip;
     HRESULT hr;
 
     mask_geo = unsafe_impl_from_ID2D1Geometry(geometry);
-    if (!mask_geo->fill.face_count)
-        return;
 
     saved_transform = context->drawing_state.transform;
     context->drawing_state.transform._11 = 1.0f;
@@ -1483,14 +1486,18 @@ static void d2d_device_context_render_mask_to_stencil(struct d2d_device_context 
     context->drawing_state.transform._31 = 0.0f;
     context->drawing_state.transform._32 = 0.0f;
 
+    d2d_device_context_get_fill_clip(context, mask_geo, &clip);
+    fill = d2d_geometry_acquire_fill(mask_geo, &clip);
+    if (!fill->face_count)
+        goto done;
+
     /* Bail on CB map failure rather than drawing the stencil mask with stale
      * constants, which would yield an undefined clip mask. */
     if (FAILED(hr = d2d_device_context_update_vs_cb(context, &mask_geo->transform, 0.0f, 0.0f, D2D1_LINE_JOIN_MITER, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT))
             || FAILED(hr = d2d_device_context_update_ps_cb(context, NULL, NULL, FALSE, FALSE)))
     {
         WARN("Failed to update constant buffers, hr %#lx.\n", hr);
-        context->drawing_state.transform = saved_transform;
-        return;
+        goto done;
     }
 
     /* The mask goes through the same dynamic scratch buffers as the fills. A
@@ -1499,20 +1506,21 @@ static void d2d_device_context_render_mask_to_stencil(struct d2d_device_context 
      * cards clipped to rounded rectangles pushed about 50 masks per frame and
      * waited for the command stream twice for each of them. */
     if (FAILED(hr = d2d_device_context_get_scratch_buffer(context, D3D11_BIND_INDEX_BUFFER,
-            mask_geo->fill.face_count * sizeof(*mask_geo->fill.faces),
-            &context->scratch_ib[D2D_SHAPE_TYPE_TRIANGLE], mask_geo->fill.faces, &geo_ib))
+            fill->face_count * sizeof(*fill->faces),
+            &context->scratch_ib[D2D_SHAPE_TYPE_TRIANGLE], fill->faces, &geo_ib))
             || FAILED(hr = d2d_device_context_get_scratch_buffer(context, D3D11_BIND_VERTEX_BUFFER,
-            mask_geo->fill.vertex_count * sizeof(*mask_geo->fill.vertices),
-            &context->scratch_vb[D2D_SHAPE_TYPE_TRIANGLE], mask_geo->fill.vertices, &geo_vb)))
+            fill->vertex_count * sizeof(*fill->vertices),
+            &context->scratch_vb[D2D_SHAPE_TYPE_TRIANGLE], fill->vertices, &geo_vb)))
     {
         WARN("Failed to upload the mask geometry, hr %#lx.\n", hr);
-        context->drawing_state.transform = saved_transform;
-        return;
+        goto done;
     }
 
     d2d_device_context_draw(context, D2D_SHAPE_TYPE_TRIANGLE, geo_ib,
-            3 * mask_geo->fill.face_count, geo_vb, sizeof(*mask_geo->fill.vertices), NULL, NULL);
+            3 * fill->face_count, geo_vb, sizeof(*fill->vertices), NULL, NULL);
 
+done:
+    d2d_geometry_release_fill(mask_geo);
     context->drawing_state.transform = saved_transform;
 }
 
@@ -1940,16 +1948,16 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
 
 /* Draw filled triangles without anti-aliasing (plain index+vertex buffer path). */
 static void d2d_device_context_fill_triangles(struct d2d_device_context *render_target,
-        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+        const struct d2d_fill *fill, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
 {
     ID3D11Buffer *ib, *vb;
     HRESULT hr;
 
     if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
             D3D11_BIND_INDEX_BUFFER,
-            geometry->fill.face_count * sizeof(*geometry->fill.faces),
+            fill->face_count * sizeof(*fill->faces),
             &render_target->scratch_ib[D2D_SHAPE_TYPE_TRIANGLE],
-            geometry->fill.faces, &ib)))
+            fill->faces, &ib)))
     {
         WARN("Failed to create index buffer, hr %#lx.\n", hr);
         return;
@@ -1957,16 +1965,16 @@ static void d2d_device_context_fill_triangles(struct d2d_device_context *render_
 
     if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
             D3D11_BIND_VERTEX_BUFFER,
-            geometry->fill.vertex_count * sizeof(*geometry->fill.vertices),
+            fill->vertex_count * sizeof(*fill->vertices),
             &render_target->scratch_vb[D2D_SHAPE_TYPE_TRIANGLE],
-            geometry->fill.vertices, &vb)))
+            fill->vertices, &vb)))
     {
         ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
         return;
     }
 
-    d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * geometry->fill.face_count, vb,
-            sizeof(*geometry->fill.vertices), brush, opacity_brush);
+    d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_TRIANGLE, ib, 3 * fill->face_count, vb,
+            sizeof(*fill->vertices), brush, opacity_brush);
 }
 
 /* Hash a vertex position by its bit pattern. The fill vertices and the corners
@@ -1984,7 +1992,7 @@ static UINT32 d2d_fill_aa_position_hash(const D2D1_POINT_2F *p)
 /* Index of a fill vertex at the given position, or ~0 if the point is not one
  * of them — which is the normal case for a bezier control point outside the
  * filled area, since only control points inside it become figure vertices. */
-static size_t d2d_fill_aa_find_vertex(const struct d2d_geometry *geometry,
+static size_t d2d_fill_aa_find_vertex(const struct d2d_fill *fill,
         const UINT32 *vertex_map, size_t map_size, const D2D1_POINT_2F *p)
 {
     UINT32 slot = d2d_fill_aa_position_hash(p) % map_size;
@@ -1992,7 +2000,7 @@ static size_t d2d_fill_aa_find_vertex(const struct d2d_geometry *geometry,
 
     while (probe < map_size && vertex_map[slot])
     {
-        if (!memcmp(&geometry->fill.vertices[vertex_map[slot] - 1], p, sizeof(*p)))
+        if (!memcmp(&fill->vertices[vertex_map[slot] - 1], p, sizeof(*p)))
             return vertex_map[slot] - 1;
         slot = (slot + 1) % map_size;
         ++probe;
@@ -2034,6 +2042,42 @@ static void d2d_device_context_get_pixel_matrix(const struct d2d_device_context 
     m[1] = sx * (w->_11 * g->_21 + w->_21 * g->_22);
     m[2] = sy * (w->_12 * g->_11 + w->_22 * g->_12);
     m[3] = sy * (w->_12 * g->_21 + w->_22 * g->_22);
+}
+
+/* The part of geometry space a fill of geometry can reach the target from: the
+ * target with a margin for the antialiasing ramps, mapped back through the
+ * transforms of the draw. A path too large to tessellate in Close() is
+ * tessellated clipped to it (d2d_geometry_acquire_fill()). A transform without
+ * an inverse maps everything onto a line, so nothing is in view. */
+static void d2d_device_context_get_fill_clip(const struct d2d_device_context *context,
+        const struct d2d_geometry *geometry, D2D1_RECT_F *clip)
+{
+    static const float margin = 4.0f;
+    D2D1_MATRIX_3X2_F m = geometry->transform, inv;
+    float sx = context->desc.dpiX / 96.0f, sy = context->desc.dpiY / 96.0f;
+    float w = context->pixel_size.width, h = context->pixel_size.height;
+    D2D1_POINT_2F p;
+    unsigned int i;
+
+    d2d_matrix_multiply(&m, &context->drawing_state.transform);
+    m._11 *= sx;
+    m._21 *= sx;
+    m._31 *= sx;
+    m._12 *= sy;
+    m._22 *= sy;
+    m._32 *= sy;
+
+    memset(clip, 0, sizeof(*clip));
+    if (!d2d_matrix_invert(&inv, &m))
+        return;
+
+    clip->left = clip->top = FLT_MAX;
+    clip->right = clip->bottom = -FLT_MAX;
+    for (i = 0; i < 4; ++i)
+    {
+        d2d_point_transform(&p, &inv, i & 1 ? w + margin : -margin, i & 2 ? h + margin : -margin);
+        d2d_rect_expand(clip, &p);
+    }
 }
 
 /* Whether the control point of the quadratic Bézier triangle v lies within 1/16 px
@@ -2083,7 +2127,7 @@ static BOOL d2d_curve_is_flat(const struct d2d_curve_vertex *v, const float *m)
  * Returns FALSE if the marking could not be completed. Half-marked data is
  * worse than none — an unmarked seam would get a skirt and be drawn twice — so
  * the caller falls back to the plain fill in that case. */
-static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_geometry *geometry,
+static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
         const UINT32 *edge_keys, BYTE *edge_curve, struct d2d_fill_aa_seam *seams, size_t map_size,
         const float *m)
 {
@@ -2091,23 +2135,23 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_geometry *geometry,
     size_t counts[2], vertex_map_size, i, c;
     UINT32 *vertex_map;
 
-    curves[0] = geometry->fill.bezier_vertices;
-    counts[0] = geometry->fill.bezier_vertex_count;
-    curves[1] = geometry->fill.arc_vertices;
-    counts[1] = geometry->fill.arc_vertex_count;
+    curves[0] = fill->bezier_vertices;
+    counts[0] = fill->bezier_vertex_count;
+    curves[1] = fill->arc_vertices;
+    counts[1] = fill->arc_vertex_count;
 
-    vertex_map_size = geometry->fill.vertex_count * 2 + 16;
+    vertex_map_size = fill->vertex_count * 2 + 16;
     if (!(vertex_map = calloc(vertex_map_size, sizeof(*vertex_map))))
         return FALSE;
 
-    for (i = 0; i < geometry->fill.vertex_count; ++i)
+    for (i = 0; i < fill->vertex_count; ++i)
     {
-        const D2D1_POINT_2F *p = &geometry->fill.vertices[i];
+        const D2D1_POINT_2F *p = &fill->vertices[i];
         UINT32 slot = d2d_fill_aa_position_hash(p) % vertex_map_size;
         size_t probe = 0;
 
         while (probe < vertex_map_size && vertex_map[slot]
-                && memcmp(&geometry->fill.vertices[vertex_map[slot] - 1], p, sizeof(*p)))
+                && memcmp(&fill->vertices[vertex_map[slot] - 1], p, sizeof(*p)))
         {
             slot = (slot + 1) % vertex_map_size;
             ++probe;
@@ -2134,7 +2178,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_geometry *geometry,
 
             for (a = 0; a < 3; ++a)
             {
-                idx[a] = d2d_fill_aa_find_vertex(geometry, vertex_map, vertex_map_size,
+                idx[a] = d2d_fill_aa_find_vertex(fill, vertex_map, vertex_map_size,
                         &curves[c][i + a].position);
                 if (idx[a] == ~(size_t)0)
                     ++missing;
@@ -2221,7 +2265,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_geometry *geometry,
 /* The ramp of face f towards its seam e: t of the three corners along the seam,
  * and the curve's distance from it in units of the edge weight, which reaches 1
  * at the opposite corner. */
-static BOOL d2d_fill_aa_seam_params(const struct d2d_geometry *geometry, const struct d2d_face *f, int e,
+static BOOL d2d_fill_aa_seam_params(const struct d2d_fill *fill, const struct d2d_face *f, int e,
         const struct d2d_fill_aa_seam *seam, float *t, float *c1, float *c2)
 {
     UINT16 a = f->v[(e + 1) % 3], b = f->v[(e + 2) % 3], end;
@@ -2236,9 +2280,9 @@ static BOOL d2d_fill_aa_seam_params(const struct d2d_geometry *geometry, const s
     else
         return FALSE;
 
-    s = &geometry->fill.vertices[seam->start];
-    n = &geometry->fill.vertices[end];
-    o = &geometry->fill.vertices[f->v[e]];
+    s = &fill->vertices[seam->start];
+    n = &fill->vertices[end];
+    o = &fill->vertices[f->v[e]];
     dx = n->x - s->x;
     dy = n->y - s->y;
     if (!((l2 = dx * dx + dy * dy) > 0.0f))
@@ -2278,12 +2322,13 @@ struct d2d_fill_aa_vertex
  * the fill has nothing to antialias or the mesh cannot be built; the plain
  * triangle path draws the geometry then. The caller frees *out. */
 static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_target,
-        const struct d2d_geometry *geometry, struct d2d_fill_aa_vertex **out, size_t *out_count)
+        const struct d2d_geometry *geometry, const struct d2d_fill *fill,
+        struct d2d_fill_aa_vertex **out, size_t *out_count)
 {
     struct d2d_fill_aa_vertex *expanded;
     BYTE *on_outline;
     struct d2d_fill_aa_seam *seams;
-    size_t fc = geometry->fill.face_count;
+    size_t fc = fill->face_count;
     size_t boundary_count = 0, seam_count = 0;
     size_t expanded_count, map_size, i, vi;
     UINT32 *edge_keys;
@@ -2311,7 +2356,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     /* Pass 1: count edge occurrences via open-addressing hash. */
     for (i = 0; i < fc; i++)
     {
-        const struct d2d_face *f = &geometry->fill.faces[i];
+        const struct d2d_face *f = &fill->faces[i];
         int e;
         for (e = 0; e < 3; e++)
         {
@@ -2340,8 +2385,8 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
      * side. The fill ramps towards a seam by the distance to the curve instead,
      * which is where the inner half of the ramp has to come from wherever the
      * curve triangle is thinner than half a pixel. */
-    if ((geometry->fill.bezier_vertex_count || geometry->fill.arc_vertex_count)
-            && !d2d_fill_aa_mark_curve_edges(geometry, edge_keys, edge_curve, seams, map_size, m))
+    if ((fill->bezier_vertex_count || fill->arc_vertex_count)
+            && !d2d_fill_aa_mark_curve_edges(fill, edge_keys, edge_curve, seams, map_size, m))
     {
         free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
         return FALSE;
@@ -2366,7 +2411,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     /* Allocate: inner triangles (3 per face) + skirt quads (6 per boundary edge). */
     expanded_count = fc * 3 + boundary_count * 6;
     expanded = calloc(expanded_count, sizeof(*expanded));
-    on_outline = calloc(geometry->fill.vertex_count, sizeof(*on_outline));
+    on_outline = calloc(fill->vertex_count, sizeof(*on_outline));
     if (!expanded || !on_outline)
     {
         free(on_outline);
@@ -2378,7 +2423,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
      * edge and of a chord, the curve end of a control edge. */
     for (i = 0; i < fc; i++)
     {
-        const struct d2d_face *f = &geometry->fill.faces[i];
+        const struct d2d_face *f = &fill->faces[i];
         int e;
 
         for (e = 0; e < 3; e++)
@@ -2402,7 +2447,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     /* Pass 2: build inner triangle vertices with edge weights. */
     for (i = 0; i < fc; i++)
     {
-        const struct d2d_face *f = &geometry->fill.faces[i];
+        const struct d2d_face *f = &fill->faces[i];
         float w[3][3], t[3][3], c1[3], c2[3];
         int j, e;
 
@@ -2431,7 +2476,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
                 ramp = TRUE;
             else
                 ramp = seams[slot].start != ~0u
-                        && d2d_fill_aa_seam_params(geometry, f, e, &seams[slot], t[e], &c1[e], &c2[e]);
+                        && d2d_fill_aa_seam_params(fill, f, e, &seams[slot], t[e], &c1[e], &c2[e]);
             for (j = 0; j < 3; j++)
                 w[e][j] = ramp ? (j == e ? 1.0f : 0.0f) : 10.0f;
         }
@@ -2439,13 +2484,13 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
         for (j = 0; j < 3; j++)
         {
             vi = i * 3 + j;
-            expanded[vi].pos = geometry->fill.vertices[f->v[j]];
+            expanded[vi].pos = fill->vertices[f->v[j]];
             expanded[vi].u = w[0][j];
             expanded[vi].v = w[1][j];
             expanded[vi].s = w[2][j];
             for (e = 0; e < 3; e++)
             {
-                const D2D1_POINT_2F *corner = &geometry->fill.vertices[f->v[e]];
+                const D2D1_POINT_2F *corner = &fill->vertices[f->v[e]];
 
                 expanded[vi].seam_t[e] = t[e][j];
                 expanded[vi].seam_c1[e] = c1[e];
@@ -2461,7 +2506,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     vi = fc * 3;
     for (i = 0; i < fc; i++)
     {
-        const struct d2d_face *f = &geometry->fill.faces[i];
+        const struct d2d_face *f = &fill->faces[i];
         int e;
         for (e = 0; e < 3; e++)
         {
@@ -2478,9 +2523,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             if (edge_cnt[slot] != 1 || edge_curve[slot] || edge_processed[slot]) continue;
 
             /* Compute outward normal (away from opposite vertex). */
-            pa = geometry->fill.vertices[ai];
-            pb = geometry->fill.vertices[bi];
-            pc = geometry->fill.vertices[f->v[e]]; /* opposite vertex */
+            pa = fill->vertices[ai];
+            pb = fill->vertices[bi];
+            pc = fill->vertices[f->v[e]]; /* opposite vertex */
             edge_dir.x = pb.x - pa.x;
             edge_dir.y = pb.y - pa.y;
             edge_len = sqrtf(edge_dir.x * edge_dir.x + edge_dir.y * edge_dir.y);
@@ -2548,14 +2593,15 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
 }
 
 static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *render_target,
-        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+        const struct d2d_geometry *geometry, const struct d2d_fill *fill,
+        struct d2d_brush *brush, struct d2d_brush *opacity_brush)
 {
     struct d2d_fill_aa_vertex *expanded;
     size_t expanded_count;
     ID3D11Buffer *vb;
     HRESULT hr;
 
-    if (!d2d_device_context_fill_aa_expand(render_target, geometry, &expanded, &expanded_count))
+    if (!d2d_device_context_fill_aa_expand(render_target, geometry, fill, &expanded, &expanded_count))
         return FALSE;
 
     if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
@@ -2902,50 +2948,51 @@ static BOOL d2d_device_context_fill_batch_add_curves(struct d2d_device_context *
  * batched: it is the one mode in which fills of the same colour commute, which
  * the flush relies on where they overlap. */
 static BOOL d2d_device_context_batch_fill(struct d2d_device_context *context,
-        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+        const struct d2d_geometry *geometry, const struct d2d_fill *fill,
+        struct d2d_brush *brush, struct d2d_brush *opacity_brush)
 {
     struct d2d_fill_batch *batch = &context->fill_batch;
     unsigned int bezier_start, bezier_count, arc_start, arc_count;
-    struct d2d_fill_aa_vertex *fill;
-    size_t fill_count, curve_mark;
+    struct d2d_fill_aa_vertex *expanded;
+    size_t expanded_count, curve_mark;
     struct d2d_fill_run *run;
 
     if (!brush || brush->type != D2D_BRUSH_TYPE_SOLID || opacity_brush
             || context->target.type != D2D_TARGET_BITMAP || batch->flushing
             || context->drawing_state.antialiasMode != D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
             || context->drawing_state.primitiveBlend != D2D1_PRIMITIVE_BLEND_SOURCE_OVER
-            || !geometry->fill.face_count)
+            || !fill->face_count)
         return FALSE;
 
     /* Lines recorded before this fill have to land underneath it. */
     d2d_device_context_flush_lines(context);
 
-    if (batch->run_count && ((batch->fill_vertex_count + 3 * geometry->fill.face_count)
+    if (batch->run_count && ((batch->fill_vertex_count + 3 * fill->face_count)
             * sizeof(*batch->fill_vertices) > D2D_FILL_BATCH_MAX_BYTES
             || memcmp(&batch->transform, &context->drawing_state.transform, sizeof(batch->transform))
             || memcmp(&batch->geometry_transform, &geometry->transform, sizeof(batch->geometry_transform))))
         d2d_device_context_flush_fills(context);
 
-    if (!d2d_device_context_fill_aa_expand(context, geometry, &fill, &fill_count))
+    if (!d2d_device_context_fill_aa_expand(context, geometry, fill, &expanded, &expanded_count))
         return FALSE;
 
     if (!d2d_array_reserve((void **)&batch->fill_vertices, &batch->fill_vertices_size,
-            batch->fill_vertex_count + fill_count, sizeof(*batch->fill_vertices))
+            batch->fill_vertex_count + expanded_count, sizeof(*batch->fill_vertices))
             || !d2d_array_reserve((void **)&batch->runs, &batch->runs_size,
             batch->run_count + 1, sizeof(*batch->runs)))
     {
-        free(fill);
+        free(expanded);
         return FALSE;
     }
 
     curve_mark = batch->curve_vertex_count;
-    if (!d2d_device_context_fill_batch_add_curves(context, geometry, geometry->fill.bezier_vertices,
-            geometry->fill.bezier_vertex_count, TRUE, &bezier_start, &bezier_count)
-            || !d2d_device_context_fill_batch_add_curves(context, geometry, geometry->fill.arc_vertices,
-            geometry->fill.arc_vertex_count, FALSE, &arc_start, &arc_count))
+    if (!d2d_device_context_fill_batch_add_curves(context, geometry, fill->bezier_vertices,
+            fill->bezier_vertex_count, TRUE, &bezier_start, &bezier_count)
+            || !d2d_device_context_fill_batch_add_curves(context, geometry, fill->arc_vertices,
+            fill->arc_vertex_count, FALSE, &arc_start, &arc_count))
     {
         batch->curve_vertex_count = curve_mark;
-        free(fill);
+        free(expanded);
         return FALSE;
     }
 
@@ -2993,21 +3040,22 @@ static BOOL d2d_device_context_batch_fill(struct d2d_device_context *context,
     if (!run->arc_count)
         run->arc_start = arc_start;
 
-    memcpy(&batch->fill_vertices[batch->fill_vertex_count], fill, fill_count * sizeof(*fill));
-    batch->fill_vertex_count += fill_count;
-    run->fill_count += fill_count;
+    memcpy(&batch->fill_vertices[batch->fill_vertex_count], expanded, expanded_count * sizeof(*expanded));
+    batch->fill_vertex_count += expanded_count;
+    run->fill_count += expanded_count;
     run->bezier_count += bezier_count;
     run->arc_count += arc_count;
-    free(fill);
+    free(expanded);
     return TRUE;
 }
 
-static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
-        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+static void d2d_device_context_fill_geometry_data(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, const struct d2d_fill *fill,
+        struct d2d_brush *brush, struct d2d_brush *opacity_brush)
 {
     HRESULT hr;
 
-    if (d2d_device_context_batch_fill(render_target, geometry, brush, opacity_brush))
+    if (d2d_device_context_batch_fill(render_target, geometry, fill, brush, opacity_brush))
         return;
 
     /* A fill the batch declines is drawn below with the constant buffers set
@@ -3034,25 +3082,37 @@ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_t
      * antialiases the straight boundary edges, ramps towards the seams with the
      * curve segments by the distance to the curve, and declines a shape it can
      * do nothing for. */
-    if (geometry->fill.face_count
+    if (fill->face_count
             && render_target->drawing_state.antialiasMode == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
     {
-        if (!d2d_device_context_fill_triangles_aa(render_target, geometry, brush, opacity_brush))
-            d2d_device_context_fill_triangles(render_target, geometry, brush, opacity_brush);
+        if (!d2d_device_context_fill_triangles_aa(render_target, geometry, fill, brush, opacity_brush))
+            d2d_device_context_fill_triangles(render_target, fill, brush, opacity_brush);
     }
-    else if (geometry->fill.face_count)
+    else if (fill->face_count)
     {
-        d2d_device_context_fill_triangles(render_target, geometry, brush, opacity_brush);
+        d2d_device_context_fill_triangles(render_target, fill, brush, opacity_brush);
     }
 
-    if (geometry->fill.bezier_vertex_count)
-        d2d_device_context_draw_curves(render_target, geometry, geometry->fill.bezier_vertices,
-                geometry->fill.bezier_vertex_count, brush, opacity_brush, TRUE);
+    if (fill->bezier_vertex_count)
+        d2d_device_context_draw_curves(render_target, geometry, fill->bezier_vertices,
+                fill->bezier_vertex_count, brush, opacity_brush, TRUE);
 
-    if (geometry->fill.arc_vertex_count
+    if (fill->arc_vertex_count
             && SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE)))
-        d2d_device_context_draw_curves(render_target, geometry, geometry->fill.arc_vertices,
-                geometry->fill.arc_vertex_count, brush, opacity_brush, FALSE);
+        d2d_device_context_draw_curves(render_target, geometry, fill->arc_vertices,
+                fill->arc_vertex_count, brush, opacity_brush, FALSE);
+}
+
+static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+{
+    const struct d2d_fill *fill;
+    D2D1_RECT_F clip;
+
+    d2d_device_context_get_fill_clip(render_target, geometry, &clip);
+    fill = d2d_geometry_acquire_fill(geometry, &clip);
+    d2d_device_context_fill_geometry_data(render_target, geometry, fill, brush, opacity_brush);
+    d2d_geometry_release_fill(geometry);
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_FillGeometry(ID2D1DeviceContext6 *iface,
@@ -4810,7 +4870,7 @@ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *
                 if (mb.left <= 1.0f && mb.top <= 1.0f
                         && mb.right >= context->pixel_size.width - 1
                         && mb.bottom >= context->pixel_size.height - 1
-                        && mask_geo->fill.face_count <= 2)
+                        && d2d_geometry_fill_is_simple(mask_geo))
                 {
                     /* Full-frame simple rectangle — skip geometry. Complex
                      * shapes (face_count > 2) must always be applied. */
@@ -7509,7 +7569,7 @@ static void STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_PushLayer(ID
                 if (mb.left <= 1.0f && mb.top <= 1.0f
                         && mb.right >= context->pixel_size.width - 1
                         && mb.bottom >= context->pixel_size.height - 1
-                        && mask_geo->fill.face_count <= 2)
+                        && d2d_geometry_fill_is_simple(mask_geo))
                 {
                     /* Full-frame simple rectangle — no clipping needed. */
                 }

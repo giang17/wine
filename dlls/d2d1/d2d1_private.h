@@ -853,6 +853,26 @@ struct d2d_geometry_ops
             ID2D1GeometrySink *sink);
 };
 
+/* The tessellation a geometry is filled with: triangles between its vertices,
+ * curve triangles for the Bézier and arc segments. */
+struct d2d_fill
+{
+    D2D1_POINT_2F *vertices;
+    size_t vertex_count;
+
+    struct d2d_face *faces;
+    size_t faces_size;
+    size_t face_count;
+
+    struct d2d_curve_vertex *bezier_vertices;
+    size_t bezier_vertices_size;
+    size_t bezier_vertex_count;
+
+    struct d2d_curve_vertex *arc_vertices;
+    size_t arc_vertices_size;
+    size_t arc_vertex_count;
+};
+
 struct d2d_geometry
 {
     ID2D1Geometry ID2D1Geometry_iface;
@@ -864,23 +884,7 @@ struct d2d_geometry
 
     D2D_MATRIX_3X2_F transform;
 
-    struct
-    {
-        D2D1_POINT_2F *vertices;
-        size_t vertex_count;
-
-        struct d2d_face *faces;
-        size_t faces_size;
-        size_t face_count;
-
-        struct d2d_curve_vertex *bezier_vertices;
-        size_t bezier_vertices_size;
-        size_t bezier_vertex_count;
-
-        struct d2d_curve_vertex *arc_vertices;
-        size_t arc_vertices_size;
-        size_t arc_vertex_count;
-    } fill;
+    struct d2d_fill fill;
 
     struct
     {
@@ -930,6 +934,17 @@ struct d2d_geometry
             UINT32 segment_count;
 
             D2D1_RECT_F bounds;
+
+            /* A path of many vertices and no curves is tessellated when it is
+             * first filled, clipped to the target of that fill, instead of in
+             * Close(); see d2d_geometry_acquire_fill(). */
+            struct
+            {
+                BOOL deferred;
+                BOOL valid;
+                BOOL whole;
+                D2D1_RECT_F clip;
+            } lazy_fill;
         } path;
         struct
         {
@@ -970,6 +985,9 @@ void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *
 HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
         D2D1_FILL_MODE fill_mode, ID2D1Geometry **src_geometries, unsigned int geometry_count);
 struct d2d_geometry *unsafe_impl_from_ID2D1Geometry(ID2D1Geometry *iface);
+const struct d2d_fill *d2d_geometry_acquire_fill(const struct d2d_geometry *geometry, const D2D1_RECT_F *clip);
+void d2d_geometry_release_fill(const struct d2d_geometry *geometry);
+BOOL d2d_geometry_fill_is_simple(const struct d2d_geometry *geometry);
 struct d2d_geometry *d2d_geometry_create_dashed_outline(ID2D1Geometry *iface,
         ID2D1StrokeStyle *stroke_style, float unit, const D2D1_MATRIX_3X2_F *metric);
 void d2d_geometry_destroy_dashed_outline(struct d2d_geometry *outline);

@@ -5631,6 +5631,105 @@ static void d2d_fill_cache_insert(const struct d2d_blob *key, uint32_t hash, con
     LeaveCriticalSection(&d2d_fill_cache_cs);
 }
 
+/* Remove collinear LINE vertices from figures to reduce CDT complexity. This is
+ * safe because the outline data is already computed in EndFigure, and removing
+ * collinear points does not change the filled area. One pass moves the vertices
+ * that stay down behind the last one kept; removing them one at a time moved
+ * the rest of the figure each time, quadratic in the vertex count (wine-dev
+ * issue 572: Serum 2's zoomed oscillator view froze in this loop). Each vertex
+ * is tested against the last one kept and the next one, as before. */
+static void d2d_path_geometry_remove_collinear_vertices(struct d2d_geometry *geometry)
+{
+    size_t i;
+
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        struct d2d_figure *figure = &geometry->u.path.figures[i];
+        size_t k, kept, count = figure->vertex_count;
+        D2D1_POINT_2F *v = figure->vertices;
+
+        if (count < 3)
+            continue;
+
+        for (k = kept = 1; k + 1 < count; ++k)
+        {
+            if (figure->vertex_types[k] == D2D_VERTEX_TYPE_LINE)
+            {
+                /* Check if vertex k is collinear with the last kept vertex and k+1
+                 * using cross product. */
+                float cross = (v[k].x - v[kept - 1].x) * (v[k + 1].y - v[kept - 1].y)
+                        - (v[k].y - v[kept - 1].y) * (v[k + 1].x - v[kept - 1].x);
+
+                if (cross >= -1e-6f && cross <= 1e-6f)
+                    continue;
+            }
+            v[kept] = v[k];
+            figure->vertex_types[kept] = figure->vertex_types[k];
+            ++kept;
+        }
+        v[kept] = v[count - 1];
+        figure->vertex_types[kept] = figure->vertex_types[count - 1];
+        figure->vertex_count = kept + 1;
+    }
+}
+
+/* Fills of paths too large to tessellate in Close() (wine-dev issue 572).
+ *
+ * Serum 2 draws the gradient area behind its oscillator view, zoomed in while
+ * MIDI plays, as one filled path of up to 1.8 million vertices per frame, a
+ * few hundred pixels of which are in view; the constrained Delaunay
+ * triangulation of the whole path in Close() took about a second per frame.
+ * Windows tessellates a geometry when it is drawn, under the transform of that
+ * draw and clipped to the target. A path of D2D_FILL_DEFER_VERTEX_COUNT
+ * vertices or more without curves therefore leaves Close() without a fill. Its
+ * first fill tessellates it, clipped to the target of that fill mapped into
+ * geometry space with a margin for the antialiasing ramps
+ * (d2d_device_context_get_fill_clip()); a later fill that shows a part outside
+ * that clip tessellates it again, and a fill whose clip holds the whole path
+ * tessellates the whole path once and keeps it. The clipped figures are copies,
+ * so the figures of the path stay as the application built them, for Stream(),
+ * FillContainsPoint() and the dashed strokes. Transformed and group geometries
+ * copy the fill of the path they wrap when they are created, empty for such a
+ * path, so every consumer of a fill goes through d2d_geometry_acquire_fill(),
+ * which finds that path. The fill is locked while a consumer uses it: a second
+ * thread filling the same path under another transform would replace it.
+ * WINE_D2D_LAZY_FILL=0 tessellates every path in Close(), as before. */
+#define D2D_FILL_DEFER_VERTEX_COUNT 65536
+
+static BOOL d2d_lazy_fill_enabled(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_LAZY_FILL", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+static BOOL d2d_path_geometry_defer_fill(struct d2d_geometry *geometry)
+{
+    size_t i, count = 0;
+
+    if (!d2d_lazy_fill_enabled())
+        return FALSE;
+
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        const struct d2d_figure *figure = &geometry->u.path.figures[i];
+
+        if (figure->bezier_control_count)
+            return FALSE;
+        if (!(figure->flags & D2D_FIGURE_FLAG_HOLLOW))
+            count += figure->vertex_count;
+    }
+    if (count < D2D_FILL_DEFER_VERTEX_COUNT)
+        return FALSE;
+
+    TRACE("Deferring the fill of path %p with %Iu vertices to its first fill.\n", geometry, count);
+    geometry->u.path.lazy_fill.deferred = TRUE;
+    return TRUE;
+}
+
 static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *iface)
 {
     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
@@ -5679,42 +5778,13 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
         }
     }
 
-    /* Remove collinear LINE vertices from figures to reduce CDT complexity.
-     * This is safe because the outline data is already computed in EndFigure,
-     * and removing collinear points does not change the filled area. One pass
-     * moves the vertices that stay down behind the last one kept; removing them
-     * one at a time moved the rest of the figure each time, quadratic in the
-     * vertex count (wine-dev issue 572: Serum 2's zoomed oscillator view froze
-     * in this loop). Each vertex is tested against the last one kept and the
-     * next one, as before. */
-    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    d2d_path_geometry_remove_collinear_vertices(geometry);
+
+    /* A path this large is tessellated by its first fill, clipped to the target. */
+    if (d2d_path_geometry_defer_fill(geometry))
     {
-        struct d2d_figure *figure = &geometry->u.path.figures[i];
-        size_t k, kept, count = figure->vertex_count;
-        D2D1_POINT_2F *v = figure->vertices;
-
-        if (count < 3)
-            continue;
-
-        for (k = kept = 1; k + 1 < count; ++k)
-        {
-            if (figure->vertex_types[k] == D2D_VERTEX_TYPE_LINE)
-            {
-                /* Check if vertex k is collinear with the last kept vertex and k+1
-                 * using cross product. */
-                float cross = (v[k].x - v[kept - 1].x) * (v[k + 1].y - v[kept - 1].y)
-                        - (v[k].y - v[kept - 1].y) * (v[k + 1].x - v[kept - 1].x);
-
-                if (cross >= -1e-6f && cross <= 1e-6f)
-                    continue;
-            }
-            v[kept] = v[k];
-            figure->vertex_types[kept] = figure->vertex_types[k];
-            ++kept;
-        }
-        v[kept] = v[count - 1];
-        figure->vertex_types[kept] = figure->vertex_types[count - 1];
-        figure->vertex_count = kept + 1;
+        hr = S_OK;
+        goto done;
     }
 
     if (d2d_fill_cache_enabled())
@@ -7833,18 +7903,20 @@ static HRESULT d2d_geometry_tessellate(ID2D1Geometry *geometry, const D2D1_MATRI
     if (SUCCEEDED(hr = d2d_geometry_get_simplified(geometry, transform, tolerance, &path_geometry)))
     {
         struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)path_geometry);
+        const struct d2d_fill *fill = d2d_geometry_acquire_fill(path_impl, NULL);
         D2D1_TRIANGLE t;
 
-        for (size_t i = 0; i < path_impl->fill.face_count; ++i)
+        for (size_t i = 0; i < fill->face_count; ++i)
         {
-            const struct d2d_face *face = &path_impl->fill.faces[i];
+            const struct d2d_face *face = &fill->faces[i];
 
-            t.point1 = path_impl->fill.vertices[face->v[0]];
-            t.point2 = path_impl->fill.vertices[face->v[1]];
-            t.point3 = path_impl->fill.vertices[face->v[2]];
+            t.point1 = fill->vertices[face->v[0]];
+            t.point2 = fill->vertices[face->v[1]];
+            t.point3 = fill->vertices[face->v[2]];
             ID2D1TessellationSink_AddTriangles(sink, &t, 1);
         }
 
+        d2d_geometry_release_fill(path_impl);
         ID2D1PathGeometry_Release(path_geometry);
     }
 
@@ -7874,20 +7946,22 @@ static HRESULT d2d_geometry_compute_area(ID2D1Geometry *geometry, const D2D1_MAT
     if (SUCCEEDED(hr = d2d_geometry_get_simplified(geometry, transform, tolerance, &path_geometry)))
     {
         struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)path_geometry);
+        const struct d2d_fill *fill = d2d_geometry_acquire_fill(path_impl, NULL);
         D2D1_TRIANGLE t;
 
-        for (size_t i = 0; i < path_impl->fill.face_count; ++i)
+        for (size_t i = 0; i < fill->face_count; ++i)
         {
-            const struct d2d_face *face = &path_impl->fill.faces[i];
+            const struct d2d_face *face = &fill->faces[i];
 
-            t.point1 = path_impl->fill.vertices[face->v[0]];
-            t.point2 = path_impl->fill.vertices[face->v[1]];
-            t.point3 = path_impl->fill.vertices[face->v[2]];
+            t.point1 = fill->vertices[face->v[0]];
+            t.point2 = fill->vertices[face->v[1]];
+            t.point3 = fill->vertices[face->v[2]];
             area += d2d_triangle_area(&t);
         }
 
         *ret = area;
 
+        d2d_geometry_release_fill(path_impl);
         ID2D1PathGeometry_Release(path_geometry);
     }
 
@@ -10358,6 +10432,284 @@ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *fac
     }
 
     return hr;
+}
+
+static CRITICAL_SECTION d2d_lazy_fill_cs;
+static CRITICAL_SECTION_DEBUG d2d_lazy_fill_cs_debug =
+{
+    0, 0, &d2d_lazy_fill_cs,
+    { &d2d_lazy_fill_cs_debug.ProcessLocksList, &d2d_lazy_fill_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": d2d_lazy_fill_cs") }
+};
+static CRITICAL_SECTION d2d_lazy_fill_cs = { &d2d_lazy_fill_cs_debug, -1, 0, 0, 0, 0 };
+
+/* One pass of Sutherland-Hodgman: the part of the closed polygon "in" on one
+ * side of a vertical (x = limit) or horizontal (y = limit) line, "greater"
+ * saying which side. A vertex on the line is inside. Writes at most 2 * count
+ * points. */
+static size_t d2d_polygon_clip_line(const D2D1_POINT_2F *in, size_t count, D2D1_POINT_2F *out,
+        BOOL vertical, float limit, BOOL greater)
+{
+    const D2D1_POINT_2F *prev = &in[count - 1];
+    float prev_c = vertical ? prev->x : prev->y;
+    BOOL prev_in = greater ? prev_c >= limit : prev_c <= limit;
+    size_t i, n = 0;
+
+    for (i = 0; i < count; ++i)
+    {
+        const D2D1_POINT_2F *cur = &in[i];
+        float cur_c = vertical ? cur->x : cur->y;
+        BOOL cur_in = greater ? cur_c >= limit : cur_c <= limit;
+
+        if (cur_in != prev_in)
+        {
+            /* The crossing, put exactly on the line. */
+            double t = (limit - prev_c) / ((double)cur_c - prev_c);
+            D2D1_POINT_2F p;
+
+            if (vertical)
+            {
+                p.x = limit;
+                p.y = prev->y + (float)(t * ((double)cur->y - prev->y));
+            }
+            else
+            {
+                p.x = prev->x + (float)(t * ((double)cur->x - prev->x));
+                p.y = limit;
+            }
+            if (isfinite(p.x) && isfinite(p.y))
+                out[n++] = p;
+        }
+        if (cur_in)
+            out[n++] = *cur;
+
+        prev = cur;
+        prev_c = cur_c;
+        prev_in = cur_in;
+    }
+
+    return n;
+}
+
+static void d2d_fill_free_triangles(struct d2d_fill *fill)
+{
+    free(fill->faces);
+    free(fill->vertices);
+    fill->faces = NULL;
+    fill->faces_size = 0;
+    fill->face_count = 0;
+    fill->vertices = NULL;
+    fill->vertex_count = 0;
+}
+
+/* Tessellate the part of the path within clip: the figures are clipped to it
+ * into a scratch path geometry, which goes through the steps Close() takes for
+ * a path. Outside the clip the result is wrong (the clipped figures run along
+ * the sides of the clip), inside it is the fill of the path, because the sides
+ * enclose no area. */
+static HRESULT d2d_path_geometry_tessellate_clipped(struct d2d_geometry *geometry, const D2D1_RECT_F *clip)
+{
+    struct d2d_geometry tmp = {0};
+    D2D1_POINT_2F *buf[2] = {NULL, NULL};
+    size_t buf_size[2] = {0, 0}, i;
+    HRESULT hr = E_OUTOFMEMORY;
+
+    tmp.u.path.fill_mode = geometry->u.path.fill_mode;
+    if (!(tmp.u.path.figures = calloc(geometry->u.path.figure_count, sizeof(*tmp.u.path.figures))))
+        goto done;
+    tmp.u.path.figures_size = geometry->u.path.figure_count;
+
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        static const struct { BOOL vertical, greater; } side[4] = {{TRUE, TRUE}, {TRUE, FALSE}, {FALSE, TRUE}, {FALSE, FALSE}};
+        const struct d2d_figure *src = &geometry->u.path.figures[i];
+        size_t count = src->vertex_count, n, m, k;
+        struct d2d_figure *dst;
+        D2D1_POINT_2F *swap;
+
+        /* The last vertex of a figure that ends where it started repeats the first. */
+        if (count && src->vertex_types[count - 1] == D2D_VERTEX_TYPE_END)
+            --count;
+        if (count < 3 || !d2d_rect_check_overlap(&src->bounds, clip))
+            continue;
+
+        if (!d2d_array_reserve((void **)&buf[0], &buf_size[0], count, sizeof(**buf)))
+            goto done;
+        memcpy(buf[0], src->vertices, count * sizeof(**buf));
+        n = count;
+        for (k = 0; k < 4 && n >= 3; ++k)
+        {
+            float limit = k == 0 ? clip->left : k == 1 ? clip->right : k == 2 ? clip->top : clip->bottom;
+
+            if (!d2d_array_reserve((void **)&buf[1], &buf_size[1], 2 * n, sizeof(**buf)))
+                goto done;
+            n = d2d_polygon_clip_line(buf[0], n, buf[1], side[k].vertical, limit, side[k].greater);
+            swap = buf[0];
+            buf[0] = buf[1];
+            buf[1] = swap;
+            m = buf_size[0];
+            buf_size[0] = buf_size[1];
+            buf_size[1] = m;
+        }
+        if (n < 3)
+            continue;
+
+        /* Points that coincide with their predecessor (a vertex on a side of the
+         * clip next to its crossing) would make segments of zero length. */
+        for (k = 0, m = 0; k < n; ++k)
+        {
+            if (!m || memcmp(&buf[0][m - 1], &buf[0][k], sizeof(**buf)))
+                buf[0][m++] = buf[0][k];
+        }
+        while (m > 1 && !memcmp(&buf[0][m - 1], &buf[0][0], sizeof(**buf)))
+            --m;
+        if ((n = m) < 3)
+            continue;
+
+        dst = &tmp.u.path.figures[tmp.u.path.figure_count++];
+        if (!(dst->vertices = malloc(n * sizeof(*dst->vertices)))
+                || !(dst->vertex_types = malloc(n * sizeof(*dst->vertex_types))))
+            goto done;
+        memcpy(dst->vertices, buf[0], n * sizeof(*dst->vertices));
+        dst->vertices_size = dst->vertex_types_size = dst->vertex_count = n;
+        dst->flags = src->flags;
+        dst->bounds.left = dst->bounds.top = FLT_MAX;
+        dst->bounds.right = dst->bounds.bottom = -FLT_MAX;
+        for (k = 0; k < n; ++k)
+        {
+            dst->vertex_types[k] = D2D_VERTEX_TYPE_LINE;
+            d2d_rect_expand(&dst->bounds, &dst->vertices[k]);
+        }
+    }
+
+    d2d_path_geometry_remove_collinear_vertices(&tmp);
+    /* No curves, so there is nothing for d2d_geometry_resolve_beziers() to do. */
+    if (!d2d_geometry_intersect_self(&tmp))
+        goto done;
+    if (FAILED(hr = d2d_path_geometry_triangulate(&tmp)))
+        goto done;
+
+    geometry->fill = tmp.fill;
+    memset(&tmp.fill, 0, sizeof(tmp.fill));
+    hr = S_OK;
+
+done:
+    free(buf[0]);
+    free(buf[1]);
+    d2d_fill_free_triangles(&tmp.fill);
+    d2d_path_geometry_free_figures(&tmp);
+    return hr;
+}
+
+static BOOL d2d_rect_contains(const D2D1_RECT_F *outer, const D2D1_RECT_F *inner)
+{
+    return outer->left <= inner->left && outer->top <= inner->top
+            && outer->right >= inner->right && outer->bottom >= inner->bottom;
+}
+
+/* Make the fill of a path whose tessellation Close() left to the first fill
+ * cover clip, or the whole path for a NULL clip. */
+static void d2d_path_geometry_fill_ensure(struct d2d_geometry *geometry, const D2D1_RECT_F *clip)
+{
+    D2D1_RECT_F bounds = {FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX};
+    BOOL whole = TRUE;
+    HRESULT hr;
+    size_t i;
+
+    if (clip)
+    {
+        for (i = 0; i < geometry->u.path.figure_count; ++i)
+            d2d_rect_union(&bounds, &geometry->u.path.figures[i].bounds);
+        whole = d2d_rect_contains(clip, &bounds);
+    }
+
+    if (geometry->u.path.lazy_fill.valid && (geometry->u.path.lazy_fill.whole
+            || (!whole && d2d_rect_contains(&geometry->u.path.lazy_fill.clip, clip))))
+        return;
+
+    d2d_fill_free_triangles(&geometry->fill);
+    if (whole)
+    {
+        hr = E_OUTOFMEMORY;
+        if (d2d_geometry_intersect_self(geometry) && SUCCEEDED(hr = d2d_geometry_resolve_beziers(geometry)))
+            hr = d2d_path_geometry_triangulate(geometry);
+    }
+    else
+    {
+        hr = d2d_path_geometry_tessellate_clipped(geometry, clip);
+    }
+
+    if (FAILED(hr))
+    {
+        WARN("Failed to tessellate path %p%s, hr %#lx.\n", geometry, whole ? "" : " clipped", hr);
+        d2d_fill_free_triangles(&geometry->fill);
+    }
+    else if (whole)
+    {
+        TRACE("Path %p tessellated whole, %Iu vertices, %Iu faces.\n", geometry,
+                geometry->fill.vertex_count, geometry->fill.face_count);
+    }
+    else
+    {
+        TRACE("Path %p tessellated within %s, %Iu vertices, %Iu faces.\n", geometry,
+                debug_d2d_rect_f(clip), geometry->fill.vertex_count, geometry->fill.face_count);
+    }
+
+    geometry->u.path.lazy_fill.valid = TRUE;
+    geometry->u.path.lazy_fill.whole = whole;
+    if (!whole)
+        geometry->u.path.lazy_fill.clip = *clip;
+}
+
+/* The geometry whose fill a geometry draws: transformed and group geometries
+ * draw the fill of the path they wrap. */
+static struct d2d_geometry *d2d_geometry_fill_owner(const struct d2d_geometry *geometry)
+{
+    /* The fill is a cache that the first fill completes; the geometry itself
+     * does not change. */
+    struct d2d_geometry *g = (struct d2d_geometry *)geometry;
+
+    for (;;)
+    {
+        if (g->ops == &d2d_transformed_geometry_ops)
+            g = unsafe_impl_from_ID2D1Geometry(g->u.transformed.src_geometry);
+        else if (g->ops == &d2d_geometry_group_ops)
+            g = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)g->u.group.path);
+        else
+            return g;
+    }
+}
+
+static BOOL d2d_geometry_fill_is_deferred(const struct d2d_geometry *owner)
+{
+    return owner->ops == &d2d_path_geometry_ops && owner->u.path.lazy_fill.deferred;
+}
+
+/* The fill of a geometry, complete within clip (geometry space of the path it
+ * draws) or, for a NULL clip, for the whole geometry. Held until
+ * d2d_geometry_release_fill(). */
+const struct d2d_fill *d2d_geometry_acquire_fill(const struct d2d_geometry *geometry, const D2D1_RECT_F *clip)
+{
+    struct d2d_geometry *owner = d2d_geometry_fill_owner(geometry);
+
+    if (!d2d_geometry_fill_is_deferred(owner))
+        return &geometry->fill;
+
+    EnterCriticalSection(&d2d_lazy_fill_cs);
+    d2d_path_geometry_fill_ensure(owner, clip);
+    return &owner->fill;
+}
+
+void d2d_geometry_release_fill(const struct d2d_geometry *geometry)
+{
+    if (d2d_geometry_fill_is_deferred(d2d_geometry_fill_owner(geometry)))
+        LeaveCriticalSection(&d2d_lazy_fill_cs);
+}
+
+/* Whether the fill is at most two triangles, a rectangle at most. */
+BOOL d2d_geometry_fill_is_simple(const struct d2d_geometry *geometry)
+{
+    return !d2d_geometry_fill_is_deferred(d2d_geometry_fill_owner(geometry)) && geometry->fill.face_count <= 2;
 }
 
 /* Dashed strokes. The figures are cut into dash pieces along their arc length,
