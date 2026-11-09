@@ -3502,6 +3502,9 @@ struct d2d_grid_entry
     size_t next;         /* next entry in this cell, SIZE_MAX = end */
 };
 
+#define D2D_GRID_MAX_SIDE 65536
+#define D2D_GRID_MAX_CELLS (1u << 20)
+
 struct d2d_grid
 {
     size_t *cells;                    /* cells[row * cols + col] = first grid_entry index */
@@ -3543,14 +3546,25 @@ static BOOL d2d_grid_init(struct d2d_grid *grid, const D2D_RECT_F *total_bounds,
     }
     else
     {
-        float target_cells = (float)segment_count / 4.0f;
+        /* The cells follow the aspect ratio of the path without a fixed cap per
+         * side. With at most 256 columns, a waveform 8,000 times as wide as high
+         * (Serum 2's zoomed oscillator view, 1.5 million vertices) got 256 cells
+         * of thousands of segments each, tested pairwise: 12 s per Close()
+         * (wine-dev issue 572). The total stays bounded to keep the cell array
+         * small. */
+        float target_cells = min((float)segment_count / 4.0f, (float)D2D_GRID_MAX_CELLS);
         aspect = width / height;
-        grid->cols = (size_t)(sqrtf(target_cells * aspect) + 0.5f);
-        grid->rows = (size_t)(sqrtf(target_cells / aspect) + 0.5f);
+        grid->cols = (size_t)min(sqrtf(target_cells * aspect) + 0.5f, (float)D2D_GRID_MAX_SIDE);
+        grid->rows = (size_t)min(sqrtf(target_cells / aspect) + 0.5f, (float)D2D_GRID_MAX_SIDE);
         if (grid->cols < 1) grid->cols = 1;
         if (grid->rows < 1) grid->rows = 1;
-        if (grid->cols > 256) grid->cols = 256;
-        if (grid->rows > 256) grid->rows = 256;
+        if (grid->cols * grid->rows > D2D_GRID_MAX_CELLS)
+        {
+            if (grid->cols > grid->rows)
+                grid->cols = D2D_GRID_MAX_CELLS / grid->rows;
+            else
+                grid->rows = D2D_GRID_MAX_CELLS / grid->cols;
+        }
     }
 
     grid->cell_w = width / (float)grid->cols;
