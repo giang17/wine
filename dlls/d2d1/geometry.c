@@ -5630,44 +5630,40 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
 
     /* Remove collinear LINE vertices from figures to reduce CDT complexity.
      * This is safe because the outline data is already computed in EndFigure,
-     * and removing collinear points does not change the filled area. */
+     * and removing collinear points does not change the filled area. One pass
+     * moves the vertices that stay down behind the last one kept; removing them
+     * one at a time moved the rest of the figure each time, quadratic in the
+     * vertex count (wine-dev issue 572: Serum 2's zoomed oscillator view froze
+     * in this loop). Each vertex is tested against the last one kept and the
+     * next one, as before. */
     for (i = 0; i < geometry->u.path.figure_count; ++i)
     {
         struct d2d_figure *figure = &geometry->u.path.figures[i];
-        size_t k;
+        size_t k, kept, count = figure->vertex_count;
+        D2D1_POINT_2F *v = figure->vertices;
 
-        if (figure->vertex_count < 3)
+        if (count < 3)
             continue;
 
-        for (k = 1; k + 1 < figure->vertex_count;)
+        for (k = kept = 1; k + 1 < count; ++k)
         {
-            float cross;
-
-            if (figure->vertex_types[k] != D2D_VERTEX_TYPE_LINE)
+            if (figure->vertex_types[k] == D2D_VERTEX_TYPE_LINE)
             {
-                ++k;
-                continue;
-            }
+                /* Check if vertex k is collinear with the last kept vertex and k+1
+                 * using cross product. */
+                float cross = (v[k].x - v[kept - 1].x) * (v[k + 1].y - v[kept - 1].y)
+                        - (v[k].y - v[kept - 1].y) * (v[k + 1].x - v[kept - 1].x);
 
-            /* Check if vertex k is collinear with k-1 and k+1 using cross product. */
-            cross = (figure->vertices[k].x - figure->vertices[k - 1].x)
-                    * (figure->vertices[k + 1].y - figure->vertices[k - 1].y)
-                    - (figure->vertices[k].y - figure->vertices[k - 1].y)
-                    * (figure->vertices[k + 1].x - figure->vertices[k - 1].x);
-
-            if (cross >= -1e-6f && cross <= 1e-6f)
-            {
-                memmove(&figure->vertices[k], &figure->vertices[k + 1],
-                        (figure->vertex_count - k - 1) * sizeof(*figure->vertices));
-                memmove(&figure->vertex_types[k], &figure->vertex_types[k + 1],
-                        (figure->vertex_count - k - 1) * sizeof(*figure->vertex_types));
-                --figure->vertex_count;
+                if (cross >= -1e-6f && cross <= 1e-6f)
+                    continue;
             }
-            else
-            {
-                ++k;
-            }
+            v[kept] = v[k];
+            figure->vertex_types[kept] = figure->vertex_types[k];
+            ++kept;
         }
+        v[kept] = v[count - 1];
+        figure->vertex_types[kept] = figure->vertex_types[count - 1];
+        figure->vertex_count = kept + 1;
     }
 
     if (d2d_fill_cache_enabled())
