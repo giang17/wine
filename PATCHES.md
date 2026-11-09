@@ -965,6 +965,21 @@ This is the recommended branch. What it changes, by subsystem:
   tool windows. The window manager places the maximised undecorated window on the work
   area, so an application frame that `WM_NCCALCSIZE` keeps at the edge is on screen there
   (4 px for `ncfull.c`), where Windows keeps it off screen.
+- **winex11**: dragging the caption of a maximised window restores it under the pointer
+  and moves it (vatSys ASD title strip, giang17/wine issue 26, issue 547). The driver
+  refused `SC_MOVE` for every maximised window and `DefWindowProc`'s own move loop returns
+  at once for one, so `WM_NCLBUTTONDOWN` on `HTCAPTION` did nothing; a window with a
+  window manager frame never showed it, because there the frame takes the drag. A move
+  started with the mouse is now passed to the window manager (`_NET_WM_MOVERESIZE`) for a
+  maximised window too; sizing and the keyboard move stay refused. A test window with a
+  30 px strip of its own that answers `HTCAPTION` (`projects/nc-titlebar-test/capdrag.c`,
+  KWin 5.27.11 on X11): before, the window stayed at (0,0)-(1920,1080) through press, ten
+  pointer steps and release; now KWin restores it after the third step to 800x500 with
+  the pointer at the same three quarters of the strip width, the window follows the
+  pointer, and the application sees `WM_ENTERSIZEMOVE`, `SC_RESTORE`, the moves and
+  `WM_EXITSIZEMOVE`. A press and release without a move leaves the window maximised; the
+  drag of the restored window is unchanged. The maximised vatSys ASD window (1920x1080)
+  is restored to 804x478 under the pointer and moved the same way.
 - **win32u / winex11**: a top-level window the window manager raised on its own (a click
   under X11) is brought to the top of the win32 Z-order as well, as Windows does on
   activation, and the win32 order that results is applied back to the X stacking. An
