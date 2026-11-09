@@ -4135,11 +4135,13 @@ static BOOL d2d_geometry_outline_add_join(struct d2d_geometry *geometry,
  * direction and "next" its opposite; the vector lengths encode the corner of
  * the cap quad as for a join, with the lengths 3 and 4 in place of 1 and 2 on
  * the next vector of a start cap and on the prev vector of an end cap, which
- * tells the outline vertex shader that it is a cap and which cap style to use. */
-void d2d_outline_cap_vertices(struct d2d_outline_vertex *v, const D2D1_POINT_2F *p,
-        float dx, float dy, BOOL start)
+ * tells the outline vertex shader that it is a cap and which cap style to use.
+ * The end of a dash that is not an end of the figure takes the dash cap; it
+ * carries the lengths 5 and 6 instead. */
+static void d2d_outline_cap_vertices_ex(struct d2d_outline_vertex *v, const D2D1_POINT_2F *p,
+        float dx, float dy, BOOL start, BOOL dash)
 {
-    float a = start ? 1.0f : 3.0f, b = start ? 3.0f : 1.0f;
+    float c = dash ? 5.0f : 3.0f, a = start ? 1.0f : c, b = start ? c : 1.0f;
 
     d2d_outline_vertex_set(&v[0], p->x, p->y, a * dx, a * dy, -b * dx, -b * dy);
     d2d_outline_vertex_set(&v[1], p->x, p->y, a * dx, a * dy, -(b + 1.0f) * dx, -(b + 1.0f) * dy);
@@ -4147,8 +4149,14 @@ void d2d_outline_cap_vertices(struct d2d_outline_vertex *v, const D2D1_POINT_2F 
     d2d_outline_vertex_set(&v[3], p->x, p->y, (a + 1.0f) * dx, (a + 1.0f) * dy, -(b + 1.0f) * dx, -(b + 1.0f) * dy);
 }
 
+void d2d_outline_cap_vertices(struct d2d_outline_vertex *v, const D2D1_POINT_2F *p,
+        float dx, float dy, BOOL start)
+{
+    d2d_outline_cap_vertices_ex(v, p, dx, dy, start, FALSE);
+}
+
 static BOOL d2d_geometry_outline_add_cap(struct d2d_geometry *geometry,
-        const D2D1_POINT_2F *p, const D2D1_POINT_2F *outward, BOOL start)
+        const D2D1_POINT_2F *p, const D2D1_POINT_2F *outward, BOOL start, BOOL dash)
 {
     struct d2d_face *f;
     size_t base_idx;
@@ -4169,7 +4177,7 @@ static BOOL d2d_geometry_outline_add_cap(struct d2d_geometry *geometry,
     }
     f = &geometry->outline.faces[geometry->outline.face_count];
 
-    d2d_outline_cap_vertices(&geometry->outline.vertices[base_idx], p, outward->x, outward->y, start);
+    d2d_outline_cap_vertices_ex(&geometry->outline.vertices[base_idx], p, outward->x, outward->y, start, dash);
     geometry->outline.vertex_count += 4;
 
     d2d_face_set(&f[0], base_idx + 2, base_idx + 3, base_idx + 0);
@@ -4426,7 +4434,7 @@ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
             /* The start cap of an open figure points away from the first segment. */
             d2d_point_subtract(&outward, p0, next);
             d2d_point_normalise(&outward);
-            if (!d2d_geometry_outline_add_cap(geometry, p0, &outward, TRUE))
+            if (!d2d_geometry_outline_add_cap(geometry, p0, &outward, TRUE, FALSE))
             {
                 ERR("Failed to add start cap.\n");
                 return FALSE;
@@ -4443,7 +4451,7 @@ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
 
         d2d_point_subtract(&outward, p0, prev);
         d2d_point_normalise(&outward);
-        if (!d2d_geometry_outline_add_cap(geometry, p0, &outward, FALSE))
+        if (!d2d_geometry_outline_add_cap(geometry, p0, &outward, FALSE, FALSE))
         {
             ERR("Failed to add end cap.\n");
             return FALSE;
@@ -10291,6 +10299,535 @@ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *fac
     }
 
     return hr;
+}
+
+/* Dashed strokes. The figures are cut into dash pieces along their arc length,
+ * measured through "metric": geometry space for a normal stroke, device space
+ * for a fixed or hairline one, with the pattern in multiples of the width that
+ * applies there. Each piece goes into a scratch outline with the joins it
+ * crosses. Windows gives the ends of a piece the start or end cap where they
+ * are an end of an open figure and the dash cap everywhere else, draws dashes
+ * of length zero (dots) only through their caps. The start point of a closed
+ * figure ends the dashes there with dash caps; only a single dash all around
+ * the figure is joined there. Measured against Windows 10 with
+ * projects/d2d1-dash-449 (workspace). */
+#define D2D_DASH_QUAD_STEPS 16
+#define D2D_DASH_MAX_INTERVALS 100000
+
+struct d2d_dash_segment
+{
+    D2D1_POINT_2F p0, c, p1;
+    BOOL quad;
+    float start, length;
+    float table[D2D_DASH_QUAD_STEPS + 1];
+};
+
+struct d2d_dash_piece
+{
+    D2D1_POINT_2F p0, c, p1;
+    BOOL quad;
+};
+
+struct d2d_dash_interval
+{
+    float a, b;
+};
+
+struct d2d_dash_context
+{
+    struct d2d_geometry *outline;
+    D2D1_MATRIX_3X2_F metric;
+    const struct d2d_dash_pattern *pattern;
+
+    struct d2d_dash_segment *segments;
+    size_t segments_size, segment_count;
+    float length;
+
+    struct d2d_dash_piece *pieces;
+    size_t pieces_size, piece_count;
+
+    struct d2d_dash_interval *intervals;
+    size_t intervals_size, interval_count;
+};
+
+static float d2d_dash_metric_length(const D2D1_MATRIX_3X2_F *m, const D2D1_POINT_2F *a, const D2D1_POINT_2F *b)
+{
+    float dx = b->x - a->x, dy = b->y - a->y;
+    float x = m->_11 * dx + m->_21 * dy, y = m->_12 * dx + m->_22 * dy;
+
+    return sqrtf(x * x + y * y);
+}
+
+static BOOL d2d_dash_add_segment(struct d2d_dash_context *ctx, const D2D1_POINT_2F *p0,
+        const D2D1_POINT_2F *c, const D2D1_POINT_2F *p1)
+{
+    struct d2d_dash_segment *s;
+    D2D1_POINT_2F prev, p;
+    unsigned int i;
+
+    if (!d2d_array_reserve((void **)&ctx->segments, &ctx->segments_size,
+            ctx->segment_count + 1, sizeof(*ctx->segments)))
+        return FALSE;
+    s = &ctx->segments[ctx->segment_count];
+    s->p0 = *p0;
+    s->p1 = *p1;
+    if ((s->quad = !!c))
+    {
+        s->c = *c;
+        s->table[0] = 0.0f;
+        prev = *p0;
+        for (i = 1; i <= D2D_DASH_QUAD_STEPS; ++i)
+        {
+            d2d_point_calculate_bezier(&p, p0, c, p1, (float)i / D2D_DASH_QUAD_STEPS);
+            s->table[i] = s->table[i - 1] + d2d_dash_metric_length(&ctx->metric, &prev, &p);
+            prev = p;
+        }
+        s->length = s->table[D2D_DASH_QUAD_STEPS];
+    }
+    else
+    {
+        s->c = *p0;
+        s->length = d2d_dash_metric_length(&ctx->metric, p0, p1);
+    }
+
+    /* Segments of length zero carry no part of the pattern. */
+    if (!(s->length > 0.0f))
+        return TRUE;
+    s->start = ctx->length;
+    ctx->length += s->length;
+    ++ctx->segment_count;
+    return TRUE;
+}
+
+/* The curve parameter at arc length u into the segment. */
+static float d2d_dash_segment_t(const struct d2d_dash_segment *s, float u)
+{
+    unsigned int i;
+    float d;
+
+    if (u <= 0.0f)
+        return 0.0f;
+    if (u >= s->length)
+        return 1.0f;
+    if (!s->quad)
+        return u / s->length;
+
+    for (i = 1; i < D2D_DASH_QUAD_STEPS && s->table[i] < u; ++i);
+    d = s->table[i] - s->table[i - 1];
+    return (i - 1 + (d > 0.0f ? (u - s->table[i - 1]) / d : 0.0f)) / D2D_DASH_QUAD_STEPS;
+}
+
+/* The polar form of the quadratic: f(t, t) is the point at t, f(t0, t1) the
+ * control point of the piece between t0 and t1. */
+static void d2d_dash_quad_blossom(D2D1_POINT_2F *out, const struct d2d_dash_segment *s, float a, float b)
+{
+    float w0 = (1.0f - a) * (1.0f - b), w1 = a * (1.0f - b) + b * (1.0f - a), w2 = a * b;
+
+    out->x = w0 * s->p0.x + w1 * s->c.x + w2 * s->p1.x;
+    out->y = w0 * s->p0.y + w1 * s->c.y + w2 * s->p1.y;
+}
+
+static void d2d_dash_segment_point(const struct d2d_dash_segment *s, float t, D2D1_POINT_2F *p, D2D1_POINT_2F *tangent)
+{
+    if (!s->quad)
+    {
+        d2d_point_lerp(p, &s->p0, &s->p1, t);
+        d2d_point_subtract(tangent, &s->p1, &s->p0);
+    }
+    else
+    {
+        d2d_point_calculate_bezier(p, &s->p0, &s->c, &s->p1, t);
+        tangent->x = (1.0f - t) * (s->c.x - s->p0.x) + t * (s->p1.x - s->c.x);
+        tangent->y = (1.0f - t) * (s->c.y - s->p0.y) + t * (s->p1.y - s->c.y);
+        if (d2d_point_dot(tangent, tangent) < 1e-12f)
+            d2d_point_subtract(tangent, &s->p1, &s->p0);
+    }
+    d2d_point_normalise(tangent);
+}
+
+/* The direction a piece leaves its start point in, and the one it arrives at
+ * its end point in. */
+static void d2d_dash_piece_out_dir(const struct d2d_dash_piece *piece, D2D1_POINT_2F *dir)
+{
+    d2d_point_subtract(dir, piece->quad ? &piece->c : &piece->p1, &piece->p0);
+    if (d2d_point_dot(dir, dir) < 1e-12f)
+        d2d_point_subtract(dir, &piece->p1, &piece->p0);
+    d2d_point_normalise(dir);
+}
+
+static void d2d_dash_piece_in_dir(const struct d2d_dash_piece *piece, D2D1_POINT_2F *dir)
+{
+    d2d_point_subtract(dir, &piece->p1, piece->quad ? &piece->c : &piece->p0);
+    if (d2d_point_dot(dir, dir) < 1e-12f)
+        d2d_point_subtract(dir, &piece->p1, &piece->p0);
+    d2d_point_normalise(dir);
+}
+
+/* Append the part of the figure between the arc lengths a and b. */
+static BOOL d2d_dash_collect(struct d2d_dash_context *ctx, float a, float b)
+{
+    struct d2d_dash_piece *piece;
+    float s0, s1, t0, t1;
+    size_t i;
+
+    for (i = 0; i < ctx->segment_count; ++i)
+    {
+        const struct d2d_dash_segment *s = &ctx->segments[i];
+
+        s0 = s->start;
+        s1 = s0 + s->length;
+        if (s1 <= a)
+            continue;
+        if (s0 >= b)
+            break;
+
+        t0 = d2d_dash_segment_t(s, max(a, s0) - s0);
+        t1 = d2d_dash_segment_t(s, min(b, s1) - s0);
+        if (!(t1 > t0))
+            continue;
+
+        if (!d2d_array_reserve((void **)&ctx->pieces, &ctx->pieces_size,
+                ctx->piece_count + 1, sizeof(*ctx->pieces)))
+            return FALSE;
+        piece = &ctx->pieces[ctx->piece_count++];
+        if ((piece->quad = s->quad))
+        {
+            d2d_dash_quad_blossom(&piece->p0, s, t0, t0);
+            d2d_dash_quad_blossom(&piece->c, s, t0, t1);
+            d2d_dash_quad_blossom(&piece->p1, s, t1, t1);
+        }
+        else
+        {
+            d2d_point_lerp(&piece->p0, &s->p0, &s->p1, t0);
+            d2d_point_lerp(&piece->p1, &s->p0, &s->p1, t1);
+            piece->c = piece->p0;
+        }
+    }
+
+    return TRUE;
+}
+
+/* A dash of length zero is only its two caps, back to back on the tangent. */
+static BOOL d2d_dash_emit_dot(struct d2d_dash_context *ctx, const D2D1_POINT_2F *p,
+        const D2D1_POINT_2F *tangent, BOOL start_is_figure_end, BOOL end_is_figure_end)
+{
+    D2D1_POINT_2F outward = {-tangent->x, -tangent->y};
+
+    return d2d_geometry_outline_add_cap(ctx->outline, p, &outward, TRUE, !start_is_figure_end)
+            && d2d_geometry_outline_add_cap(ctx->outline, p, tangent, FALSE, !end_is_figure_end);
+}
+
+static BOOL d2d_dash_emit_dot_at(struct d2d_dash_context *ctx, float s,
+        BOOL start_is_figure_end, BOOL end_is_figure_end)
+{
+    const struct d2d_dash_segment *seg = NULL;
+    D2D1_POINT_2F p, tangent;
+    size_t i;
+
+    for (i = 0; i < ctx->segment_count; ++i)
+    {
+        seg = &ctx->segments[i];
+        if (s < seg->start + seg->length)
+            break;
+    }
+    if (!seg)
+        return TRUE;
+
+    d2d_dash_segment_point(seg, d2d_dash_segment_t(seg, s - seg->start), &p, &tangent);
+    return d2d_dash_emit_dot(ctx, &p, &tangent, start_is_figure_end, end_is_figure_end);
+}
+
+/* Tessellate the collected pieces as one dash: the joins between them, and
+ * either the caps at both ends or, for a dash all around a closed figure, the
+ * join at the start point. */
+static BOOL d2d_dash_emit(struct d2d_dash_context *ctx, BOOL start_is_figure_end,
+        BOOL end_is_figure_end, BOOL loop)
+{
+    const struct d2d_dash_piece *piece, *prev;
+    D2D1_POINT_2F q_prev, q_next;
+    size_t i, count = ctx->piece_count;
+    BOOL ret = TRUE;
+
+    ctx->piece_count = 0;
+    for (i = 0; i < count && ret; ++i)
+    {
+        piece = &ctx->pieces[i];
+        if (piece->quad)
+            ret = d2d_geometry_outline_add_bezier_segment(ctx->outline, &piece->p0, &piece->c, &piece->p1);
+        else
+            ret = d2d_geometry_outline_add_line_segment(ctx->outline, &piece->p0, &piece->p1);
+
+        if (ret && (i || loop))
+        {
+            prev = &ctx->pieces[i ? i - 1 : count - 1];
+            d2d_dash_piece_in_dir(prev, &q_prev);
+            d2d_point_scale(&q_prev, -1.0f);
+            d2d_dash_piece_out_dir(piece, &q_next);
+            ret = d2d_geometry_outline_add_join(ctx->outline, &q_prev, &piece->p0, &q_next);
+        }
+    }
+    if (!ret || loop || !count)
+        return ret;
+
+    d2d_dash_piece_out_dir(&ctx->pieces[0], &q_next);
+    d2d_point_scale(&q_next, -1.0f);
+    d2d_dash_piece_in_dir(&ctx->pieces[count - 1], &q_prev);
+    return d2d_geometry_outline_add_cap(ctx->outline, &ctx->pieces[0].p0, &q_next, TRUE, !start_is_figure_end)
+            && d2d_geometry_outline_add_cap(ctx->outline, &ctx->pieces[count - 1].p1, &q_prev, FALSE,
+            !end_is_figure_end);
+}
+
+static BOOL d2d_dash_emit_interval(struct d2d_dash_context *ctx, float a, float b, BOOL closed)
+{
+    BOOL start_is_figure_end = !closed && a <= 0.0f, end_is_figure_end = !closed && b >= ctx->length;
+
+    if (b > a)
+    {
+        if (!d2d_dash_collect(ctx, a, b))
+            return FALSE;
+        if (ctx->piece_count)
+            return d2d_dash_emit(ctx, start_is_figure_end, end_is_figure_end, FALSE);
+    }
+    return d2d_dash_emit_dot_at(ctx, a, start_is_figure_end, end_is_figure_end);
+}
+
+/* Lay the pattern along the segments of one figure. The pattern restarts with
+ * every figure, at the position dashOffset. */
+static BOOL d2d_dash_figure(struct d2d_dash_context *ctx, BOOL closed, const D2D1_POINT_2F *first_vertex)
+{
+    const struct d2d_dash_pattern *pattern = ctx->pattern;
+    const struct d2d_dash_interval *first;
+    float s, end, p, length = ctx->length;
+    unsigned int idx = 0;
+    size_t i;
+
+    ctx->interval_count = 0;
+    p = pattern->offset;
+    while (p > pattern->dashes[idx] || (p == pattern->dashes[idx] && pattern->dashes[idx] != 0.0f))
+    {
+        p -= pattern->dashes[idx];
+        idx = (idx + 1) % pattern->count;
+    }
+
+    if (!(length > 0.0f))
+    {
+        /* A figure of length zero, e.g. DrawLine() from a point to itself:
+         * Windows draws the caps if the pattern is on there. */
+        D2D1_POINT_2F tangent = {1.0f, 0.0f};
+
+        if (idx & 1)
+            return TRUE;
+        return d2d_dash_emit_dot(ctx, first_vertex, &tangent, !closed, !closed);
+    }
+
+    s = 0.0f;
+    end = pattern->dashes[idx] - p;
+    for (;;)
+    {
+        if (!(idx & 1))
+        {
+            if (ctx->interval_count == D2D_DASH_MAX_INTERVALS)
+            {
+                FIXME("More than %u dashes in a figure, drawing the rest of the figure solid.\n",
+                        D2D_DASH_MAX_INTERVALS);
+                ctx->intervals[ctx->interval_count - 1].b = length;
+                break;
+            }
+            if (!d2d_array_reserve((void **)&ctx->intervals, &ctx->intervals_size,
+                    ctx->interval_count + 1, sizeof(*ctx->intervals)))
+                return FALSE;
+            ctx->intervals[ctx->interval_count].a = s;
+            ctx->intervals[ctx->interval_count].b = min(end, length);
+            ++ctx->interval_count;
+        }
+        if (end > length)
+            break;
+        s = end;
+        idx = (idx + 1) % pattern->count;
+        end = s + pattern->dashes[idx];
+    }
+
+    if (!ctx->interval_count)
+        return TRUE;
+
+    /* A dash all around a closed figure is drawn like a solid one, with the
+     * join at the start point. Otherwise the start point of a closed figure
+     * ends the dashes there with dash caps, even where one dash ends exactly
+     * where the next begins. */
+    first = &ctx->intervals[0];
+    if (closed && ctx->interval_count == 1 && first->a <= 0.0f && first->b >= length)
+    {
+        if (!d2d_dash_collect(ctx, 0.0f, length))
+            return FALSE;
+        return d2d_dash_emit(ctx, FALSE, FALSE, TRUE);
+    }
+
+    for (i = 0; i < ctx->interval_count; ++i)
+    {
+        if (!d2d_dash_emit_interval(ctx, ctx->intervals[i].a, ctx->intervals[i].b, closed))
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+/* The segments of a figure as Simplify() reports them. The fill code inserts
+ * vertices into the figures when the path is closed (intersections, also with
+ * the implied closing edge of an open figure, and curve splits); like
+ * d2d_figure_simplify() this skips them and takes each cubic from its original
+ * control points, split into quadratics the way AddBezier() does. */
+static BOOL d2d_dash_add_figure(struct d2d_dash_context *ctx, const struct d2d_figure *figure)
+{
+    struct d2d_quadratic_bezier quadratics[D2D_BEZIER_MAX_QUADRATICS];
+    BOOL closed = !!(figure->flags & D2D_FIGURE_FLAG_CLOSED);
+    enum d2d_vertex_type type = D2D_VERTEX_TYPE_NONE;
+    unsigned int j, quadratic_count;
+    D2D1_POINT_2F cubic[4], p, first;
+    size_t i, bezier_idx;
+
+    ctx->segment_count = 0;
+    ctx->length = 0.0f;
+
+    for (i = 0; i < figure->vertex_count; ++i)
+    {
+        if (figure->vertex_types[i] == D2D_VERTEX_TYPE_NONE)
+            continue;
+        p = figure->vertices[i];
+        type = figure->vertex_types[i];
+        break;
+    }
+    if (i == figure->vertex_count)
+    {
+        if (!figure->vertex_count)
+            return TRUE;
+        p = figure->vertices[0];
+    }
+    first = p;
+
+    for (bezier_idx = 0, ++i; i < figure->vertex_count; ++i)
+    {
+        enum d2d_vertex_type next_type;
+
+        if ((next_type = figure->vertex_types[i]) == D2D_VERTEX_TYPE_NONE
+                || d2d_vertex_type_is_split_bezier(next_type))
+            continue;
+
+        if (type == D2D_VERTEX_TYPE_BEZIER)
+        {
+            cubic[0] = p;
+            cubic[1] = figure->original_bezier_controls[bezier_idx++];
+            cubic[2] = figure->original_bezier_controls[bezier_idx++];
+            cubic[3] = figure->vertices[i];
+            quadratic_count = d2d_cubic_bezier_to_quadratics(cubic, quadratics);
+            for (j = 0; j < quadratic_count; ++j)
+            {
+                if (!d2d_dash_add_segment(ctx, &quadratics[j].p0, &quadratics[j].control, &quadratics[j].p2))
+                    return FALSE;
+            }
+        }
+        else if (!d2d_dash_add_segment(ctx, &p, NULL, &figure->vertices[i]))
+        {
+            return FALSE;
+        }
+        p = figure->vertices[i];
+        type = next_type;
+    }
+
+    if (closed && memcmp(&p, &first, sizeof(p)) && !d2d_dash_add_segment(ctx, &p, NULL, &first))
+        return FALSE;
+
+    return d2d_dash_figure(ctx, closed, &first);
+}
+
+void d2d_geometry_destroy_dashed_outline(struct d2d_geometry *outline)
+{
+    if (!outline)
+        return;
+    free(outline->outline.arc_faces);
+    free(outline->outline.arcs);
+    free(outline->outline.bezier_faces);
+    free(outline->outline.beziers);
+    free(outline->outline.faces);
+    free(outline->outline.vertices);
+    free(outline);
+}
+
+/* Build the outline of the dashed stroke of a geometry, or return NULL if the
+ * stroke style has no usable dash pattern. unit is the width the pattern is a
+ * multiple of, metric the linear map the arc lengths are measured through. */
+struct d2d_geometry *d2d_geometry_create_dashed_outline(ID2D1Geometry *iface,
+        ID2D1StrokeStyle *stroke_style, float unit, const D2D1_MATRIX_3X2_F *metric)
+{
+    struct d2d_geometry *geometry = unsafe_impl_from_ID2D1Geometry(iface), *path;
+    struct d2d_dash_context ctx = {0};
+    struct d2d_dash_pattern pattern;
+    ID2D1PathGeometry *tmp = NULL;
+    ID2D1GeometrySink *sink;
+    BOOL ret = FALSE;
+    HRESULT hr;
+    size_t i;
+
+    if (!d2d_dash_pattern_init(&pattern, stroke_style, unit))
+        return NULL;
+
+    if (iface->lpVtbl == (const ID2D1GeometryVtbl *)&d2d_path_geometry_vtbl)
+    {
+        path = geometry;
+    }
+    else
+    {
+        /* The other geometries have no figures of their own; Simplify() hands
+         * them over with the transform of a transformed geometry applied, which
+         * is where its stroke is laid out. */
+        if (FAILED(hr = ID2D1Factory_CreatePathGeometry(geometry->factory, &tmp)))
+            return NULL;
+        if (FAILED(hr = ID2D1PathGeometry_Open(tmp, &sink)))
+        {
+            ID2D1PathGeometry_Release(tmp);
+            return NULL;
+        }
+        hr = ID2D1Geometry_Simplify(iface, D2D1_GEOMETRY_SIMPLIFICATION_OPTION_CUBICS_AND_LINES, NULL,
+                D2D1_DEFAULT_FLATTENING_TOLERANCE, (ID2D1SimplifiedGeometrySink *)sink);
+        if (SUCCEEDED(hr))
+            hr = ID2D1GeometrySink_Close(sink);
+        ID2D1GeometrySink_Release(sink);
+        if (FAILED(hr))
+        {
+            WARN("Failed to simplify geometry %p, hr %#lx.\n", iface, hr);
+            ID2D1PathGeometry_Release(tmp);
+            return NULL;
+        }
+        path = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)tmp);
+    }
+
+    if (!(ctx.outline = calloc(1, sizeof(*ctx.outline))))
+        goto done;
+    ctx.outline->transform = path->transform;
+    ctx.metric = *metric;
+    ctx.pattern = &pattern;
+
+    for (i = 0; i < path->u.path.figure_count; ++i)
+    {
+        if (!d2d_dash_add_figure(&ctx, &path->u.path.figures[i]))
+        {
+            ERR("Failed to build the dashed outline.\n");
+            goto done;
+        }
+    }
+    ret = TRUE;
+
+done:
+    free(ctx.intervals);
+    free(ctx.pieces);
+    free(ctx.segments);
+    if (tmp)
+        ID2D1PathGeometry_Release(tmp);
+    if (!ret)
+    {
+        d2d_geometry_destroy_dashed_outline(ctx.outline);
+        return NULL;
+    }
+    return ctx.outline;
 }
 
 struct d2d_geometry *unsafe_impl_from_ID2D1Geometry(ID2D1Geometry *iface)
