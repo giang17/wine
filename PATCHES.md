@@ -886,7 +886,16 @@ This is the recommended branch. What it changes, by subsystem:
   with its main window. Measured with `scripts/repro-432-fullscreen-ontop.sh` (workspace) on
   KWin X11: above the active fullscreen main window in 0 of 4 steps before, 6 of 6 after;
   confirmed by the user in Cubase Pro 15.0.30. Cubase hides the monitor itself while another
-  application is active and shows it again on the next click into a Cubase window.
+  application is active and shows it again on the next click into a Cubase window. On a
+  single monitor the monitor stayed visible but could not be clicked: the Expose rectangles
+  of a window growing to fullscreen include the area beneath the tool window, and
+  `X11DRV_Expose()` passed them to `update_window_zorder`, which moved the project window
+  above the tool window in the win32 order while X kept the opposite. With the cursor
+  clipped to the fullscreen window (its monitor is the whole virtual screen), every click
+  arrives at the clip window and win32 hit-testing picks the target, so the clicks went to
+  the project window. An Expose beneath the window's transient tool window no longer
+  changes the win32 order (same repro on one 1920x1080 screen: 0 of 3 clicks reach the
+  tool window before, 3 of 3 after; issue 570).
 - **win32u / winex11**: the Z-order resync after a window-manager raise no longer counts a
   window's own owned popups as predecessors. `sync_zorder_after_wm_raise()` looked for the
   first visible window above the clicked top-level and, if there was one, requested
