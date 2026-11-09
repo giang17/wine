@@ -4718,7 +4718,10 @@ LRESULT X11DRV_SysCommand( HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT 
         goto failed;
     }
 
-    if (NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_MAXIMIZE) goto failed;
+    /* A maximized window is neither sized nor moved with the keyboard.  Dragging its
+     * caption restores it under the pointer and moves it, on Windows as with the window
+     * manager, which does both when asked to move a maximized window. */
+    if ((NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_MAXIMIZE) && dir != _NET_WM_MOVERESIZE_MOVE) goto failed;
 
     if (!is_net_supported( x11drv_atom(_NET_WM_MOVERESIZE) ))
     {
