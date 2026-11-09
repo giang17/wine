@@ -389,7 +389,7 @@ static ID3D11DeviceContext1 *d2d_device_context_draw_setup(struct d2d_device_con
 
     ID3D11DeviceContext1_IASetInputLayout(context, shape_resources->il);
     ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext1_IASetIndexBuffer(context, ib, DXGI_FORMAT_R16_UINT, 0);
+    ID3D11DeviceContext1_IASetIndexBuffer(context, ib, DXGI_FORMAT_R32_UINT, 0);
     offset = 0;
     ID3D11DeviceContext1_IASetVertexBuffers(context, 0, 1, &vb, &vb_stride, &offset);
     ID3D11DeviceContext1_VSSetConstantBuffers(context, 0, 1, &vs_cb);
@@ -1679,7 +1679,7 @@ static BOOL d2d_device_context_batch_line(struct d2d_device_context *context, co
     }
     extra = (start_cap != D2D1_CAP_STYLE_FLAT ? 4 : 0) + (end_cap != D2D1_CAP_STYLE_FLAT ? 4 : 0);
 
-    /* One vertex buffer with 16-bit indices per batch. */
+    /* One vertex buffer per batch, flushed before it grows past 65,535 vertices. */
     if (batch->run_count && (batch->vertex_count + 4 + extra > 0xffff || batch->stroke_width != stroke_width
             || batch->miter_limit != miter_limit
             || batch->start_cap != start_cap || batch->end_cap != end_cap
@@ -2140,7 +2140,7 @@ static BOOL d2d_curve_is_flat(const struct d2d_curve_vertex *v, const float *m)
  * worse than none — an unmarked seam would get a skirt and be drawn twice — so
  * the caller falls back to the plain fill in that case. */
 static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
-        const UINT32 *edge_keys, BYTE *edge_curve, struct d2d_fill_aa_seam *seams, size_t map_size,
+        const UINT64 *edge_keys, BYTE *edge_curve, struct d2d_fill_aa_seam *seams, size_t map_size,
         const float *m)
 {
     const struct d2d_curve_vertex *curves[2];
@@ -2215,14 +2215,15 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
             {
                 for (b = a + 1; b < 3; ++b)
                 {
-                    UINT32 lo, hi, key, slot;
+                    UINT32 lo, hi, slot;
                     size_t probe = 0;
+                    UINT64 key;
 
-                    if (idx[a] > 0xffff || idx[b] > 0xffff || idx[a] == idx[b])
+                    if (idx[a] == idx[b])
                         continue;
                     lo = idx[a] < idx[b] ? idx[a] : idx[b];
                     hi = idx[a] < idx[b] ? idx[b] : idx[a];
-                    key = lo * 65536u + hi + 1u;
+                    key = ((UINT64)lo << 32) + hi + 1u;
                     slot = key % map_size;
                     while (probe < map_size && edge_keys[slot] && edge_keys[slot] != key)
                     {
@@ -2280,7 +2281,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
 static BOOL d2d_fill_aa_seam_params(const struct d2d_fill *fill, const struct d2d_face *f, int e,
         const struct d2d_fill_aa_seam *seam, float *t, float *c1, float *c2)
 {
-    UINT16 a = f->v[(e + 1) % 3], b = f->v[(e + 2) % 3], end;
+    UINT32 a = f->v[(e + 1) % 3], b = f->v[(e + 2) % 3], end;
     const D2D1_POINT_2F *s, *n, *o;
     float dx, dy, l2, h;
     int j;
@@ -2343,7 +2344,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     size_t fc = fill->face_count;
     size_t boundary_count = 0, seam_count = 0;
     size_t expanded_count, map_size, i, vi;
-    UINT32 *edge_keys;
+    UINT64 *edge_keys;
     BYTE *edge_cnt, *edge_processed, *edge_curve;
     float m[4];
 
@@ -2372,9 +2373,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
         int e;
         for (e = 0; e < 3; e++)
         {
-            UINT16 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
+            UINT32 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
             UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
-            UINT32 key = lo * 65536u + hi + 1u;
+            UINT64 key = ((UINT64)lo << 32) + hi + 1u;
             UINT32 slot = key % map_size;
             size_t probe = 0;
             while (probe < map_size && edge_keys[slot] && edge_keys[slot] != key)
@@ -2440,9 +2441,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
 
         for (e = 0; e < 3; e++)
         {
-            UINT16 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
+            UINT32 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
             UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
-            UINT32 key = lo * 65536u + hi + 1u;
+            UINT64 key = ((UINT64)lo << 32) + hi + 1u;
             UINT32 slot = key % map_size;
 
             while (edge_keys[slot] != key)
@@ -2465,9 +2466,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
 
         for (e = 0; e < 3; e++)
         {
-            UINT16 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
+            UINT32 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
             UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
-            UINT32 key = lo * 65536u + hi + 1u;
+            UINT64 key = ((UINT64)lo << 32) + hi + 1u;
             UINT32 slot = key % map_size;
             BOOL ramp;
 
@@ -2522,9 +2523,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
         int e;
         for (e = 0; e < 3; e++)
         {
-            UINT16 ai = f->v[(e + 1) % 3], bi = f->v[(e + 2) % 3];
+            UINT32 ai = f->v[(e + 1) % 3], bi = f->v[(e + 2) % 3];
             UINT32 lo = ai < bi ? ai : bi, hi = ai < bi ? bi : ai;
-            UINT32 key = lo * 65536u + hi + 1u;
+            UINT64 key = ((UINT64)lo << 32) + hi + 1u;
             UINT32 slot = key % map_size;
             D2D1_POINT_2F pa, pb, pc, edge_dir, outward;
             float dot_test, edge_len;
@@ -10228,7 +10229,7 @@ d2d_quad[] =
     { 1.0f,  1.0f},
     { 1.0f, -1.0f},
 };
-static const UINT16 d2d_quad_indices[] = {0, 1, 2, 2, 1, 3};
+static const UINT32 d2d_quad_indices[] = {0, 1, 2, 2, 1, 3};
 
 static HRESULT d2d_device_ensure_shape_resources(struct d2d_device *device, ID3D11Device1 *d3d_device)
 {

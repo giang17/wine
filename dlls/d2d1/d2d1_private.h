@@ -806,9 +806,13 @@ struct d2d_curve_vertex
     } texcoord;
 };
 
+/* The vertex indices of a fill or stroke mesh. 32 bits: the outline of a
+ * figure has four vertices per segment and per join, so a stroke of 16,384
+ * segments or more, and a fill of more than 65,536 vertices, would wrap
+ * 16-bit indices and draw triangles between the wrong points. */
 struct d2d_face
 {
-    UINT16 v[3];
+    UINT32 v[3];
 };
 
 /* What the end of an outline piece meets: a join with the next piece, or a
