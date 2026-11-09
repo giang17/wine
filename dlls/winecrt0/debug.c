@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include "windef.h"
 #include "winbase.h"
+#include "winternl.h"
 #include "wine/debug.h"
 
 WINE_DECLARE_DEBUG_CHANNEL(pid);
@@ -45,15 +46,87 @@ static int options_size;
 static struct __wine_debug_channel *debug_options;
 static DWORD partial_line_tid;  /* id of the last thread to output a partial line */
 
+/* Look up an ntdll export without taking the loader lock: the first use of a debug
+ * function in a module can come from a thread that must not wait for that lock, e.g.
+ * from a crash handler that suspended a thread inside the loader before it calls
+ * MiniDumpWriteDump(). ntdll is one of the first two entries of the load order list;
+ * these are linked before the process has a second thread and are never unlinked, so
+ * their links can be followed without the lock. */
+static void *find_ntdll_export( const char *name )
+{
+#ifndef __arm64ec__
+    static const WCHAR ntdllW[] = L"ntdll.dll";
+    const LIST_ENTRY *head = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
+    const LIST_ENTRY *entry = head->Flink;
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    const IMAGE_DATA_DIRECTORY *dir;
+    const IMAGE_NT_HEADERS *nt;
+    const DWORD *names, *functions;
+    const WORD *ordinals;
+    const char *base = NULL;
+    unsigned int i, j;
+    int min, max, pos, res;
+    DWORD rva;
+
+    for (i = 0; i < 2 && entry != head; i++, entry = entry->Flink)
+    {
+        const LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
+
+        if (mod->BaseDllName.Length != sizeof(ntdllW) - sizeof(WCHAR)) continue;
+        for (j = 0; j < ARRAY_SIZE(ntdllW) - 1; j++)
+        {
+            WCHAR ch = mod->BaseDllName.Buffer[j];
+            if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+            if (ch != ntdllW[j]) break;
+        }
+        if (j < ARRAY_SIZE(ntdllW) - 1) continue;
+        base = mod->DllBase;
+        break;
+    }
+    if (!base) return NULL;
+
+    nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir->VirtualAddress || dir->Size < sizeof(*exports)) return NULL;
+    exports = (const IMAGE_EXPORT_DIRECTORY *)(base + dir->VirtualAddress);
+    names = (const DWORD *)(base + exports->AddressOfNames);
+    ordinals = (const WORD *)(base + exports->AddressOfNameOrdinals);
+    functions = (const DWORD *)(base + exports->AddressOfFunctions);
+
+    min = 0;
+    max = exports->NumberOfNames - 1;
+    while (min <= max)
+    {
+        pos = (min + max) / 2;
+        if (!(res = strcmp( name, base + names[pos] )))
+        {
+            if (ordinals[pos] >= exports->NumberOfFunctions) return NULL;
+            rva = functions[ordinals[pos]];
+            /* a forward is left to GetProcAddress() */
+            if (!rva || (rva >= dir->VirtualAddress && rva < dir->VirtualAddress + dir->Size)) return NULL;
+            return (void *)(base + rva);
+        }
+        if (res < 0) max = pos - 1;
+        else min = pos + 1;
+    }
+#endif
+    return NULL;
+}
+
 static void load_func( void **func, const char *name, void *def )
 {
     if (!*func)
     {
-        DWORD err = GetLastError();
-        HMODULE module = GetModuleHandleW( L"ntdll.dll" );
-        void *proc = GetProcAddress( module, name );
+        void *proc = find_ntdll_export( name );
+
+        if (!proc)
+        {
+            DWORD err = GetLastError();
+            HMODULE module = GetModuleHandleW( L"ntdll.dll" );
+            proc = GetProcAddress( module, name );
+            SetLastError( err );
+        }
         InterlockedExchangePointer( func, proc ? proc : def );
-        SetLastError( err );
     }
 }
 #define LOAD_FUNC(name) load_func( (void **)&p ## name, #name, fallback ## name )
