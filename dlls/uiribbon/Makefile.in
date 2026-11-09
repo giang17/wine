@@ -1,5 +1,5 @@
 MODULE    = uiribbon.dll
-IMPORTS   = uuid ole32
+IMPORTS   = uuid ole32 user32 gdi32
 
 SOURCES = \
 	main.c \
