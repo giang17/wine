@@ -104,7 +104,7 @@ static void ListUninstallPrograms(void)
 }
 
 
-static void RemoveSpecificProgram(WCHAR *nameW)
+static BOOL RemoveSpecificProgram(WCHAR *nameW)
 {
     unsigned int i;
 
@@ -120,9 +120,13 @@ static void RemoveSpecificProgram(WCHAR *nameW)
     }
 
     if (i < numentries)
+    {
         UninstallProgram();
-    else
-        output_message(FALSE, STRING_NO_APP_MATCH, nameW);
+        return TRUE;
+    }
+
+    output_message(FALSE, STRING_NO_APP_MATCH, nameW);
+    return FALSE;
 }
 
 
@@ -185,8 +189,7 @@ int __cdecl wmain(int argc, WCHAR *argv[])
                 return 1;
             }
 
-            RemoveSpecificProgram( argv[i++] );
-            return 0;
+            return RemoveSpecificProgram( argv[i++] ) ? 0 : 1;
         }
         else
         {
