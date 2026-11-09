@@ -895,6 +895,35 @@ struct d2d_fill
     size_t arc_vertex_count;
 };
 
+/* The mesh a geometry is stroked with: a quad per segment, joins and caps,
+ * curve pieces for the Bézier and arc segments. */
+struct d2d_outline
+{
+    struct d2d_outline_vertex *vertices;
+    size_t vertices_size;
+    size_t vertex_count;
+
+    struct d2d_face *faces;
+    size_t faces_size;
+    size_t face_count;
+
+    struct d2d_curve_outline_vertex *beziers;
+    size_t beziers_size;
+    size_t bezier_count;
+
+    struct d2d_face *bezier_faces;
+    size_t bezier_faces_size;
+    size_t bezier_face_count;
+
+    struct d2d_curve_outline_vertex *arcs;
+    size_t arcs_size;
+    size_t arc_count;
+
+    struct d2d_face *arc_faces;
+    size_t arc_faces_size;
+    size_t arc_face_count;
+};
+
 struct d2d_geometry
 {
     ID2D1Geometry ID2D1Geometry_iface;
@@ -907,33 +936,7 @@ struct d2d_geometry
     D2D_MATRIX_3X2_F transform;
 
     struct d2d_fill fill;
-
-    struct
-    {
-        struct d2d_outline_vertex *vertices;
-        size_t vertices_size;
-        size_t vertex_count;
-
-        struct d2d_face *faces;
-        size_t faces_size;
-        size_t face_count;
-
-        struct d2d_curve_outline_vertex *beziers;
-        size_t beziers_size;
-        size_t bezier_count;
-
-        struct d2d_face *bezier_faces;
-        size_t bezier_faces_size;
-        size_t bezier_face_count;
-
-        struct d2d_curve_outline_vertex *arcs;
-        size_t arcs_size;
-        size_t arc_count;
-
-        struct d2d_face *arc_faces;
-        size_t arc_faces_size;
-        size_t arc_face_count;
-    } outline;
+    struct d2d_outline outline;
 
     union
     {
@@ -957,9 +960,11 @@ struct d2d_geometry
 
             D2D1_RECT_F bounds;
 
-            /* A path of many vertices and no curves is tessellated when it is
-             * first filled, clipped to the target of that fill, instead of in
-             * Close(); see d2d_geometry_acquire_fill(). */
+            /* A path of many vertices without curves is tessellated when it
+             * is first filled, clipped to the target of that fill, instead of
+             * in Close(), and its stroke outline is built when it is first
+             * stroked instead of in EndFigure(); see the comment at
+             * d2d_geometry_sink_EndFigure() in geometry.c. */
             struct
             {
                 BOOL deferred;
@@ -967,6 +972,11 @@ struct d2d_geometry
                 BOOL whole;
                 D2D1_RECT_F clip;
             } lazy_fill;
+            struct
+            {
+                BOOL deferred;
+                BOOL valid;
+            } lazy_outline;
         } path;
         struct
         {
@@ -1010,6 +1020,8 @@ struct d2d_geometry *unsafe_impl_from_ID2D1Geometry(ID2D1Geometry *iface);
 const struct d2d_fill *d2d_geometry_acquire_fill(const struct d2d_geometry *geometry, const D2D1_RECT_F *clip);
 void d2d_geometry_release_fill(const struct d2d_geometry *geometry);
 BOOL d2d_geometry_fill_is_simple(const struct d2d_geometry *geometry);
+const struct d2d_outline *d2d_geometry_acquire_outline(const struct d2d_geometry *geometry);
+void d2d_geometry_release_outline(const struct d2d_geometry *geometry);
 struct d2d_geometry *d2d_geometry_create_dashed_outline(ID2D1Geometry *iface,
         ID2D1StrokeStyle *stroke_style, float unit, const D2D1_MATRIX_3X2_F *metric);
 void d2d_geometry_destroy_dashed_outline(struct d2d_geometry *outline);
