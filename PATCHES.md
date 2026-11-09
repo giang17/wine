@@ -165,6 +165,25 @@ This is the recommended branch. What it changes, by subsystem:
   covers 11.3 px² like an inscribed octagon, radius 3 covers 27.4 of 28.3 — and the fork draws
   the disc, which is why round dots and dash ends come out 3–10 % brighter than on Windows
   (issue 571)
+- **D2D1 mesh indices**: the fill and stroke meshes indexed their vertices with 16 bits
+  (`struct d2d_face`, `DXGI_FORMAT_R16_UINT`; upstream the same), so a mesh of more than 65,536
+  vertices wrapped its indices and drew triangles between the wrong points. The stroke outline has
+  four vertices per segment and per join, so every stroke of a figure of 16,384 segments or more
+  was affected: a 3 px stroke of a closed figure of 64,000 vertices showed half of its baseline or
+  half of its wave (2,052 and 3,137 lit pixels, the figure with 4,000 or 16,000 vertices 10,702 and
+  10,652); a fill of 800,000 vertices tessellated whole and shifted so that the vertices in view
+  had indices around 400,000 drew nothing. The fill lost faces as well, not only their places: the
+  face of a wrapped index points at a wrong vertex, its orientation test fails about half the time
+  and the face is dropped -- the whole tessellation of a 400,000-point wave produced 202,880 faces
+  for 399,318 vertices and produces 399,431 now (2,000,000 points: 1,008,740 and 2,010,498), so
+  Close() and the fill of such a path take correspondingly longer (1.97 s instead of 1.23 s, 585
+  instead of 283 ms), the time per face being unchanged. The indices, the index buffers and the
+  edge keys of the fill antialiasing are 32 bits now: the 64,000-vertex stroke is complete (10,635 pixels, the
+  two orders of the figure pixel-identical), the shifted fill shows its wave (87,176 pixels, the
+  clipped tessellation of issue 572 draws 87,177), the whole and the clipped tessellation of the
+  fill in view differ in 32 pixels where the wrapped indices had made 1,029. Every image of
+  `d2d1-dash-449` and `d2d1-curve-edge-aa` is pixel-identical, the d2d1 tests fail at the same
+  30 places (issue 575)
 - **D2D1 antialiasing ramp**: the shape pixel shader turned the signed pixel distance from a
   pixel centre to an edge into coverage with `saturate(d + 0.5)`, which is the covered area only
   for an edge parallel to a pixel side. Across a 45° edge the pixel's corners reach 1/√2 from its
