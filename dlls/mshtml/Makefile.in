@@ -11,6 +11,7 @@ SOURCES = \
 	htmlarea.c \
 	htmlattr.c \
 	htmlbody.c \
+	htmlcanvas.c \
 	htmlcurstyle.c \
 	htmldoc.c \
 	htmlelem.c \

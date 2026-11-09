@@ -67,7 +67,7 @@ static const tag_desc_t tag_descs[] = {
     {L"BODY",           HTMLBodyElement_Create},
     {L"BR",             HTMLElement_Ctor},
     {L"BUTTON",         HTMLButtonElement_Create},
-    {L"CANVAS",         HTMLElement_Ctor},
+    {L"CANVAS",         HTMLCanvasElement_Create},
     {L"CAPTION",        HTMLElement_Ctor},
     {L"CENTER",         HTMLElement_Ctor},
     {L"CITE",           HTMLElement_Ctor},
