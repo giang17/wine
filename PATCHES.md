@@ -610,6 +610,27 @@ This is the recommended branch. What it changes, by subsystem:
   nothing for other elements, whose automatic minimum is zero already, and any rule of the
   page overrides it; the mshtml `style`, `dom` and `events` tests give the same results with
   and without it
+- **mshtml**: a `canvas` element has `getContext()`; `getContext("2d")` returns a context with
+  the `font` property and `measureText()`, whose `TextMetrics` result carries the text width
+  measured with GDI (CSS font shorthand: style, weight, size in `px` or `pt`, family list with
+  the generic families mapped to Arial, Times New Roman and Courier New). No drawing method is
+  defined, so a script testing for one still finds it missing; other context types return
+  `null`. Before, `CANVAS` was a plain `HTMLElement`: the HTML ribbon of Power BI Desktop's
+  classic Power Query editor measures its button and tab labels this way, stopped with "Object
+  doesn't support this property or method" and left the editor on its loading spinner. The
+  mshtml `script` test passes with the three objects (`HTMLCanvasElement`,
+  `CanvasRenderingContext2D`, `TextMetrics`) taken off its todo lists and a test of the
+  measuring calls added (issue 562)
+- **uiribbon**: `IUIFramework::Initialize()`, `LoadUI()`, `GetView()` and `Destroy()` succeed
+  instead of returning `E_NOTIMPL`; the application gets `IUIApplication::OnViewChanged()` for
+  a ribbon view of height 0, the framework object and the view each have the `IPropertyStore`
+  on which applications set the ribbon colours and `UI_PKEY_Viewable`, and
+  `UIRibbonImageFromBitmapFactory` (registered, but without an implementation) wraps a bitmap
+  in an `IUIImage`. The ribbon markup is not read, no command is created and nothing is drawn:
+  an application that relies on the native ribbon for its commands gets an empty one. Power BI
+  Desktop's classic Power Query editor ("Transform data") failed with "Could not initialize
+  ribbon framework"; it draws its ribbon in HTML and opens with these calls answered
+  (issue 562)
 - **winemenubuilder**: a shortcut without arguments no longer produces a desktop entry whose
   `Exec` line ends in an empty `""` argument (backport of 1977760e374 from Wine 11.19). vatSys,
   which registers the `vatsys://` URL protocol, exited silently during its .NET start-up when
@@ -2304,7 +2325,7 @@ these were developed against, but they are not specific to it.
 | NinjaTrader 8.1.8.4 | .NET Framework 4.8 WPF (Direct3D 9); chat in WebView2 inside an `UpdateLayeredWindow()` window | Runs with native .NET Framework 4.8 (`winetricks dotnet48`; under Wine-Mono it stops at start-up, WineHQ bug 59948): logs on to the simulation data servers, charts with live data, the chat, and the built-in self-update (8.1.8.3 → 8.1.8.4). Needs from this branch: the `websocket.dll` WebSocket Protocol Component, without which the logon fails in the .NET `WebSocketProtocolComponent` type initializer; the wineserver changes that keep the client area of an `UpdateLayeredWindow()` window in its surface region and let a DirectComposition child of another process draw over it, without which the chat shows only its grey background; and the present blit no longer replayed over a layered window's content, without which the welcome window keeps an L-shaped hole at its top-left corner |
 | UTAU 0.4.19 (singing voice synthesis) | Visual Basic 6 | Installs (`utau0419cInstaller.zip`, Japanese MSI) and starts with `LANG=ja_JP.UTF-8`: project window with piano roll and the voicebank report at start-up. The project window is owned by a 1x1 window that skips the taskbar; it gets its own taskbar entry from the owned `WS_EX_APPWINDOW` change in this branch, without which it has none under KDE Plasma (KDE bug 514758). In a fresh prefix the installer's text shows as boxes, the application's own text does not. Editing and rendering were not tried |
 | D16 Group Echolite 1.0.0 / Frontier (VST3 in Reaper) | JUCE 7.0.8 | Online activation with a D16 account holds across re-insertion and REAPER restarts. Needs the `ntdll` creation-time patch from this branch: without it the plug-in asks for activation again on every load, because writing the key changes the creation time Wine reports for its folder (WineHQ bug 51870) |
-| Power BI Desktop 2.158 | .NET Framework 4.8 WinForms + WebView2 (report views, title bar) + IE web browser control (dialogs); Analysis Services engine `msmdsrv.exe` | Runs on the devel branch only: the local NTLM sign-in to the Analysis Services engine needs Wine 11.17 or later, on `d2d1-dcomp-11.0` the start ends in "Authentication failed". Also needs native .NET Framework 4.8 (`winetricks dotnet48`), Gecko for the IE control and `ntlm_auth` from Samba's winbind package (the daemon need not run). Then: the untitled report with its semantic model, the options and error dialogs, move, resize and maximize without flicker or black frames, clean exit; importing data and publishing were not tried. Needs from this branch: `NtImpersonateAnonymousToken()`, the Windows Runtime metadata files (without them the start fails on `Windows.Storage.Streams.IInputStreamReference`), the dcomp clipping of covered `WS_EX_TRANSPARENT` hosts and the hold of an absent swap-chain leaf, the wineserver fixes for the surface flush over foreign children and for the sibling list during an unlink, the winex11 capture during a window-manager move, and the IE flex minimum in mshtml. `Windows.System.Launcher` and `IStorageItemProperties` are defined in no IDL yet |
+| Power BI Desktop 2.158 | .NET Framework 4.8 WinForms + WebView2 (report views, title bar) + IE web browser control (dialogs); Analysis Services engine `msmdsrv.exe` | Runs on the devel branch only: the local NTLM sign-in to the Analysis Services engine needs Wine 11.17 or later, on `d2d1-dcomp-11.0` the start ends in "Authentication failed". Also needs native .NET Framework 4.8 (`winetricks dotnet48`), Gecko for the IE control and `ntlm_auth` from Samba's winbind package (the daemon need not run). Then: the untitled report with its semantic model, the options and error dialogs, move, resize and maximize without flicker or black frames, clean exit; importing the sample workbook and editing it in the classic Power Query editor ("Transform data") work; publishing was not tried. Needs from this branch: `NtImpersonateAnonymousToken()`, the Windows Runtime metadata files (without them the start fails on `Windows.Storage.Streams.IInputStreamReference`), the dcomp clipping of covered `WS_EX_TRANSPARENT` hosts and the hold of an absent swap-chain leaf, the wineserver fixes for the surface flush over foreign children and for the sibling list during an unlink, the winex11 capture during a window-manager move, the IE flex minimum and the canvas text measuring in mshtml, and the `uiribbon` framework start-up. `Windows.System.Launcher` and `IStorageItemProperties` are defined in no IDL yet |
 
 ## Font Setup
 
