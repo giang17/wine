@@ -149,7 +149,22 @@ This is the recommended branch. What it changes, by subsystem:
   for a normal stroke and on the device for fixed and hairline ones. A hairline stroke is one
   pixel wide now (it was drawn with the transformed width). Every cell is within RMS 0.023 of
   Windows (before: all solid); solid strokes render pixel-identical, the d2d1 tests fail at the
-  same places (issue 449)
+  same places (issue 449). The flat end of a stroke — the start or end cap of an open figure,
+  or a flat dash cap — was cut hard by the rasterizer: a flat cap draws nothing, and the quad of
+  a straight segment or the strip of a curve piece ended on the line across the end, so on a
+  diagonal the end stepped where Windows ramps it (the 45° zig-zag of the dash cells: 255 and 0
+  at the figure's start and end against Windows' 143). A piece that ends in a flat cap now runs
+  0.75 px past the end, and the pixel shader ramps the end like the sides, a corner pixel with
+  the product of both ramps (Windows 48, the fork 97 before and 48 now). The zig-zag cells go
+  from RMS 0.014 to 0.008 against Windows, the dashed cubic from 0.023 to 0.013, the rotated
+  dashed line from 0.023 to 0.005, the bevel and miter zig-zags of `d2d1-curve-edge-aa` from
+  0.024 and 0.021 to 0.018 and 0.013; round, square and triangle caps, joins, closed figures and
+  fills render pixel-identical, the d2d1 tests fail at the same places. What remains at the
+  ends is Windows' own coverage (0.56 on a 45° end line through the pixel centre, where the
+  area is 0.50). Round caps are not touched: Windows draws them as polygons — a dot of radius 2
+  covers 11.3 px² like an inscribed octagon, radius 3 covers 27.4 of 28.3 — and the fork draws
+  the disc, which is why round dots and dash ends come out 3–10 % brighter than on Windows
+  (issue 571)
 - **D2D1 geometry realizations**: `DrawGeometryRealization()` drew only into a command list;
   on a bitmap, DXGI surface or swap chain target it returned without drawing, so an application
   that uses `CreateFilledGeometryRealization()` / `CreateStrokedGeometryRealization()` lost the
