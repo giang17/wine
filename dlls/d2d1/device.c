@@ -1612,6 +1612,24 @@ static void d2d_device_context_flush_batches(struct d2d_device_context *context)
     d2d_device_context_flush_fills(context);
 }
 
+/* The stroke width in world units. A fixed stroke keeps its width on the
+ * device, a hairline is one pixel wide whatever the width asked for. */
+static float d2d_device_context_stroke_width(const struct d2d_device_context *context,
+        const struct d2d_stroke_style *stroke_style, float stroke_width)
+{
+    const D2D1_MATRIX_3X2_F *w = &context->drawing_state.transform;
+    float scale;
+
+    if (!stroke_style || stroke_style->desc.transformType == D2D1_STROKE_TRANSFORM_TYPE_NORMAL)
+        return stroke_width;
+
+    if (!((scale = w->m11) > 0.0f) && !((scale = sqrtf(fabsf(w->m11 * w->m22 - w->m12 * w->m21))) > 0.0f))
+        scale = 1.0f;
+    if (stroke_style->desc.transformType == D2D1_STROKE_TRANSFORM_TYPE_HAIRLINE)
+        return 96.0f / context->desc.dpiX / scale;
+    return stroke_width / scale;
+}
+
 /* Appends a line to the batch. Returns FALSE when the line cannot be batched;
  * the caller then draws it the ordinary way, which flushes the batch first. The
  * geometry is what d2d_geometry_outline_add_line_segment() produces for an open
@@ -1638,10 +1656,9 @@ static BOOL d2d_device_context_batch_line(struct d2d_device_context *context, co
     /* What DrawGeometry() takes from a stroke style for a two-point figure;
      * dashes are ignored there as well. */
     miter_limit = 10.0f;
+    stroke_width = d2d_device_context_stroke_width(context, stroke_style_impl, stroke_width);
     if (stroke_style_impl)
     {
-        if (stroke_style_impl->desc.transformType == D2D1_STROKE_TRANSFORM_TYPE_FIXED)
-            stroke_width /= context->drawing_state.transform.m11;
         miter_limit = stroke_style_impl->desc.miterLimit;
         start_cap = stroke_style_impl->desc.startCap;
         end_cap = stroke_style_impl->desc.endCap;
@@ -1888,11 +1905,7 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext
             FIXME("Ignoring stroke style %p.\n", stroke_style);
     }
 
-    if (stroke_style_impl)
-    {
-        if (stroke_style_impl->desc.transformType == D2D1_STROKE_TRANSFORM_TYPE_FIXED)
-            stroke_width /= context->drawing_state.transform.m11;
-    }
+    stroke_width = d2d_device_context_stroke_width(context, stroke_style_impl, stroke_width);
 
     {
         D2D1_CAP_STYLE start_cap = D2D1_CAP_STYLE_FLAT, end_cap = D2D1_CAP_STYLE_FLAT;
