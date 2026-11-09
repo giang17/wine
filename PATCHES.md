@@ -1204,7 +1204,19 @@ This is the recommended branch. What it changes, by subsystem:
   instead of 243 ms; at 4,000 points 2.4, 2.6 and 1.9 ms instead of 26, 16 and 6.5 ms. A
   polyline of 32,000 points along one line stays at 2.8 s: every face's probe still meets every
   edge there (issue 528; a winding propagation over the triangulation would be linear for that
-  case too, not done).
+  case too, not done). Two more loops of `Close()` scaled badly on the paths Serum 2 fills per
+  frame for its oscillator view zoomed in while MIDI plays (one figure, up to 1.77 million
+  vertices, 223 units high and up to 1.8 million wide; the plug-in UI froze for seconds): the
+  removal of collinear `LINE` vertices moved the rest of the figure down once per removed
+  vertex and now compacts the figure in one pass, and the self-intersection grid, capped at 256
+  cells per side, put such a path into one row of 256 cells with thousands of segments each and
+  now follows the aspect ratio up to 65,536 cells per side and 2^20 in all. Measured with a probe
+  in `Close()` in Serum: per million vertices 6.6 s before (5.4 s of it in the intersection
+  search), 1.1 s after (0.09 s), the longest `Close()` 14.4 s before, 1.0 s after. What is left
+  is the triangulation of the whole path, most of it outside the target, so the view still
+  stalls while MIDI plays (issue 572). `scripts/repro-572-close-collinear.c` (workspace) closes
+  2 x 32,000 points with a collinear return in 35 ms instead of 185-316 ms; the fills render
+  hash-identical, the images of issues 444 and 449 pixel-identical, the d2d1 tests unchanged.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
