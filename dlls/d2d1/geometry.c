@@ -4712,6 +4712,58 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_AddBeziers(ID2D1GeometrySink *if
     geometry->u.path.segment_count += count;
 }
 
+/* Large paths (wine-dev issue 572).
+ *
+ * Serum 2 draws the gradient area behind its oscillator view, zoomed in while
+ * MIDI plays, as one filled path of up to 5 million vertices per frame, a few
+ * hundred pixels of which are in view. Two things cost about a second per
+ * frame: EndFigure() built the stroke outline of the figure (four vertices and
+ * two faces per segment, 480 MB for that path), though the path is never
+ * stroked, and Close() triangulated the whole path for the fill. Windows
+ * tessellates a geometry when it is drawn, under the transform of that draw
+ * and clipped to the target.
+ *
+ * A figure of D2D_LAZY_VERTEX_COUNT vertices or more without curves therefore
+ * leaves EndFigure() without an outline, and the outline of the path, all of
+ * its figures, is built when the path is first stroked
+ * (d2d_geometry_acquire_outline()). A path of that many vertices without
+ * curves leaves Close() without a fill; its first fill tessellates it, clipped
+ * to the target of that fill mapped into geometry space with a margin for the
+ * antialiasing ramps (d2d_device_context_get_fill_clip(),
+ * d2d_geometry_acquire_fill()). A later fill that shows a part outside that
+ * clip tessellates it again, a fill whose clip holds the whole path
+ * tessellates the whole path once and keeps it. The clipped figures are
+ * copies, so the figures of the path stay as the application built them, for
+ * Stream(), FillContainsPoint() and the dashed strokes. Transformed and group
+ * geometries copy the fill and the outline of the path they wrap when they are
+ * created, empty for such a path, so every consumer goes through the acquire
+ * functions, which find that path and hold a lock while the data is in use: a
+ * second thread filling the same path under another transform would replace
+ * it. WINE_D2D_LAZY_GEOMETRY=0 builds everything in EndFigure() and Close(),
+ * as before. */
+#define D2D_LAZY_VERTEX_COUNT 16384
+
+static BOOL d2d_lazy_geometry_enabled(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_LAZY_GEOMETRY", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+static void d2d_outline_free(struct d2d_outline *outline)
+{
+    free(outline->arc_faces);
+    free(outline->arcs);
+    free(outline->bezier_faces);
+    free(outline->beziers);
+    free(outline->faces);
+    free(outline->vertices);
+    memset(outline, 0, sizeof(*outline));
+}
+
 static void STDMETHODCALLTYPE d2d_geometry_sink_EndFigure(ID2D1GeometrySink *iface, D2D1_FIGURE_END figure_end)
 {
     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
@@ -4735,7 +4787,21 @@ static void STDMETHODCALLTYPE d2d_geometry_sink_EndFigure(ID2D1GeometrySink *ifa
     if (figure_end == D2D1_FIGURE_END_CLOSED)
         ++geometry->u.path.segment_count;
 
-    if (!d2d_geometry_add_figure_outline(geometry, figure, figure_end))
+    /* The outline of a large figure is built when the path is first stroked
+     * (comment above); the figures before it give theirs up, so that the
+     * outline is built as one then. */
+    if (geometry->u.path.lazy_outline.deferred || (figure->vertex_count >= D2D_LAZY_VERTEX_COUNT
+            && !figure->bezier_control_count && d2d_lazy_geometry_enabled()))
+    {
+        if (!geometry->u.path.lazy_outline.deferred)
+        {
+            TRACE("Deferring the outline of path %p to its first stroke, figure of %Iu vertices.\n",
+                    geometry, figure->vertex_count);
+            d2d_outline_free(&geometry->outline);
+            geometry->u.path.lazy_outline.deferred = TRUE;
+        }
+    }
+    else if (!d2d_geometry_add_figure_outline(geometry, figure, figure_end))
     {
         ERR("Failed to add figure outline.\n");
         d2d_geometry_set_error(geometry, E_OUTOFMEMORY);
@@ -5673,44 +5739,13 @@ static void d2d_path_geometry_remove_collinear_vertices(struct d2d_geometry *geo
     }
 }
 
-/* Fills of paths too large to tessellate in Close() (wine-dev issue 572).
- *
- * Serum 2 draws the gradient area behind its oscillator view, zoomed in while
- * MIDI plays, as one filled path of up to 1.8 million vertices per frame, a
- * few hundred pixels of which are in view; the constrained Delaunay
- * triangulation of the whole path in Close() took about a second per frame.
- * Windows tessellates a geometry when it is drawn, under the transform of that
- * draw and clipped to the target. A path of D2D_FILL_DEFER_VERTEX_COUNT
- * vertices or more without curves therefore leaves Close() without a fill. Its
- * first fill tessellates it, clipped to the target of that fill mapped into
- * geometry space with a margin for the antialiasing ramps
- * (d2d_device_context_get_fill_clip()); a later fill that shows a part outside
- * that clip tessellates it again, and a fill whose clip holds the whole path
- * tessellates the whole path once and keeps it. The clipped figures are copies,
- * so the figures of the path stay as the application built them, for Stream(),
- * FillContainsPoint() and the dashed strokes. Transformed and group geometries
- * copy the fill of the path they wrap when they are created, empty for such a
- * path, so every consumer of a fill goes through d2d_geometry_acquire_fill(),
- * which finds that path. The fill is locked while a consumer uses it: a second
- * thread filling the same path under another transform would replace it.
- * WINE_D2D_LAZY_FILL=0 tessellates every path in Close(), as before. */
-#define D2D_FILL_DEFER_VERTEX_COUNT 65536
-
-static BOOL d2d_lazy_fill_enabled(void)
-{
-    static int enabled = -1;
-    char buf[8];
-
-    if (enabled < 0)
-        enabled = !(GetEnvironmentVariableA("WINE_D2D_LAZY_FILL", buf, sizeof(buf)) && !strcmp(buf, "0"));
-    return enabled;
-}
-
+/* Whether Close() leaves the fill of the path to its first fill; see the
+ * comment at d2d_geometry_sink_EndFigure(). */
 static BOOL d2d_path_geometry_defer_fill(struct d2d_geometry *geometry)
 {
     size_t i, count = 0;
 
-    if (!d2d_lazy_fill_enabled())
+    if (!d2d_lazy_geometry_enabled())
         return FALSE;
 
     for (i = 0; i < geometry->u.path.figure_count; ++i)
@@ -5722,7 +5757,7 @@ static BOOL d2d_path_geometry_defer_fill(struct d2d_geometry *geometry)
         if (!(figure->flags & D2D_FIGURE_FLAG_HOLLOW))
             count += figure->vertex_count;
     }
-    if (count < D2D_FILL_DEFER_VERTEX_COUNT)
+    if (count < D2D_LAZY_VERTEX_COUNT)
         return FALSE;
 
     TRACE("Deferring the fill of path %p with %Iu vertices to its first fill.\n", geometry, count);
@@ -10434,14 +10469,14 @@ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *fac
     return hr;
 }
 
-static CRITICAL_SECTION d2d_lazy_fill_cs;
-static CRITICAL_SECTION_DEBUG d2d_lazy_fill_cs_debug =
+static CRITICAL_SECTION d2d_lazy_cs;
+static CRITICAL_SECTION_DEBUG d2d_lazy_cs_debug =
 {
-    0, 0, &d2d_lazy_fill_cs,
-    { &d2d_lazy_fill_cs_debug.ProcessLocksList, &d2d_lazy_fill_cs_debug.ProcessLocksList },
-      0, 0, { (DWORD_PTR)(__FILE__ ": d2d_lazy_fill_cs") }
+    0, 0, &d2d_lazy_cs,
+    { &d2d_lazy_cs_debug.ProcessLocksList, &d2d_lazy_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": d2d_lazy_cs") }
 };
-static CRITICAL_SECTION d2d_lazy_fill_cs = { &d2d_lazy_fill_cs_debug, -1, 0, 0, 0, 0 };
+static CRITICAL_SECTION d2d_lazy_cs = { &d2d_lazy_cs_debug, -1, 0, 0, 0, 0 };
 
 /* One pass of Sutherland-Hodgman: the part of the closed polygon "in" on one
  * side of a vertical (x = limit) or horizontal (y = limit) line, "greater"
@@ -10661,12 +10696,12 @@ static void d2d_path_geometry_fill_ensure(struct d2d_geometry *geometry, const D
         geometry->u.path.lazy_fill.clip = *clip;
 }
 
-/* The geometry whose fill a geometry draws: transformed and group geometries
- * draw the fill of the path they wrap. */
-static struct d2d_geometry *d2d_geometry_fill_owner(const struct d2d_geometry *geometry)
+/* The geometry whose fill and outline a geometry draws: transformed and group
+ * geometries draw those of the path they wrap. */
+static struct d2d_geometry *d2d_geometry_data_owner(const struct d2d_geometry *geometry)
 {
-    /* The fill is a cache that the first fill completes; the geometry itself
-     * does not change. */
+    /* The fill and the outline are caches that the first draw completes; the
+     * geometry itself does not change. */
     struct d2d_geometry *g = (struct d2d_geometry *)geometry;
 
     for (;;)
@@ -10690,26 +10725,76 @@ static BOOL d2d_geometry_fill_is_deferred(const struct d2d_geometry *owner)
  * d2d_geometry_release_fill(). */
 const struct d2d_fill *d2d_geometry_acquire_fill(const struct d2d_geometry *geometry, const D2D1_RECT_F *clip)
 {
-    struct d2d_geometry *owner = d2d_geometry_fill_owner(geometry);
+    struct d2d_geometry *owner = d2d_geometry_data_owner(geometry);
 
     if (!d2d_geometry_fill_is_deferred(owner))
         return &geometry->fill;
 
-    EnterCriticalSection(&d2d_lazy_fill_cs);
+    EnterCriticalSection(&d2d_lazy_cs);
     d2d_path_geometry_fill_ensure(owner, clip);
     return &owner->fill;
 }
 
 void d2d_geometry_release_fill(const struct d2d_geometry *geometry)
 {
-    if (d2d_geometry_fill_is_deferred(d2d_geometry_fill_owner(geometry)))
-        LeaveCriticalSection(&d2d_lazy_fill_cs);
+    if (d2d_geometry_fill_is_deferred(d2d_geometry_data_owner(geometry)))
+        LeaveCriticalSection(&d2d_lazy_cs);
 }
 
 /* Whether the fill is at most two triangles, a rectangle at most. */
 BOOL d2d_geometry_fill_is_simple(const struct d2d_geometry *geometry)
 {
-    return !d2d_geometry_fill_is_deferred(d2d_geometry_fill_owner(geometry)) && geometry->fill.face_count <= 2;
+    return !d2d_geometry_fill_is_deferred(d2d_geometry_data_owner(geometry)) && geometry->fill.face_count <= 2;
+}
+
+/* Build the outline EndFigure() left to the first stroke: every figure, as
+ * EndFigure() would have. */
+static void d2d_path_geometry_outline_ensure(struct d2d_geometry *geometry)
+{
+    size_t i;
+
+    if (geometry->u.path.lazy_outline.valid)
+        return;
+
+    for (i = 0; i < geometry->u.path.figure_count; ++i)
+    {
+        struct d2d_figure *figure = &geometry->u.path.figures[i];
+
+        if (!d2d_geometry_add_figure_outline(geometry, figure,
+                figure->flags & D2D_FIGURE_FLAG_CLOSED ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN))
+        {
+            WARN("Failed to build the outline of path %p.\n", geometry);
+            d2d_outline_free(&geometry->outline);
+            break;
+        }
+    }
+    TRACE("Path %p outlined, %Iu vertices, %Iu faces.\n", geometry,
+            geometry->outline.vertex_count, geometry->outline.face_count);
+    geometry->u.path.lazy_outline.valid = TRUE;
+}
+
+static BOOL d2d_geometry_outline_is_deferred(const struct d2d_geometry *owner)
+{
+    return owner->ops == &d2d_path_geometry_ops && owner->u.path.lazy_outline.deferred;
+}
+
+/* The outline of a geometry, held until d2d_geometry_release_outline(). */
+const struct d2d_outline *d2d_geometry_acquire_outline(const struct d2d_geometry *geometry)
+{
+    struct d2d_geometry *owner = d2d_geometry_data_owner(geometry);
+
+    if (!d2d_geometry_outline_is_deferred(owner))
+        return &geometry->outline;
+
+    EnterCriticalSection(&d2d_lazy_cs);
+    d2d_path_geometry_outline_ensure(owner);
+    return &owner->outline;
+}
+
+void d2d_geometry_release_outline(const struct d2d_geometry *geometry)
+{
+    if (d2d_geometry_outline_is_deferred(d2d_geometry_data_owner(geometry)))
+        LeaveCriticalSection(&d2d_lazy_cs);
 }
 
 /* Dashed strokes. The figures are cut into dash pieces along their arc length,

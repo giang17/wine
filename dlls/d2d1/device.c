@@ -1771,9 +1771,10 @@ static BOOL d2d_device_context_batch_line(struct d2d_device_context *context, co
     return TRUE;
 }
 
-static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
-        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width, float miter_limit,
-        D2D1_LINE_JOIN line_join, D2D1_CAP_STYLE start_cap, D2D1_CAP_STYLE end_cap, D2D1_CAP_STYLE dash_cap)
+static void d2d_device_context_draw_outline(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, const struct d2d_outline *outline, struct d2d_brush *brush,
+        float stroke_width, float miter_limit, D2D1_LINE_JOIN line_join, D2D1_CAP_STYLE start_cap,
+        D2D1_CAP_STYLE end_cap, D2D1_CAP_STYLE dash_cap)
 {
     ID3D11Buffer *ib, *vb;
     HRESULT hr;
@@ -1790,13 +1791,13 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
         return;
     }
 
-    if (geometry->outline.face_count)
+    if (outline->face_count)
     {
         if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
                 D3D11_BIND_INDEX_BUFFER,
-                geometry->outline.face_count * sizeof(*geometry->outline.faces),
+                outline->face_count * sizeof(*outline->faces),
                 &render_target->scratch_ib[D2D_SHAPE_TYPE_OUTLINE],
-                geometry->outline.faces, &ib)))
+                outline->faces, &ib)))
         {
             WARN("Failed to create index buffer, hr %#lx.\n", hr);
             return;
@@ -1804,25 +1805,25 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
 
         if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
                 D3D11_BIND_VERTEX_BUFFER,
-                geometry->outline.vertex_count * sizeof(*geometry->outline.vertices),
+                outline->vertex_count * sizeof(*outline->vertices),
                 &render_target->scratch_vb[D2D_SHAPE_TYPE_OUTLINE],
-                geometry->outline.vertices, &vb)))
+                outline->vertices, &vb)))
         {
             ERR("Failed to create vertex buffer, hr %#lx.\n", hr);
             return;
         }
 
-        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_OUTLINE, ib, 3 * geometry->outline.face_count, vb,
-                sizeof(*geometry->outline.vertices), brush, NULL);
+        d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_OUTLINE, ib, 3 * outline->face_count, vb,
+                sizeof(*outline->vertices), brush, NULL);
     }
 
-    if (geometry->outline.bezier_face_count)
+    if (outline->bezier_face_count)
     {
         if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
                 D3D11_BIND_INDEX_BUFFER,
-                geometry->outline.bezier_face_count * sizeof(*geometry->outline.bezier_faces),
+                outline->bezier_face_count * sizeof(*outline->bezier_faces),
                 &render_target->scratch_ib[D2D_SHAPE_TYPE_BEZIER_OUTLINE],
-                geometry->outline.bezier_faces, &ib)))
+                outline->bezier_faces, &ib)))
         {
             WARN("Failed to create curves index buffer, hr %#lx.\n", hr);
             return;
@@ -1830,26 +1831,26 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
 
         if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
                 D3D11_BIND_VERTEX_BUFFER,
-                geometry->outline.bezier_count * sizeof(*geometry->outline.beziers),
+                outline->bezier_count * sizeof(*outline->beziers),
                 &render_target->scratch_vb[D2D_SHAPE_TYPE_BEZIER_OUTLINE],
-                geometry->outline.beziers, &vb)))
+                outline->beziers, &vb)))
         {
             ERR("Failed to create curves vertex buffer, hr %#lx.\n", hr);
             return;
         }
 
         d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_BEZIER_OUTLINE, ib,
-                3 * geometry->outline.bezier_face_count, vb,
-                sizeof(*geometry->outline.beziers), brush, NULL);
+                3 * outline->bezier_face_count, vb,
+                sizeof(*outline->beziers), brush, NULL);
     }
 
-    if (geometry->outline.arc_face_count)
+    if (outline->arc_face_count)
     {
         if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
                 D3D11_BIND_INDEX_BUFFER,
-                geometry->outline.arc_face_count * sizeof(*geometry->outline.arc_faces),
+                outline->arc_face_count * sizeof(*outline->arc_faces),
                 &render_target->scratch_ib[D2D_SHAPE_TYPE_ARC_OUTLINE],
-                geometry->outline.arc_faces, &ib)))
+                outline->arc_faces, &ib)))
         {
             WARN("Failed to create arcs index buffer, hr %#lx.\n", hr);
             return;
@@ -1857,9 +1858,9 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
 
         if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
                 D3D11_BIND_VERTEX_BUFFER,
-                geometry->outline.arc_count * sizeof(*geometry->outline.arcs),
+                outline->arc_count * sizeof(*outline->arcs),
                 &render_target->scratch_vb[D2D_SHAPE_TYPE_ARC_OUTLINE],
-                geometry->outline.arcs, &vb)))
+                outline->arcs, &vb)))
         {
             ERR("Failed to create arcs vertex buffer, hr %#lx.\n", hr);
             return;
@@ -1867,9 +1868,20 @@ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_t
 
         if (SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, NULL, TRUE, TRUE)))
             d2d_device_context_draw(render_target, D2D_SHAPE_TYPE_ARC_OUTLINE, ib,
-                    3 * geometry->outline.arc_face_count, vb,
-                    sizeof(*geometry->outline.arcs), brush, NULL);
+                    3 * outline->arc_face_count, vb,
+                    sizeof(*outline->arcs), brush, NULL);
     }
+}
+
+static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width, float miter_limit,
+        D2D1_LINE_JOIN line_join, D2D1_CAP_STYLE start_cap, D2D1_CAP_STYLE end_cap, D2D1_CAP_STYLE dash_cap)
+{
+    const struct d2d_outline *outline = d2d_geometry_acquire_outline(geometry);
+
+    d2d_device_context_draw_outline(render_target, geometry, outline, brush, stroke_width, miter_limit,
+            line_join, start_cap, end_cap, dash_cap);
+    d2d_geometry_release_outline(geometry);
 }
 
 static void STDMETHODCALLTYPE d2d_device_context_DrawGeometry(ID2D1DeviceContext6 *iface,
