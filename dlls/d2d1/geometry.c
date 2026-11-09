@@ -4201,11 +4201,36 @@ static BOOL d2d_geometry_outline_add_cap(struct d2d_geometry *geometry,
     return TRUE;
 }
 
+/* The four vertices of a straight segment, two on each end point. "prev" is
+ * the direction along the segment, scaled by 8 plus a role code, and "next"
+ * is the far end point. The outline vertex shader widens the quad to the
+ * stroke from that and, where an end meets a flat cap, lengthens it by the
+ * antialiasing margin and has the pixel shader ramp the end like the sides.
+ * Code bits: 1 the side, 2 the far end point, 4 and 8 what the start meets,
+ * 16 and 32 what the end meets (enum d2d_outline_end). */
+void d2d_outline_line_vertices(struct d2d_outline_vertex *v, const D2D1_POINT_2F *p0,
+        const D2D1_POINT_2F *p1, enum d2d_outline_end start, enum d2d_outline_end end)
+{
+    float code = 8.0f + 4.0f * start + 16.0f * end;
+    D2D1_POINT_2F q;
+
+    d2d_point_subtract(&q, p1, p0);
+    if (q.x != 0.0f || q.y != 0.0f)
+        d2d_point_normalise(&q);
+    else
+        d2d_point_set(&q, 1.0f, 0.0f);
+
+    d2d_outline_vertex_set(&v[0], p0->x, p0->y, code * q.x, code * q.y, p1->x, p1->y);
+    d2d_outline_vertex_set(&v[1], p0->x, p0->y, (code + 1.0f) * q.x, (code + 1.0f) * q.y, p1->x, p1->y);
+    d2d_outline_vertex_set(&v[2], p1->x, p1->y, (code + 2.0f) * q.x, (code + 2.0f) * q.y, p0->x, p0->y);
+    d2d_outline_vertex_set(&v[3], p1->x, p1->y, (code + 3.0f) * q.x, (code + 3.0f) * q.y, p0->x, p0->y);
+}
+
 static BOOL d2d_geometry_outline_add_line_segment(struct d2d_geometry *geometry,
-        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *next)
+        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *next,
+        enum d2d_outline_end start, enum d2d_outline_end end)
 {
     struct d2d_outline_vertex *v;
-    D2D1_POINT_2F q_next;
     struct d2d_face *f;
     size_t base_idx;
 
@@ -4226,13 +4251,7 @@ static BOOL d2d_geometry_outline_add_line_segment(struct d2d_geometry *geometry,
     }
     f = &geometry->outline.faces[geometry->outline.face_count];
 
-    d2d_point_subtract(&q_next, next, p0);
-    d2d_point_normalise(&q_next);
-
-    d2d_outline_vertex_set(&v[0], p0->x, p0->y,  q_next.x,  q_next.y,  q_next.x,  q_next.y);
-    d2d_outline_vertex_set(&v[1], p0->x, p0->y, -2.0f * q_next.x, -2.0f * q_next.y, -2.0f * q_next.x, -2.0f * q_next.y);
-    d2d_outline_vertex_set(&v[2], next->x, next->y,  q_next.x,  q_next.y,  q_next.x,  q_next.y);
-    d2d_outline_vertex_set(&v[3], next->x, next->y, -2.0f * q_next.x, -2.0f * q_next.y, -2.0f * q_next.x, -2.0f * q_next.y);
+    d2d_outline_line_vertices(v, p0, next, start, end);
     geometry->outline.vertex_count += 4;
 
     d2d_face_set(&f[0], base_idx + 0, base_idx + 1, base_idx + 2);
@@ -4242,9 +4261,15 @@ static BOOL d2d_geometry_outline_add_line_segment(struct d2d_geometry *geometry,
     return TRUE;
 }
 
+/* The vertices carry what the ends of the piece meet in the length of "next":
+ * 1 + what the start meets + 4 * what the end meets, plus 16 on the vertices
+ * at p0 and 32 on those at p2, which the outline vertex shader lengthens by
+ * the antialiasing margin where the end meets a flat cap. */
 static BOOL d2d_geometry_outline_add_bezier_segment(struct d2d_geometry *geometry,
-        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1, const D2D1_POINT_2F *p2)
+        const D2D1_POINT_2F *p0, const D2D1_POINT_2F *p1, const D2D1_POINT_2F *p2,
+        enum d2d_outline_end start, enum d2d_outline_end end)
 {
+    float code = 1.0f + start + 4.0f * end, at_p0 = code + 16.0f, at_p2 = code + 32.0f;
     struct d2d_curve_outline_vertex *b;
     D2D1_POINT_2F r0, r1, r2;
     D2D1_POINT_2F q0, q1, q2;
@@ -4287,13 +4312,13 @@ static BOOL d2d_geometry_outline_add_bezier_segment(struct d2d_geometry *geometr
         d2d_point_scale(&r2, -1.0f);
     }
 
-    d2d_curve_outline_vertex_set(&b[0],  p0, p0, p1, p2,  r0.x,  r0.y,  r0.x,  r0.y);
-    d2d_curve_outline_vertex_set(&b[1],  p0, p0, p1, p2, -r0.x, -r0.y, -r0.x, -r0.y);
-    d2d_curve_outline_vertex_set(&b[2], &q0, p0, p1, p2,  r0.x,  r0.y,  r1.x,  r1.y);
-    d2d_curve_outline_vertex_set(&b[3], &q2, p0, p1, p2, -r1.x, -r1.y, -r1.x, -r1.y);
-    d2d_curve_outline_vertex_set(&b[4], &q1, p0, p1, p2,  r1.x,  r1.y,  r2.x,  r2.y);
-    d2d_curve_outline_vertex_set(&b[5],  p2, p0, p1, p2, -r2.x, -r2.y, -r2.x, -r2.y);
-    d2d_curve_outline_vertex_set(&b[6],  p2, p0, p1, p2,  r2.x,  r2.y,  r2.x,  r2.y);
+    d2d_curve_outline_vertex_set(&b[0],  p0, p0, p1, p2,  r0.x,  r0.y,  at_p0 * r0.x,  at_p0 * r0.y);
+    d2d_curve_outline_vertex_set(&b[1],  p0, p0, p1, p2, -r0.x, -r0.y, -at_p0 * r0.x, -at_p0 * r0.y);
+    d2d_curve_outline_vertex_set(&b[2], &q0, p0, p1, p2,  r0.x,  r0.y,  code * r1.x,  code * r1.y);
+    d2d_curve_outline_vertex_set(&b[3], &q2, p0, p1, p2, -r1.x, -r1.y, -code * r1.x, -code * r1.y);
+    d2d_curve_outline_vertex_set(&b[4], &q1, p0, p1, p2,  r1.x,  r1.y,  code * r2.x,  code * r2.y);
+    d2d_curve_outline_vertex_set(&b[5],  p2, p0, p1, p2, -r2.x, -r2.y, -at_p2 * r2.x, -at_p2 * r2.y);
+    d2d_curve_outline_vertex_set(&b[6],  p2, p0, p1, p2,  r2.x,  r2.y,  at_p2 * r2.x,  at_p2 * r2.y);
     geometry->outline.bezier_count += 7;
 
     d2d_face_set(&f[0], base_idx + 0, base_idx + 1, base_idx + 2);
@@ -4362,8 +4387,10 @@ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
         struct d2d_figure *figure, D2D1_FIGURE_END figure_end)
 {
     const D2D1_POINT_2F *prev, *p0, *p1, *next, *next_prev;
-    size_t bezier_idx, i, vertex_count;
+    enum d2d_outline_end start_end, end_end;
+    size_t bezier_idx, i, vertex_count, last;
     enum d2d_vertex_type type;
+    BOOL open;
 
     if (!(vertex_count = figure->vertex_count))
         return TRUE;
@@ -4388,6 +4415,13 @@ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
         prev = p0;
     }
 
+    /* The first and the last segment of an open figure end in the start and
+     * the end cap. */
+    open = figure_end != D2D1_FIGURE_END_CLOSED;
+    last = vertex_count - 1;
+    while (last && figure->vertex_types[last] == D2D_VERTEX_TYPE_NONE)
+        --last;
+
     for (i = 0, bezier_idx = 0; i < vertex_count; ++i)
     {
         if ((type = figure->vertex_types[i]) == D2D_VERTEX_TYPE_NONE)
@@ -4395,6 +4429,9 @@ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
             prev = next_prev = &figure->vertices[i];
             continue;
         }
+
+        start_end = open && !i ? D2D_OUTLINE_END_START_CAP : D2D_OUTLINE_END_JOIN;
+        end_end = open && i == last ? D2D_OUTLINE_END_END_CAP : D2D_OUTLINE_END_JOIN;
 
         /* next: tangent along next segment, at p0.
          * p1: next vertex. */
@@ -4404,7 +4441,7 @@ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
             /* type BEZIER implies i + 1 < figure->vertex_count. */
             p1 = &figure->vertices[i + 1];
 
-            if (!d2d_geometry_outline_add_bezier_segment(geometry, p0, next, p1))
+            if (!d2d_geometry_outline_add_bezier_segment(geometry, p0, next, p1, start_end, end_end))
             {
                 ERR("Failed to add bezier segment.\n");
                 return FALSE;
@@ -4418,7 +4455,7 @@ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
                 next = p1 = &figure->vertices[i + 1];
             next_prev = p0;
 
-            if (!d2d_geometry_outline_add_line_segment(geometry, p0, p1))
+            if (!d2d_geometry_outline_add_line_segment(geometry, p0, p1, start_end, end_end))
             {
                 ERR("Failed to add line segment.\n");
                 return FALSE;
@@ -9063,13 +9100,17 @@ HRESULT d2d_rectangle_geometry_init(struct d2d_geometry *geometry, ID2D1Factory 
     d2d_face_set(&f[1], 0, 2, 3);
     geometry->fill.face_count = 2;
 
-    if (!d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1]))
+    if (!d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN))
         goto fail;
-    if (!d2d_geometry_outline_add_line_segment(geometry, &v[1], &v[2]))
+    if (!d2d_geometry_outline_add_line_segment(geometry, &v[1], &v[2],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN))
         goto fail;
-    if (!d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3]))
+    if (!d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN))
         goto fail;
-    if (!d2d_geometry_outline_add_line_segment(geometry, &v[3], &v[0]))
+    if (!d2d_geometry_outline_add_line_segment(geometry, &v[3], &v[0],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN))
         goto fail;
 
     if (!d2d_geometry_outline_add_join(geometry, &prev[0], &v[0], &next[0]))
@@ -9149,10 +9190,14 @@ void d2d_rectangle_geometry_reinit(struct d2d_geometry *geometry, const D2D1_REC
     /* Outline tessellation — d2d_array_reserve is a no-op because arrays are
      * already sized from the first init (or a previous reinit with larger
      * rect). These calls just write into the existing buffers. */
-    d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1]);
-    d2d_geometry_outline_add_line_segment(geometry, &v[1], &v[2]);
-    d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3]);
-    d2d_geometry_outline_add_line_segment(geometry, &v[3], &v[0]);
+    d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN);
+    d2d_geometry_outline_add_line_segment(geometry, &v[1], &v[2],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN);
+    d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN);
+    d2d_geometry_outline_add_line_segment(geometry, &v[3], &v[0],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN);
 
     d2d_geometry_outline_add_join(geometry, &prev[0], &v[0], &next[0]);
     d2d_geometry_outline_add_join(geometry, &prev[1], &v[1], &next[1]);
@@ -9608,19 +9653,23 @@ HRESULT d2d_rounded_rectangle_geometry_init(struct d2d_geometry *geometry,
         goto fail;
     v = geometry->fill.vertices;
 
-    if (!d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1]))
+    if (!d2d_geometry_outline_add_line_segment(geometry, &v[0], &v[1],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN))
         goto fail;
     if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[1], v1, &v[2]))
         goto fail;
-    if (!d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3]))
+    if (!d2d_geometry_outline_add_line_segment(geometry, &v[2], &v[3],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN))
         goto fail;
     if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[3], v2, &v[4]))
         goto fail;
-    if (!d2d_geometry_outline_add_line_segment(geometry, &v[4], &v[5]))
+    if (!d2d_geometry_outline_add_line_segment(geometry, &v[4], &v[5],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN))
         goto fail;
     if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[5], v3, &v[6]))
         goto fail;
-    if (!d2d_geometry_outline_add_line_segment(geometry, &v[6], &v[7]))
+    if (!d2d_geometry_outline_add_line_segment(geometry, &v[6], &v[7],
+            D2D_OUTLINE_END_JOIN, D2D_OUTLINE_END_JOIN))
         goto fail;
     if (!d2d_geometry_outline_add_arc_quadrant(geometry, &v[7], v4, &v[0]))
         goto fail;
@@ -10561,11 +10610,18 @@ static BOOL d2d_dash_emit(struct d2d_dash_context *ctx, BOOL start_is_figure_end
     ctx->piece_count = 0;
     for (i = 0; i < count && ret; ++i)
     {
+        enum d2d_outline_end start = D2D_OUTLINE_END_JOIN, end = D2D_OUTLINE_END_JOIN;
+
         piece = &ctx->pieces[i];
+        if (!loop && !i)
+            start = start_is_figure_end ? D2D_OUTLINE_END_START_CAP : D2D_OUTLINE_END_DASH_CAP;
+        if (!loop && i == count - 1)
+            end = end_is_figure_end ? D2D_OUTLINE_END_END_CAP : D2D_OUTLINE_END_DASH_CAP;
         if (piece->quad)
-            ret = d2d_geometry_outline_add_bezier_segment(ctx->outline, &piece->p0, &piece->c, &piece->p1);
+            ret = d2d_geometry_outline_add_bezier_segment(ctx->outline, &piece->p0, &piece->c, &piece->p1,
+                    start, end);
         else
-            ret = d2d_geometry_outline_add_line_segment(ctx->outline, &piece->p0, &piece->p1);
+            ret = d2d_geometry_outline_add_line_segment(ctx->outline, &piece->p0, &piece->p1, start, end);
 
         if (ret && (i || loop))
         {
