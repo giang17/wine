@@ -551,6 +551,21 @@ This is the recommended branch. What it changes, by subsystem:
   back as `0` followed by a line break and a tab, so the next start rejected the file
   (`msmdsrv_Failed_ini.bak`). The engine now starts and listens; the next stop was
   `ImpersonateAnonymousToken()` (ntdll, below)
+- **ntdll (process exit watchdog)**: a process whose `exit()` did not finish within 31/64 s was
+  SIGKILLed by the wineserver, exit status 137 instead of what the application returned, output
+  complete. Measured with `d2d1_curve_edge_aa.exe` on `:99` (llvmpipe): 27 of 170 runs.
+  `ExitProcess()` has the server kill the other threads with SIGQUIT; in those runs the signal
+  hit the wined3d CS thread inside `_int_free()` with the lock of its glibc malloc arena taken
+  (it was deleting GL shader programs: Mesa `st_release_variants()` → `ralloc_free()`), its
+  `pthread_exit()` ran the TLS destructors, the one of `libEGL_nvidia` called `free()` on the
+  same arena and blocked for good, and the main thread's `exit()` blocked in Mesa's
+  `builtin_builder` destructor, freeing a chunk of that arena as well. The Unix exit path now
+  arms a 300 ms watchdog before `exit()` (SIGALRM, `_exit()` with the process's own status):
+  40 of 40 runs end with status 0, the hung ones 300 ms after the hang starts instead of 480 ms
+  later by SIGKILL. `WINE_EXIT_WATCHDOG_MS` sets the time, 0 restores the old behaviour (3 of
+  20 runs with status 137). The deadlock itself, between glibc's arena lock, Mesa's destructors
+  and the asynchronous thread kill, is not resolved; the kernel32 process tests fail at the
+  same places with and without the watchdog (issue 574)
 - **ntdll**: `NtImpersonateAnonymousToken()` lets the thread impersonate a new token for the
   anonymous logon SID (S-1-5-7) at `SecurityImpersonation` level, without privileges, as
   measured on Windows 10 19045; the stub returned `STATUS_NOT_IMPLEMENTED`, also upstream as of
