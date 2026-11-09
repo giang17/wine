@@ -1003,16 +1003,40 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
 
     if (event->window != root_window)
     {
+        struct x11drv_win_data *child;
+        BOOL beneath_child = FALSE;
+        RECT tmp;
+
         abs_rect = rect;
         OffsetRect( &abs_rect, data->rects.client.left, data->rects.client.top );
 
-        SERVER_START_REQ( update_window_zorder )
+        /* A tool window that update_zorder_transient() made transient for this window stays
+         * above it in X, so an Expose beneath it says nothing about the order.  X does report
+         * such areas: when a window grows to fullscreen under KWin, the exposed rectangles
+         * include what the tool window covers, and update_window_zorder would move the window
+         * above the tool window in win32 while X keeps the opposite order (wine-dev issue 570;
+         * with the fullscreen cursor clip, win32 hit-testing then sends the clicks meant for the
+         * tool window to this one). */
+        if (data->zorder_transient_child && (child = get_win_data( data->zorder_transient_child )))
         {
-            req->window      = wine_server_user_handle( hwnd );
-            req->rect        = wine_server_rectangle( abs_rect );
-            wine_server_call( req );
+            beneath_child = child->zorder_transient_for == data->whole_window &&
+                            intersect_rect( &tmp, &abs_rect, &child->rects.visible );
+            release_win_data( child );
         }
-        SERVER_END_REQ;
+
+        if (beneath_child)
+            TRACE( "win %p exposed beneath its transient %p, keeping the win32 Z-order\n",
+                   hwnd, data->zorder_transient_child );
+        else
+        {
+            SERVER_START_REQ( update_window_zorder )
+            {
+                req->window      = wine_server_user_handle( hwnd );
+                req->rect        = wine_server_rectangle( abs_rect );
+                wine_server_call( req );
+            }
+            SERVER_END_REQ;
+        }
     }
     else flags &= ~RDW_ALLCHILDREN;
 
