@@ -615,6 +615,13 @@ This is the recommended branch. What it changes, by subsystem:
   which registers the `vatsys://` URL protocol, exited silently during its .NET start-up when
   launched with that argument from the desktop icon Wine had generated: no window, no crash,
   nothing in its own error log
+- **uninstaller**: `uninstaller --remove <key>` exits with 1 when no uninstall entry matches
+  the key; it exited with 0, like a completed removal, after reporting the miss in a message
+  box (on stderr with `--silent`). Scripts that remove packages one by one could not tell a
+  miss from a removal: removing "Wine Mono Runtime" also removes "Wine Mono Windows Support",
+  and the following call for the second GUID returned 0 as well. A matching entry still
+  returns 0, also through the 32-bit `uninstaller.exe`, which restarts the 64-bit one
+  (issue 576)
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
 - **ntdll**: the heap enabled the LFH frontend only for size classes up to 1K; blocks between
   1K and 16K stayed in the backend heap, whose free path writes the free-list links over the
