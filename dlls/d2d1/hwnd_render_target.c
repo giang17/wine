@@ -811,15 +811,12 @@ static D2D1_WINDOW_STATE STDMETHODCALLTYPE d2d_hwnd_render_target_CheckWindowSta
             DXGI_STATUS_OCCLUDED ? D2D1_WINDOW_STATE_OCCLUDED : D2D1_WINDOW_STATE_NONE;
 }
 
-static HRESULT STDMETHODCALLTYPE d2d_hwnd_render_target_Resize(ID2D1HwndRenderTarget *iface, const D2D1_SIZE_U *size)
+static HRESULT d2d_hwnd_render_target_resize(struct d2d_hwnd_render_target *render_target, const D2D1_SIZE_U *size)
 {
-    struct d2d_hwnd_render_target *render_target = impl_from_ID2D1HwndRenderTarget(iface);
     IDXGISurface1 *dxgi_surface;
     ID2D1DeviceContext *context;
     ID2D1Bitmap1 *bitmap;
     HRESULT hr;
-
-    TRACE("iface %p, width %u, height %u.\n", iface, size->width, size->height);
 
     if (render_target->gdi_surface)
         return d2d_hwnd_render_target_create_gdi_target(render_target, *size);
@@ -852,6 +849,32 @@ static HRESULT STDMETHODCALLTYPE d2d_hwnd_render_target_Resize(ID2D1HwndRenderTa
     }
 
     ID2D1DeviceContext_Release(context);
+
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE d2d_hwnd_render_target_Resize(ID2D1HwndRenderTarget *iface, const D2D1_SIZE_U *size)
+{
+    struct d2d_hwnd_render_target *render_target = impl_from_ID2D1HwndRenderTarget(iface);
+    ID2D1Multithread *multithread;
+    ID2D1Factory *factory;
+    HRESULT hr;
+
+    TRACE("iface %p, width %u, height %u.\n", iface, size->width, size->height);
+
+    /* The device context has no target and no pixel format between the two
+     * SetTarget() calls of a resize. With a multithreaded factory, keep the
+     * other threads out for the whole exchange. */
+    ID2D1RenderTarget_GetFactory(render_target->dxgi_target, &factory);
+    hr = ID2D1Factory_QueryInterface(factory, &IID_ID2D1Multithread, (void **)&multithread);
+    ID2D1Factory_Release(factory);
+    if (FAILED(hr))
+        return d2d_hwnd_render_target_resize(render_target, size);
+
+    ID2D1Multithread_Enter(multithread);
+    hr = d2d_hwnd_render_target_resize(render_target, size);
+    ID2D1Multithread_Leave(multithread);
+    ID2D1Multithread_Release(multithread);
 
     return hr;
 }
