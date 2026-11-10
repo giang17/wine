@@ -1231,6 +1231,17 @@ This is the recommended branch. What it changes, by subsystem:
   `get_scratch_buffer()` once and hung at the first frame once; after, DXVK 4 of 5 runs of 300
   frames and wined3d 3 of 3 runs of 100 frames completed (the remaining DXVK run was at frame 200
   when the 180 s limit hit, no error).
+- **d2d1**: `ID2D1HwndRenderTarget::Resize()` on a multi-threaded factory holds the factory
+  lock for the whole call. A resize takes the target off the device context, resizes the swap
+  chain (or, on the GDI present path, creates a new bitmap) and sets the new target; the lock
+  of issue 511 was taken per call, so between the two `SetTarget()` calls another thread saw
+  a context without target and pixel format, and `CreateCompatibleRenderTarget()` without a
+  format failed with `D2DERR_UNSUPPORTED_PIXEL_FORMAT`. Measured with
+  `scripts/repro-577-hwnd-resize-compatible-target.c` (one thread resizes 2000 times, a second
+  one creates 16x16 compatible targets; i686 and x86_64, three runs each): Windows 10 fails
+  none of 56,088 to 426,458 creates per run; before the fix 82 to 99.9 % of the creates of a
+  run failed with 0x88982f80 in 6 of 6 runs, with it none of 2,170 to 3,533 (issue 578).
+  Single-threaded factories are unchanged
 - **d2d1**: closing a path no longer hangs when resolving overlapping Bézier control triangles
   reaches a triangle one ULP across. Halving such a triangle rounds every midpoint back onto its
   corners, so the half that stays in place is bitwise identical to the segment, its area stays
