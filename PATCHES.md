@@ -980,6 +980,36 @@ This is the recommended branch. What it changes, by subsystem:
   `WM_EXITSIZEMOVE`. A press and release without a move leaves the window maximised; the
   drag of the restored window is unchanged. The maximised vatSys ASD window (1920x1080)
   is restored to 804x478 under the pointer and moved the same way.
+- **win32u**: the menu bar is laid out again when its window gets or loses `WS_CAPTION`
+  (giang17/wine issue 31). The items of a bar are measured through
+  `WM_UAHMEASUREMENUITEM` only for a captioned window, and the layout was kept until the
+  items or the width changed, so a window that dropped `WS_CAPTION` at the same width kept
+  the height its owner had answered. Ableton Live 12 makes its bar 4 px taller that way
+  and goes fullscreen by removing `WS_CAPTION` and `WS_THICKFRAME` and placing the window
+  19 px above the monitor; from a maximised window the bar keeps its width, the client
+  area started 4 px below the monitor's top, Live took 4 px off the window height again
+  and again, and the fullscreen request was dropped. Measured with
+  `projects/menubar-uah-caption-test/uahcaption.exe`: the bar is 18 px instead of 22 after
+  the styles are dropped at the same width. Live 12.4.5, KWin 5.27 on X11, F11 from the
+  maximised window: `_NET_WM_STATE_FULLSCREEN` at 1920x1080, before no fullscreen state.
+- **win32u / user32**: a visible top-level window that loses both `WS_CAPTION` and
+  `WS_THICKFRAME` through `SetWindowLong()`, or gets one of them again, is posted
+  `WM_DWMNCRENDERINGCHANGED` (wParam: has a frame), and when the message is dispatched its
+  frame is computed again (`SetWindowPos()` with `SWP_FRAMECHANGED`, no size, move,
+  Z-order or activation), as on Windows 10, where that also happens when the window
+  procedure does not pass the message to `DefWindowProc` (giang17/wine issue 31).
+  Ableton Live 12 relies on it on the way back from fullscreen to a maximised window: it
+  sets the two styles again and calls `SetWindowPlacement()` with `SW_SHOWMAXIMIZED`,
+  which does nothing for a window that is maximised already, so the client area stayed
+  where the uncaptioned window had it and the window came back undecorated at the size of
+  the monitor. Measured on Windows 10 22H2 and here with
+  `projects/maxstyle-roundtrip-test/maxstyle.exe` (the sequence of Live on a maximised
+  window with a menu bar, the three variants `SetWindowPlacement()`, `ShowWindow()` and no
+  call; which style changes post the message): after the message loop the client area is
+  that of the maximised window again on both. Live 12.4.5, KWin 5.27 on X11, F11 twice
+  from the maximised window: fullscreen, then maximised with its frame at 1920x1045+0+35.
+  Not done: Windows also posts the message when a window is first shown, and it does not
+  compute the frame for a `WS_POPUP` window that got a caption.
 - **winex11**: with several monitors, each side of `_NET_WORKAREA` is applied to the
   monitor whose edge is nearest to it instead of to every monitor (giang17/wine issue 26,
   issue 546). `_NET_WORKAREA` is one rectangle for the whole X screen; KWin sets only that
