@@ -1908,6 +1908,17 @@ This is the recommended branch. What it changes, by subsystem:
   a 32-bit DirectInput 8 test, ten keys, NumLock on: before 1 fake `DIK_NUMLOCK` without a
   hook and 20 with one, the toggle left off; now 0 and the toggle on, as on Windows 11. A
   lock key changed while no Wine window had the focus is no longer replayed to hooks
+- **Idle wake-ups of the SDL controller bus (winebus)**: the `winedevice.exe` that hosts
+  `winebus.sys` kept one thread waking about 900 times per second for as long as a
+  wineserver ran, also with no game controller attached. SDL is initialised there without
+  its video subsystem, and without one `SDL_WaitEventTimeout()` does not block: it polls
+  its event queue every millisecond until the timeout. While the SDL bus has no device,
+  the thread now polls once and sleeps 20 ms; with a controller attached it waits as
+  before. Measured with SDL 2.30.0 in an idle prefix: 922 to 933 wake-ups per second
+  before, 50 now (0.9 % of a core on the desktop before, 0.1 % now; 3.4 % on an i7-5600U
+  before). With a virtual Xbox 360 pad attached 911, unchanged; a hotplugged pad reached
+  `sdl_add_device()` 61 ms after udev announced it (63 ms before), and its button and
+  stick changes reached XInput within 3 ms. Builds without SDL do not have the thread
 - **Application compatibility layers (win32u)**: an entry under
   `Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers` (HKCU or HKLM) named
   after the full path of the executable applies, as on Windows. Wine looked up only the
