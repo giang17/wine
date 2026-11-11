@@ -115,10 +115,37 @@ static int query_screens(void)
     return count;
 }
 
+/* rectangles of all the screens in root coordinates, to be freed by the caller */
+unsigned int xinerama_get_screen_rects( RECT **rects )
+{
+    int i, count, event_base, error_base;
+    XineramaScreenInfo *screens;
+
+    *rects = NULL;
+    if (!pXineramaQueryScreens) load_xinerama();
+    if (!pXineramaQueryExtension || !pXineramaQueryScreens ||
+        !pXineramaQueryExtension( gdi_display, &event_base, &error_base ) ||
+        !(screens = pXineramaQueryScreens( gdi_display, &count ))) return 0;
+
+    if (count <= 0 || !(*rects = malloc( count * sizeof(**rects) ))) count = 0;
+    for (i = 0; i < count; i++)
+        SetRect( *rects + i, screens[i].x_org, screens[i].y_org,
+                 screens[i].x_org + screens[i].width, screens[i].y_org + screens[i].height );
+
+    XFree( screens );
+    return count;
+}
+
 #else  /* SONAME_LIBXINERAMA */
 
 static inline int query_screens(void)
 {
+    return 0;
+}
+
+unsigned int xinerama_get_screen_rects( RECT **rects )
+{
+    *rects = NULL;
     return 0;
 }
 
