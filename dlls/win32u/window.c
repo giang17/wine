@@ -1698,6 +1698,13 @@ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
         user_driver->pSetWindowStyle( hwnd, offset, &style );
         if (made_visible || layered) update_window_state( hwnd );
         send_message( hwnd, WM_STYLECHANGED, offset, (LPARAM)&style );
+
+        /* Windows 10 posts WM_DWMNCRENDERINGCHANGED to a visible top-level window that lost
+         * its frame or got one, and the frame is computed again when the message is
+         * dispatched (see NtUserDispatchMessage). */
+        if (offset == GWL_STYLE && (newval & (WS_VISIBLE | WS_CHILD)) == WS_VISIBLE &&
+            !(retval & (WS_CAPTION | WS_THICKFRAME)) != !(newval & (WS_CAPTION | WS_THICKFRAME)))
+            NtUserPostMessage( hwnd, WM_DWMNCRENDERINGCHANGED, (newval & (WS_CAPTION | WS_THICKFRAME)) != 0, 0 );
     }
 
     if (offset == GWLP_WNDPROC) return (ULONG_PTR)get_window_proc( (WNDPROC)retval, old_ansi, ansi );

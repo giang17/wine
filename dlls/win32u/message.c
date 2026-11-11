@@ -4115,6 +4115,13 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
 
     spy_exit_message( SPY_RESULT_OK, msg->hwnd, msg->message, retval, msg->wParam, msg->lParam );
 
+    /* Windows 10 computes the frame again after a window lost its frame or got one,
+     * whether or not the window procedure passes the message to DefWindowProc. */
+    if (msg->message == WM_DWMNCRENDERINGCHANGED &&
+        !(get_window_long( msg->hwnd, GWL_STYLE ) & WS_CHILD))
+        NtUserSetWindowPos( msg->hwnd, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
+                            SWP_NOACTIVATE | SWP_FRAMECHANGED );
+
     if (msg->message == WM_PAINT)
     {
         /* send a WM_NCPAINT and WM_ERASEBKGND if the non-client area is still invalid */
