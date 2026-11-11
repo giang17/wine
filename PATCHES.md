@@ -980,6 +980,28 @@ This is the recommended branch. What it changes, by subsystem:
   `WM_EXITSIZEMOVE`. A press and release without a move leaves the window maximised; the
   drag of the restored window is unchanged. The maximised vatSys ASD window (1920x1080)
   is restored to 804x478 under the pointer and moved the same way.
+- **winex11**: with several monitors, each side of `_NET_WORKAREA` is applied to the
+  monitor whose edge is nearest to it instead of to every monitor (giang17/wine issue 26,
+  issue 546). `_NET_WORKAREA` is one rectangle for the whole X screen; KWin sets only that
+  and not `_GTK_WORKAREAS_D0`, and `get_work_area()` intersected it with each monitor, so
+  a panel at the bottom of a low monitor cut the work area of a taller monitor beside it
+  at the same height. A window the application maximises (`ShowWindow(SW_MAXIMIZE)`, a
+  maximise button it draws itself) is sized from `rcWork`, so it first stopped there and
+  reached the monitor's bottom only when the window manager placed it. A side of the
+  rectangle that lies inside several monitors now belongs to the monitor that a panel
+  explains with the least thickness; monitors at the same distance are all cut as
+  before, a single monitor and a window manager with `_GTK_WORKAREAS_D0` are unchanged.
+  The panels' `_NET_WM_STRUT_PARTIAL` cannot give the answer: Plasma 5.27 on X11 sets a
+  strut of zeros for a panel whose edge is not the edge of the X screen, and under a
+  Wayland session the panels are no X windows. Measured with
+  `projects/workarea-546/workarea.exe` (`GetMonitorInfo`, window rectangle after
+  `SW_MAXIMIZE`) on Xwayland with two outputs of 1024x600 and 1024x800 side by side and
+  `_NET_WORKAREA` set by hand: for `0,0,2048,560` the second monitor's work area ends at
+  800 instead of 560 and the maximised window at 804 instead of 564, the first monitor
+  keeps 560; a panel at the bottom or right of the second monitor, at the left of the
+  first and at the top of both give the expected work areas; one monitor with a 44 px
+  panel keeps 1036. A monitor with a panel of its own that another monitor's panel hides
+  in the single rectangle gets its whole area.
 - **win32u / winex11**: a top-level window the window manager raised on its own (a click
   under X11) is brought to the top of the win32 Z-order as well, as Windows does on
   activation, and the win32 order that results is applied back to the X stacking. An
