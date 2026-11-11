@@ -834,7 +834,7 @@ LRESULT WINAPI DECLSPEC_HOTPATCH DispatchMessageA( const MSG* msg )
     }
 
     /* whenever possible, avoid using NtUserDispatchMessage to make the call unwindable */
-    if (msg->message != WM_SYSTIMER && msg->message != WM_PAINT)
+    if (msg->message != WM_SYSTIMER && msg->message != WM_PAINT && msg->message != WM_DWMNCRENDERINGCHANGED)
         return dispatch_message( msg, TRUE );
 
     return NtUserDispatchMessage( msg );
@@ -887,7 +887,7 @@ LRESULT WINAPI DECLSPEC_HOTPATCH DispatchMessageW( const MSG* msg )
     }
 
     /* whenever possible, avoid using NtUserDispatchMessage to make the call unwindable */
-    if (msg->message != WM_SYSTIMER && msg->message != WM_PAINT)
+    if (msg->message != WM_SYSTIMER && msg->message != WM_PAINT && msg->message != WM_DWMNCRENDERINGCHANGED)
         return dispatch_message( msg, FALSE );
 
     return NtUserDispatchMessage( msg );
