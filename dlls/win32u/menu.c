@@ -75,6 +75,7 @@ struct menu
     ULONG_PTR   dwMenuData;     /* application defined value */
     HMENU       hSysMenuOwner;  /* handle to the dummy sys menu holder */
     WORD        textOffset;     /* offset of text when items have both bitmaps and text */
+    BOOL        themed;         /* menu bar laid out through WM_UAHMEASUREMENUITEM */
 };
 
 /* the accelerator user object */
@@ -2321,7 +2322,8 @@ static void calc_menu_bar_size( HDC hdc, POINT pos, UINT width, struct menu *men
     start = 0;
     help_pos = ~0u;
     menu->textOffset = 0;
-    if (menu_bar_is_themed( menu, owner )) send_uah_init_menu( owner, menu, hdc, UAH_MENU_WHOLE_BAR );
+    if ((menu->themed = menu_bar_is_themed( menu, owner )))
+        send_uah_init_menu( owner, menu, hdc, UAH_MENU_WHOLE_BAR );
     while (start < menu->nItems)
     {
         item = &menu->items[start];
@@ -2381,8 +2383,11 @@ UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y )
 
     /* NtUserDrawMenuBarTemp() lays the bar out only while its height is invalid, and
      * the height is invalidated only when the items change. The bar wraps by width:
-     * a height laid out for another width is invalid too. */
-    if ((menu = unsafe_menu_ptr( get_menu( hwnd ) )) && menu->Width != width) menu->Height = 0;
+     * a height laid out for another width is invalid too, and so is one from the other
+     * way of measuring the items, when the window got or lost WS_CAPTION since. */
+    if ((menu = unsafe_menu_ptr( get_menu( hwnd ) )) &&
+        (menu->Width != width || menu->themed != menu_bar_is_themed( menu, hwnd )))
+        menu->Height = 0;
 
     hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_WINDOW );
     height = NtUserDrawMenuBarTemp( hwnd, hdc, &rect, 0, 0 );
