@@ -184,6 +184,7 @@ namespace Windows.Security.Authentication.Web.Core {
     {
         [propget] HRESULT ErrorCode([out, retval] UINT32 *value);
         [propget] HRESULT ErrorMessage([out, retval] HSTRING *value);
+        [propget] HRESULT Properties([out, retval] Windows.Foundation.Collections.IMap<HSTRING, HSTRING> **value);
     }
 
     [
