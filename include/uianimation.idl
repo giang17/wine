@@ -644,7 +644,7 @@ interface IUIAnimationManager2 : IUnknown
 
     HRESULT SetManagerEventHandler(
         [in] IUIAnimationManagerEventHandler2 *handler,
-        [in] LONG registerfornextanimationevent);
+        [in] BOOL registerfornextanimationevent);
 
     HRESULT SetCancelPriorityComparison(
         [in] IUIAnimationPriorityComparison2 *comparison);
