@@ -1308,9 +1308,9 @@ static HRESULT WINAPI manager2_Resume( IUIAnimationManager2 *iface )
 }
 
 static HRESULT WINAPI manager2_SetManagerEventHandler( IUIAnimationManager2 *iface,
-        IUIAnimationManagerEventHandler2 *handler, LONG register_for_next_event )
+        IUIAnimationManagerEventHandler2 *handler, BOOL register_for_next_event )
 {
-    FIXME( "stub (%p)->(%p %ld)\n", iface, handler, register_for_next_event );
+    FIXME( "stub (%p)->(%p %d)\n", iface, handler, register_for_next_event );
     return S_OK;
 }
 
