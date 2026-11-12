@@ -1671,6 +1671,18 @@ This is the recommended branch. What it changes, by subsystem:
   with it, at 100 % of a core with every client waiting. Closing Power BI Desktop 2.158 hung
   this way in two of four tries: its WebView2 host thread unlinks a `Chrome_WidgetWin_0`
   while the main thread enumerates that window's siblings
+- **win32u**: a `HWND_MESSAGE` window created while `explorer` is still setting up the
+  desktop is a message-only window. `explorer` creates the desktop window first and the
+  message window once the graphics driver has set up the desktop; a thread that asked for
+  the desktop window in between kept a desktop without a message window, and every
+  `HWND_MESSAGE` window it created from then on (ole32's apartment window, for one) became a
+  hidden top-level window with an X window, window manager notifications included. Such a
+  thread now waits for `explorer` to become idle, like the process that started it, and
+  asks again. A program that creates a `HWND_MESSAGE` window from a new thread every 10 ms
+  from the moment `explorer.exe` exists in a prefix that was not running got 137 and 134
+  top-level windows out of 288 with wine-stable 11.0, all in the first 1.4 s, and none out
+  of 290 with the change (three runs, two more as a 32-bit process); the message window is
+  still the one `explorer` creates (issue 586)
 - **wined3d**: a GDI present of a window below a top level of another process blits
   through a fresh cache DC instead of the one held since the swap chain was created.
   That DC keeps the device origin and visible region of the window's position at that
