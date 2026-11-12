@@ -564,7 +564,7 @@ static void test_spvoice(void)
     todo_wine ok(hr == S_FALSE, "got %#lx.\n", hr);
 
     hr = ISpVoice_SetVoice(voice, NULL);
-    todo_wine ok(hr == S_OK, "got %#lx.\n", hr);
+    ok(hr == S_OK, "got %#lx.\n", hr);
 
     check_apttype();
     ok(test_apt_data.type == APTTYPE_MTA || broken(test_apt_data.type == APTTYPE_UNITIALIZED) /* w8, w10v1507 */,
@@ -576,7 +576,7 @@ static void test_spvoice(void)
         win_skip("apt type is not MTA.\n");
 
     hr = ISpVoice_GetVoice(voice, &token);
-    todo_wine ok(hr == S_OK, "got %#lx.\n", hr);
+    ok(hr == S_OK, "got %#lx.\n", hr);
 
     if (SUCCEEDED(hr))
     {
