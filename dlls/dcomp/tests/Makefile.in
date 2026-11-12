@@ -1,0 +1,5 @@
+TESTDLL   = dcomp.dll
+IMPORTS   = dcomp d3d11 dxgi dxguid uuid user32
+
+SOURCES = \
+	dcomp.c
