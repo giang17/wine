@@ -654,6 +654,15 @@ This is the recommended branch. What it changes, by subsystem:
   which registers the `vatsys://` URL protocol, exited silently during its .NET start-up when
   launched with that argument from the desktop icon Wine had generated: no window, no crash,
   nothing in its own error log
+- **winemenubuilder**: the waits for the menu-building semaphore and for the parent process
+  dispatch the messages that arrive in the meantime; the first message used to end them as a
+  failed wait. `winemenubuilder <lnk>` started in a prefix that was not running wrote no entry
+  and logged "failed wait for semaphore": `wineboot` starts `winemenubuilder -a -r` at every
+  prefix start, which holds the semaphore while it refreshes the file associations, and the
+  second process received a window message during that time (the X11 state notification for
+  its OLE apartment window, which is a top-level window there, issue 586). On the desktop
+  display 0 of 3 cold-prefix runs wrote the entry before and 5 of 5 after; wine-stable 11.0
+  fails the same way, 0 of 3 (issue 484)
 - **uninstaller**: `uninstaller --remove <key>` exits with 1 when no uninstall entry matches
   the key; it exited with 0, like a completed removal, after reporting the miss in a message
   box (on stderr with `--silent`). Scripts that remove packages one by one could not tell a
