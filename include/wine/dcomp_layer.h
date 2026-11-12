@@ -94,6 +94,44 @@
 
 #define WINE_DCOMP_LAYER_MAGIC      0x4c434457 /* "WDCL" */
 
+/* The names of the window properties the three PE halves of the composition
+ * path pass state through.  Each used to be spelled out at every use -- dcomp,
+ * wined3d and dxgi each carried their own copies, 65 literals for 12 names --
+ * and a typo in one of them would have shown as a black window and nothing
+ * else (wine-dev issue 301).
+ *
+ * On the target window, written by dcomp and read by wined3d: the number of
+ * serialized swapchain leaves and, per leaf, its composition window, its
+ * offset packed as two signed 16-bit values and its opacity. */
+#define WINE_DCOMP_CHILD_COUNT_PROP        L"__wine_dcomp_child_count"
+#define WINE_DCOMP_CHILD_WND_PROP_FMT      L"__wine_dcomp_child_%u_wnd"
+#define WINE_DCOMP_CHILD_OFFSET_PROP_FMT   L"__wine_dcomp_child_%u_offset"
+#define WINE_DCOMP_CHILD_OPACITY_PROP_FMT  L"__wine_dcomp_child_%u_opacity"
+
+/* On the target window, set by dcomp and read by wined3d's command stream: a
+ * present on this window has to flush. */
+#define WINE_DCOMP_PRESENT_FLUSH_PROP      L"__wine_dcomp_present_flush"
+
+/* On a composition window, maintained by wined3d and dxgi and read by dcomp:
+ * the CPU copy of the composition buffer, its size, its memory DC, and the
+ * mark of a window that composites as a child of another swapchain. */
+#define WINE_DCOMP_COMP_BITS_PROP          L"__wine_dcomp_comp_bits"
+#define WINE_DCOMP_COMP_SIZE_PROP          L"__wine_dcomp_comp_size"
+#define WINE_DCOMP_COMP_DC_PROP            L"__wine_dcomp_comp_dc"
+#define WINE_DCOMP_IS_CHILD_PROP           L"__wine_dcomp_is_child"
+
+/* On a target window, shared by the subclass procedures of dxgi and dcomp, and
+ * the back reference from a window to its composition swapchain. */
+#define WINE_DCOMP_ORIG_WNDPROC_PROP       L"__wine_dcomp_orig_wndproc"
+#define WINE_DCOMP_SUBCLASS_PROC_PROP      L"__wine_dcomp_subclass_proc"
+#define WINE_DCOMP_SWAPCHAIN_PROP          L"__wine_dcomp_swapchain"
+
+/* Not covered: winex11 is built for Unix, where L"" is not a WCHAR string, and
+ * spells its four names as character arrays -- __wine_dcomp_target and
+ * __wine_dcomp_swapchain (winex11.drv/init.c, window.c), __wine_dcomp_popup_parent
+ * and the prefix __wine_dcomp_active_ (window.c).  A change to WINE_DCOMP_SWAPCHAIN_PROP
+ * or to one of those names in dcomp or dxgi has to be made there as well. */
+
 /* The commit generation of the __wine_dcomp_child_* leaf properties, on the
  * target window.  dcomp holds it odd while it rewrites the set and advances it
  * to the next even value after __wine_dcomp_child_count; wined3d reads it

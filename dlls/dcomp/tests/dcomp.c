@@ -647,20 +647,20 @@ static void test_object_creation(void)
  * properties of the target window.  Only composition swapchain leaves are
  * written, depth first, with the offsets and opacities of their ancestors
  * accumulated. */
-static ULONG_PTR get_child_prop(HWND hwnd, unsigned int idx, const WCHAR *name)
+static ULONG_PTR get_child_prop(HWND hwnd, unsigned int idx, const WCHAR *format)
 {
     WCHAR buffer[64];
 
-    swprintf(buffer, ARRAY_SIZE(buffer), L"__wine_dcomp_child_%u_%s", idx, name);
+    swprintf(buffer, ARRAY_SIZE(buffer), format, idx);
     return (ULONG_PTR)GetPropW(hwnd, buffer);
 }
 
 #define check_leaf(hwnd, idx, x, y, opacity) check_leaf_(__LINE__, hwnd, idx, x, y, opacity)
 static void check_leaf_(unsigned int line, HWND hwnd, unsigned int idx, int x, int y, float opacity)
 {
-    ULONG_PTR offset = get_child_prop(hwnd, idx, L"offset");
-    ULONG_PTR prop = get_child_prop(hwnd, idx, L"opacity");
-    HWND wnd = (HWND)get_child_prop(hwnd, idx, L"wnd");
+    ULONG_PTR offset = get_child_prop(hwnd, idx, WINE_DCOMP_CHILD_OFFSET_PROP_FMT);
+    ULONG_PTR prop = get_child_prop(hwnd, idx, WINE_DCOMP_CHILD_OPACITY_PROP_FMT);
+    HWND wnd = (HWND)get_child_prop(hwnd, idx, WINE_DCOMP_CHILD_WND_PROP_FMT);
 
     ok_(__FILE__, line)(wnd && IsWindow(wnd), "Leaf %u: got composition window %p.\n", idx, wnd);
     ok_(__FILE__, line)((short)LOWORD(offset) == (short)x && (short)HIWORD(offset) == (short)y,
@@ -725,7 +725,7 @@ static void test_leaf_serialization(void)
     hr = IDCompositionDesktopDevice_Commit(device);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     flush_events(100);
-    count = (ULONG_PTR)GetPropW(hwnd, L"__wine_dcomp_child_count");
+    count = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_COUNT_PROP);
     ok(!count, "Got %Iu leaves.\n", count);
     gen = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_GEN_PROP);
 
@@ -766,7 +766,7 @@ static void test_leaf_serialization(void)
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     flush_events(100);
 
-    count = (ULONG_PTR)GetPropW(hwnd, L"__wine_dcomp_child_count");
+    count = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_COUNT_PROP);
     ok(count == 4, "Got %Iu leaves.\n", count);
     gen2 = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_GEN_PROP);
     ok(!(gen2 & 1) && gen2 > gen, "Got generation %Iu after %Iu.\n", gen2, gen);
@@ -774,7 +774,7 @@ static void test_leaf_serialization(void)
     check_leaf(hwnd, 1, 22, 34, 0.5f);
     check_leaf(hwnd, 2, 15, 26, 0.25f);
     check_leaf(hwnd, 3, 7, 16, 1.0f);
-    ok(get_child_prop(hwnd, 0, L"wnd") != get_child_prop(hwnd, 1, L"wnd"), "Leaves 0 and 1 share a window.\n");
+    ok(get_child_prop(hwnd, 0, WINE_DCOMP_CHILD_WND_PROP_FMT) != get_child_prop(hwnd, 1, WINE_DCOMP_CHILD_WND_PROP_FMT), "Leaves 0 and 1 share a window.\n");
 
     /* A hidden group takes its leaves with it. */
     hr = IDCompositionVisual3_SetVisible(group3, FALSE);
@@ -782,7 +782,7 @@ static void test_leaf_serialization(void)
     hr = IDCompositionDesktopDevice_Commit(device);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     flush_events(100);
-    count = (ULONG_PTR)GetPropW(hwnd, L"__wine_dcomp_child_count");
+    count = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_COUNT_PROP);
     ok(count == 2, "Got %Iu leaves.\n", count);
     check_leaf(hwnd, 0, 11, 22, 1.0f);
     check_leaf(hwnd, 1, 7, 16, 1.0f);
@@ -794,7 +794,7 @@ static void test_leaf_serialization(void)
     hr = IDCompositionDesktopDevice_Commit(device);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     flush_events(100);
-    count = (ULONG_PTR)GetPropW(hwnd, L"__wine_dcomp_child_count");
+    count = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_COUNT_PROP);
     ok(count == 4, "Got %Iu leaves.\n", count);
     check_leaf(hwnd, 3, 40010, 16, 1.0f);
     IDCompositionVisual2_SetOffsetX(leaf[3], -3.0f);
@@ -812,7 +812,7 @@ static void test_leaf_serialization(void)
     hr = IDCompositionDesktopDevice_Commit(device);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     flush_events(100);
-    count = (ULONG_PTR)GetPropW(hwnd, L"__wine_dcomp_child_count");
+    count = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_COUNT_PROP);
     ok(count == 4, "Got %Iu leaves.\n", count);
     check_leaf(hwnd, 0, 11, 22, 1.0f);
     hr = IDCompositionVisual2_RemoveVisual(root, (IDCompositionVisual *)surface_visual);
@@ -828,10 +828,10 @@ static void test_leaf_serialization(void)
     hr = IDCompositionDesktopDevice_Commit(device);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     flush_events(100);
-    count = (ULONG_PTR)GetPropW(hwnd, L"__wine_dcomp_child_count");
+    count = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_COUNT_PROP);
     ok(count == 16, "Got %Iu leaves.\n", count);
     check_leaf(hwnd, 15, 10 + 15, 20, 1.0f);
-    ok(!get_child_prop(hwnd, 16, L"wnd"), "Leaf 16 was written.\n");
+    ok(!get_child_prop(hwnd, 16, WINE_DCOMP_CHILD_WND_PROP_FMT), "Leaf 16 was written.\n");
 
     /* An empty tree again. */
     hr = IDCompositionVisual2_RemoveAllVisuals(root);
@@ -839,7 +839,7 @@ static void test_leaf_serialization(void)
     hr = IDCompositionDesktopDevice_Commit(device);
     ok(hr == S_OK, "Got hr %#lx.\n", hr);
     flush_events(100);
-    count = (ULONG_PTR)GetPropW(hwnd, L"__wine_dcomp_child_count");
+    count = (ULONG_PTR)GetPropW(hwnd, WINE_DCOMP_CHILD_COUNT_PROP);
     ok(!count, "Got %Iu leaves.\n", count);
 
     IDCompositionVisual2_Release(surface_visual);

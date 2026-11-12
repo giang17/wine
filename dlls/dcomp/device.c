@@ -3594,7 +3594,7 @@ static const WCHAR dcomp_target_prop[] = L"__wine_dcomp_target";
  * will handle WM_WINE_DCOMP_PRESENT_FLUSH.  dxgi reads it after each present
  * to decide whether to post the flush message at all -- foreign-process
  * targets have no subclass of ours, so they are never signalled. */
-static const WCHAR dcomp_present_flush_prop[] = L"__wine_dcomp_present_flush";
+static const WCHAR dcomp_present_flush_prop[] = WINE_DCOMP_PRESENT_FLUSH_PROP;
 
 /* The number of leaves dcomp_serialize_visual_leaves() writes to the target
  * window.  Kept as a name so the commit log can say which limit it hit;
@@ -3610,7 +3610,7 @@ static const WCHAR dcomp_real_wndproc_prop[] = L"__wine_dcomp_real_wndproc";
  * our own.  Both modules publish what they installed here and consult it
  * before chaining, so neither builds a chain that runs through the other and
  * back into itself (issue 101). */
-static const WCHAR dcomp_subclass_proc_prop[] = L"__wine_dcomp_subclass_proc";
+static const WCHAR dcomp_subclass_proc_prop[] = WINE_DCOMP_SUBCLASS_PROC_PROP;
 
 static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
@@ -4213,7 +4213,7 @@ static unsigned int dcomp_serialize_visual_leaves_locked(HWND target_hwnd, struc
             if (child_comp_wnd)
             {
                 swprintf(prop_name, ARRAY_SIZE(prop_name),
-                        L"__wine_dcomp_child_%u_wnd", idx);
+                        WINE_DCOMP_CHILD_WND_PROP_FMT, idx);
                 SetPropW(target_hwnd, prop_name, (HANDLE)child_comp_wnd);
 
                 /* Pack offset as two signed 16-bit values */
@@ -4231,14 +4231,14 @@ static unsigned int dcomp_serialize_visual_leaves_locked(HWND target_hwnd, struc
                                 vx, vy, target_hwnd, wrap_count, (short)vx, (short)vy);
                 }
                 swprintf(prop_name, ARRAY_SIZE(prop_name),
-                        L"__wine_dcomp_child_%u_offset", idx);
+                        WINE_DCOMP_CHILD_OFFSET_PROP_FMT, idx);
                 SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)MAKELPARAM(vx, vy));
 
                 /* Written for every leaf, opaque ones included: the slots are
                  * reused from commit to commit and a stale factor would fade a
                  * leaf that has since become opaque. */
                 swprintf(prop_name, ARRAY_SIZE(prop_name),
-                        L"__wine_dcomp_child_%u_opacity", idx);
+                        WINE_DCOMP_CHILD_OPACITY_PROP_FMT, idx);
                 SetPropW(target_hwnd, prop_name, (HANDLE)(ULONG_PTR)wine_dcomp_opacity_to_prop(op));
 
                 ++idx;
@@ -4361,7 +4361,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
 
         if (target_hwnd)
         {
-            SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)0);
+            SetPropW(target_hwnd, WINE_DCOMP_CHILD_COUNT_PROP, (HANDLE)0);
             KillTimer(target_hwnd, DCOMP_TREE_TIMER);
             if (root)
                 root->serialized_gen = tree_gen;
@@ -4414,7 +4414,7 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
                     dcomp_visual_root_opacity(root), idx, &stats);
     }
 
-    SetPropW(target_hwnd, L"__wine_dcomp_child_count", (HANDLE)(ULONG_PTR)idx);
+    SetPropW(target_hwnd, WINE_DCOMP_CHILD_COUNT_PROP, (HANDLE)(ULONG_PTR)idx);
     SetPropW(target_hwnd, WINE_DCOMP_CHILD_GEN_PROP, (HANDLE)(gen + 1));
     root->serialized_gen = tree_gen;
 
@@ -5120,8 +5120,8 @@ static void dcomp_composite_leaf(struct dcomp_target *target, struct dcomp_compo
             target->walk_leaf_absent = TRUE;
         else
         {
-            bits = (DWORD *)GetPropW(comp_wnd, L"__wine_dcomp_comp_bits");
-            dims = (ULONG_PTR)GetPropW(comp_wnd, L"__wine_dcomp_comp_size");
+            bits = (DWORD *)GetPropW(comp_wnd, WINE_DCOMP_COMP_BITS_PROP);
+            dims = (ULONG_PTR)GetPropW(comp_wnd, WINE_DCOMP_COMP_SIZE_PROP);
             /* Between two swapchains of one visual (see DCOMP_LEAF_ABSENT_HOLD_MS). */
             if (!bits || !dims)
                 target->walk_leaf_absent = TRUE;
@@ -5297,7 +5297,7 @@ static BOOL dcomp_visual_leaf_extent_locked(struct dcomp_visual *visual, UINT *w
                 WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)visual->content);
         if (!(comp_wnd = (HWND)GetPropW(GetDesktopWindow(), prop_name)))
             return FALSE;
-        if (!(dims = (ULONG_PTR)GetPropW(comp_wnd, L"__wine_dcomp_comp_size")))
+        if (!(dims = (ULONG_PTR)GetPropW(comp_wnd, WINE_DCOMP_COMP_SIZE_PROP)))
             return FALSE;
         *w = LOWORD(dims);
         *h = HIWORD(dims);
@@ -8142,7 +8142,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
              * because it subclassed on top of us; adopting it would make us call
              * ourselves.  Take it only when it is neither our own procedure nor
              * the one currently installed. */
-            WNDPROC saved = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+            WNDPROC saved = (WNDPROC)GetPropW(hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP);
 
             if (saved != dcomp_target_wndproc && saved != installed)
                 object->orig_wndproc = saved;

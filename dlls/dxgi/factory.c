@@ -18,6 +18,7 @@
  */
 
 #include "dxgi_private.h"
+#include "wine/dcomp_layer.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dxgi);
 
@@ -404,8 +405,8 @@ static inline struct d3d11_swapchain *d3d11_swapchain_from_IDXGISwapChain4(IDXGI
  * (client coordinates) limits the blit to that region. */
 static void dcomp_reblit_comp_buffer_clipped(HWND hwnd, const char *reason, HRGN clip)
 {
-    HDC comp_dc = (HDC)GetPropW(hwnd, L"__wine_dcomp_comp_dc");
-    LPARAM dims = (LPARAM)GetPropW(hwnd, L"__wine_dcomp_comp_size");
+    HDC comp_dc = (HDC)GetPropW(hwnd, WINE_DCOMP_COMP_DC_PROP);
+    LPARAM dims = (LPARAM)GetPropW(hwnd, WINE_DCOMP_COMP_SIZE_PROP);
 
     if (comp_dc && dims)
     {
@@ -572,7 +573,7 @@ static void dcomp_restore_parent_clip(HWND hwnd)
  * interference that causes main plugin window to flicker. */
 static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    WNDPROC orig = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP);
 
     switch (msg)
     {
@@ -617,7 +618,7 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
         case WM_NCDESTROY:
         {
             LRESULT result;
-            IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+            IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, WINE_DCOMP_SWAPCHAIN_PROP);
 
             InterlockedDecrement(&dcomp_subclassed_target_count);
             dcomp_update_active_prop();
@@ -661,11 +662,11 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
             dcomp_restore_parent_clip(hwnd);
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
-            RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
-            RemovePropW(hwnd, L"__wine_dcomp_subclass_proc");
-            RemovePropW(hwnd, L"__wine_dcomp_swapchain");
-            RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
-            RemovePropW(hwnd, L"__wine_dcomp_comp_size");
+            RemovePropW(hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP);
+            RemovePropW(hwnd, WINE_DCOMP_SUBCLASS_PROC_PROP);
+            RemovePropW(hwnd, WINE_DCOMP_SWAPCHAIN_PROP);
+            RemovePropW(hwnd, WINE_DCOMP_COMP_DC_PROP);
+            RemovePropW(hwnd, WINE_DCOMP_COMP_SIZE_PROP);
             return result;
         }
     }
@@ -681,7 +682,7 @@ static LRESULT CALLBACK dcomp_popup_wndproc(HWND hwnd, UINT msg, WPARAM wparam, 
  * reach child windows when the top-level parent loses focus. */
 static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
-    WNDPROC orig = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP);
 
     switch (msg)
     {
@@ -727,7 +728,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
                 if (paint_count <= 5 || !(paint_count % 200))
                     FIXME("WM_PAINT #%u (forwarded): hwnd %p, comp_dc=%p.\n",
                             paint_count, hwnd,
-                            (HDC)GetPropW(hwnd, L"__wine_dcomp_comp_dc"));
+                            (HDC)GetPropW(hwnd, WINE_DCOMP_COMP_DC_PROP));
             }
             if (update_type == ERROR)
                 dcomp_reblit_comp_buffer(hwnd, "paint");
@@ -742,7 +743,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         case WM_TIMER:
             if (wparam == DCOMP_REBLIT_TIMER_ID)
             {
-                IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+                IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, WINE_DCOMP_SWAPCHAIN_PROP);
                 DWORD present_thread_id = sc ? d3d11_swapchain_from_IDXGISwapChain4(sc)->present_thread_id : 0;
 
                 /* An application that presents from a render thread of its
@@ -803,7 +804,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         case WM_NCDESTROY:
         {
             LRESULT result;
-            IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+            IDXGISwapChain4 *sc = (IDXGISwapChain4 *)GetPropW(hwnd, WINE_DCOMP_SWAPCHAIN_PROP);
             InterlockedDecrement(&dcomp_subclassed_target_count);
             dcomp_update_active_prop();
             dcomp_popup_stack_remove(hwnd);
@@ -815,11 +816,11 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             dcomp_restore_parent_clip(hwnd);
             result = orig ? CallWindowProcW(orig, hwnd, msg, wparam, lparam)
                          : DefWindowProcW(hwnd, msg, wparam, lparam);
-            RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
-            RemovePropW(hwnd, L"__wine_dcomp_subclass_proc");
-            RemovePropW(hwnd, L"__wine_dcomp_swapchain");
-            RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
-            RemovePropW(hwnd, L"__wine_dcomp_comp_size");
+            RemovePropW(hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP);
+            RemovePropW(hwnd, WINE_DCOMP_SUBCLASS_PROC_PROP);
+            RemovePropW(hwnd, WINE_DCOMP_SWAPCHAIN_PROP);
+            RemovePropW(hwnd, WINE_DCOMP_COMP_DC_PROP);
+            RemovePropW(hwnd, WINE_DCOMP_COMP_SIZE_PROP);
             return result;
         }
     }
@@ -845,7 +846,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
  * is being freed, and both wndprocs tolerate their absence. */
 void dcomp_swapchain_subclass_teardown(HWND hwnd)
 {
-    WNDPROC orig = (WNDPROC)GetPropW(hwnd, L"__wine_dcomp_orig_wndproc");
+    WNDPROC orig = (WNDPROC)GetPropW(hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP);
     WNDPROC installed = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
 
     KillTimer(hwnd, DCOMP_REBLIT_TIMER_ID);
@@ -854,8 +855,8 @@ void dcomp_swapchain_subclass_teardown(HWND hwnd)
     if (orig && (installed == dcomp_popup_wndproc || installed == dcomp_target_wndproc))
     {
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)orig);
-        RemovePropW(hwnd, L"__wine_dcomp_orig_wndproc");
-        RemovePropW(hwnd, L"__wine_dcomp_subclass_proc");
+        RemovePropW(hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP);
+        RemovePropW(hwnd, WINE_DCOMP_SUBCLASS_PROC_PROP);
         InterlockedDecrement(&dcomp_subclassed_target_count);
         dcomp_update_active_prop();
         dcomp_popup_stack_remove(hwnd);
@@ -864,9 +865,9 @@ void dcomp_swapchain_subclass_teardown(HWND hwnd)
         FIXME("DComp: hwnd %p runs wndproc %p, not ours -- leaving the chain alone, "
                 "bookkeeping deferred to WM_NCDESTROY.\n", hwnd, installed);
 
-    RemovePropW(hwnd, L"__wine_dcomp_comp_dc");
-    RemovePropW(hwnd, L"__wine_dcomp_comp_size");
-    RemovePropW(hwnd, L"__wine_dcomp_comp_bits");
+    RemovePropW(hwnd, WINE_DCOMP_COMP_DC_PROP);
+    RemovePropW(hwnd, WINE_DCOMP_COMP_SIZE_PROP);
+    RemovePropW(hwnd, WINE_DCOMP_COMP_BITS_PROP);
 }
 
 static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
@@ -898,7 +899,7 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
         case WM_WINE_DCOMP_SET_TARGET:
         {
             HWND target_hwnd = (HWND)lparam;
-            IDXGISwapChain4 *iface = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+            IDXGISwapChain4 *iface = (IDXGISwapChain4 *)GetPropW(hwnd, WINE_DCOMP_SWAPCHAIN_PROP);
             if (iface && target_hwnd)
             {
                 struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
@@ -1084,8 +1085,8 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                          * procedure it saved (ours) right back (issue 101). */
                         if (installed == dcomp_popup_wndproc || installed == dcomp_target_wndproc
                                 || (installed
-                                    && installed == (WNDPROC)GetPropW(target_hwnd, L"__wine_dcomp_subclass_proc")
-                                    && GetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc")))
+                                    && installed == (WNDPROC)GetPropW(target_hwnd, WINE_DCOMP_SUBCLASS_PROC_PROP)
+                                    && GetPropW(target_hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP)))
                         {
                             FIXME("DComp: target %p already subclassed (wndproc %p), not chaining again.\n",
                                     target_hwnd, installed);
@@ -1101,11 +1102,11 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                                 (LONG_PTR)dcomp_popup_wndproc);
                         if (orig)
                         {
-                            SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
+                            SetPropW(target_hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP, (HANDLE)orig);
                             /* Publish what we installed so dcomp recognises the
                              * subclass as ours (issue 101). */
-                            SetPropW(target_hwnd, L"__wine_dcomp_subclass_proc", (HANDLE)dcomp_popup_wndproc);
-                            SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
+                            SetPropW(target_hwnd, WINE_DCOMP_SUBCLASS_PROC_PROP, (HANDLE)dcomp_popup_wndproc);
+                            SetPropW(target_hwnd, WINE_DCOMP_SWAPCHAIN_PROP, (HANDLE)iface);
                             /* Anchor transient_for at the previously-opened target
                              * (read by winex11 set_style_hints) instead of
                              * get_active_window → nested hierarchy, no main-window pull. */
@@ -1130,11 +1131,11 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                                 (LONG_PTR)dcomp_target_wndproc);
                         if (orig)
                         {
-                            SetPropW(target_hwnd, L"__wine_dcomp_orig_wndproc", (HANDLE)orig);
+                            SetPropW(target_hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP, (HANDLE)orig);
                             /* Publish what we installed so dcomp recognises the
                              * subclass as ours (issue 101). */
-                            SetPropW(target_hwnd, L"__wine_dcomp_subclass_proc", (HANDLE)dcomp_target_wndproc);
-                            SetPropW(target_hwnd, L"__wine_dcomp_swapchain", (HANDLE)iface);
+                            SetPropW(target_hwnd, WINE_DCOMP_SUBCLASS_PROC_PROP, (HANDLE)dcomp_target_wndproc);
+                            SetPropW(target_hwnd, WINE_DCOMP_SWAPCHAIN_PROP, (HANDLE)iface);
                             SetTimer(target_hwnd, DCOMP_REBLIT_TIMER_ID, 200, NULL);
                             InterlockedIncrement(&dcomp_subclassed_target_count);
                             dcomp_update_active_prop();
@@ -1187,7 +1188,7 @@ dcomp_subclass_done:
 
         case WM_WINE_DCOMP_SET_CHILD_MODE:
         {
-            IDXGISwapChain4 *iface = (IDXGISwapChain4 *)GetPropW(hwnd, L"__wine_dcomp_swapchain");
+            IDXGISwapChain4 *iface = (IDXGISwapChain4 *)GetPropW(hwnd, WINE_DCOMP_SWAPCHAIN_PROP);
             if (iface)
             {
                 struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
@@ -1201,7 +1202,7 @@ dcomp_subclass_done:
                     wined3d_swapchain_set_premultiplied_alpha(swapchain->wined3d_swapchain, TRUE);
 
                 /* Mark this window as a child visual's comp window */
-                SetPropW(hwnd, L"__wine_dcomp_is_child", (HANDLE)(ULONG_PTR)1);
+                SetPropW(hwnd, WINE_DCOMP_IS_CHILD_PROP, (HANDLE)(ULONG_PTR)1);
 
                 FIXME("DComp child mode: hwnd %p, sc %p, alpha_mode %u.\n",
                         hwnd, iface, swapchain->alpha_mode);
@@ -1273,7 +1274,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWin
                 WINE_DCOMP_WND_PROP_FMT, GetCurrentProcessId(), (UINT_PTR)*swapchain);
         SetPropW(GetDesktopWindow(), prop_name, (HANDLE)window);
         /* Store back-reference for WM_WINE_DCOMP_SET_TARGET handler */
-        SetPropW(window, L"__wine_dcomp_swapchain", (HANDLE)*swapchain);
+        SetPropW(window, WINE_DCOMP_SWAPCHAIN_PROP, (HANDLE)*swapchain);
         /* Remember the composition window for teardown in d3d11_swapchain_Release. */
         d3d11_swapchain_from_IDXGISwapChain4((IDXGISwapChain4 *)*swapchain)->comp_wnd = window;
         FIXME("Created composition window %p (%ux%u) for swapchain %p.\n",

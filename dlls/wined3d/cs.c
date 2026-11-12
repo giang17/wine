@@ -18,6 +18,7 @@
 
 #include "wined3d_private.h"
 #include "wined3d_gl.h"
+#include "wine/dcomp_layer.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
 WINE_DECLARE_DEBUG_CHANNEL(d3d_perf);
@@ -760,7 +761,7 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
      * Pro (issue 190).  Windows without the property (no in-process dcomp
      * target, composition swapchains) pay one GetPropW per present. */
     if (swapchain->win_handle
-            && GetPropW(swapchain->win_handle, L"__wine_dcomp_present_flush"))
+            && GetPropW(swapchain->win_handle, WINE_DCOMP_PRESENT_FLUSH_PROP))
         PostMessageW(swapchain->win_handle, WM_WINE_DCOMP_PRESENT_FLUSH, 0, 0);
 
     /* Copy the just-presented content back into back_buffer[0] so the app can
