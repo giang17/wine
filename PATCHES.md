@@ -1260,6 +1260,14 @@ This is the recommended branch. What it changes, by subsystem:
   foreground. The driver now removes the state once per map when the map did not ask for
   activation or the foreground belongs to the same process, unless `FlashWindowEx()` set it.
   vatSys's strip windows and VSCS came up flashing on every start.
+- **winex11**: asking for the window properties that dcomp, dxgi, d2d1 and dwmapi set on the
+  windows they render to no longer changes the caller's last error. In a process that never
+  set one, the name has no atom and the lookup failed with `ERROR_FILE_NOT_FOUND`, which stayed
+  as the last error of the user32 call that led there: `EnableWindow( hwnd, FALSE )` returned
+  with error 2 (its `WS_DISABLED` change re-sends the window manager hints, which ask for
+  `__wine_dcomp_popup_parent`), and the user32 `win` test failed `win.c:3779` in every run.
+  With the change it failed in none of 3 runs, and no line appeared that the fork did not
+  show before (issue 587)
 - **win32u / winex11**: the window manager gets the application's minimum and maximum track
   size as `PMinSize`/`PMaxSize`. `set_size_hints()` sent them only for windows that are not
   resizable; a resizable window got position and gravity only, so the window manager shrank it
