@@ -1014,6 +1014,20 @@ static inline UINT get_palette_entries( HPALETTE palette, UINT start, UINT count
 
 /* user helpers */
 
+/* Query one of the marker properties that dcomp, dxgi, d2d1 and dwmapi set on the windows
+ * they render to.  In a process that never set one, nothing has registered the name as an
+ * atom, the lookup fails with STATUS_OBJECT_NAME_NOT_FOUND, and the server call sets
+ * ERROR_FILE_NOT_FOUND as the last error of whatever user32 call got here -- EnableWindow()
+ * changing WS_DISABLED, for one.  Keep it out of the caller's last error. */
+static inline HANDLE get_marker_prop( HWND hwnd, const WCHAR *name )
+{
+    DWORD error = RtlGetLastWin32Error();
+    HANDLE ret = NtUserGetProp( hwnd, name );
+
+    RtlSetLastWin32Error( error );
+    return ret;
+}
+
 static inline LRESULT send_message( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
     return NtUserMessageCall( hwnd, msg, wparam, lparam, NULL, NtUserSendMessage, FALSE );

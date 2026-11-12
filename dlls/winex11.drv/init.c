@@ -274,7 +274,7 @@ static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw, BOOL vulkan )
          * and are left on the normal compositing path.  Do not "unify" the two
          * markers here without a verified swapchain-child test case: it would
          * change the offscreen decision for currently-working windows. */
-        if (NtUserGetProp( hwnd, dcomp_target_propW )) return FALSE;
+        if (get_marker_prop( hwnd, dcomp_target_propW )) return FALSE;
         /* ID2D1HwndRenderTarget windows (e.g. VSTGUI plugins with DComp disabled)
          * render via wined3d's swapchain_blit_gdi to the HWND DC, but the GDI
          * present path never triggers client_surface_present.  When the window
@@ -290,7 +290,7 @@ static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw, BOOL vulkan )
          * offscreen window to the top-level.  Attached, the window stayed
          * black - vatSys's strip bays with DXVK, while its map, a child without
          * the property, rendered. */
-        if (!vulkan && NtUserGetProp( hwnd, d3d_hwnd_target_propW )) return FALSE;
+        if (!vulkan && get_marker_prop( hwnd, d3d_hwnd_target_propW )) return FALSE;
         return TRUE; /* child window, needs compositing */
     }
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
