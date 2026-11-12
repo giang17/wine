@@ -428,6 +428,12 @@ This is the recommended branch. What it changes, by subsystem:
   Vulkan renderer presents it through a `B8G8R8A8_SRGB` swapchain image for the same reason
   (it fell back to `B8G8R8A8_UNORM` before, or took a float surface format in the non-linear
   sRGB colour space where one was offered).
+  A flip-model FP16 swapchain on a child window is presented by the GDI blit like an 8-bit
+  one, through an 8-bit sRGB copy made on the GPU. The blit needs a format GDI can read,
+  which a float back buffer is not, so since the format reports `DISPLAY` those swapchains
+  had been presented through GL. SynthEdit's window resized in steps 85 ms apart paints
+  202–222 frames per run instead of 123–144, with 3–5 gaps of 170 ms or more between frames
+  instead of 18–25 (KWin X11, NVIDIA); the picture is identical between the two paths.
   `CheckColorSpaceSupport()` and `SetColorSpace1()` answer by the back buffer format, the
   rule DXVK applies as well: scRGB only for `R16G16B16A16_FLOAT`, sRGB for every other
   format (`SetColorSpace1()` accepted sRGB only, also for FP16, and the check was `E_NOTIMPL`)
