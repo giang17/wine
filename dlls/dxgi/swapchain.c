@@ -18,6 +18,7 @@
  */
 
 #include "dxgi_private.h"
+#include "wine/dcomp_layer.h"
 
 #define VKD3D_NO_VULKAN_H
 #define VKD3D_NO_WIN32_TYPES
@@ -255,7 +256,7 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
         {
             HWND t = swapchain->target_hwnd;
 
-            RemovePropW(t, L"__wine_dcomp_swapchain");
+            RemovePropW(t, WINE_DCOMP_SWAPCHAIN_PROP);
             if (IsWindow(t) && GetWindowThreadProcessId(t, NULL) == GetCurrentThreadId())
                 dcomp_swapchain_subclass_teardown(t);
             swapchain->target_hwnd = NULL;
@@ -274,7 +275,7 @@ static ULONG STDMETHODCALLTYPE d3d11_swapchain_Release(IDXGISwapChain4 *iface)
              * finds nothing and its content never reaches the screen. */
             if (GetPropW(GetDesktopWindow(), prop_name) == (HANDLE)swapchain->comp_wnd)
                 RemovePropW(GetDesktopWindow(), prop_name);
-            RemovePropW(swapchain->comp_wnd, L"__wine_dcomp_swapchain");
+            RemovePropW(swapchain->comp_wnd, WINE_DCOMP_SWAPCHAIN_PROP);
             if (IsWindow(swapchain->comp_wnd))
             {
                 DWORD owner = GetWindowThreadProcessId(swapchain->comp_wnd, NULL);

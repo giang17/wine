@@ -89,9 +89,9 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
      * and __wine_dcomp_is_child are owned by dcomp/dxgi and removed there. */
     if (swapchain->win_handle)
     {
-        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_dc");
-        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_size");
-        RemovePropW(swapchain->win_handle, L"__wine_dcomp_comp_bits");
+        RemovePropW(swapchain->win_handle, WINE_DCOMP_COMP_DC_PROP);
+        RemovePropW(swapchain->win_handle, WINE_DCOMP_COMP_SIZE_PROP);
+        RemovePropW(swapchain->win_handle, WINE_DCOMP_COMP_BITS_PROP);
     }
 
     /* The dcomp leaf layer (issue 206): count out of the sink so dcomp stops
@@ -788,7 +788,7 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
     gen_before = (ULONG_PTR)GetPropW(swapchain->win_handle, WINE_DCOMP_CHILD_GEN_PROP);
 
     child_count_val = (ULONG_PTR)GetPropW(swapchain->win_handle,
-            L"__wine_dcomp_child_count");
+            WINE_DCOMP_CHILD_COUNT_PROP);
     child_count = (unsigned int)child_count_val;
     if (!child_count)
         return;
@@ -814,7 +814,7 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         int ox, oy;
 
         swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_child_%u_wnd", i);
+                WINE_DCOMP_CHILD_WND_PROP_FMT, i);
         child_wnd = (HWND)GetPropW(swapchain->win_handle, prop_name);
         if (!child_wnd)
         {
@@ -834,8 +834,8 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
             continue;
         }
 
-        child_bits = (DWORD *)GetPropW(child_wnd, L"__wine_dcomp_comp_bits");
-        child_dims = (LPARAM)GetPropW(child_wnd, L"__wine_dcomp_comp_size");
+        child_bits = (DWORD *)GetPropW(child_wnd, WINE_DCOMP_COMP_BITS_PROP);
+        child_dims = (LPARAM)GetPropW(child_wnd, WINE_DCOMP_COMP_SIZE_PROP);
         if (!child_bits || !child_dims)
         {
             /* The window is there but carries no composite buffer yet -- the
@@ -854,7 +854,7 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         ch = HIWORD(child_dims);
 
         swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_child_%u_offset", i);
+                WINE_DCOMP_CHILD_OFFSET_PROP_FMT, i);
         child_offset = (LPARAM)GetPropW(swapchain->win_handle, prop_name);
         ox = (short)LOWORD(child_offset);
         oy = (short)HIWORD(child_offset);
@@ -862,7 +862,7 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
         /* Opacity in 256ths, 0 = opaque (issue 363, see dcomp_layer.h).  A
          * value the protocol does not define is drawn opaque. */
         swprintf(prop_name, ARRAY_SIZE(prop_name),
-                L"__wine_dcomp_child_%u_opacity", i);
+                WINE_DCOMP_CHILD_OPACITY_PROP_FMT, i);
         child_opacity = (unsigned int)(ULONG_PTR)GetPropW(swapchain->win_handle, prop_name);
         if (child_opacity > 255)
             child_opacity = 0;
@@ -878,7 +878,7 @@ static void swapchain_composite_children(struct wined3d_swapchain *swapchain,
 
         /* Flush GDI operations on child's comp_dc before reading bits */
         {
-            HDC child_dc = (HDC)GetPropW(child_wnd, L"__wine_dcomp_comp_dc");
+            HDC child_dc = (HDC)GetPropW(child_wnd, WINE_DCOMP_COMP_DC_PROP);
             if (child_dc)
                 GdiFlush();
         }
@@ -1571,7 +1571,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
         /* Phase 3 Compositor: rebuild comp_bits from clean root surface_bits,
          * then composite child visuals on top. */
-        if (!GetPropW(swapchain->win_handle, L"__wine_dcomp_is_child"))
+        if (!GetPropW(swapchain->win_handle, WINE_DCOMP_IS_CHILD_PROP))
         {
             if (swapchain->surface_valid && swapchain->surface_bits && swapchain->comp_bits)
             {
@@ -1587,7 +1587,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
         /* Child visuals: only update comp buffer, skip window blit.
          * The root visual reads our comp_bits directly. */
-        if (GetPropW(swapchain->win_handle, L"__wine_dcomp_is_child"))
+        if (GetPropW(swapchain->win_handle, WINE_DCOMP_IS_CHILD_PROP))
         {
             /* Child visuals: only update comp buffer, skip window blit. */
         }
@@ -1622,16 +1622,16 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
         /* Store comp_dc as window property so WM_PAINT can re-blit. Don't
          * publish a partially-initialized composition state via props. */
-        if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_dc", (HANDLE)swapchain->comp_dc))
+        if (!SetPropW(swapchain->win_handle, WINE_DCOMP_COMP_DC_PROP, (HANDLE)swapchain->comp_dc))
             WARN("Failed to set __wine_dcomp_comp_dc property.\n");
         {
             /* Store dimensions as a single LPARAM-sized value. */
             LPARAM dims = MAKELPARAM(dst_w, dst_h);
-            if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_size", (HANDLE)dims))
+            if (!SetPropW(swapchain->win_handle, WINE_DCOMP_COMP_SIZE_PROP, (HANDLE)dims))
                 WARN("Failed to set __wine_dcomp_comp_size property.\n");
         }
         /* Expose surface_bits so root can composite per-visual layers. */
-        if (!SetPropW(swapchain->win_handle, L"__wine_dcomp_comp_bits",
+        if (!SetPropW(swapchain->win_handle, WINE_DCOMP_COMP_BITS_PROP,
                 (HANDLE)(swapchain->surface_bits ? swapchain->surface_bits : swapchain->comp_bits)))
             WARN("Failed to set __wine_dcomp_comp_bits property.\n");
 
