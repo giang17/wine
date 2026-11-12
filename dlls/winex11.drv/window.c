@@ -627,7 +627,7 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
      * the exposed area immediately, avoiding a 1-frame flash of undefined
      * content (garbage, terminal, white) that occurs with NotUseful because
      * the client has not yet processed the Expose event. */
-    if (NtUserGetProp( data->hwnd, dcomp_swapchain_prop ))
+    if (get_marker_prop( data->hwnd, dcomp_swapchain_prop ))
     {
         TRACE( "using None background_pixmap + Always backing_store for DComp window %p\n", data->hwnd );
         attr->background_pixmap = None;
@@ -1316,7 +1316,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
      * unchanged get_active_window() path below. */
     if (!owner_win)
     {
-        HWND popup_parent = NtUserGetProp( data->hwnd, dcomp_popup_parent_prop );
+        HWND popup_parent = get_marker_prop( data->hwnd, dcomp_popup_parent_prop );
         if (popup_parent && popup_parent != data->hwnd)
         {
             Window parent_win = X11DRV_get_whole_window( NtUserGetAncestor( popup_parent, GA_ROOT ) );
@@ -1368,7 +1368,7 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
              * popups carry no __wine_dcomp_popup_parent property).  Embedded plugin
              * GUIs anchor to the host window, which is NOT a DComp swapchain target,
              * so they stay UTILITY → unchanged (no embedded regression). */
-            if (active_root && NtUserGetProp( active_root, dcomp_swapchain_prop ))
+            if (active_root && get_marker_prop( active_root, dcomp_swapchain_prop ))
                 anchor_is_dcomp = TRUE;
         }
     }
@@ -1448,8 +1448,8 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
          * ("deliberately broad") and mis-typed borderless tool popups of unrelated
          * non-DComp processes as DROPDOWN_MENU while any DComp GUI was open
          * elsewhere — issue 74, repro scripts/repro-74-mixed-popup.sh. */
-        if (NtUserGetProp( data->hwnd, dcomp_popup_parent_prop ) || anchor_is_dcomp
-                || NtUserGetProp( NtUserGetDesktopWindow(), dcomp_active_prop() ))
+        if (get_marker_prop( data->hwnd, dcomp_popup_parent_prop ) || anchor_is_dcomp
+                || get_marker_prop( NtUserGetDesktopWindow(), dcomp_active_prop() ))
             window_set_net_wm_window_type( data, XATOM__NET_WM_WINDOW_TYPE_DROPDOWN_MENU );
         else
             /* Issue 84: ownerless TOOLWINDOW popups of non-DComp apps (KM88
@@ -2674,7 +2674,7 @@ static BOOL can_be_zorder_transient( HWND hwnd, HWND main )
     ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE );
     if ((style & (WS_VISIBLE | WS_CHILD)) != WS_VISIBLE) return FALSE;
     if ((ex_style & (WS_EX_TOOLWINDOW | WS_EX_APPWINDOW | WS_EX_TOPMOST)) != WS_EX_TOOLWINDOW) return FALSE;
-    if (NtUserGetProp( hwnd, dcomp_popup_parent_prop )) return FALSE;
+    if (get_marker_prop( hwnd, dcomp_popup_parent_prop )) return FALSE;
     if (is_owned_by( main, hwnd )) return FALSE;
     return TRUE;
 }
@@ -3364,7 +3364,7 @@ static void create_whole_window( struct x11drv_win_data *data )
      * state is the same visual either way; deciding here only skips the
      * transition. */
     if (!data->embedded && !data->wants_argb && argb_visual.visualid
-            && NtUserGetProp( data->hwnd, dwm_glass_prop ))
+            && get_marker_prop( data->hwnd, dwm_glass_prop ))
     {
         TRACE( "window %p asked for DWM glass before creation, using an ARGB visual\n", data->hwnd );
         data->wants_argb = 1;
@@ -3538,7 +3538,7 @@ void update_window_argb_visual( struct x11drv_win_data *data )
 {
     if (!data->wants_argb)
     {
-        if (!NtUserGetProp( data->hwnd, dwm_glass_prop )) return;
+        if (!get_marker_prop( data->hwnd, dwm_glass_prop )) return;
         TRACE( "window %p requested DWM glass, using an ARGB visual\n", data->hwnd );
         data->wants_argb = 1;
     }
