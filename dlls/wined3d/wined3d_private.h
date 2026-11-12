@@ -4183,6 +4183,10 @@ struct wined3d_swapchain
     unsigned int layer_tex_width;
     unsigned int layer_tex_height;
     BOOL layer_sink;
+
+    /* The 8-bit sRGB copy the GDI blit reads when the back buffer has no DDI
+     * format (a floating-point swapchain), see swapchain_update_gdi_texture(). */
+    struct wined3d_texture *gdi_texture;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);

@@ -107,6 +107,12 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
     }
     swapchain->layer = NULL;
 
+    if (swapchain->gdi_texture)
+    {
+        wined3d_texture_decref(swapchain->gdi_texture);
+        swapchain->gdi_texture = NULL;
+    }
+
     if (swapchain->surface_bits)
     {
         HeapFree(GetProcessHeap(), 0, swapchain->surface_bits);
@@ -1153,10 +1159,80 @@ static void swapchain_release_blit_dc(struct wined3d_swapchain *swapchain, HDC d
     if (fresh) ReleaseDC(swapchain->win_handle, dc);
 }
 
+/* The GDI blit hands memory to D3DKMTCreateDCFromMemory() and so needs a DDI
+ * format, which only the 8-bit BGR formats have.  A floating-point back buffer
+ * (R16G16B16A16_FLOAT, presented by DXGI as scRGB: linear values, encoded for
+ * display) is copied on the GPU into a B8G8R8A8_UNORM_SRGB texture of the same
+ * size first; the blit into an sRGB attachment encodes, and the download then
+ * reads four bytes per pixel as it does for an 8-bit back buffer.  The texture
+ * is created without data, like the staging textures of texture2d_blt_fbo(),
+ * so creating it here activates no context.  Context activation is done by the
+ * caller. */
+static struct wined3d_texture *swapchain_update_gdi_texture(struct wined3d_swapchain *swapchain,
+        struct wined3d_context *context)
+{
+    struct wined3d_texture *back_buffer = swapchain->back_buffers[0];
+    struct wined3d_device *device = swapchain->device;
+    struct wined3d_texture *texture;
+    struct wined3d_resource_desc desc;
+    unsigned int width, height;
+    DWORD location;
+    RECT rect;
+    HRESULT hr;
+
+    width = wined3d_texture_get_level_width(back_buffer, 0);
+    height = wined3d_texture_get_level_height(back_buffer, 0);
+
+    if ((texture = swapchain->gdi_texture)
+            && (texture->resource.width != width || texture->resource.height != height))
+    {
+        wined3d_texture_decref(texture);
+        texture = swapchain->gdi_texture = NULL;
+    }
+
+    if (!texture)
+    {
+        desc.resource_type = WINED3D_RTYPE_TEXTURE_2D;
+        desc.format = WINED3DFMT_B8G8R8A8_UNORM_SRGB;
+        desc.multisample_type = WINED3D_MULTISAMPLE_NONE;
+        desc.multisample_quality = 0;
+        desc.usage = WINED3DUSAGE_CS;
+        desc.bind_flags = 0;
+        desc.access = WINED3D_RESOURCE_ACCESS_GPU;
+        desc.width = width;
+        desc.height = height;
+        desc.depth = 1;
+        desc.size = 0;
+
+        if (FAILED(hr = wined3d_texture_create(device, &desc, 1, 1, 0, NULL, NULL,
+                &wined3d_null_parent_ops, &texture)))
+        {
+            ERR("Failed to create the %ux%u GDI present texture, hr %#lx.\n", width, height, hr);
+            return NULL;
+        }
+        swapchain->gdi_texture = texture;
+        TRACE("Created a %ux%u GDI present texture for swapchain %p.\n", width, height, swapchain);
+    }
+
+    location = WINED3D_LOCATION_TEXTURE_RGB;
+    if (back_buffer->resource.multisample_type)
+        location = WINED3D_LOCATION_RB_RESOLVED;
+
+    SetRect(&rect, 0, 0, width, height);
+    location = device->blitter->ops->blitter_blit(device->blitter, WINED3D_BLIT_OP_COLOR_BLIT, context,
+            back_buffer, 0, location, &rect, texture, 0, WINED3D_LOCATION_TEXTURE_RGB, &rect,
+            NULL, WINED3D_TEXF_NONE, NULL);
+    wined3d_texture_validate_location(texture, 0, location);
+    wined3d_texture_invalidate_location(texture, 0, ~location);
+
+    return texture;
+}
+
 static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         struct wined3d_context *context, const RECT *src_rect, const RECT *dst_rect)
 {
     struct wined3d_texture *back_buffer = swapchain->back_buffers[0];
+    struct wined3d_texture *src_texture = back_buffer;
     D3DKMT_DESTROYDCFROMMEMORY destroy_desc;
     D3DKMT_CREATEDCFROMMEMORY create_desc;
     const struct wined3d_format *format;
@@ -1178,17 +1254,29 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
     format = back_buffer->resource.format;
     if (!format->ddi_format)
     {
-        WARN("Cannot create a DC for format %s.\n", debug_d3dformat(format->id));
-        return;
+        if (!(format->attrs & WINED3D_FORMAT_ATTR_FLOAT)
+                || !(src_texture = swapchain_update_gdi_texture(swapchain, context))
+                || !src_texture->resource.format->ddi_format)
+        {
+            WARN("Cannot create a DC for format %s.\n", debug_d3dformat(format->id));
+            return;
+        }
+        format = src_texture->resource.format;
+    }
+    else if (swapchain->gdi_texture)
+    {
+        /* ResizeBuffers() changed to a format the blit reads directly. */
+        wined3d_texture_decref(swapchain->gdi_texture);
+        swapchain->gdi_texture = NULL;
     }
 
-    wined3d_texture_load_location(back_buffer, 0, context, WINED3D_LOCATION_SYSMEM);
-    wined3d_texture_get_pitch(back_buffer, 0, &row_pitch, &slice_pitch);
+    wined3d_texture_load_location(src_texture, 0, context, WINED3D_LOCATION_SYSMEM);
+    wined3d_texture_get_pitch(src_texture, 0, &row_pitch, &slice_pitch);
 
-    create_desc.pMemory = back_buffer->resource.heap_memory;
+    create_desc.pMemory = src_texture->resource.heap_memory;
     create_desc.Format = format->ddi_format;
-    create_desc.Width = wined3d_texture_get_level_width(back_buffer, 0);
-    create_desc.Height = wined3d_texture_get_level_height(back_buffer, 0);
+    create_desc.Width = wined3d_texture_get_level_width(src_texture, 0);
+    create_desc.Height = wined3d_texture_get_level_height(src_texture, 0);
     create_desc.Pitch = row_pitch;
     create_desc.hDeviceDc = CreateCompatibleDC(NULL);
     create_desc.pColorTable = NULL;
@@ -1389,7 +1477,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                     /* Skip degenerate rects (fully clipped or inverted). */
                     if (cw > 0 && ch > 0)
                         comp_buffer_alpha_copy(target, stride,
-                                back_buffer->resource.heap_memory, row_pitch,
+                                src_texture->resource.heap_memory, row_pitch,
                                 cdx, cdy, csx, csy, cw, ch);
                 }
                 else
@@ -1473,7 +1561,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                  * comp_bits for the final BitBlt to the window. */
                 GdiFlush();
                 comp_buffer_alpha_merge(swapchain->surface_bits, swapchain->surface_width * 4,
-                        back_buffer->resource.heap_memory, row_pitch,
+                        src_texture->resource.heap_memory, row_pitch,
                         dst_w, dst_h);
                 swapchain->surface_valid = TRUE;
             }
@@ -1566,7 +1654,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
          * that is the back buffer copy this branch is about to write to the
          * window (issue 206). */
         composited_layer = format->byte_count == 4 && swapchain_composite_layer(swapchain,
-                (DWORD *)back_buffer->resource.heap_memory, row_pitch / 4,
+                (DWORD *)src_texture->resource.heap_memory, row_pitch / 4,
                 create_desc.Width, create_desc.Height);
         if (composited_layer)
             GdiFlush();
@@ -1586,7 +1674,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         /* Do not leave the leaves in that copy: a later present skipping the
          * download would blit them a second time and the leaf would trail. */
         if (composited_layer)
-            wined3d_texture_invalidate_location(back_buffer, 0, WINED3D_LOCATION_SYSMEM);
+            wined3d_texture_invalidate_location(src_texture, 0, WINED3D_LOCATION_SYSMEM);
     }
 
     /* No ValidateRect() on the window here.  A present never validates the
@@ -1926,9 +2014,14 @@ bool wined3d_swapchain_keeps_back_buffers(const struct wined3d_swapchain *swapch
  * and wined3d_context_gl_update_window() decide by the same rule, so the
  * context of a GDI-only swapchain never touches its window's DC.
  *
- * The blit hands the back buffer to D3DKMTCreateDCFromMemory() and so needs
- * a DDI format for it (ddi_formats[] in utils.c: the BGR formats only).
- * Without one swapchain_blit_gdi() returns before drawing, and nothing else
+ * The blit hands memory to D3DKMTCreateDCFromMemory() and so needs a DDI
+ * format for it (ddi_formats[] in utils.c: the BGR formats only).  A
+ * floating-point back buffer gets one through an 8-bit sRGB copy
+ * (swapchain_update_gdi_texture()): GMPI, the framework behind SynthEdit,
+ * renders the canvases on its child windows into R16G16B16A16_FLOAT
+ * swapchains, and presented through GL a resize of the window painted
+ * about half as many frames (issue 582).  With any other format that has
+ * no DDI format swapchain_blit_gdi() returns before drawing, and nothing else
  * presents the frame: VirtualDJ 2026 keeps two FLIP_SEQUENTIAL swapchains
  * with R8G8B8A8_UNORM back buffers on popup-style top levels and showed
  * only black windows (issue 406).  Such a swapchain presents through GL,
@@ -1953,6 +2046,11 @@ bool wined3d_swapchain_gdi_present_forced(const struct wined3d_swapchain *swapch
     if (!format->ddi_format)
     {
         static unsigned int once;
+
+        /* A floating-point back buffer reaches the blit through an 8-bit
+         * sRGB copy, see swapchain_update_gdi_texture(). */
+        if (format->attrs & WINED3D_FORMAT_ATTR_FLOAT)
+            return true;
 
         if (!once++)
             WARN("No DDI format for %s, presenting swapchain %p through GL.\n",

@@ -945,6 +945,16 @@ static void texture2d_blt_fbo(struct wined3d_device *device, struct wined3d_cont
             gl_info->gl_ops.gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
         context_invalidate_state(context, STATE_SHADER(WINED3D_SHADER_TYPE_PIXEL));
     }
+    /* The same encoding for the 8-bit sRGB copy of a floating-point back buffer
+     * that the GDI present reads (swapchain_update_gdi_texture()).  Between two
+     * textures GL_FRAMEBUFFER_SRGB is otherwise whatever the last draw left. */
+    else if (gl_info->supported[ARB_FRAMEBUFFER_SRGB]
+            && (src_texture->resource.format_attrs & WINED3D_FORMAT_ATTR_FLOAT)
+            && dst_texture->resource.format->id == WINED3DFMT_B8G8R8A8_UNORM_SRGB)
+    {
+        gl_info->gl_ops.gl.p_glEnable(GL_FRAMEBUFFER_SRGB);
+        context_invalidate_state(context, STATE_SHADER(WINED3D_SHADER_TYPE_PIXEL));
+    }
 
     gl_info->fbo_ops.glBlitFramebuffer(src_rect->left, src_rect->top, src_rect->right, src_rect->bottom,
             dst_rect->left, dst_rect->top, dst_rect->right, dst_rect->bottom, GL_COLOR_BUFFER_BIT, gl_filter);
