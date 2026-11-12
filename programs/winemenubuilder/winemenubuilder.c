@@ -272,6 +272,19 @@ static int winemenubuilder_rb_string_compare(const void *key, const struct wine_
     return wcscmp((WCHAR *)key, t->string);
 }
 
+/* Wait for a handle, dispatching the messages that arrive in the meantime. */
+static DWORD wait_for_object( HANDLE handle )
+{
+    DWORD ret;
+    MSG msg;
+
+    while ((ret = MsgWaitForMultipleObjects( 1, &handle, FALSE, INFINITE, QS_ALLINPUT )) == WAIT_OBJECT_0 + 1)
+    {
+        while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
+    }
+    return ret;
+}
+
 static void winemenubuilder_rb_destroy(struct wine_rb_entry *entry, void *context)
 {
     struct rb_string_entry *t = WINE_RB_ENTRY_VALUE(entry, struct rb_string_entry, entry);
@@ -2305,7 +2318,7 @@ static BOOL InvokeShellLinker( IShellLinkW *sl, LPCWSTR link, BOOL bWait )
 
     /* building multiple menus concurrently has race conditions */
     hsem = CreateSemaphoreA( NULL, 1, 1, "winemenubuilder_semaphore");
-    if( WAIT_OBJECT_0 != MsgWaitForMultipleObjects( 1, &hsem, FALSE, INFINITE, QS_ALLINPUT ) )
+    if (wait_for_object( hsem ) != WAIT_OBJECT_0)
     {
         WINE_ERR("failed wait for semaphore\n");
         goto cleanup;
@@ -2421,7 +2434,7 @@ static BOOL InvokeShellLinkerForURL( IUniformResourceLocatorW *url, LPCWSTR link
     }
 
     hSem = CreateSemaphoreA( NULL, 1, 1, "winemenubuilder_semaphore");
-    if( WAIT_OBJECT_0 != MsgWaitForMultipleObjects( 1, &hSem, FALSE, INFINITE, QS_ALLINPUT ) )
+    if (wait_for_object( hSem ) != WAIT_OBJECT_0)
     {
         WINE_ERR("failed wait for semaphore\n");
         goto cleanup;
@@ -2478,7 +2491,7 @@ static BOOL WaitForParentProcess( void )
         goto done;
     }
 
-    if (MsgWaitForMultipleObjects( 1, &hprocess, FALSE, INFINITE, QS_ALLINPUT ) == WAIT_OBJECT_0)
+    if (wait_for_object( hprocess ) == WAIT_OBJECT_0)
         ret = TRUE;
     else
         WINE_ERR("Unable to wait for parent process, error %ld\n", GetLastError());
@@ -2615,7 +2628,7 @@ static void RefreshFileTypeAssociations(void)
     BOOL hasChanged;
 
     hSem = CreateSemaphoreA( NULL, 1, 1, "winemenubuilder_semaphore");
-    if( WAIT_OBJECT_0 != MsgWaitForMultipleObjects( 1, &hSem, FALSE, INFINITE, QS_ALLINPUT ) )
+    if (wait_for_object( hSem ) != WAIT_OBJECT_0)
     {
         WINE_ERR("failed wait for semaphore\n");
         CloseHandle(hSem);
