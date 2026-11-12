@@ -1683,6 +1683,24 @@ This is the recommended branch. What it changes, by subsystem:
   top-level windows out of 288 with wine-stable 11.0, all in the first 1.4 s, and none out
   of 290 with the change (three runs, two more as a 32-bit process); the message window is
   still the one `explorer` creates (issue 586)
+- **win32u**: backport of 5ac766de7d7 from Wine 11.20 (Rémi Bernon): `wglGetPixelFormat()`,
+  `wglSetPixelFormat()` and `wglSetPixelFormatWINE()` use the window's pixel format only
+  for a window of the calling process; for a window of another process — the desktop
+  window included, which belongs to `explorer.exe` — they use the DC's own format. Before,
+  `SetPixelFormat()` on such a DC failed and no context could be created on it. Checked
+  with Wine 11.21's `opengl32` test, built from the devel tree: in
+  `test_other_process_window_process()`, where a second process sets a format on, creates a
+  context for, clears and swaps a window the test owns, 13 checks per run failed before and
+  1 after, 64- and 32-bit on llvmpipe; the remaining one (`GL_DOUBLEBUFFER` of a
+  single-buffered format reads 1) fails the same way for a window of the own process. The
+  other failures of the newer test against this branch are the same before and after. On
+  the NVIDIA driver the block fails as with Wine 11.21, three read-backs of the first case,
+  plus that `GL_DOUBLEBUFFER` check. On the screen DC (`GetDC(NULL)`) `SetPixelFormat()` now
+  succeeds and a context clears and swaps, as with Wine 11.21 (wine-stable 11.0:
+  `SetPixelFormat()` returns FALSE, `wglCreateContext()` NULL). Plug-in bridges that create
+  their own window and reparent it into the host (yabridge, FL Studio's `ilbridge.exe`)
+  render into a window of their own process and take the unchanged path; the test case for
+  that (`test_other_process_parent()`) gives the same results before and after (issue 464)
 - **wined3d**: a GDI present of a window below a top level of another process blits
   through a fresh cache DC instead of the one held since the swap chain was created.
   That DC keeps the device origin and visible region of the window's position at that
