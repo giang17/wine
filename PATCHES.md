@@ -348,6 +348,18 @@ This is the recommended branch. What it changes, by subsystem:
   in 14.9 % of captured frames before and 0.0 % after. A layer nobody draws would hide the
   leaves in every frame, so dcomp returns to the blit path on its own after about 200
   undrawn deliveries. The Vulkan present path is untouched
+- **DComp in 32-bit processes**: dxgi and dcomp agree on the name under which the
+  composition window of a swapchain is stored. The name was formatted with `%I64x` from a
+  pointer-sized argument, so in a 32-bit process its upper half came from the stack, dcomp
+  never found the window and took every composition swapchain of the process for one of
+  another process: in the dcomp tests 18 of 18 swapchain leaves went the foreign-swapchain
+  way and none was handed to wined3d, now all 18 take the path of a 64-bit process.
+  `DCompositionCreateDevice*()` with a NULL object pointer returns `E_INVALIDARG` instead
+  of crashing, `AddVisual()` of a visual to itself no longer hangs the next walk of the
+  tree, and a reference visual that is not a child is rejected, all as measured on
+  Windows 10. dcomp has tests now (`dlls/dcomp/tests`): device creation, the visual tree,
+  targets, surfaces and the leaf properties written for wined3d -- 266 tests without a
+  failure on Windows 10, 554 on the fork with the 97 known differences marked.
 - **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
   only the version 1 classes, so an application that creates the version 2 pair while
   bringing up its Direct Composition engine fails there. Applications built on the CCL
