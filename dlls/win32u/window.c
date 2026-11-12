@@ -587,6 +587,35 @@ HWND get_hwnd_message_parent(void)
     struct user_thread_info *thread_info = get_user_thread_info();
 
     if (!thread_info->msg_window) get_desktop_window(); /* trigger creation */
+    if (!thread_info->msg_window && thread_info->top_window)
+    {
+        /* explorer creates the desktop window first and the message window when the
+         * desktop is set up; a request in between returns only the former. Wait for
+         * explorer like the process that started it, then ask again. */
+        OBJECT_ATTRIBUTES attr = { .Length = sizeof(attr) };
+        CLIENT_ID cid = { 0 };
+        HANDLE process;
+        DWORD pid = 0;
+
+        get_window_thread( thread_info->top_window, &pid );
+        if (pid == GetCurrentProcessId()) return 0;  /* explorer itself */
+        if (pid)
+        {
+            cid.UniqueProcess = UlongToHandle( pid );
+            if (!NtOpenProcess( &process, PROCESS_QUERY_INFORMATION | SYNCHRONIZE, &attr, &cid ))
+            {
+                NtUserWaitForInputIdle( process, 10000, FALSE );
+                NtClose( process );
+            }
+        }
+
+        SERVER_START_REQ( get_desktop_window )
+        {
+            req->force = 1;
+            if (!wine_server_call( req )) thread_info->msg_window = wine_server_ptr_handle( reply->msg_window );
+        }
+        SERVER_END_REQ;
+    }
     return thread_info->msg_window;
 }
 
