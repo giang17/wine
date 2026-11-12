@@ -40,8 +40,14 @@ cpp_quote("struct wined3d_device_parent;")
  * host app and its webview2 child).  The process id scopes each process's
  * address space apart; within a single process the ownership check in
  * d3d11_swapchain_Release keeps a recycled address from stranding a live
- * window.  See wine-dev issue 148. */
-cpp_quote("#define WINE_DCOMP_WND_PROP_FMT L\"__wine_dcomp_wnd_%lu_%I64x\"")
+ * window.  See wine-dev issue 148.
+ *
+ * The second argument is the pointer as a UINT_PTR, hence %Ix: with %I64x a
+ * 32-bit caller pushed four bytes for a conversion that reads eight, the name
+ * took its upper half from whatever followed on the stack, and dxgi and dcomp
+ * disagreed on it -- dcomp then treated every composition swapchain of a
+ * 32-bit process as one from another process. */
+cpp_quote("#define WINE_DCOMP_WND_PROP_FMT L\"__wine_dcomp_wnd_%lu_%Ix\"")
 
 [
     object,
