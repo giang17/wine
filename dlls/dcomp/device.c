@@ -3192,6 +3192,20 @@ static HRESULT STDMETHODCALLTYPE dcomp_visual_AddVisual_locked(IDCompositionVisu
     if (!visual)
         return E_INVALIDARG;
 
+    /* Windows accepts a visual as its own child and returns S_OK.  Linking it
+     * here would close the sibling list into a ring that every walk of the
+     * tree then follows forever, so the call succeeds and changes nothing. */
+    if (child == parent)
+    {
+        FIXME("Visual %p added to itself, ignored.\n", iface);
+        return S_OK;
+    }
+
+    /* A reference visual has to be a child of this visual, as on Windows.  One
+     * that is not would lend its own parent -- or none -- to the new child. */
+    if (ref && ref->parent != parent)
+        return E_INVALIDARG;
+
     /* Remove from old parent if already in a tree */
     if (child->parent)
     {
@@ -9386,6 +9400,9 @@ static HRESULT dcomp_device_create(IUnknown *rendering_device, REFIID iid, void 
     const WCHAR *caller_name = L"";
     HMODULE caller_module;
     HRESULT hr;
+
+    if (!device)
+        return E_INVALIDARG;
 
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             caller, &caller_module))
