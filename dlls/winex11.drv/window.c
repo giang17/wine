@@ -1591,30 +1591,49 @@ static void set_wm_hints( struct x11drv_win_data *data )
 /***********************************************************************
  *              refresh_owned_group_hints
  *
- * The owner of group-transient WS_EX_APPWINDOW windows was shown or hidden: rebuild the
- * WM_HINTS of the owned windows this thread has mapped, so that they join the owner's
- * window group behind it (or leave it while the owner is hidden), see set_style_hints().
+ * The owner of windows this thread has mapped was shown or hidden.
+ *
+ * Group-transient WS_EX_APPWINDOW windows: rebuild their WM_HINTS, so that they join
+ * the owner's window group behind it (or leave it while the owner is hidden), see
+ * set_style_hints().
+ *
+ * Other owned windows are transient for the owner. KWin does not take that relation
+ * up again when the owner is mapped again, also not when WM_TRANSIENT_FOR is written
+ * again with the value it had, and then raises an activated owner above the windows
+ * it owns (wine-dev issue 588). It does when the property was removed in between, so
+ * remove it while the owner is hidden and set it again when the owner is shown.
+ *
  * Bottom-up in the win32 Z-order, so that the join order keeps the sibling order the
  * window manager derives from it.
  */
 static void refresh_owned_group_hints( HWND owner )
 {
     HWND hwnd = NtUserGetWindowRelative( NtUserGetDesktopWindow(), GW_CHILD );
+    BOOL owner_visible = (NtUserGetWindowLongW( owner, GWL_STYLE ) & WS_VISIBLE) != 0;
 
     if (hwnd) hwnd = NtUserGetWindowRelative( hwnd, GW_HWNDLAST );
     for (; hwnd; hwnd = NtUserGetWindowRelative( hwnd, GW_HWNDPREV ))
     {
         struct x11drv_win_data *data;
+        BOOL appwindow;
 
         if (NtUserGetWindowRelative( hwnd, GW_OWNER ) != owner) continue;
-        if (!(NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_APPWINDOW)) continue;
+        appwindow = (NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_APPWINDOW) != 0;
         if (!(NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE)) continue;
         if (NtUserGetWindowThread( hwnd, NULL ) != GetCurrentThreadId()) continue; /* the hints go through the thread's display */
         if (!(data = get_win_data( hwnd ))) continue;
         if (data->whole_window && data->managed && !data->embedded && data->desired_state.wm_state != WithdrawnState)
         {
-            TRACE( "owner %p shown or hidden, rebuilding the hints of owned window %p/%lx\n", owner, hwnd, data->whole_window );
-            set_wm_hints( data );
+            if (appwindow || owner_visible)
+            {
+                TRACE( "owner %p shown or hidden, rebuilding the hints of owned window %p/%lx\n", owner, hwnd, data->whole_window );
+                set_wm_hints( data );
+            }
+            else
+            {
+                TRACE( "owner %p hidden, dropping WM_TRANSIENT_FOR of owned window %p/%lx\n", owner, hwnd, data->whole_window );
+                XDeleteProperty( data->display, data->whole_window, XA_WM_TRANSIENT_FOR );
+            }
         }
         release_win_data( data );
     }
@@ -4417,7 +4436,8 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if (was_fullscreen) NtUserClipCursor( NULL );
 
-    /* owned group transients join the group of a shown owner behind it, and leave it when the owner hides */
+    /* owned group transients join the group of a shown owner behind it, and leave it when the owner hides;
+     * other owned windows are made transient for it again */
     if ((swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) && !(new_style & WS_CHILD) &&
         NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow())
         refresh_owned_group_hints( hwnd );
