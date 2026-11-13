@@ -800,8 +800,9 @@ This is the recommended branch. What it changes, by subsystem:
 - **Window-surface repaints (win32u, winex11)**: a series of erase-and-repaint races in
   the window-surface path. Flushes are held back while an erase waits for its repaint,
   `XShmPutImage` is waited for before the surface is painted into again, a new surface
-  inherits its predecessor's pixels, a plain move invalidates only child windows, the
-  xrender PutImage path is flushed, and a client window that will render offscreen is
+  inherits its predecessor's pixels, a move invalidates a top level only when its size
+  changes and a child window only when its parent lays it out (see the win32u entry for
+  issue 587 below), the xrender PutImage path is flushed, and a client window that will render offscreen is
   created under the dummy parent. Seen as MDI captions going dark during a resize, a
   black toolbar after a menu and a stale MDI client after a drag in SynthEdit 1.5, and as
   a one-frame black flash on a fast resize in FL Studio. An empty surface clip region now
@@ -1268,6 +1269,18 @@ This is the recommended branch. What it changes, by subsystem:
   `__wine_dcomp_popup_parent`), and the user32 `win` test failed `win.c:3779` in every run.
   With the change it failed in none of 3 runs, and no line appeared that the fork did not
   show before (issue 587)
+- **win32u**: the full repaint the fork forces after a window moves or resizes
+  (`RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN`) reaches a child window only when it is moved
+  as part of a layout: inside a `DeferWindowPos` batch, or while another window's position
+  change is still in progress, as when a dialog places its controls from its own resize. A
+  child moved on its own keeps its update region and the copied bits, as on Windows. Reaper's
+  Preferences dialog grown by 240x160 in twelve steps keeps 10 485 stale pixels without the
+  repaint (old frame lines of its group boxes, cut buttons), 8 142 with it inside batches
+  only, and none with the layout rule; SynthEdit 1.5's MDI canvas dragged by its title bar,
+  the case of issue 260, leaves the same 0 and 33 pixels for a full repaint with and without
+  it. The user32 `win` test passes `win.c:10986` (`test_update_region`) in 3 of 3 runs instead
+  of failing in every one, and the `msg` test goes from 115 to 101 failures with no new one
+  (issue 587)
 - **win32u / winex11**: the window manager gets the application's minimum and maximum track
   size as `PMinSize`/`PMaxSize`. `set_size_hints()` sent them only for windows that are not
   resizable; a resizable window got position and gravity only, so the window manager shrank it
