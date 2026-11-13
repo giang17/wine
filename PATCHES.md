@@ -327,6 +327,30 @@ This is the recommended branch. What it changes, by subsystem:
   `Serum2.vst3` refused: Serum 2 takes the plain swapchain and draws pixel-identical, Cymatics
   Hotline on Xvfb and EPROM - Memory Rites on the NVIDIA desktop keep their composition swap
   chain and present as without the variable. Off by default
+- **DComp overlay (`WINE_DCOMP_HUD=1`)**: dcomp writes four lines into the top left corner
+  of the frame it is about to deliver — the path the content took (`surface`, `swapchain`
+  for a swapchain of this dxgi under a tree without root content, `readback foreign` for a
+  swapchain of another dxgi, `texture`), the adapter of the device behind the largest leaf
+  from `IDXGIAdapter::GetDesc()`, the size of the content and of the client area, and the
+  frames built and delivered per second with the mean cost of a texture or swapchain
+  readback. DXVK draws its own HUD into the Vulkan swap image at `Present`; its composition
+  swapchain presents into a hidden window and a DComp surface is never presented at all, so
+  in plug-ins on these paths that HUD has nothing to appear on, whichever device is
+  underneath. The adapter line tells the implementations apart: DXVK reports the Vulkan
+  device, wined3d the name from its card table. Measured in REAPER on an NVIDIA RTX 2000
+  Ada: Serum 2 shows `surface` and `NVIDIA GeForce GTX 470` on the builtin d3d11 and
+  `NVIDIA RTX 2000 Ada Generation` with DXVK set up for `reaper.exe`; Korg Trinity with
+  DXVK shows `readback foreign`, `NVIDIA RTX 2000 Ada Generation` and 6.7–6.9 ms a readback
+  at 1382x806 and 1459x851; EPROM - Memory Rites shows `swapchain` and
+  `NVIDIA GeForce GTX 470` in the same DXVK host, because its page is drawn by the WebView2
+  process, which the per-application override does not cover. Drawn on the composite of a
+  tree without root content and on the present of a surface root; a swapchain root of this
+  dxgi is a window handover that wined3d presents through GL and has no overlay, nor do the
+  region delivery below the coverage threshold and the layer route. The box covers what is
+  under it and an idle tree is delivered again when the lines change, once a second at
+  most. Off by default; without the variable none of the overlay code runs (the three
+  plug-ins in REAPER, three reproducers and `dcomp_test` with 554 tests give the same
+  results as before)
 - **DComp on a layered top-level without attributes**: a rootless visual tree whose target
   is a top-level window with `WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP` and no layered
   attributes is presented with `UpdateLayeredWindow()`, composited over a transparent
