@@ -90,12 +90,28 @@ static struct wayland_win_data *wayland_win_data_create(HWND hwnd, const struct 
 }
 
 /***********************************************************************
+ *           wayland_win_data_clear_xdg_parent
+ *
+ * The toplevel of the window is going away: the compositor forgets its parent
+ * and gives its children to that parent. Called with the win_data lock held.
+ */
+static void wayland_win_data_clear_xdg_parent(struct wayland_win_data *data)
+{
+    struct wayland_win_data *other;
+
+    RB_FOR_EACH_ENTRY(other, &win_data_rb, struct wayland_win_data, entry)
+        if (other->xdg_parent == data->hwnd) other->xdg_parent = data->xdg_parent;
+    data->xdg_parent = 0;
+}
+
+/***********************************************************************
  *           wayland_win_data_destroy
  */
 static void wayland_win_data_destroy(struct wayland_win_data *data)
 {
     TRACE("hwnd=%p\n", data->hwnd);
 
+    wayland_win_data_clear_xdg_parent(data);
     rb_remove(&win_data_rb, &data->entry);
 
     pthread_mutex_unlock(&win_data_mutex);
@@ -370,6 +386,119 @@ static BOOL has_owned_popups(HWND hwnd)
     return ret;
 }
 
+#define MAX_OWNERS 8
+
+/* The owner of a window and the owners of that one in turn, nearest first.
+ * Must be called without the win_data lock. */
+static UINT get_window_owners(HWND hwnd, HWND owners[MAX_OWNERS])
+{
+    UINT count = 0;
+
+    while (count < MAX_OWNERS && (hwnd = NtUserGetWindowRelative(hwnd, GW_OWNER))) owners[count++] = hwnd;
+    return count;
+}
+
+static struct wayland_surface *get_mapped_toplevel(struct wayland_win_data *data)
+{
+    struct wayland_surface *surface;
+
+    if (!data || !(surface = data->wayland_surface)) return NULL;
+    if (!wayland_surface_is_toplevel(surface) || !surface->content_width) return NULL;
+    return surface;
+}
+
+/***********************************************************************
+ *           wayland_win_data_update_xdg_parent
+ *
+ * Tell the compositor which toplevel a managed window belongs to, so that it
+ * keeps the window above its owner: the nearest owner that is mapped, as only
+ * a mapped toplevel can have children. Called with the win_data lock held, with
+ * owners read before taking it. Returns TRUE if the parents of other windows
+ * have to be looked at again.
+ */
+static BOOL wayland_win_data_update_xdg_parent(struct wayland_win_data *data, const HWND *owners, UINT count)
+{
+    struct wayland_surface *surface = data->wayland_surface, *parent_surface = NULL;
+    struct wayland_win_data *parent_data = NULL, *ancestor;
+    HWND hwnd, parent = 0;
+    BOOL stale = FALSE;
+    UINT i;
+
+    if (!surface || !wayland_surface_is_toplevel(surface)) return FALSE;
+
+    for (i = 0; i < count && !parent_surface; i++)
+    {
+        parent_data = wayland_win_data_get_nolock(owners[i]);
+        if ((parent_surface = get_mapped_toplevel(parent_data))) parent = owners[i];
+    }
+    if (!parent && !data->xdg_parent) return FALSE;
+
+    /* A parent that is a descendant of its child is a protocol error. The owner of
+     * a window can change without the driver being told, so a window on the way up
+     * may still have this one as its parent for the compositor. */
+    for (hwnd = parent, i = 0; hwnd && (ancestor = wayland_win_data_get_nolock(hwnd)); hwnd = ancestor->xdg_parent)
+    {
+        if (ancestor->xdg_parent != data->hwnd && ++i < 64) continue;
+        TRACE("hwnd=%p dropping parent %p of %p\n", data->hwnd, ancestor->xdg_parent, hwnd);
+        if (ancestor->wayland_surface && wayland_surface_is_toplevel(ancestor->wayland_surface))
+            xdg_toplevel_set_parent(ancestor->wayland_surface->xdg_toplevel, NULL);
+        ancestor->xdg_parent = 0;
+        stale = TRUE;
+        break;
+    }
+
+    TRACE("hwnd=%p parent %p -> %p\n", data->hwnd, data->xdg_parent, parent);
+    xdg_toplevel_set_parent(surface->xdg_toplevel, parent_surface ? parent_surface->xdg_toplevel : NULL);
+    data->xdg_parent = parent;
+    return stale;
+}
+
+/***********************************************************************
+ *           wayland_update_xdg_parents
+ *
+ * Set the parents of all managed windows of the process again: a toplevel
+ * was mapped and can have children now, or one went away.
+ */
+static void wayland_update_xdg_parents(void)
+{
+    HWND *list, (*owners)[MAX_OWNERS];
+    struct wayland_win_data *data;
+    UINT i, pass, count = 0, *owner_count;
+    BOOL again = TRUE;
+    DWORD pid;
+
+    if (!(list = build_hwnd_list())) return;
+    while (list[count] != HWND_BOTTOM) count++;
+    owners = malloc(count * sizeof(*owners));
+    owner_count = calloc(count, sizeof(*owner_count));
+
+    if (owners && owner_count)
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (!NtUserGetWindowThread(list[i], &pid) || pid != GetCurrentProcessId()) continue;
+            owner_count[i] = get_window_owners(list[i], owners[i]);
+        }
+
+        pthread_mutex_lock(&win_data_mutex);
+        for (pass = 0; again && pass < 2; pass++)
+        {
+            again = FALSE;
+            for (i = 0; i < count; i++)
+            {
+                if (!(data = wayland_win_data_get_nolock(list[i])) || !data->managed) continue;
+                again |= wayland_win_data_update_xdg_parent(data, owners[i], owner_count[i]);
+            }
+        }
+        pthread_mutex_unlock(&win_data_mutex);
+        wl_display_flush(process_wayland.wl_display);
+    }
+
+    free(owner_count);
+    free(owners);
+    free(list);
+}
+
 static inline HWND get_active_window(void)
 {
     GUITHREADINFO info;
@@ -452,6 +581,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct wayland_client_surface *client;
     struct wayland_win_data *data, *toplevel_data;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+    BOOL had_toplevel, update_parents = FALSE;
+    HWND owners[MAX_OWNERS];
+    UINT owner_count = 0;
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
 
@@ -459,8 +591,10 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * may need to query win_data information about other HWNDs and thus
      * acquire the lock itself internally. */
     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) toplevel = owner_hint;
+    if (managed) owner_count = get_window_owners(hwnd, owners);
 
     if (!(data = wayland_win_data_get(hwnd))) return;
+    had_toplevel = data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface);
     toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
     toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
 
@@ -489,7 +623,23 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         wayland_win_data_update_wayland_state(data);
     }
 
+    if (data->wayland_surface && wayland_surface_is_toplevel(data->wayland_surface))
+    {
+        /* a new toplevel has no parent yet */
+        if (!had_toplevel) data->xdg_parent = 0;
+        update_parents = wayland_win_data_update_xdg_parent(data, owners, owner_count);
+        wl_display_flush(process_wayland.wl_display);
+    }
+    else if (had_toplevel)
+    {
+        /* the windows it owns go to the next owner that is mapped */
+        wayland_win_data_clear_xdg_parent(data);
+        update_parents = TRUE;
+    }
+
     wayland_win_data_release(data);
+
+    if (update_parents) NtUserPostMessage(hwnd, WM_WAYLAND_UPDATE_XDG_PARENTS, 0, 0);
 }
 
 static void wayland_configure_window(HWND hwnd)
@@ -653,6 +803,9 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_WAYLAND_SET_FOREGROUND:
         NtUserSetForegroundWindowInternal(hwnd);
+        return 0;
+    case WM_WAYLAND_UPDATE_XDG_PARENTS:
+        wayland_update_xdg_parents();
         return 0;
     default:
         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
@@ -841,9 +994,10 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
 {
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
-    BOOL committed = FALSE;
+    BOOL committed = FALSE, mapped;
 
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+    mapped = get_mapped_toplevel(data) != NULL;
 
     if ((wayland_surface = data->wayland_surface))
     {
@@ -866,7 +1020,11 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
         wayland_shm_buffer_unref(data->window_contents);
     wayland_shm_buffer_ref((data->window_contents = shm_buffer));
 
+    mapped = !mapped && get_mapped_toplevel(data);
     wayland_win_data_release(data);
+
+    /* the toplevel got its first buffer, it can be the parent of the windows it owns now */
+    if (mapped) NtUserPostMessage(hwnd, WM_WAYLAND_UPDATE_XDG_PARENTS, 0, 0);
 
     return committed;
 }
@@ -887,8 +1045,10 @@ void ensure_window_surface_contents(HWND hwnd)
 {
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
+    BOOL mapped;
 
     if (!(data = wayland_win_data_get(hwnd))) return;
+    mapped = get_mapped_toplevel(data) != NULL;
 
     if ((wayland_surface = data->wayland_surface))
     {
@@ -904,5 +1064,8 @@ void ensure_window_surface_contents(HWND hwnd)
         }
     }
 
+    mapped = !mapped && get_mapped_toplevel(data);
     wayland_win_data_release(data);
+
+    if (mapped) NtUserPostMessage(hwnd, WM_WAYLAND_UPDATE_XDG_PARENTS, 0, 0);
 }
