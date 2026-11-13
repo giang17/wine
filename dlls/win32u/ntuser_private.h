@@ -143,6 +143,7 @@ struct user_thread_info
     struct opengl_thread_data    *opengl_data;            /* OpenGL private thread data */
     struct list                   known_pointers;         /* list of known pointers */
     UINT                          paint_depth;            /* WM_NCPAINT / WM_ERASEBKGND sends in progress */
+    UINT                          swp_depth;              /* set_window_pos() calls and DeferWindowPos batches in progress */
 };
 
 extern struct user_thread_info *get_user_thread_info(void);

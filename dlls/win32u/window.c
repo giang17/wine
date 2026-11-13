@@ -4421,6 +4421,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     }
 
     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( winpos->hwnd ));
+    get_user_thread_info()->swp_depth++;
 
     if (!calc_winpos( winpos, &old_rects, &new_rects )) goto done;
 
@@ -4447,47 +4448,42 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
     if (surface) window_surface_release( surface );
 
     /* After apply_window_pos, the window's content may have been BitBlt'd from the
-     * old position. During batch processing (EndDeferWindowPos), sibling expose_window
-     * calls can set update regions that cause DCX_EXCLUDERGN to skip parts of the
-     * BitBlt, leaving stale content. Force a full invalidation so WM_PAINT repaints
-     * everything correctly on top of the BitBlt'd content.
+     * old position.  When a window lays out its children - in a batch
+     * (EndDeferWindowPos) or one SetWindowPos after the other while its own
+     * position change is still in progress - the children's bits are copied one
+     * window at a time out of the same surface, with DCX_EXCLUDERGN leaving out each
+     * child's update region, and part of what ends up on screen is stale: Reaper's
+     * Preferences dialog, grown by 240x160 in twelve steps, keeps the old frame lines
+     * of its group boxes and edit fields and half-drawn buttons ("Cancel" ->
+     * "ancel"), 10 485 pixels after growing and 636 after shrinking, every time.
+     * Invalidating only inside a batch still leaves 8 142 and 274.  Force a full
+     * invalidation so WM_PAINT repaints everything on top of the copied content.
      *
-     * Nothing was BitBlt'd when nothing moved, though, and SWP_AGG_NOGEOMETRYCHANGE
-     * does not cover the move bits: masking with SWP_AGG_STATUSFLAGS keeps
-     * SWP_NOMOVE|SWP_NOCLIENTMOVE in the result, so a SetWindowPos that changes
-     * nothing at all (flags 0x5917 -> masked 0x1807) never compares equal to
-     * SWP_AGG_NOGEOMETRYCHANGE (0x805) and invalidates the whole window with
-     * RDW_ERASE.  Applications that re-assert their layout on every mouse move get
-     * a full erase per motion event, and the erase reaches the screen on its own
-     * because window surfaces are flushed when the message loop goes idle - one
-     * flush shows the erased window, the next one the repainted one (issue 253:
-     * SynthEdit's canvas frames flickering while the mouse is over the menu bar).
+     * Nothing was BitBlt'd when nothing moved, though: a SetWindowPos that changes
+     * nothing at all is exempt, compared against the full status mask so that
+     * SWP_FRAMECHANGED still invalidates (issue 253: SynthEdit's canvas frames
+     * flickered from one full erase per mouse move over the menu bar; without
+     * FRAMECHANGED the canvas background stays unpainted at startup).
      *
-     * Skip that case, but compare against the *full* status mask rather than just
-     * the position bits: SWP_FRAMECHANGED asks for a non-client repaint and is a
-     * reason to invalidate even when nothing moved.  Dropping it as well leaves
-     * SynthEdit's canvas background unpainted at startup (blackcheck 18.6 %). */
-    /* SWP_AGG_NOGEOMETRYCHANGE must not be a second exemption here.  It covers size
-     * and z-order but not the move bits, so a window that moves without resizing
-     * masks to exactly SWP_AGG_NOGEOMETRYCHANGE (0x805) and gets skipped - which is
-     * precisely the case move_window_bits BitBlts, and therefore the one this
-     * invalidation was written for (issue 260: dragging SynthEdit's MDI canvas by
-     * its title bar leaves the MDI client stale until something else repaints it).
-     * Only "nothing changed at all" stays exempt.
+     * A top-level window that only moves has its own X window, which carries its
+     * pixels along, and the erase would paint an MDI client over its children once
+     * per motion event of a window-manager drag (issue 281).  Top levels are
+     * invalidated when their size changes.
      *
-     * That plain-move case is a child's, though: only a child window has its bits
-     * inside an ancestor's surface for move_window_bits to BitBlt.  A top-level
-     * window that moves without resizing has its own X window, which carries its
-     * pixels along - there is nothing to repaint, but the erase this invalidation
-     * queues paints the MDI client over its children once per motion event, and a
-     * window-manager drag delivers one such SetWindowPos per motion event (issue
-     * 281: SynthEdit's canvas captions flicker while the main window is dragged;
-     * 40 moves -> 40 invalidations -> 8 frames showing the 0x404040 erase).  So a
-     * plain move invalidates child windows only. */
+     * A child window is invalidated only when it moves as part of such a layout,
+     * that is inside another window's position change or a DeferWindowPos batch
+     * (swp_depth > 1).  A child that is moved on its own keeps its update region
+     * and the copied bits, as on Windows: the user32 win test (test_update_region,
+     * a SetWindowPos of a child with an update region) expects exactly that, and
+     * SynthEdit's MDI canvas dragged by its title bar - the case this used to cover
+     * (issue 260) - no longer needs it: after four drags that change about 290 000
+     * pixels each, a full repaint changes the same 0 and 33 pixels with and without the
+     * invalidation. */
     if (!(winpos->flags & (SWP_NOREDRAW | SWP_HIDEWINDOW | SWP_SHOWWINDOW)) &&
         (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOPOSCHANGE &&
-        ((winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOGEOMETRYCHANGE ||
-         (get_window_long( winpos->hwnd, GWL_STYLE ) & WS_CHILD)))
+        ((get_window_long( winpos->hwnd, GWL_STYLE ) & WS_CHILD)
+             ? get_user_thread_info()->swp_depth > 1
+             : (winpos->flags & SWP_AGG_STATUSFLAGS) != SWP_AGG_NOGEOMETRYCHANGE))
     {
         TRACE( "hwnd %p: post-move invalidation (flags %08x)\n", winpos->hwnd, (int)winpos->flags );
         NtUserRedrawWindow( winpos->hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN );
@@ -4558,6 +4554,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
 
     ret = TRUE;
 done:
+    get_user_thread_info()->swp_depth--;
     set_thread_dpi_awareness_context( context );
     return ret;
 }
@@ -4743,6 +4740,7 @@ BOOL WINAPI NtUserEndDeferWindowPosEx( HDWP hdwp, BOOL async )
         return FALSE;
     }
 
+    get_user_thread_info()->swp_depth++;  /* the windows of a batch are moved as one layout */
     for (i = 0, winpos = dwp->winpos; i < dwp->count; i++, winpos++)
     {
         TRACE( "hwnd %p, after %p, %d,%d (%dx%d), flags %08x\n",
@@ -4754,6 +4752,7 @@ BOOL WINAPI NtUserEndDeferWindowPosEx( HDWP hdwp, BOOL async )
         else
             send_message( winpos->hwnd, WM_WINE_SETWINDOWPOS, 0, (LPARAM)winpos );
     }
+    get_user_thread_info()->swp_depth--;
     free( dwp->winpos );
     free( dwp );
     return TRUE;
