@@ -1290,11 +1290,13 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
+    BOOL mapped = FALSE;
 
     if (!(data = wayland_win_data_get(toplevel))) return;
 
     if ((wayland_surface = data->wayland_surface))
     {
+        mapped = wayland_surface_is_toplevel(wayland_surface) && wayland_surface->content_width;
         wayland_surface_ensure_contents(wayland_surface);
 
         /* Handle any processed configure request, to ensure the related
@@ -1305,9 +1307,14 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
         {
             wl_surface_commit(wayland_surface->wl_surface);
         }
+
+        mapped = !mapped && wayland_surface_is_toplevel(wayland_surface) && wayland_surface->content_width;
     }
 
     wayland_win_data_release(data);
+
+    /* the toplevel got its first buffer, it can be the parent of the windows it owns now */
+    if (mapped) NtUserPostMessage(toplevel, WM_WAYLAND_UPDATE_XDG_PARENTS, 0, 0);
 
     set_client_surface(hwnd, surface);
 }
