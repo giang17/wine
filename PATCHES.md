@@ -1267,7 +1267,10 @@ This is the recommended branch. What it changes, by subsystem:
   Measured with `scripts/repro-508-owned-toplevels.sh --driver x11` from KWin's window list
   (KWin 5.27, Plasma Wayland session through Xwayland): 4 of 22 checks failed before, none
   now, also with the main window maximized; on kwin_x11 (stacking from
-  `_NET_CLIENT_LIST_STACKING`) 2 of 9 before, none now (issue 588)
+  `_NET_CLIENT_LIST_STACKING`) 2 of 9 before, none now (issue 588). A window that loses its
+  owner at run time (`SetWindowLongPtr(GWLP_HWNDPARENT, 0)` and a frame change) no longer
+  keeps `WM_TRANSIENT_FOR`: KWin listed the former owner as its parent, now none; the
+  relation the driver itself gives an ownerless tool window is kept (issue 589)
 - **winex11**: a window shown without activation no longer flashes in the taskbar. KWin marks
   every normal window it does not activate on map with `_NET_WM_STATE_DEMANDS_ATTENTION`;
   Windows flashes a taskbar button only on `FlashWindowEx()` or when another process keeps the
