@@ -1255,6 +1255,19 @@ This is the recommended branch. What it changes, by subsystem:
   UTAU 0.4.19 has the same pattern with a 1x1 owner that skips the taskbar (KDE bug 514758):
   its project window now has `WM_TRANSIENT_FOR` set to the root window and its own taskbar
   entry, which stays while it is minimised (Plasma 5.27.12 on X11).
+- **Owned windows after their owner is hidden and shown again (winex11)**: an owned window
+  without `WS_EX_APPWINDOW` is transient for its owner (`WM_TRANSIENT_FOR`). When the owner
+  was hidden and shown again KWin did not take the relation up again, although the property
+  still named the owner's window, and raised the activated owner above the windows it owns —
+  the same for a window owned by a dialog after the dialog was hidden and shown. Writing the
+  property again with the same value changed nothing. The driver now removes
+  `WM_TRANSIENT_FOR` from the mapped windows a window owns when it is hidden and rebuilds
+  their hints when it is shown, as it does for the window group of owned `WS_EX_APPWINDOW`
+  windows. Nothing changes for a window whose owner was never shown or is on another thread.
+  Measured with `scripts/repro-508-owned-toplevels.sh --driver x11` from KWin's window list
+  (KWin 5.27, Plasma Wayland session through Xwayland): 4 of 22 checks failed before, none
+  now, also with the main window maximized; on kwin_x11 (stacking from
+  `_NET_CLIENT_LIST_STACKING`) 2 of 9 before, none now (issue 588)
 - **winex11**: a window shown without activation no longer flashes in the taskbar. KWin marks
   every normal window it does not activate on map with `_NET_WM_STATE_DEMANDS_ATTENTION`;
   Windows flashes a taskbar button only on `FlashWindowEx()` or when another process keeps the
