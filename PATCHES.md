@@ -2078,6 +2078,22 @@ This is the recommended branch. What it changes, by subsystem:
   KWin 5.27 the window comes back through Alt+Tab, a click on its task bar entry does not
   restore it (the same with Wine 11.20, which has the three commits). Only the Wayland driver
   is affected; the fork default is winex11 through Xwayland
+- **Buffer swaps of windows that are not shown, under the Wayland driver (winewayland)**:
+  with a swap interval other than zero `eglSwapBuffers()` waits for the frame callback of
+  the previous swap — NVIDIA's egl-wayland without a timeout — and a compositor does not
+  send the callback for a surface that is not shown. When a window was hidden, minimized or
+  destroyed, the next `SwapBuffers()` did not return: the rendering thread stopped, a hidden
+  child window stayed frozen after it was shown again, and a Direct3D device (wined3d
+  presents from its command thread) was never released, so the process stayed after its
+  windows were gone — vatSys after a clean close, in 2 of 2 runs. The driver now sets the
+  EGL swap interval to zero and throttles itself: it requests a frame callback before each
+  swap and waits for it at the next one for at most 100 ms; once a callback is missed the
+  swaps go on every 16 ms until it arrives. Measured on KWin 5.27 with NVIDIA 580 and
+  egl-wayland 1.1.18: a visible window stays at 60 frames per second, a hidden or minimized
+  one goes on at 58-61 instead of none, a second window drawn by the same thread keeps its
+  rate, and vatSys ends after a clean close in 3 of 3 runs. A Vulkan swapchain in FIFO mode
+  (DXVK with a sync interval) blocks in `vkQueuePresentKHR()` the same way and is not
+  changed. Only the Wayland driver is affected (issue 510)
 - **Scroll bar size (win32u)**: the default `ScrollHeight` and `ScrollWidth` are 17 px
   (-255 twips) as on Windows — measured on Windows 10 22H2, where
   `HKCU\Control Panel\Desktop\WindowMetrics` carries -255 and
