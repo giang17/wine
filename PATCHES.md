@@ -348,9 +348,9 @@ This is the recommended branch. What it changes, by subsystem:
   dxgi is a window handover that wined3d presents through GL and has no overlay, nor do the
   region delivery below the coverage threshold and the layer route. The box covers what is
   under it and an idle tree is delivered again when the lines change, once a second at
-  most. Off by default; without the variable none of the overlay code runs (the three
-  plug-ins in REAPER, three reproducers and `dcomp_test` with 554 tests give the same
-  results as before)
+  most. Off by default; without the variable none of the overlay code runs (three
+  reproducers and `dcomp_test` with 554 tests give the same results as before, and the
+  three plug-ins in REAPER show no overlay)
 - **DComp on a layered top-level without attributes**: a rootless visual tree whose target
   is a top-level window with `WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP` and no layered
   attributes is presented with `UpdateLayeredWindow()`, composited over a transparent
