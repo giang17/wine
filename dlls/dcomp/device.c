@@ -151,6 +151,8 @@ static void dcomp_device_remove_target(struct dcomp_device *device, struct dcomp
 #define DCOMP_TREE_TIMER     ((UINT_PTR)0xDC0FFEE2)
 #define DCOMP_TREE_TIMER_MS  16
 #define DCOMP_ANIMATION_TIMER ((UINT_PTR)0xDC0FFEE3)   /* issue 364 */
+#define DCOMP_HUD_TIMER      ((UINT_PTR)0xDC0FFEE4)   /* issue 590 */
+#define DCOMP_HUD_TIMER_MS   250
 #define DCOMP_TREE_FRAME_MS  16   /* ~60 Hz rate limit for hook-driven composites */
 
 /* Measurement dial (issue 206): the tree timer period, adjustable without a
@@ -3603,6 +3605,18 @@ static void dcomp_visual_try_reparent(struct dcomp_visual *visual)
 
     FIXME("Requested swapchain window switch from %p to target %p.\n",
             comp_wnd, visual->target_hwnd);
+
+    /* The overlay of a handed-over window is a layer the target's timer keeps
+     * up to date (issue 590).  A target on a window of another process has no
+     * subclass of ours to receive the timer. */
+    if (dcomp_hud())
+    {
+        DWORD pid = 0;
+
+        GetWindowThreadProcessId(visual->target_hwnd, &pid);
+        if (pid == GetCurrentProcessId())
+            SetTimer(visual->target_hwnd, DCOMP_HUD_TIMER, DCOMP_HUD_TIMER_MS, NULL);
+    }
 }
 
 /* =====================================================================
@@ -3660,6 +3674,7 @@ enum dcomp_hud_kind
     DCOMP_HUD_FOREIGN,                    /* swapchain of another dxgi, read back (issue 397) */
     DCOMP_HUD_TEXTURE,                    /* composition texture, read back */
     DCOMP_HUD_SURFACE,                    /* DComp surface */
+    DCOMP_HUD_HANDOVER,                   /* swapchain of this dxgi as the root: it presents into the target window itself */
 };
 
 struct dcomp_hud_adapter
@@ -3687,6 +3702,17 @@ struct dcomp_hud
     DWORD text_hash;                      /* of the lines last drawn */
     BOOL frame_uniform;                   /* the frame was one colour before the overlay went in */
     LONG box_width, box_height;           /* never shrinks: an overlay left in a backdrop stays covered */
+    /* Window handover (issue 590): no frame of ours to write into, the lines
+     * go out as a layer for the present path.  The DIB is what GDI draws
+     * into, handover_bits what the layer points at. */
+    HDC handover_dc;
+    HBITMAP handover_bitmap;
+    DWORD *handover_dib;
+    DWORD *handover_bits;
+    BOOL handover_live;                   /* the layer of this target carries the overlay right now */
+    DWORD handover_hash;                  /* of the lines last published */
+    LONG handover_drawn;                  /* the layer's draw count when the rate was last taken */
+    unsigned int present_rate;
 };
 
 struct dcomp_target
@@ -3896,6 +3922,7 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         {
             KillTimer(target->hwnd, DCOMP_TREE_TIMER);
             KillTimer(target->hwnd, DCOMP_ANIMATION_TIMER);
+            KillTimer(target->hwnd, DCOMP_HUD_TIMER);
         }
 
         /* Remove WndProc subclass (Phase 5).  Restore only while the window still
@@ -3969,6 +3996,13 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         }
         free(target->layer_buf[0]);
         free(target->layer_buf[1]);
+        /* The overlay of a handed-over window (issue 590); the layer no longer
+         * points at it. */
+        if (target->hud.handover_bitmap)
+            DeleteObject(target->hud.handover_bitmap);
+        if (target->hud.handover_dc)
+            DeleteDC(target->hud.handover_dc);
+        free(target->hud.handover_bits);
 
         if (target->root_visual)
             IDCompositionVisual_Release(&target->root_visual->IDCompositionVisual_iface);
@@ -5129,6 +5163,7 @@ static const WCHAR *dcomp_hud_adapter(struct dcomp_hud *hud, enum dcomp_hud_kind
     switch (kind)
     {
         case DCOMP_HUD_SWAPCHAIN:
+        case DCOMP_HUD_HANDOVER:
         {
             IDXGISwapChain *swapchain;
 
@@ -5204,6 +5239,54 @@ static void dcomp_hud_note_leaf(struct dcomp_target *target, enum dcomp_hud_kind
     hud->adapter = dcomp_hud_adapter(hud, kind, source);
 }
 
+#define DCOMP_HUD_LINES 4
+
+/* Write the lines of the overlay into the top left corner of a 32-bit DIB of
+ * `width' x `height' pixels selected into `dc'; `box' receives the rectangle
+ * they take.  Sets the hash of the lines and keeps the box from shrinking. */
+static void dcomp_hud_draw_lines(struct dcomp_hud *hud, HDC dc, DWORD *bits, UINT width, UINT height,
+        WCHAR line[DCOMP_HUD_LINES][128], const int *len, RECT *box)
+{
+    DWORD hash = 2166136261u;
+    LONG x, y, text_width = 0;
+    int saved, i;
+    SIZE size;
+
+    saved = SaveDC(dc);
+    SelectObject(dc, GetStockObject(ANSI_FIXED_FONT));
+    size.cy = 0;
+    for (i = 0; i < DCOMP_HUD_LINES; ++i)
+    {
+        const WCHAR *c;
+
+        GetTextExtentPoint32W(dc, line[i], len[i], &size);
+        text_width = max(text_width, size.cx);
+        for (c = line[i]; *c; ++c)
+            hash = (hash ^ *c) * 16777619u;
+    }
+    hud->text_hash = hash;
+    hud->box_width = max(hud->box_width, text_width + 8);
+    hud->box_height = max(hud->box_height, (LONG)DCOMP_HUD_LINES * size.cy + 6);
+    SetRect(box, 0, 0, min(hud->box_width, (LONG)width), min(hud->box_height, (LONG)height));
+
+    SetBkMode(dc, OPAQUE);
+    SetBkColor(dc, RGB(0, 0, 0));
+    SetTextColor(dc, RGB(255, 220, 0));
+    SetTextAlign(dc, TA_LEFT | TA_TOP);
+    ExtTextOutW(dc, 4, 3, ETO_OPAQUE | ETO_CLIPPED, box, line[0], len[0], NULL);
+    for (i = 1; i < DCOMP_HUD_LINES; ++i)
+        ExtTextOutW(dc, 4, 3 + i * size.cy, ETO_CLIPPED, box, line[i], len[i], NULL);
+    RestoreDC(dc, saved);
+    GdiFlush();
+
+    /* GDI leaves the alpha byte of what it draws at 0, and both the layered
+     * route and the layer for the present path carry these pixels with their
+     * alpha. */
+    for (y = box->top; y < box->bottom; ++y)
+        for (x = box->left; x < box->right; ++x)
+            bits[y * width + x] |= 0xff000000;
+}
+
 /* Draw the overlay into the frame in comp_bits; `box' receives the rectangle
  * it takes, empty if there was nothing to name. */
 static void dcomp_hud_draw(struct dcomp_target *target, RECT *box)
@@ -5214,15 +5297,14 @@ static void dcomp_hud_draw(struct dcomp_target *target, RECT *box)
         [DCOMP_HUD_FOREIGN]   = L"readback foreign",
         [DCOMP_HUD_TEXTURE]   = L"texture",
         [DCOMP_HUD_SURFACE]   = L"surface",
+        [DCOMP_HUD_HANDOVER]  = L"handover",
     };
     struct dcomp_hud *hud = &target->hud;
-    DWORD now = GetTickCount(), elapsed = now - hud->rate_tick, hash = 2166136261u;
-    WCHAR line[4][128];
+    DWORD now = GetTickCount(), elapsed = now - hud->rate_tick;
+    WCHAR line[DCOMP_HUD_LINES][128];
     HDC dc = target->comp_dc;
     RECT client = {0};
-    LONG x, y, width = 0;
-    int len[4], saved, i;
-    SIZE size;
+    int len[DCOMP_HUD_LINES];
 
     SetRectEmpty(box);
     if (!dc || !target->comp_bits || !hud->leaves)
@@ -5254,39 +5336,7 @@ static void dcomp_hud_draw(struct dcomp_target *target, RECT *box)
         len[3] += swprintf(line[3] + len[3], ARRAY_SIZE(line[3]) - len[3], L" | readback %u.%02u ms",
                 hud->readback_us / 1000, hud->readback_us % 1000 / 10);
 
-    saved = SaveDC(dc);
-    SelectObject(dc, GetStockObject(ANSI_FIXED_FONT));
-    size.cy = 0;
-    for (i = 0; i < ARRAY_SIZE(line); ++i)
-    {
-        const WCHAR *c;
-
-        GetTextExtentPoint32W(dc, line[i], len[i], &size);
-        width = max(width, size.cx);
-        for (c = line[i]; *c; ++c)
-            hash = (hash ^ *c) * 16777619u;
-    }
-    hud->text_hash = hash;
-    hud->box_width = max(hud->box_width, width + 8);
-    hud->box_height = max(hud->box_height, (LONG)ARRAY_SIZE(line) * size.cy + 6);
-    SetRect(box, 0, 0, min(hud->box_width, (LONG)target->comp_width),
-            min(hud->box_height, (LONG)target->comp_height));
-
-    SetBkMode(dc, OPAQUE);
-    SetBkColor(dc, RGB(0, 0, 0));
-    SetTextColor(dc, RGB(255, 220, 0));
-    SetTextAlign(dc, TA_LEFT | TA_TOP);
-    ExtTextOutW(dc, 4, 3, ETO_OPAQUE | ETO_CLIPPED, box, line[0], len[0], NULL);
-    for (i = 1; i < ARRAY_SIZE(line); ++i)
-        ExtTextOutW(dc, 4, 3 + i * size.cy, ETO_CLIPPED, box, line[i], len[i], NULL);
-    RestoreDC(dc, saved);
-    GdiFlush();
-
-    /* GDI leaves the alpha byte of what it draws at 0, and the layered route
-     * hands these pixels to the window manager with their alpha. */
-    for (y = box->top; y < box->bottom; ++y)
-        for (x = box->left; x < box->right; ++x)
-            target->comp_bits[y * target->comp_width + x] |= 0xff000000;
+    dcomp_hud_draw_lines(hud, dc, target->comp_bits, target->comp_width, target->comp_height, line, len, box);
 }
 
 /* The composite walk does not read a D3D or DXGI resource under the tree
@@ -6350,6 +6400,46 @@ static void dcomp_target_retract_layer(struct dcomp_target *target)
     TRACE("Retracted the layer on hwnd %p.\n", target->hwnd);
 }
 
+/* The layer structure of the target's window, created on first use.  Caller
+ * holds device->cs. */
+static struct wine_dcomp_layer *dcomp_target_get_layer(struct dcomp_target *target)
+{
+    struct wine_dcomp_layer *layer;
+
+    if ((layer = target->layer))
+        return layer;
+
+    /* Pick up the one an earlier target on this window left behind: it is
+     * deliberately never freed, see dcomp_layer.h. */
+    if ((layer = (struct wine_dcomp_layer *)GetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP))
+            && (layer->magic != WINE_DCOMP_LAYER_MAGIC || layer->size != sizeof(*layer)))
+    {
+        /* Left behind by a dcomp built against another layout.  We own the
+         * property, so replace it; the old structure stays unfreed like any
+         * other -- a reader of its vintage may still hold a pointer. */
+        ERR("Replacing the layer on hwnd %p: magic %#lx, size %lu, expected %#x, %Iu "
+                "-- it was published by a dcomp built against another layout.\n",
+                target->hwnd, layer->magic, layer->size,
+                WINE_DCOMP_LAYER_MAGIC, sizeof(*layer));
+        layer = NULL;
+    }
+    if (!layer)
+    {
+        if (!(layer = calloc(1, sizeof(*layer))))
+            return NULL;
+        layer->magic = WINE_DCOMP_LAYER_MAGIC;
+        layer->size = sizeof(*layer);
+        if (!SetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP, (HANDLE)layer))
+        {
+            WARN("Failed to publish the layer property on hwnd %p.\n", target->hwnd);
+            free(layer);
+            return NULL;
+        }
+    }
+    target->layer = layer;
+    return layer;
+}
+
 /* Caller holds device->cs. */
 static void dcomp_target_publish_layer(struct dcomp_target *target, const RECT *rc, HRGN rgn)
 {
@@ -6365,37 +6455,8 @@ static void dcomp_target_publish_layer(struct dcomp_target *target, const RECT *
     if (!root || !w || !h)
         return;
 
-    if (!(layer = target->layer))
-    {
-        /* Pick up the one an earlier target on this window left behind: it is
-         * deliberately never freed, see dcomp_layer.h. */
-        if ((layer = (struct wine_dcomp_layer *)GetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP))
-                && (layer->magic != WINE_DCOMP_LAYER_MAGIC || layer->size != sizeof(*layer)))
-        {
-            /* Left behind by a dcomp built against another layout.  We own the
-             * property, so replace it; the old structure stays unfreed like any
-             * other -- a reader of its vintage may still hold a pointer. */
-            ERR("Replacing the layer on hwnd %p: magic %#lx, size %lu, expected %#x, %Iu "
-                    "-- it was published by a dcomp built against another layout.\n",
-                    target->hwnd, layer->magic, layer->size,
-                    WINE_DCOMP_LAYER_MAGIC, sizeof(*layer));
-            layer = NULL;
-        }
-        if (!layer)
-        {
-            if (!(layer = calloc(1, sizeof(*layer))))
-                return;
-            layer->magic = WINE_DCOMP_LAYER_MAGIC;
-            layer->size = sizeof(*layer);
-            if (!SetPropW(target->hwnd, WINE_DCOMP_LAYER_PROP, (HANDLE)layer))
-            {
-                WARN("Failed to publish the layer property on hwnd %p.\n", target->hwnd);
-                free(layer);
-                return;
-            }
-        }
-        target->layer = layer;
-    }
+    if (!(layer = dcomp_target_get_layer(target)))
+        return;
 
     if (!target->layer_buf[0] || target->layer_width != w || target->layer_height != h)
     {
@@ -6485,6 +6546,161 @@ static void dcomp_target_publish_layer(struct dcomp_target *target, const RECT *
 
     target->layer_live = TRUE;
     target->layer_back = back ^ 1;
+}
+
+/* The overlay for a root that is a swapchain of this dxgi (issue 590).  The
+ * target window was handed over to that swapchain (dcomp_visual_try_reparent)
+ * and wined3d presents into it; no frame passes through this module that the
+ * lines could be written into.  They go out as a layer instead, the route the
+ * leaves of a tree below the coverage threshold take (issue 206,
+ * include/wine/dcomp_layer.h): wined3d draws the layer into every frame it
+ * presents to the window, in its GL branch and in its GDI one, and counts the
+ * frames it drew it into -- which is where the presents per second come from.
+ *
+ * The sink property is not asked.  wined3d keeps it on the window a swapchain
+ * was created for, here the hidden composition window, and looks the layer up
+ * on the window it presents to.  A Vulkan swapchain draws no layer and shows
+ * no overlay.
+ *
+ * Driven by DCOMP_HUD_TIMER on the target window; published only when the
+ * lines changed, which the rate allows once a second. */
+#define DCOMP_HUD_HANDOVER_WIDTH  640
+#define DCOMP_HUD_HANDOVER_HEIGHT 96
+
+static void dcomp_hud_handover_retract(struct dcomp_target *target)
+{
+    struct wine_dcomp_layer *layer = target->layer;
+    struct dcomp_hud *hud = &target->hud;
+
+    if (!hud->handover_live)
+        return;
+    hud->handover_live = FALSE;
+    if (!layer)
+        return;
+    AcquireSRWLockExclusive(&layer->lock);
+    if (layer->bits == hud->handover_bits)
+    {
+        layer->bits = NULL;
+        SetRectEmpty(&layer->box);
+        layer->rect_count = 0;
+    }
+    ReleaseSRWLockExclusive(&layer->lock);
+    TRACE("Retracted the overlay layer on hwnd %p.\n", target->hwnd);
+}
+
+static void dcomp_hud_handover_tick(struct dcomp_target *target)
+{
+    static const SIZE_T size = (SIZE_T)DCOMP_HUD_HANDOVER_WIDTH * DCOMP_HUD_HANDOVER_HEIGHT * sizeof(DWORD);
+    struct dcomp_hud *hud = &target->hud;
+    WCHAR line[DCOMP_HUD_LINES][128];
+    struct wine_dcomp_layer *layer;
+    IDXGISwapChain *swapchain = NULL;
+    DXGI_SWAP_CHAIN_DESC desc = {{0}};
+    struct dcomp_visual *root;
+    IUnknown *content = NULL;
+    int len[DCOMP_HUD_LINES];
+    const WCHAR *adapter;
+    RECT client = {0}, box;
+    DWORD now, elapsed;
+    LONG drawn;
+
+    if (!target->device || !target->hwnd)
+        return;
+
+    EnterCriticalSection(&target->device->cs);
+    EnterCriticalSection(&dcomp_content_cs);
+    if ((root = target->root_visual) && !root->foreign_proxy && !root->surface_content
+            && !root->texture_content && !root->dynamic_content && (content = root->content))
+        IUnknown_AddRef(content);
+    LeaveCriticalSection(&dcomp_content_cs);
+
+    if (content)
+        IUnknown_QueryInterface(content, &IID_IDXGISwapChain, (void **)&swapchain);
+    /* The tree's own leaves have the layer while they are published. */
+    if (!swapchain || target->layer_live || !(layer = dcomp_target_get_layer(target)))
+    {
+        dcomp_hud_handover_retract(target);
+        if (!swapchain)
+            KillTimer(target->hwnd, DCOMP_HUD_TIMER);
+        goto done;
+    }
+
+    if (!hud->handover_dc)
+    {
+        BITMAPINFO bmi = {{0}};
+
+        bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+        bmi.bmiHeader.biWidth = DCOMP_HUD_HANDOVER_WIDTH;
+        bmi.bmiHeader.biHeight = -DCOMP_HUD_HANDOVER_HEIGHT;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        hud->handover_bits = calloc(1, size);
+        if ((hud->handover_dc = CreateCompatibleDC(NULL)))
+            hud->handover_bitmap = CreateDIBSection(hud->handover_dc, &bmi, DIB_RGB_COLORS,
+                    (void **)&hud->handover_dib, NULL, 0);
+        if (!hud->handover_bits || !hud->handover_bitmap)
+        {
+            WARN("Failed to create the overlay bitmap for hwnd %p.\n", target->hwnd);
+            if (hud->handover_bitmap)
+                DeleteObject(hud->handover_bitmap);
+            if (hud->handover_dc)
+                DeleteDC(hud->handover_dc);
+            free(hud->handover_bits);
+            hud->handover_dc = NULL;
+            hud->handover_bitmap = NULL;
+            hud->handover_bits = hud->handover_dib = NULL;
+            KillTimer(target->hwnd, DCOMP_HUD_TIMER);
+            goto done;
+        }
+        SelectObject(hud->handover_dc, hud->handover_bitmap);
+    }
+
+    now = GetTickCount();
+    elapsed = now - hud->rate_tick;
+    if (elapsed >= 1000)
+    {
+        drawn = InterlockedCompareExchange(&layer->drawn, 0, 0);
+        hud->present_rate = hud->rate_tick ? (unsigned int)(drawn - hud->handover_drawn) * 1000 / elapsed : 0;
+        hud->handover_drawn = drawn;
+        hud->rate_tick = now ? now : 1;
+    }
+
+    adapter = dcomp_hud_adapter(hud, DCOMP_HUD_HANDOVER, content);
+    IDXGISwapChain_GetDesc(swapchain, &desc);
+    GetClientRect(target->hwnd, &client);
+    len[0] = swprintf(line[0], ARRAY_SIZE(line[0]), L"dcomp: handover");
+    len[1] = swprintf(line[1], ARRAY_SIZE(line[1]), L"%ls", adapter ? adapter : L"?");
+    len[2] = swprintf(line[2], ARRAY_SIZE(line[2]), L"content %ux%u target %ldx%ld",
+            desc.BufferDesc.Width, desc.BufferDesc.Height, client.right, client.bottom);
+    len[3] = swprintf(line[3], ARRAY_SIZE(line[3]), L"%u/s presented", hud->present_rate);
+    dcomp_hud_draw_lines(hud, hud->handover_dc, hud->handover_dib, DCOMP_HUD_HANDOVER_WIDTH,
+            DCOMP_HUD_HANDOVER_HEIGHT, line, len, &box);
+
+    if (!hud->handover_live || hud->text_hash != hud->handover_hash)
+    {
+        /* One buffer, rewritten under the exclusive lock: a present waits for
+         * a copy of 240 kB at most, a few times a second. */
+        AcquireSRWLockExclusive(&layer->lock);
+        memcpy(hud->handover_bits, hud->handover_dib, size);
+        layer->bits = hud->handover_bits;
+        layer->width = DCOMP_HUD_HANDOVER_WIDTH;
+        layer->height = DCOMP_HUD_HANDOVER_HEIGHT;
+        layer->box = box;
+        layer->rect_count = 1;
+        layer->rects[0] = box;
+        ReleaseSRWLockExclusive(&layer->lock);
+        hud->handover_live = TRUE;
+        hud->handover_hash = hud->text_hash;
+        TRACE("Published the overlay %s as a layer on hwnd %p.\n", wine_dbgstr_rect(&box), target->hwnd);
+    }
+
+done:
+    LeaveCriticalSection(&target->device->cs);
+    if (swapchain)
+        IDXGISwapChain_Release(swapchain);
+    if (content)
+        IUnknown_Release(content);
 }
 
 /* The region to deliver is passed in rather than read off the target: with the
@@ -8021,6 +8237,12 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
             dcomp_target_animation_tick(target);
             return 0;
         }
+        /* WINE_DCOMP_HUD on a swapchain root (issue 590). */
+        if (wparam == DCOMP_HUD_TIMER)
+        {
+            dcomp_hud_handover_tick(target);
+            return 0;
+        }
         break;
 
     case WM_WINE_DCOMP_PRESENT_FLUSH:
@@ -8174,6 +8396,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
          * procedure at all. */
         KillTimer(hwnd, DCOMP_TREE_TIMER);
         KillTimer(hwnd, DCOMP_ANIMATION_TIMER);
+        KillTimer(hwnd, DCOMP_HUD_TIMER);
         /* Tell our delivery thread to stop, but do not wait for it here: it may
          * be inside a GDI call on the very window being torn down, and blocking
          * the GUI thread on that is exactly what this thread exists to avoid.
