@@ -26,8 +26,11 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #include "waylanddrv.h"
@@ -46,10 +49,22 @@ static const struct opengl_funcs *funcs;
 static const struct opengl_drawable_funcs wayland_drawable_funcs;
 static BOOL (*p_egl_describe_pixel_format)( int format, struct wgl_pixel_format *pf );
 
+/* How long a swap waits for the frame callback of the previous one. The compositor
+ * is free to never send it for a surface that is not shown (hidden, minimized,
+ * covered, on another desktop). Once a callback is missed the swaps go on at a
+ * fixed pace, until it arrives. */
+#define FRAME_CALLBACK_TIMEOUT_MS 100
+#define FRAME_MISSED_PACE_MS 16
+
 struct wayland_gl_drawable
 {
     struct opengl_drawable base;
     struct wl_egl_window *wl_egl_window;
+    struct wl_event_queue *wl_event_queue;   /* queue of the frame callbacks */
+    struct wl_surface *wl_surface_wrapper;   /* client wl_surface, with events on wl_event_queue */
+    struct wl_callback *frame_callback;      /* frame callback of an earlier swap, if still pending */
+    BOOL frame_missed;                       /* the last swap gave up waiting for frame_callback */
+    struct timespec last_swap;               /* time of the last swap */
 };
 
 static struct wayland_gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
@@ -60,7 +75,69 @@ static struct wayland_gl_drawable *impl_from_opengl_drawable(struct opengl_drawa
 static void wayland_drawable_destroy(struct opengl_drawable *base)
 {
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
+    if (gl->frame_callback) wl_callback_destroy(gl->frame_callback);
+    if (gl->wl_surface_wrapper) wl_proxy_wrapper_destroy(gl->wl_surface_wrapper);
+    if (gl->wl_event_queue) wl_event_queue_destroy(gl->wl_event_queue);
     if (gl->wl_egl_window) wl_egl_window_destroy(gl->wl_egl_window);
+}
+
+static void frame_callback_handle_done(void *data, struct wl_callback *callback, uint32_t time)
+{
+    struct wayland_gl_drawable *gl = data;
+
+    if (gl->frame_callback == callback) gl->frame_callback = NULL;
+    wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener frame_callback_listener =
+{
+    frame_callback_handle_done
+};
+
+static int timespec_diff_ms(const struct timespec *end, const struct timespec *start)
+{
+    return (end->tv_sec - start->tv_sec) * 1000 + (end->tv_nsec - start->tv_nsec) / 1000000;
+}
+
+/* Wait for the pending frame callback, but not for longer than FRAME_CALLBACK_TIMEOUT_MS,
+ * or than the rest of FRAME_MISSED_PACE_MS since the last swap if that one gave up on it
+ * already. A callback that didn't come stays pending, so there is never more than one. */
+static void wayland_gl_drawable_wait_frame(struct wayland_gl_drawable *gl)
+{
+    struct wl_display *display = process_wayland.wl_display;
+    struct pollfd pfd = {.fd = wl_display_get_fd(display), .events = POLLIN};
+    int ret, remaining, timeout = FRAME_CALLBACK_TIMEOUT_MS;
+    struct timespec start, now;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if (gl->frame_missed) timeout = FRAME_MISSED_PACE_MS - timespec_diff_ms(&start, &gl->last_swap);
+
+    while (gl->frame_callback)
+    {
+        if (wl_display_prepare_read_queue(display, gl->wl_event_queue) == -1)
+        {
+            if (wl_display_dispatch_queue_pending(display, gl->wl_event_queue) == -1) break;
+            continue;
+        }
+        wl_display_flush(display);
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        remaining = timeout - timespec_diff_ms(&now, &start);
+        if (remaining <= 0) ret = 0;
+        else while ((ret = poll(&pfd, 1, remaining)) == -1 && errno == EINTR) /* nothing */;
+
+        if (ret <= 0)
+        {
+            wl_display_cancel_read(display);
+            break;
+        }
+        if (wl_display_read_events(display) == -1) break;
+        if (wl_display_dispatch_queue_pending(display, gl->wl_event_queue) == -1) break;
+    }
+
+    if (gl->frame_callback && !gl->frame_missed)
+        TRACE("drawable %s, no frame callback within %d ms\n", debugstr_opengl_drawable(&gl->base), timeout);
+    gl->frame_missed = gl->frame_callback != NULL;
 }
 
 static EGLConfig egl_config_for_format(int format)
@@ -104,6 +181,9 @@ static BOOL wayland_opengl_surface_create(struct client_surface *client, int for
     opengl_drawable_map_buffer(&gl->base, GL_FRONT_AND_BACK, GL_BACK);
     if (gl->base.stereo) opengl_drawable_map_buffer(&gl->base, GL_FRONT_RIGHT, GL_BACK_RIGHT);
 
+    if (!(gl->wl_event_queue = wl_display_create_queue(process_wayland.wl_display))) goto err;
+    if (!(gl->wl_surface_wrapper = wl_proxy_create_wrapper(surface->wl_surface))) goto err;
+    wl_proxy_set_queue((struct wl_proxy *)gl->wl_surface_wrapper, gl->wl_event_queue);
     if (!(gl->wl_egl_window = wl_egl_window_create(surface->wl_surface, size.cx, size.cy))) goto err;
     if (!(gl->base.surface = funcs->p_eglCreateWindowSurface(egl->display, config, gl->wl_egl_window, attribs))) goto err;
     set_client_surface(hwnd, surface);
@@ -133,7 +213,10 @@ static void wayland_drawable_flush(struct opengl_drawable *base, UINT flags)
 
     TRACE("drawable %s, flags %#x\n", debugstr_opengl_drawable(base), flags);
 
-    if (flags & GL_FLUSH_INTERVAL) funcs->p_eglSwapInterval(egl->display, abs(base->interval));
+    /* With an interval other than zero eglSwapBuffers waits for the frame callback of
+     * the previous swap, without a timeout (NVIDIA egl-wayland), and doesn't return for
+     * a surface that is not shown anymore. Throttle in wayland_drawable_swap instead. */
+    if (flags & GL_FLUSH_INTERVAL) funcs->p_eglSwapInterval(egl->display, 0);
 
     /* Since context_flush is called from operations that may latch the native size,
      * perform any pending resizes before calling them. */
@@ -145,6 +228,16 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
 
     client_surface_present(base->client);
+
+    if (base->interval)
+    {
+        wayland_gl_drawable_wait_frame(gl);
+        clock_gettime(CLOCK_MONOTONIC, &gl->last_swap);
+        /* requested here, committed by eglSwapBuffers together with the new buffer */
+        if (!gl->frame_callback && (gl->frame_callback = wl_surface_frame(gl->wl_surface_wrapper)))
+            wl_callback_add_listener(gl->frame_callback, &frame_callback_listener, gl);
+    }
+
     funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
 
     return TRUE;
