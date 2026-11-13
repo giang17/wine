@@ -344,11 +344,17 @@ This is the recommended branch. What it changes, by subsystem:
   at 1382x806 and 1459x851; EPROM - Memory Rites shows `swapchain` and
   `NVIDIA GeForce GTX 470` in the same DXVK host, because its page is drawn by the WebView2
   process, which the per-application override does not cover. Drawn on the composite of a
-  tree without root content and on the present of a surface root; a swapchain root of this
-  dxgi is a window handover that wined3d presents through GL and has no overlay, nor do the
-  region delivery below the coverage threshold and the layer route. The box covers what is
-  under it and an idle tree is delivered again when the lines change, once a second at
-  most. Off by default; without the variable none of the overlay code runs (three
+  tree without root content and on the present of a surface root. A swapchain root of this
+  dxgi is a window handover that wined3d presents itself; there the lines go out as a layer
+  that wined3d draws into every frame it presents, the path reads `handover` and the last
+  line the presents per second, taken from wined3d's count of the frames it drew the layer
+  into (issue 590). Trinity on the builtin dxgi shows `handover` and 66 presents a second
+  at 1382x806, TruePianos in the 32-bit bridge of FL Studio 2026 `handover` and 5 a second
+  at 1191x540 — an idle plug-in reads 4 or 5, the presents of dxgi's 200 ms timer on the
+  target window. The region delivery below the coverage threshold and the layer route of
+  a tree's leaves have no overlay, nor does a Vulkan swapchain of wined3d. The box covers
+  what is under it and an idle tree is delivered again when the lines change, once a second
+  at most. Off by default; without the variable none of the overlay code runs (three
   reproducers and `dcomp_test` with 554 tests give the same results as before, and the
   three plug-ins in REAPER show no overlay)
 - **DComp on a layered top-level without attributes**: a rootless visual tree whose target
