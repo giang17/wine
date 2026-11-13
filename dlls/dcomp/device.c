@@ -32,6 +32,7 @@
 #include "d3d11.h"
 #include "d3d11_4.h"
 #include "d2d1_1.h"
+#include "d2d1_3.h"
 #include "dcomp.h"
 #include "wine/debug.h"
 #include "wine/winedxgi.h"
@@ -216,6 +217,26 @@ static BOOL dcomp_hold_absent_leaf(void)
         dcomp_hold_absent_leaf_enabled = (!e || atoi(e)) ? 1 : 0;
     }
     return dcomp_hold_absent_leaf_enabled > 0;
+}
+
+/* WINE_DCOMP_HUD=1 (issue 399): write into the frame a target is about to put
+ * on screen which adapter is behind its content and which way the content
+ * came.  DXVK draws its own HUD into the Vulkan swap image at Present; its
+ * composition swapchain presents into a hidden window and a DComp surface is
+ * never presented at all, so on the paths below that HUD has nothing to
+ * appear on.  What is wanted of it here is the answer to "which implementation
+ * draws this", and the adapter description gives it: DXVK reports the Vulkan
+ * device, wined3d the name from its own card table.  Default off; without the
+ * variable none of the overlay code runs. */
+static int dcomp_hud_enabled = -1;
+static BOOL dcomp_hud(void)
+{
+    if (dcomp_hud_enabled < 0)
+    {
+        const char *e = getenv("WINE_DCOMP_HUD");
+        dcomp_hud_enabled = (e && atoi(e)) ? 1 : 0;
+    }
+    return dcomp_hud_enabled > 0;
 }
 
 static void dcomp_send_child_mode(IUnknown *content)
@@ -3632,6 +3653,42 @@ static CRITICAL_SECTION_DEBUG dcomp_all_targets_cs_debug =
 };
 static CRITICAL_SECTION dcomp_all_targets_cs = { &dcomp_all_targets_cs_debug, -1, 0, 0, 0, 0 };
 
+/* What the WINE_DCOMP_HUD overlay of one target shows (issue 399). */
+enum dcomp_hud_kind
+{
+    DCOMP_HUD_SWAPCHAIN,                  /* swapchain of this dxgi, read from the bits wined3d publishes */
+    DCOMP_HUD_FOREIGN,                    /* swapchain of another dxgi, read back (issue 397) */
+    DCOMP_HUD_TEXTURE,                    /* composition texture, read back */
+    DCOMP_HUD_SURFACE,                    /* DComp surface */
+};
+
+struct dcomp_hud_adapter
+{
+    const void *key;                      /* the object the name was asked of */
+    WCHAR name[64];
+};
+
+struct dcomp_hud
+{
+    /* The leaf with the most pixels in the frame being built. */
+    enum dcomp_hud_kind kind;
+    UINT content_width, content_height;
+    unsigned int leaves;
+    const WCHAR *adapter;
+    struct dcomp_hud_adapter adapters[4];
+    unsigned int adapter_next;
+    /* Counted over a second: frames built, frames that reached the window,
+     * readbacks of a texture or foreign swapchain and what they cost. */
+    DWORD rate_tick;
+    unsigned int frames, blits, readbacks;
+    LONGLONG readback_qpc;
+    unsigned int frame_rate, blit_rate, readback_us;
+    BOOL has_readback;
+    DWORD text_hash;                      /* of the lines last drawn */
+    BOOL frame_uniform;                   /* the frame was one colour before the overlay went in */
+    LONG box_width, box_height;           /* never shrinks: an overlay left in a backdrop stays covered */
+};
+
 struct dcomp_target
 {
     IDCompositionTarget IDCompositionTarget_iface;
@@ -3776,6 +3833,7 @@ struct dcomp_target
     RECT stack_rect;                      /* client rect in screen coordinates */
     BOOL stack_visible;
     HRGN stack_clip;                      /* client-space area the targets above have on screen */
+    struct dcomp_hud hud;                 /* WINE_DCOMP_HUD overlay (issue 399), unused without the variable */
     /* WndProc subclass for WM_ERASEBKGND / WM_PAINT protection (Phase 5) */
     WNDPROC orig_wndproc;
 };
@@ -5025,6 +5083,212 @@ static void dcomp_surface_ensure_bits(struct dcomp_surface *surface)
     SetRectEmpty(&surface->pending_dirty);
 }
 
+/* The adapter of the device behind a leaf, for the overlay (issue 399).  Asked
+ * once per object and kept: this runs for every frame. */
+static const WCHAR *dcomp_hud_adapter(struct dcomp_hud *hud, enum dcomp_hud_kind kind, const void *source)
+{
+    ID3D11Device *d3d_device = NULL;
+    IDXGIDevice *dxgi_device = NULL;
+    struct dcomp_hud_adapter *entry;
+    const void *key = source;
+    unsigned int i;
+
+    if (kind == DCOMP_HUD_TEXTURE)
+    {
+        /* A dynamic texture hands in another texture with every frame; the
+         * device behind them stays. */
+        const struct dcomp_texture *texture = source;
+
+        if (!texture->texture)
+            return NULL;
+        ID3D11Texture2D_GetDevice(texture->texture, &d3d_device);
+        key = d3d_device;
+    }
+    else if (kind == DCOMP_HUD_SURFACE)
+    {
+        const struct dcomp_surface *surface = source;
+
+        key = surface->d3d11_device ? (const void *)surface->d3d11_device : (const void *)surface->d2d1_device;
+    }
+    if (!key)
+        return NULL;
+
+    for (i = 0; i < ARRAY_SIZE(hud->adapters); ++i)
+    {
+        if (hud->adapters[i].key != key)
+            continue;
+        if (d3d_device)
+            ID3D11Device_Release(d3d_device);
+        return hud->adapters[i].name;
+    }
+
+    entry = &hud->adapters[hud->adapter_next++ % ARRAY_SIZE(hud->adapters)];
+    entry->key = key;
+    lstrcpyW(entry->name, L"?");
+
+    switch (kind)
+    {
+        case DCOMP_HUD_SWAPCHAIN:
+        {
+            IDXGISwapChain *swapchain;
+
+            if (SUCCEEDED(IUnknown_QueryInterface((IUnknown *)source, &IID_IDXGISwapChain, (void **)&swapchain)))
+            {
+                IDXGISwapChain_GetDevice(swapchain, &IID_IDXGIDevice, (void **)&dxgi_device);
+                IDXGISwapChain_Release(swapchain);
+            }
+            break;
+        }
+        case DCOMP_HUD_FOREIGN:
+            IDXGISwapChain1_GetDevice(((const struct dcomp_texture *)source)->swapchain,
+                    &IID_IDXGIDevice, (void **)&dxgi_device);
+            break;
+        case DCOMP_HUD_TEXTURE:
+            ID3D11Device_QueryInterface(d3d_device, &IID_IDXGIDevice, (void **)&dxgi_device);
+            break;
+        case DCOMP_HUD_SURFACE:
+        {
+            const struct dcomp_surface *surface = source;
+            ID2D1Device2 *d2d_device;
+
+            if (surface->d3d11_device)
+                ID3D11Device_QueryInterface(surface->d3d11_device, &IID_IDXGIDevice, (void **)&dxgi_device);
+            else if (SUCCEEDED(ID2D1Device_QueryInterface(surface->d2d1_device,
+                    &IID_ID2D1Device2, (void **)&d2d_device)))
+            {
+                ID2D1Device2_GetDxgiDevice(d2d_device, &dxgi_device);
+                ID2D1Device2_Release(d2d_device);
+            }
+            break;
+        }
+    }
+    if (d3d_device)
+        ID3D11Device_Release(d3d_device);
+
+    if (dxgi_device)
+    {
+        DXGI_ADAPTER_DESC desc;
+        IDXGIAdapter *adapter;
+
+        if (SUCCEEDED(IDXGIDevice_GetAdapter(dxgi_device, &adapter)))
+        {
+            if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &desc)))
+                lstrcpynW(entry->name, desc.Description, ARRAY_SIZE(entry->name));
+            IDXGIAdapter_Release(adapter);
+        }
+        IDXGIDevice_Release(dxgi_device);
+    }
+    return entry->name;
+}
+
+/* A frame is about to be built: forget the leaves of the last one. */
+static void dcomp_hud_begin(struct dcomp_target *target)
+{
+    target->hud.leaves = 0;
+    target->hud.adapter = NULL;
+    target->hud.content_width = target->hud.content_height = 0;
+}
+
+/* A leaf went into the frame.  The overlay names the one with the most pixels;
+ * the caller holds a reference to `source'. */
+static void dcomp_hud_note_leaf(struct dcomp_target *target, enum dcomp_hud_kind kind,
+        const void *source, UINT width, UINT height)
+{
+    struct dcomp_hud *hud = &target->hud;
+
+    if (hud->leaves++ && (UINT64)width * height <= (UINT64)hud->content_width * hud->content_height)
+        return;
+    hud->kind = kind;
+    hud->content_width = width;
+    hud->content_height = height;
+    hud->adapter = dcomp_hud_adapter(hud, kind, source);
+}
+
+/* Draw the overlay into the frame in comp_bits; `box' receives the rectangle
+ * it takes, empty if there was nothing to name. */
+static void dcomp_hud_draw(struct dcomp_target *target, RECT *box)
+{
+    static const WCHAR *const paths[] =
+    {
+        [DCOMP_HUD_SWAPCHAIN] = L"swapchain",
+        [DCOMP_HUD_FOREIGN]   = L"readback foreign",
+        [DCOMP_HUD_TEXTURE]   = L"texture",
+        [DCOMP_HUD_SURFACE]   = L"surface",
+    };
+    struct dcomp_hud *hud = &target->hud;
+    DWORD now = GetTickCount(), elapsed = now - hud->rate_tick, hash = 2166136261u;
+    WCHAR line[4][128];
+    HDC dc = target->comp_dc;
+    RECT client = {0};
+    LONG x, y, width = 0;
+    int len[4], saved, i;
+    SIZE size;
+
+    SetRectEmpty(box);
+    if (!dc || !target->comp_bits || !hud->leaves)
+        return;
+
+    hud->frames++;
+    if (elapsed >= 1000)
+    {
+        hud->frame_rate = hud->rate_tick ? hud->frames * 1000 / elapsed : 0;
+        hud->blit_rate = hud->rate_tick ? hud->blits * 1000 / elapsed : 0;
+        if ((hud->has_readback = hud->readbacks != 0))
+            hud->readback_us = (unsigned int)(hud->readback_qpc * 1000000 / dcomp_qpc_freq() / hud->readbacks);
+        hud->frames = hud->blits = hud->readbacks = 0;
+        hud->readback_qpc = 0;
+        hud->rate_tick = now ? now : 1;
+    }
+
+    GetClientRect(target->hwnd, &client);
+    /* The adapter has a line to itself: it is the long field, and the one the
+     * overlay is there for. */
+    len[0] = swprintf(line[0], ARRAY_SIZE(line[0]), L"dcomp: %ls", paths[hud->kind]);
+    if (hud->leaves > 1)
+        len[0] += swprintf(line[0] + len[0], ARRAY_SIZE(line[0]) - len[0], L" | %u leaves", hud->leaves);
+    len[1] = swprintf(line[1], ARRAY_SIZE(line[1]), L"%ls", hud->adapter ? hud->adapter : L"?");
+    len[2] = swprintf(line[2], ARRAY_SIZE(line[2]), L"content %ux%u target %ldx%ld",
+            hud->content_width, hud->content_height, client.right, client.bottom);
+    len[3] = swprintf(line[3], ARRAY_SIZE(line[3]), L"%u/s built %u/s shown", hud->frame_rate, hud->blit_rate);
+    if (hud->has_readback)
+        len[3] += swprintf(line[3] + len[3], ARRAY_SIZE(line[3]) - len[3], L" | readback %u.%02u ms",
+                hud->readback_us / 1000, hud->readback_us % 1000 / 10);
+
+    saved = SaveDC(dc);
+    SelectObject(dc, GetStockObject(ANSI_FIXED_FONT));
+    size.cy = 0;
+    for (i = 0; i < ARRAY_SIZE(line); ++i)
+    {
+        const WCHAR *c;
+
+        GetTextExtentPoint32W(dc, line[i], len[i], &size);
+        width = max(width, size.cx);
+        for (c = line[i]; *c; ++c)
+            hash = (hash ^ *c) * 16777619u;
+    }
+    hud->text_hash = hash;
+    hud->box_width = max(hud->box_width, width + 8);
+    hud->box_height = max(hud->box_height, (LONG)ARRAY_SIZE(line) * size.cy + 6);
+    SetRect(box, 0, 0, min(hud->box_width, (LONG)target->comp_width),
+            min(hud->box_height, (LONG)target->comp_height));
+
+    SetBkMode(dc, OPAQUE);
+    SetBkColor(dc, RGB(0, 0, 0));
+    SetTextColor(dc, RGB(255, 220, 0));
+    SetTextAlign(dc, TA_LEFT | TA_TOP);
+    ExtTextOutW(dc, 4, 3, ETO_OPAQUE | ETO_CLIPPED, box, line[0], len[0], NULL);
+    for (i = 1; i < ARRAY_SIZE(line); ++i)
+        ExtTextOutW(dc, 4, 3 + i * size.cy, ETO_CLIPPED, box, line[i], len[i], NULL);
+    RestoreDC(dc, saved);
+    GdiFlush();
+
+    /* GDI leaves the alpha byte of what it draws at 0, and the layered route
+     * hands these pixels to the window manager with their alpha. */
+    for (y = box->top; y < box->bottom; ++y)
+        for (x = box->left; x < box->right; ++x)
+            target->comp_bits[y * target->comp_width + x] |= 0xff000000;
+}
+
 /* The composite walk does not read a D3D or DXGI resource under the tree
  * lock: a readback can wait for the application's immediate context, and the
  * thread holding that may be the one calling SetContent().  The walk takes a
@@ -5088,6 +5352,9 @@ static void dcomp_composite_leaf(struct dcomp_target *target, struct dcomp_compo
         dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
                 leaf->surface->bits, leaf->surface->width,
                 leaf->surface->height, vx, vy, opacity);
+        if (dcomp_hud())
+            dcomp_hud_note_leaf(target, DCOMP_HUD_SURFACE, leaf->surface,
+                    leaf->surface->width, leaf->surface->height);
     }
     else if (leaf->texture)
     {
@@ -5098,7 +5365,24 @@ static void dcomp_composite_leaf(struct dcomp_target *target, struct dcomp_compo
          * reference, so the readback below works on the texture itself. */
         target->walk_leaf_hash_valid = FALSE;
 
-        dcomp_texture_ensure_bits(tex);
+        if (dcomp_hud())
+        {
+            DWORD tick = tex->last_readback_tick;
+            LONGLONG start = dcomp_qpc_now();
+
+            dcomp_texture_ensure_bits(tex);
+            /* The readback is throttled; count the ones that ran. */
+            if (tex->last_readback_tick != tick)
+            {
+                target->hud.readbacks++;
+                target->hud.readback_qpc += dcomp_qpc_now() - start;
+            }
+            if (tex->bits)
+                dcomp_hud_note_leaf(target, tex->swapchain ? DCOMP_HUD_FOREIGN : DCOMP_HUD_TEXTURE,
+                        tex, tex->bits_width, tex->bits_height);
+        }
+        else
+            dcomp_texture_ensure_bits(tex);
         if (tex->bits)
         {
             dcomp_composite_premul_over(target->comp_bits, target->comp_width, target->comp_height,
@@ -5144,6 +5428,9 @@ static void dcomp_composite_leaf(struct dcomp_target *target, struct dcomp_compo
                 }
                 dcomp_composite_premul_over(target->comp_bits, target->comp_width,
                         target->comp_height, bits, LOWORD(dims), HIWORD(dims), vx, vy, opacity);
+                if (dcomp_hud())
+                    dcomp_hud_note_leaf(target, DCOMP_HUD_SWAPCHAIN, leaf->content,
+                            LOWORD(dims), HIWORD(dims));
             }
         }
     }
@@ -6737,8 +7024,25 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
             }
         }
 
+        if (dcomp_hud())
+            dcomp_hud_begin(target);
+
         composed = dcomp_target_composite_leaves(target, root,
                 (int)root->offset_x, (int)root->offset_y, dcomp_visual_root_opacity(root));
+
+        if (composed && dcomp_hud())
+        {
+            RECT box;
+
+            /* The repair of issue 386 asks whether the delivered frame was one
+             * colour; the overlay must not answer that for the tree. */
+            target->hud.frame_uniform = dcomp_surface_uniform(target->comp_bits,
+                    (unsigned int)(rc.right * rc.bottom));
+            dcomp_hud_draw(target, &box);
+            /* A frame with other lines is another frame to the unchanged-content gate. */
+            if (!IsRectEmpty(&box))
+                target->walk_leaf_hash = (target->walk_leaf_hash ^ target->hud.text_hash) * 16777619u;
+        }
 
         if (++comp_tree_log <= 5 || !(comp_tree_log % 100))
             FIXME("Composited visual tree #%u onto target hwnd %p (%ldx%ld).\n",
@@ -6906,9 +7210,13 @@ static void dcomp_target_composite_tree(struct dcomp_target *target, BOOL from_t
                         (unsigned int)(rc.right * rc.bottom));
                 target->last_delivered_uniform = dcomp_surface_uniform(target->comp_bits,
                         (unsigned int)(rc.right * rc.bottom));
+                if (dcomp_hud())
+                    target->last_delivered_uniform = target->hud.frame_uniform;
                 target->last_delivered_valid = TRUE;
             }
             target->target_diverged_tick = 0;
+            if (dcomp_hud())
+                target->hud.blits++;
         }
         else if (clip_out < SIMPLEREGION)
         {
@@ -7485,6 +7793,24 @@ static void dcomp_target_present_region(struct dcomp_target *target,
     /* A target on a child window: what the BitBlt carries is this frame over
      * the ancestor's, the way the DWM composes the two (issue 335). */
     over_ancestor = dcomp_target_blend_over_ancestor(target, left, top, right, bottom);
+
+    if (dcomp_hud())
+    {
+        RECT box;
+
+        dcomp_hud_begin(target);
+        dcomp_hud_note_leaf(target, DCOMP_HUD_SURFACE, surface, surface->width, surface->height);
+        target->hud.blits++;
+        dcomp_hud_draw(target, &box);
+        /* The overlay is outside the region this present carries as a rule. */
+        if (!IsRectEmpty(&box))
+        {
+            left = min(left, box.left);
+            top = min(top, box.top);
+            right = max(right, box.right);
+            bottom = max(bottom, box.bottom);
+        }
+    }
 
     /* BitBlt only the present region to the target window (the rest already shows the
      * prior frame — WM_ERASEBKGND is suppressed). */
