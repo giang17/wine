@@ -245,6 +245,18 @@ void wined3d_device_cleanup(struct wined3d_device *device)
     wine_rb_destroy(&device->depth_stencil_states, device_leftover_depth_stencil_state, NULL);
     wine_rb_destroy(&device->so_descs, device_free_so_desc, NULL);
 
+    /* Drain the bo_gl free pool. */
+    {
+        struct wined3d_bo *bo = device->bo_gl_free_pool;
+        while (bo)
+        {
+            struct wined3d_bo *next = (struct wined3d_bo *)bo->map_ptr;
+            free(CONTAINING_RECORD(bo, struct wined3d_bo_gl, b));
+            bo = next;
+        }
+        device->bo_gl_free_pool = NULL;
+        device->bo_gl_free_pool_count = 0;
+    }
     wined3d_lock_cleanup(&device->bo_map_lock);
 
     wined3d_decref(device->wined3d);
@@ -1338,9 +1350,13 @@ static bool use_buffer_chunk_suballocation(struct wined3d_device_gl *device_gl,
             return true;
 
         case GL_ELEMENT_ARRAY_BUFFER:
-            /* There is no way to specify an element array buffer offset for
-             * indirect draws in OpenGL. */
-            return (device_gl->d.wined3d->flags & WINED3D_LEGACY) || !gl_info->supported[ARB_DRAW_INDIRECT];
+            /* OpenGL has no element array buffer offset for indirect draws;
+             * wined3d_context_gl_draw_indirect() copies the indices of a
+             * suballocated index buffer to a scratch buffer for those.
+             * Without suballocation every WRITE_DISCARD map of a dynamic
+             * index buffer creates a buffer object through the CS and waits
+             * for it (issue 561). */
+            return true;
 
         case GL_TEXTURE_BUFFER:
             return gl_info->supported[ARB_TEXTURE_BUFFER_RANGE];
@@ -1386,13 +1402,34 @@ bool wined3d_device_gl_create_bo(struct wined3d_device_gl *device_gl, struct win
             }
             else if (context_gl)
             {
+                struct wined3d_bo_gl tmp_bo;
                 WARN_(d3d_perf)("Not allocating chunk memory for binding type %#x.\n", binding);
-                id = wined3d_context_gl_allocate_vram_chunk_buffer(context_gl, memory_type_idx, size);
+                if (wined3d_context_gl_pop_free_bo(context_gl, size, binding, usage, coherent, flags, &tmp_bo))
+                    id = tmp_bo.id;
+                else
+                    id = wined3d_context_gl_allocate_vram_chunk_buffer(context_gl, memory_type_idx, size);
             }
         }
         else
         {
-            id = wined3d_context_gl_allocate_vram_chunk_buffer(context_gl, memory_type_idx, size);
+            /* Try to recycle a GL buffer from the free list first. */
+            if (context_gl)
+            {
+                struct wined3d_bo_gl tmp_bo;
+                if (wined3d_context_gl_pop_free_bo(context_gl, size, binding, usage, coherent, flags, &tmp_bo))
+                {
+                    id = tmp_bo.id;
+                    /* The recycled buffer may be larger, that's fine. */
+                }
+                else
+                {
+                    id = wined3d_context_gl_allocate_vram_chunk_buffer(context_gl, memory_type_idx, size);
+                }
+            }
+            else
+            {
+                id = 0;
+            }
         }
 
         if (!id)
@@ -1455,6 +1492,25 @@ void wined3d_device_gl_delete_opengl_contexts_cs(void *object)
     struct wined3d_shader *shader;
 
     TRACE("device %p.\n", device_gl);
+
+    /* Clean up BO free list. */
+    if (device_gl->bo_free_list_count)
+    {
+        context = context_acquire(&device_gl->d, NULL, 0);
+        context_gl = wined3d_context_gl(context);
+        {
+            const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+            SIZE_T j;
+
+            for (j = 0; j < device_gl->bo_free_list_count; ++j)
+                GL_EXTCALL(glDeleteBuffers(1, &device_gl->bo_free_list[j].id));
+            device_gl->bo_free_list_count = 0;
+        }
+        context_release(context);
+    }
+    free(device_gl->bo_free_list);
+    device_gl->bo_free_list = NULL;
+    device_gl->bo_free_list_size = 0;
 
     device = &device_gl->d;
 
@@ -2156,6 +2212,13 @@ void CDECL wined3d_device_context_set_viewports(struct wined3d_device_context *c
     }
 
     wined3d_device_context_lock(context);
+    if (viewport_count == state->viewport_count
+            && (!viewport_count || !memcmp(state->viewports, viewports, viewport_count * sizeof(*viewports))))
+    {
+        wined3d_device_context_unlock(context);
+        return;
+    }
+
     if (viewport_count)
         memcpy(state->viewports, viewports, viewport_count * sizeof(*viewports));
     else

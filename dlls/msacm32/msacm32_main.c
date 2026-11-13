@@ -54,8 +54,12 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
         MSACM_RegisterAllDrivers();
 	break;
     case DLL_PROCESS_DETACH:
-        MSACM_UnregisterAllDrivers();
+        /* At process exit the other threads are gone already and one of them
+         * may hold MSACM_cs; nothing that takes the lock can run here. */
         if (lpvReserved) break;
+        MSACM_UnregisterAllDrivers();
+        MSACM_cs.DebugInfo->Spare[0] = 0;
+        DeleteCriticalSection(&MSACM_cs);
         HeapDestroy(MSACM_hHeap);
 	break;
     default:

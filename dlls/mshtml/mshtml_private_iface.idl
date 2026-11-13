@@ -522,4 +522,47 @@ interface IWineXMLHttpRequestPrivate : IDispatch
     HRESULT onload([retval, out] VARIANT *p);
 }
 
+[
+    odl,
+    oleautomation,
+    dual,
+    hidden,
+    uuid(5e1f4a3c-2b0d-4c7e-9a61-3d0c8f5b7a10)
+]
+interface IWineHTMLCanvasPrivate : IDispatch
+{
+    [id(50)]
+    HRESULT getContext([in] BSTR contextId, [retval, out] IDispatch **ret);
+}
+
+[
+    odl,
+    oleautomation,
+    dual,
+    hidden,
+    uuid(5e1f4a3c-2b0d-4c7e-9a61-3d0c8f5b7a11)
+]
+interface IWineMSHTMLCanvasRenderingContext2D : IDispatch
+{
+    [propput, id(1)]
+    HRESULT font([in] BSTR v);
+    [propget, id(1)]
+    HRESULT font([retval, out] BSTR *p);
+    [id(2)]
+    HRESULT measureText([in] BSTR text, [retval, out] IDispatch **ret);
+}
+
+[
+    odl,
+    oleautomation,
+    dual,
+    hidden,
+    uuid(5e1f4a3c-2b0d-4c7e-9a61-3d0c8f5b7a12)
+]
+interface IWineMSHTMLTextMetrics : IDispatch
+{
+    [propget, id(1)]
+    HRESULT width([retval, out] float *p);
+}
+
 } /* library MSHTML_private */

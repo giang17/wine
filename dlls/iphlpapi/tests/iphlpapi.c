@@ -1722,11 +1722,12 @@ static void testGetInterfaceInfo(void)
 static void testGetAdaptersInfo(void)
 {
     IP_ADAPTER_INFO *ptr, *buf;
+    IP_ADDR_STRING *addr;
     NET_LUID luid;
     GUID guid;
     char name[ARRAY_SIZE(ptr->AdapterName)];
     DWORD err;
-    ULONG len = 0;
+    ULONG len = 0, expected = 0;
     MIB_IFROW row;
 
     err = GetAdaptersInfo( NULL, NULL );
@@ -1762,8 +1763,12 @@ static void testGetAdaptersInfo(void)
         ok( ptr->IpAddressList.IpMask.String[0], "A valid mask must be present\n" );
         ok( ptr->GatewayList.IpAddress.String[0], "A valid IP address must be present\n" );
         ok( ptr->GatewayList.IpMask.String[0], "A valid mask must be present\n" );
+        expected += sizeof(*ptr);
+        for (addr = ptr->IpAddressList.Next; addr; addr = addr->Next) expected += sizeof(*addr);
         ptr = ptr->Next;
     }
+    /* Only the addresses beyond an adapter's first take a separate IP_ADDR_STRING. */
+    ok( len == expected, "got size %lu, expected %lu\n", len, expected );
     free( buf );
 }
 

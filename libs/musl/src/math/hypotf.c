@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include "libm.h"
 
-float __cdecl _hypotf(float x, float y)
+static float hypotf_nocheck(float x, float y)
 {
 	union {float f; uint32_t i;} ux = {x}, uy = {y}, ut;
 	float_t z;
@@ -33,4 +33,18 @@ float __cdecl _hypotf(float x, float y)
 		y *= 0x1p90f;
 	}
 	return z*sqrtf((double)x*x + (double)y*y);
+}
+
+/* Windows reports an overflow through _matherr and errno with the original
+ * arguments on x86_64 only; the i386 ucrtbase returns the infinity silently
+ * (Windows 10, measured through _hypotf and cabsf).  No underflow is reported
+ * on either architecture. */
+float __cdecl _hypotf(float x, float y)
+{
+	float r = hypotf_nocheck(x, y);
+#ifndef __i386__
+	if (r == INFINITY && isfinite(x) && isfinite(y))
+		return math_error(_OVERFLOW, "_hypotf", x, y, r);
+#endif
+	return r;
 }

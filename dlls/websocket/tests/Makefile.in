@@ -1,0 +1,5 @@
+TESTDLL = websocket.dll
+IMPORTS = websocket advapi32 crypt32
+
+SOURCES = \
+	websocket.c

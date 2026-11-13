@@ -20,6 +20,7 @@
  */
 
 #include <stdarg.h>
+#include <stdlib.h>
 
 #include "winternl.h"
 #define COBJMACROS
@@ -31,7 +32,6 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(dwmapi);
-
 
 /**********************************************************************
  *           DwmIsCompositionEnabled         (DWMAPI.@)
@@ -69,6 +69,27 @@ HRESULT WINAPI DwmEnableComposition(UINT uCompositionAction)
 HRESULT WINAPI DwmExtendFrameIntoClientArea(HWND hwnd, const MARGINS* margins)
 {
     FIXME("(%p, %p) stub\n", hwnd, margins);
+
+    /* Margins of -1 mean "extend the frame over
+     * the whole client area", i.e. full DWM glass.  On Windows that makes the
+     * window per-pixel alpha capable, independently of any LWA_ALPHA constant
+     * opacity set through SetLayeredWindowAttributes.  Wine has no DWM, so
+     * record the request on the window and let the display driver pick an ARGB
+     * visual for it. */
+    if (margins && margins->cxLeftWidth == -1)
+    {
+        COLORREF key;
+        DWORD flags;
+        BYTE alpha;
+
+        SetPropW(hwnd, L"__wine_dwm_glass", (HANDLE)(ULONG_PTR)1);
+
+        /* The driver reads the property when it decides the window visual.
+         * Applications ask for glass after SetLayeredWindowAttributes, so
+         * re-apply the current attributes to run that decision again. */
+        if (GetLayeredWindowAttributes(hwnd, &key, &alpha, &flags))
+            SetLayeredWindowAttributes(hwnd, key, alpha, flags);
+    }
 
     return S_OK;
 }
@@ -284,7 +305,11 @@ HRESULT WINAPI DwmGetCompositionTimingInfo(HWND hwnd, DWM_TIMING_INFO *info)
     info->qpcRefreshPeriod = performance_frequency.QuadPart / display_frequency;
 
     QueryPerformanceCounter(&qpc);
-    info->qpcVBlank = (qpc.QuadPart / info->qpcRefreshPeriod) * info->qpcRefreshPeriod;
+    /* The DWM composes a frame ahead of scanout, so qpcVBlank denotes the
+     * upcoming vblank, not the last one. Frame pacing code (e.g. Ableton
+     * Live's compositor timer) rejects timing info whose vblank lies in
+     * the past. */
+    info->qpcVBlank = (qpc.QuadPart / info->qpcRefreshPeriod + 1) * info->qpcRefreshPeriod;
 
     return S_OK;
 }

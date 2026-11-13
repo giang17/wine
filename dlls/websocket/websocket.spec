@@ -1,13 +1,13 @@
-@ stdcall WebSocketAbortHandle(long)
-@ stub WebSocketBeginClientHandshake
-@ stub WebSocketBeginServerHandshake
-@ stub WebSocketCompleteAction
+@ stdcall WebSocketAbortHandle(ptr)
+@ stdcall WebSocketBeginClientHandshake(ptr ptr long ptr long ptr long ptr ptr)
+@ stdcall WebSocketBeginServerHandshake(ptr str ptr long ptr long ptr ptr)
+@ stdcall WebSocketCompleteAction(ptr ptr long)
 @ stdcall WebSocketCreateClientHandle(ptr long ptr)
-@ stub WebSocketCreateServerHandle
-@ stdcall WebSocketDeleteHandle(long)
-@ stub WebSocketEndClientHandshake
-@ stub WebSocketEndServerHandshake
-@ stub WebSocketGetAction
-@ stub WebSocketGetGlobalProperty
-@ stub WebSocketReceive
-@ stub WebSocketSend
+@ stdcall WebSocketCreateServerHandle(ptr long ptr)
+@ stdcall WebSocketDeleteHandle(ptr)
+@ stdcall WebSocketEndClientHandshake(ptr ptr long ptr ptr ptr)
+@ stdcall WebSocketEndServerHandshake(ptr)
+@ stdcall WebSocketGetAction(ptr long ptr ptr ptr ptr ptr ptr)
+@ stdcall WebSocketGetGlobalProperty(long ptr ptr)
+@ stdcall WebSocketReceive(ptr ptr ptr)
+@ stdcall WebSocketSend(ptr long ptr ptr)

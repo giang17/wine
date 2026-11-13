@@ -30,6 +30,21 @@ import "sapi.idl";
 
 [
     object,
+    uuid(b8aab0cf-346f-49d8-9499-c8b03f161d51),
+    helpstring("ISpObjectTokenInit"),
+    pointer_default(unique),
+    local,
+    restricted
+]
+interface ISpObjectTokenInit : ISpObjectToken
+{
+    HRESULT InitFromDataKey([in] LPCWSTR pszCategoryId,
+                            [in] LPCWSTR pszTokenId,
+                            [in] ISpDataKey *pDataKey);
+}
+
+[
+    object,
     uuid(06b64f9f-7fda-11d2-b4f2-00c04f797396),
     helpstring("ISpObjectTokenEnumBuilder"),
     pointer_default(unique),

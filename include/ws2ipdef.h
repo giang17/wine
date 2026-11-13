@@ -449,6 +449,16 @@ static inline BOOLEAN WS(IN6_IS_ADDR_UNSPECIFIED) ( const IN6_ADDR *a )
             (a->s6_words[7] == 0));
 }
 
+static inline BOOLEAN WS(IN6_IS_ADDR_V4MAPPED) ( const IN6_ADDR *a )
+{
+    return ((a->s6_words[0] == 0) &&
+            (a->s6_words[1] == 0) &&
+            (a->s6_words[2] == 0) &&
+            (a->s6_words[3] == 0) &&
+            (a->s6_words[4] == 0) &&
+            (a->s6_words[5] == 0xffff));
+}
+
 static inline BOOLEAN WS(IN6_IS_ADDR_LINKLOCAL) ( const IN6_ADDR *a )
 {
     return ((a->s6_bytes[0] == 0xfe) && ((a->s6_bytes[1] & 0xc0) == 0x80));

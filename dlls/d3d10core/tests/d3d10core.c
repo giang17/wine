@@ -13818,7 +13818,6 @@ static void check_format_support(const unsigned int *format_support,
             continue;
         }
 
-        todo_wine_if (feature_flag == D3D11_FORMAT_SUPPORT_DISPLAY)
         ok(supported, "Format %#x - %s supported, format support %#x.\n",
                 format, feature_name, format_support[format]);
     }
@@ -13875,7 +13874,6 @@ static void test_format_support(void)
 
     ok(format_support[DXGI_FORMAT_R8G8B8A8_UNORM] & D3D10_FORMAT_SUPPORT_SHADER_SAMPLE,
             "SHADER_SAMPLE is not supported for R8G8B8A8_UNORM.\n");
-    todo_wine
     ok(!(format_support[DXGI_FORMAT_R32G32B32A32_UINT] & D3D10_FORMAT_SUPPORT_SHADER_SAMPLE),
             "SHADER_SAMPLE is supported for R32G32B32A32_UINT.\n");
     ok(format_support[DXGI_FORMAT_R32G32B32A32_UINT] & D3D10_FORMAT_SUPPORT_SHADER_LOAD,

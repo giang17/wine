@@ -111,6 +111,36 @@ sync_test("page transition events", function() {
         document.body.attachEvent("onunload", function() { ok(false, "unload fired on document.body"); });
 });
 
+sync_test("canvas_measureText", function() {
+    var canvas = document.createElement("canvas"), ctx, short_width, long_width, bold_width;
+
+    if(document.documentMode < 9) {
+        ok(!("getContext" in canvas), "getContext in canvas");
+        return;
+    }
+
+    ctx = canvas.getContext("2d");
+    ok(ctx !== null, "2d context is null");
+    ok(ctx === canvas.getContext("2d"), "second getContext returned a different object");
+    ok(canvas.getContext("no-such-context") === null, "unknown context is not null");
+    ok(ctx.font === "10px sans-serif", "default font = " + ctx.font);
+    ok(ctx.measureText("").width === 0, "width of empty string = " + ctx.measureText("").width);
+
+    ctx.font = "12px Arial";
+    ok(ctx.font === "12px Arial", "font = " + ctx.font);
+    short_width = ctx.measureText("Wine").width;
+    long_width = ctx.measureText("Wine Wine").width;
+    ok(short_width > 0, "width = " + short_width);
+    ok(long_width > short_width, "long width " + long_width + " <= short width " + short_width);
+
+    ctx.font = "bold 24px Arial";
+    bold_width = ctx.measureText("Wine").width;
+    ok(bold_width > short_width, "bold 24px width " + bold_width + " <= 12px width " + short_width);
+
+    ctx.font = "not a font";
+    ok(ctx.font === "bold 24px Arial", "font after invalid value = " + ctx.font);
+});
+
 sync_test("builtin_toString", function() {
     var tags = [
         [ "abbr",            "Phrase", -1 ],
@@ -130,7 +160,7 @@ sync_test("builtin_toString", function() {
         [ "body",            "Body" ],
         [ "br",              "BR", -1 ],
         [ "button",          "Button" ],
-        [ "canvas",          "Canvas", -1 ],
+        [ "canvas",          "Canvas" ],
         [ "caption",         "TableCaption", -1 ],
         [ "center",          "Block", -1 ],
         [ "cite",            "Phrase", -1 ],
@@ -4859,13 +4889,13 @@ async_test("window own props", function() {
             "encodeURIComponent", "escape", "eval", "isFinite", "isNaN", "parseFloat", "parseInt", "testprop", "undefined", "unescape"
         ], [
             ["AesGcmEncryptResult",11], ["ANGLE_instanced_arrays",11], ["AnimationEvent",10], ["ApplicationCache",10], "Audio", ["AudioTrack",10], ["AudioTrackList",10],
-            "BeforeUnloadEvent", ["Blob",10], "BookmarkCollection", "CanvasGradient", "CanvasPattern", "CanvasPixelArray", "CanvasRenderingContext2D", "CDATASection", ["CloseEvent",10],
+            "BeforeUnloadEvent", ["Blob",10], "BookmarkCollection", "CanvasGradient", "CanvasPattern", "CanvasPixelArray", "CDATASection", ["CloseEvent",10],
             "CompositionEvent", "ControlRangeCollection", "Coordinates", ["CryptoOperation",11], "CSSFontFaceRule", "CSSImportRule", ["CSSKeyframeRule",10], ["CSSKeyframesRule",10],
             "CSSMediaRule", "CSSNamespaceRule", "CSSPageRule", "CSSRuleList", "DataTransfer", "Debug", ["DeviceAcceleration",11], ["DeviceMotionEvent",11],
             ["DeviceOrientationEvent",11], ["DeviceRotationRate",11], ["DOMError",10], "DOMException", ["DOMSettableTokenList",10], ["DOMStringList",10], ["DOMStringMap",11],
             "DragEvent", ["ErrorEvent",10], "EventException", ["EXT_texture_filter_anisotropic",11], ["File",10], ["FileList",10], ["FileReader",10],
             "FocusEvent", ["FormData",10], "Geolocation", "GetObject", ["HTMLAllCollection",11], "HTMLAppletElement", "HTMLAreasCollection", "HTMLAudioElement", "HTMLBaseElement",
-            "HTMLBaseFontElement", "HTMLBGSoundElement", "HTMLBlockElement", "HTMLBRElement", "HTMLCanvasElement", ["HTMLDataListElement",10], "HTMLDDElement", "HTMLDirectoryElement",
+            "HTMLBaseFontElement", "HTMLBGSoundElement", "HTMLBlockElement", "HTMLBRElement", ["HTMLDataListElement",10], "HTMLDDElement", "HTMLDirectoryElement",
             "HTMLDivElement", "HTMLDListElement", "HTMLDTElement", "HTMLFieldSetElement", "HTMLFontElement", "HTMLFrameSetElement", "HTMLHeadingElement", "HTMLHRElement", "HTMLIsIndexElement",
             "HTMLLegendElement", "HTMLLIElement", "HTMLMapElement", "HTMLMarqueeElement", "HTMLMediaElement", "HTMLMenuElement", "HTMLModElement", "HTMLNextIdElement", "HTMLOListElement",
             "HTMLOptGroupElement", "HTMLParagraphElement", "HTMLParamElement", "HTMLPhraseElement", "HTMLPreElement", ["HTMLProgressElement",10], "HTMLQuoteElement", "HTMLSourceElement",
@@ -4893,7 +4923,7 @@ async_test("window own props", function() {
             "SVGPathSegLinetoHorizontalRel", "SVGPathSegLinetoRel", "SVGPathSegLinetoVerticalAbs", "SVGPathSegLinetoVerticalRel", "SVGPathSegList", "SVGPathSegMovetoAbs", "SVGPathSegMovetoRel",
             "SVGPatternElement", "SVGPoint", "SVGPointList", "SVGPolygonElement", "SVGPolylineElement", "SVGPreserveAspectRatio", "SVGRadialGradientElement", "SVGRect", "SVGRectElement",
             "SVGScriptElement", "SVGStopElement", "SVGStringList", "SVGStyleElement", "SVGSwitchElement", "SVGSymbolElement", "SVGTextElement", "SVGTextPathElement", "SVGTitleElement",
-            "SVGTransform", "SVGTransformList", "SVGUnitTypes", "SVGUseElement", "SVGViewElement", "SVGZoomAndPan", "SVGZoomEvent", "TextEvent", "TextMetrics", "TextRangeCollection", ["TextTrack",10],
+            "SVGTransform", "SVGTransformList", "SVGUnitTypes", "SVGUseElement", "SVGViewElement", "SVGZoomAndPan", "SVGZoomEvent", "TextEvent", "TextRangeCollection", ["TextTrack",10],
             ["TextTrackCue",10], ["TextTrackCueList",10], ["TextTrackList",10], "TimeRanges", ["TrackEvent",10], ["TransitionEvent",10], "TreeWalker",
             ["URL",10], ["ValidityState",10], ["VideoPlaybackQuality",11], ["WebGLActiveInfo",11], ["WebGLBuffer",11], ["WebGLContextEvent",11],
             ["WebGLFramebuffer",11], ["WebGLObject",11], ["WebGLProgram",11], ["WebGLRenderbuffer",11], ["WebGLRenderingContext",11], ["WebGLShader",11], ["WebGLShaderPrecisionFormat",11],

@@ -1693,6 +1693,7 @@ enum copy_engine_opcode
 {
     COPY_ENGINE_MOVE,
     COPY_ENGINE_REMOVE_DIRECTORY_SILENT,
+    COPY_ENGINE_DELETE,
 };
 
 #define TSF_UNKNOWN_MEGRE_FLAG 0x1000
@@ -1869,6 +1870,28 @@ static HRESULT notify_post_move_item(IFileOperationProgressSink *sink, struct fi
     return IFileOperationProgressSink_PostMoveItem(sink, op->tsf, p->item, op->folder, op->name, p->result, p->new_item);
 }
 
+struct notify_delete_item_param
+{
+    IShellItem *item;
+    HRESULT result;
+};
+
+static HRESULT notify_pre_delete_item(IFileOperationProgressSink *sink, struct file_operation *operations,
+        struct copy_engine_operation *op, void *context)
+{
+    struct notify_delete_item_param *p = context;
+
+    return IFileOperationProgressSink_PreDeleteItem(sink, op->tsf, p->item);
+}
+
+static HRESULT notify_post_delete_item(IFileOperationProgressSink *sink, struct file_operation *operations,
+        struct copy_engine_operation *op, void *context)
+{
+    struct notify_delete_item_param *p = context;
+
+    return IFileOperationProgressSink_PostDeleteItem(sink, op->tsf, p->item, p->result, NULL);
+}
+
 static void set_file_operation_progress(struct file_operation *operation, unsigned int total, unsigned int sofar)
 {
     operation->progress_total = total;
@@ -1982,6 +2005,44 @@ static HRESULT copy_engine_move(struct file_operation *operation, struct copy_en
     return COPYENGINE_S_NOT_HANDLED;
 }
 
+static HRESULT copy_engine_delete(struct file_operation *operation, struct copy_engine_operation *op)
+{
+    SHFILEOPSTRUCTW fileop = { 0 };
+    WCHAR *path, *from;
+    size_t len;
+    HRESULT hr;
+    int ret;
+
+    if (FAILED(hr = SHGetNameFromIDList(op->item_pidl, SIGDN_FILESYSPATH, &path)))
+    {
+        WARN("Item is not a file system object, hr %#lx.\n", hr);
+        return hr;
+    }
+    len = wcslen(path);
+    if (!(from = malloc((len + 2) * sizeof(WCHAR))))
+    {
+        CoTaskMemFree(path);
+        return E_OUTOFMEMORY;
+    }
+    memcpy(from, path, len * sizeof(WCHAR));
+    from[len] = from[len + 1] = 0;    /* double null terminated list */
+    CoTaskMemFree(path);
+
+    fileop.wFunc = FO_DELETE;
+    fileop.pFrom = from;
+    fileop.fFlags = FOF_NOCONFIRMMKDIR | (operation->flags & (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
+            | FOF_NOERRORUI | FOF_FILESONLY | FOF_NORECURSION | FOF_WANTNUKEWARNING));
+    ret = SHFileOperationW(&fileop);
+    TRACE("%s, flags %#x, ret %d, aborted %d.\n", debugstr_w(from), fileop.fFlags, ret, fileop.fAnyOperationsAborted);
+    free(from);
+
+    if (ret)
+        return HRESULT_FROM_WIN32(ret);
+    if (fileop.fAnyOperationsAborted)
+        return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    return S_OK;
+}
+
 static HRESULT perform_file_operations(struct file_operation *operation)
 {
     struct copy_engine_operation *op;
@@ -2035,6 +2096,30 @@ static HRESULT perform_file_operations(struct file_operation *operation)
                 IShellItem_Release(p.item);
                 if (p.new_item)
                     IShellItem_Release(p.new_item);
+                break;
+            }
+
+            case COPY_ENGINE_DELETE:
+            {
+                struct notify_delete_item_param p;
+
+                if (FAILED(hr = SHCreateItemFromIDList(op->item_pidl, &IID_IShellItem, (void**)&p.item)))
+                    break;
+                op->tsf = (operation->flags & FOF_ALLOWUNDO) ? TSF_DELETE_RECYCLE_IF_POSSIBLE : 0;
+                if (FAILED((hr = file_operation_notify(operation, op, FALSE, &p, notify_pre_delete_item))))
+                {
+                    IShellItem_Release(p.item);
+                    return hr;
+                }
+                hr = copy_engine_delete(operation, op);
+                p.result = hr;
+                if (FAILED(hr = file_operation_notify(operation, op, TRUE, &p, notify_post_delete_item)))
+                {
+                    IShellItem_Release(p.item);
+                    return hr;
+                }
+                hr = p.result;
+                IShellItem_Release(p.item);
                 break;
             }
         }
@@ -2247,16 +2332,47 @@ static HRESULT WINAPI file_operation_CopyItems(IFileOperation *iface, IUnknown *
 static HRESULT WINAPI file_operation_DeleteItem(IFileOperation *iface, IShellItem *item,
         IFileOperationProgressSink *sink)
 {
-    FIXME("(%p, %p, %p): stub.\n", iface, item, sink);
+    struct file_operation *operation = impl_from_IFileOperation(iface);
 
-    return E_NOTIMPL;
+    TRACE("(%p, %p, %p).\n", iface, item, sink);
+
+    if (!item)
+        return E_INVALIDARG;
+
+    return add_operation(operation, COPY_ENGINE_DELETE, item, NULL, NULL, sink, 0, NULL);
 }
 
 static HRESULT WINAPI file_operation_DeleteItems(IFileOperation *iface, IUnknown *items)
 {
-    FIXME("(%p, %p): stub.\n", iface, items);
+    struct file_operation *operation = impl_from_IFileOperation(iface);
+    IShellItemArray *array;
+    IShellItem *item;
+    DWORD count, i;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("(%p, %p).\n", iface, items);
+
+    if (!items)
+        return E_INVALIDARG;
+    if (FAILED(IUnknown_QueryInterface(items, &IID_IShellItemArray, (void **)&array)))
+    {
+        FIXME("Unsupported items object %p.\n", items);
+        return E_NOTIMPL;
+    }
+    if (SUCCEEDED(hr = IShellItemArray_GetCount(array, &count)))
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (FAILED(hr = IShellItemArray_GetItemAt(array, i, &item)))
+                break;
+            hr = add_operation(operation, COPY_ENGINE_DELETE, item, NULL, NULL, NULL, 0, NULL);
+            IShellItem_Release(item);
+            if (FAILED(hr))
+                break;
+        }
+    }
+    IShellItemArray_Release(array);
+    return hr;
 }
 
 static HRESULT WINAPI file_operation_NewItem(IFileOperation *iface, IShellItem *folder, DWORD attributes,
@@ -2278,7 +2394,7 @@ static HRESULT WINAPI file_operation_PerformOperations(IFileOperation *iface)
     if (list_empty(&operation->ops))
         return E_UNEXPECTED;
 
-    if (operation->flags != FOF_NO_UI)
+    if (operation->flags & ~(FOF_NO_UI | FOF_ALLOWUNDO))
         FIXME("Unhandled flags %#lx.\n", operation->flags);
     hr = perform_file_operations(operation);
     free_file_operation_ops(operation);

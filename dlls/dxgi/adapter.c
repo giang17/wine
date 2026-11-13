@@ -354,13 +354,22 @@ static void STDMETHODCALLTYPE dxgi_adapter_UnregisterVideoMemoryBudgetChangeNoti
 static HRESULT STDMETHODCALLTYPE dxgi_adapter_GetDesc3(IWineDXGIAdapter *iface, DXGI_ADAPTER_DESC3 *desc)
 {
     struct dxgi_adapter *adapter = impl_from_IWineDXGIAdapter(iface);
+    HRESULT hr;
 
     TRACE("iface %p, desc %p.\n", iface, desc);
 
     if (!desc)
         return E_INVALIDARG;
 
-    return dxgi_adapter_get_desc(adapter, desc);
+    if (SUCCEEDED(hr = dxgi_adapter_get_desc(adapter, desc)))
+    {
+        /* d3d11 implements ID3D11Fence with CPU timeline semantics.  Only
+         * the GetDesc3 path may report this: the DXGI_ADAPTER_FLAG used by
+         * GetDesc/GetDesc1/GetDesc2 does not know this flag. */
+        desc->Flags |= DXGI_ADAPTER_FLAG3_SUPPORT_MONITORED_FENCES;
+    }
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE dxgi_adapter_get_adapter_info(IWineDXGIAdapter *iface,

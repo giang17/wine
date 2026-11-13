@@ -187,6 +187,10 @@ typedef struct
 
 #define XATTR_REPARSE XATTR_USER_PREFIX "WINEREPARSE"
 
+/* a creation time set through NtSetInformationFile (a ULONGLONG in 100 ns units);
+ * Linux has no call to set the birth time of a file */
+#define XATTR_CREATION_TIME XATTR_USER_PREFIX "WINECREATIONTIME"
+
 struct file_identity
 {
     dev_t dev;
@@ -1362,9 +1366,93 @@ static BOOL fd_is_mount_point( int fd, const struct stat *st )
 static unsigned int server_get_unix_name( HANDLE handle, char **unix_name );
 
 
-/* get the stat info and file attributes for a file (by file descriptor) */
+/* unix name of a handle with the last path element left unresolved.  The server keeps
+ * the realpath()'d name, in which a symlink has already been followed, so rebuild the
+ * name from the handle's NT name instead. */
+static NTSTATUS get_handle_link_unix_name( HANDLE handle, char **unix_name )
+{
+    OBJECT_NAME_INFORMATION *info;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING nt_name;
+    ULONG size = 1024;
+    NTSTATUS status;
+
+    *unix_name = NULL;
+    for (;;)
+    {
+        if (!(info = malloc( size ))) return STATUS_NO_MEMORY;
+        status = NtQueryObject( handle, ObjectNameInformation, info, size, &size );
+        if (status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_OVERFLOW) break;
+        free( info );
+    }
+    if (!status)
+    {
+        InitializeObjectAttributes( &attr, &info->Name, OBJ_CASE_INSENSITIVE, 0, NULL );
+        status = get_nt_and_unix_names( &attr, &nt_name, unix_name, FILE_OPEN, TRUE );
+        free( nt_name.Buffer );
+        if (status)
+        {
+            free( *unix_name );
+            *unix_name = NULL;
+        }
+    }
+    free( info );
+    return status;
+}
+
+
+/* <config_dir>/dosdevices/x:[/]: a drive root is a plain directory on Windows, even
+ * though the dosdevices entry is a symlink and the directory it points to may be a
+ * mount point (Z: -> /, WineHQ bug 54903) */
+static BOOL is_drive_root_unix_name( const char *path )
+{
+    size_t len = strlen( config_dir ), path_len = strlen( path );
+
+    if (path_len && path[path_len - 1] == '/') path_len--;
+    return path_len == len + 14 && !strncmp( path, config_dir, len )
+           && !strncmp( path + len, "/dosdevices/", 12 ) && path[len + 13] == ':';
+}
+
+
+/* a symlink to a directory is reported as an IO_REPARSE_TAG_SYMLINK reparse point
+ * (see get_file_info); fstat() follows the link, so handle-based queries have to
+ * look at the name */
+static BOOL is_unix_dir_symlink( const char *unix_name )
+{
+    struct stat st;
+
+    return !lstat( unix_name, &st ) && S_ISLNK( st.st_mode ) && !stat( unix_name, &st ) && S_ISDIR( st.st_mode );
+}
+
+
+/* the creation time of a file (by path, or by fd if path is NULL), 0 if unknown: a time
+ * set through NtSetInformationFile, else the birth time where the file system records
+ * one. struct stat has no birth time on Linux, statx() reports it; without either the
+ * creation time falls back to the modification time (see get_file_times), which moves
+ * whenever an entry is added to a directory -- unlike on Windows */
+static ULONGLONG get_creation_time( int fd, const char *path, BOOL follow )
+{
+    ULONGLONG time = 0;
+#if defined(__linux__) && defined(STATX_BTIME)
+    struct statx stx;
+#endif
+
+    if ((path ? xattr_get( path, XATTR_CREATION_TIME, &time, sizeof(time) )
+              : xattr_fget( fd, XATTR_CREATION_TIME, &time, sizeof(time) )) == sizeof(time) && time)
+        return time;
+#if defined(__linux__) && defined(STATX_BTIME)
+    if (!(path ? statx( AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW, STATX_BTIME, &stx )
+               : statx( fd, "", AT_EMPTY_PATH, STATX_BTIME, &stx )) && (stx.stx_mask & STATX_BTIME))
+        return ticks_from_time_t( stx.stx_btime.tv_sec ) + stx.stx_btime.tv_nsec / 100;
+#endif
+    return 0;
+}
+
+
+/* get the stat info and file attributes for a file (by file descriptor);
+ * birth (optional) receives the creation time, 0 if unknown */
 static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
-                             struct stat *st, ULONG *attr, ULONG *reparse_tag )
+                             struct stat *st, ULONG *attr, ULONG *reparse_tag, ULONGLONG *birth )
 {
     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
     char attr_data[65];
@@ -1373,16 +1461,34 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
     *attr = 0;
     ret = fstat( fd, st );
     if (ret == -1) return ret;
+    if (birth) *birth = get_creation_time( fd, NULL, FALSE );
     *attr |= get_file_attributes( st );
     if (reparse_tag) *reparse_tag = 0;
-    /* consider mount points to be reparse points (IO_REPARSE_TAG_MOUNT_POINT) */
+    /* a bound AF_UNIX socket is a reparse point on Windows */
+    if (S_ISSOCK( st->st_mode ))
+    {
+        *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+        if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
+    }
+    /* consider mount points and directory symlinks to be reparse points, except for
+     * drive roots (the server keeps the resolved unix name, so look at the NT name) */
     if (options & FILE_OPEN_REPARSE_POINT)
     {
-        if (fd_is_mount_point( fd, st ))
+        char *unix_name = NULL;
+
+        if (get_handle_link_unix_name( handle, &unix_name )) unix_name = NULL;
+        if (unix_name && is_drive_root_unix_name( unix_name )) ;
+        else if (fd_is_mount_point( fd, st ))
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_MOUNT_POINT;
         }
+        else if (unix_name && is_unix_dir_symlink( unix_name ))
+        {
+            *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+            if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_SYMLINK;
+        }
+        free( unix_name );
     }
 
     attr_len = xattr_fget( fd, XATTR_REPARSE, buffer, sizeof(buffer) );
@@ -1460,8 +1566,10 @@ static NTSTATUS fd_set_file_info( int fd, UINT attr, BOOL force_set_xattr )
 }
 
 
-/* get the stat info and file attributes for a file (by name) */
-static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG *reparse_tag )
+/* get the stat info and file attributes for a file (by name);
+ * birth (optional) receives the creation time, 0 if unknown */
+static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG *reparse_tag,
+                          ULONGLONG *birth )
 {
     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
     size_t len = strlen( path );
@@ -1473,18 +1581,29 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     ret = lstat( path, st );
     if (ret == -1) return ret;
     if (reparse_tag) *reparse_tag = 0;
+    /* the times are those of the link target when the link is followed below */
+    if (birth) *birth = get_creation_time( -1, path, S_ISLNK( st->st_mode ) );
     if (S_ISLNK( st->st_mode ))
     {
         ret = stat( path, st );
         if (ret == -1) return ret;
-        /* is a symbolic link and a directory, consider these "reparse points" */
-        if (S_ISDIR( st->st_mode ))
+        /* is a symbolic link and a directory, consider these "reparse points";
+         * reported as a Windows symlink, whose reparse data FSCTL_GET_REPARSE_POINT
+         * can serve (IO_REPARSE_TAG_LX_SYMLINK carries no data applications can
+         * resolve, see get_unix_symlink_reparse_data); a drive root is not one */
+        if (S_ISDIR( st->st_mode ) && !is_drive_root_unix_name( path ))
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
-            if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
+            if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_SYMLINK;
         }
     }
-    else if (S_ISDIR( st->st_mode ) && (parent_path = malloc( len + 4 )))
+    /* a bound AF_UNIX socket is a reparse point on Windows */
+    else if (S_ISSOCK( st->st_mode ))
+    {
+        *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+        if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
+    }
+    else if (S_ISDIR( st->st_mode ) && !is_drive_root_unix_name( path ) && (parent_path = malloc( len + 4 )))
     {
         struct stat parent_st;
 
@@ -1629,8 +1748,8 @@ static NTSTATUS set_file_times( int fd, const LARGE_INTEGER *mtime, const LARGE_
 }
 
 
-static inline void get_file_times( const struct stat *st, LARGE_INTEGER *mtime, LARGE_INTEGER *ctime,
-                                   LARGE_INTEGER *atime, LARGE_INTEGER *creation )
+static inline void get_file_times( const struct stat *st, ULONGLONG birth, LARGE_INTEGER *mtime,
+                                   LARGE_INTEGER *ctime, LARGE_INTEGER *atime, LARGE_INTEGER *creation )
 {
     mtime->QuadPart = ticks_from_time_t( st->st_mtime );
     ctime->QuadPart = ticks_from_time_t( st->st_ctime );
@@ -1665,11 +1784,13 @@ static inline void get_file_times( const struct stat *st, LARGE_INTEGER *mtime, 
 #else
     *creation = *mtime;
 #endif
+    if (birth) creation->QuadPart = birth;
 }
 
 
-/* fill in the file information that depends on the stat and attribute info */
-static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
+/* fill in the file information that depends on the stat and attribute info;
+ * birth is the creation time from fd_get_file_info/get_file_info, 0 if unknown */
+static NTSTATUS fill_file_info( const struct stat *st, ULONGLONG birth, ULONG attr, void *ptr,
                                 FILE_INFORMATION_CLASS class )
 {
     switch (class)
@@ -1678,7 +1799,7 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
         {
             FILE_BASIC_INFORMATION *info = ptr;
 
-            get_file_times( st, &info->LastWriteTime, &info->ChangeTime,
+            get_file_times( st, birth, &info->LastWriteTime, &info->ChangeTime,
                             &info->LastAccessTime, &info->CreationTime );
             info->FileAttributes = attr;
         }
@@ -1716,15 +1837,15 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
     case FileAllInformation:
         {
             FILE_ALL_INFORMATION *info = ptr;
-            fill_file_info( st, attr, &info->BasicInformation, FileBasicInformation );
-            fill_file_info( st, attr, &info->StandardInformation, FileStandardInformation );
-            fill_file_info( st, attr, &info->InternalInformation, FileInternalInformation );
+            fill_file_info( st, birth, attr, &info->BasicInformation, FileBasicInformation );
+            fill_file_info( st, birth, attr, &info->StandardInformation, FileStandardInformation );
+            fill_file_info( st, birth, attr, &info->InternalInformation, FileInternalInformation );
         }
         break;
     case FileNetworkOpenInformation:
         {
             FILE_NETWORK_OPEN_INFORMATION *info = ptr;
-            get_file_times( st, &info->LastWriteTime, &info->ChangeTime,
+            get_file_times( st, birth, &info->LastWriteTime, &info->ChangeTime,
                             &info->LastAccessTime, &info->CreationTime );
             info->FileAttributes = attr;
             if (S_ISDIR(st->st_mode))
@@ -1746,7 +1867,7 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
         {
             FILE_DIRECTORY_INFORMATION *info = ptr;
 
-            get_file_times( st, &info->LastWriteTime, &info->ChangeTime,
+            get_file_times( st, birth, &info->LastWriteTime, &info->ChangeTime,
                             &info->LastAccessTime, &info->CreationTime );
             if (S_ISDIR(st->st_mode))
             {
@@ -1765,14 +1886,14 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
         {
             FILE_ID_FULL_DIRECTORY_INFORMATION *info = ptr;
             info->FileId.QuadPart = st->st_ino;
-            fill_file_info( st, attr, info, FileDirectoryInformation );
+            fill_file_info( st, birth, attr, info, FileDirectoryInformation );
         }
         break;
     case FileIdBothDirectoryInformation:
         {
             FILE_ID_BOTH_DIRECTORY_INFORMATION *info = ptr;
             info->FileId.QuadPart = st->st_ino;
-            fill_file_info( st, attr, info, FileDirectoryInformation );
+            fill_file_info( st, birth, attr, info, FileDirectoryInformation );
         }
         break;
     case FileIdExtdBothDirectoryInformation:
@@ -1780,14 +1901,14 @@ static NTSTATUS fill_file_info( const struct stat *st, ULONG attr, void *ptr,
             FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION *info = ptr;
             memset( &info->FileId, 0, sizeof(info->FileId) );
             *(ULONGLONG *)&info->FileId = st->st_ino;
-            fill_file_info( st, attr, info, FileDirectoryInformation );
+            fill_file_info( st, birth, attr, info, FileDirectoryInformation );
         }
         break;
     case FileIdGlobalTxDirectoryInformation:
         {
             FILE_ID_GLOBAL_TX_DIR_INFORMATION *info = ptr;
             info->FileId.QuadPart = st->st_ino;
-            fill_file_info( st, attr, info, FileDirectoryInformation );
+            fill_file_info( st, birth, attr, info, FileDirectoryInformation );
         }
         break;
 
@@ -2138,9 +2259,11 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     const struct dir_data_names *names = &dir_data->names[dir_data->pos];
     union file_directory_info *info;
     struct stat st;
+    ULONGLONG birth = 0;
     ULONG name_len, start, dir_size, attributes, reparse_tag;
 
-    if (get_file_info( names->unix_name, &st, &attributes, &reparse_tag ) == -1)
+    if (get_file_info( names->unix_name, &st, &attributes, &reparse_tag,
+                       class != FileNamesInformation ? &birth : NULL ) == -1)
     {
         TRACE( "file no longer exists %s\n", debugstr_a(names->unix_name) );
         return STATUS_SUCCESS;
@@ -2167,7 +2290,7 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     if (class != FileNamesInformation)
     {
         if (st.st_dev != dir_data->id.dev) st.st_ino = 0;  /* ignore inode if on a different device */
-        fill_file_info( &st, attributes, info, class );
+        fill_file_info( &st, birth, attributes, info, class );
     }
 
     switch (class)
@@ -4568,13 +4691,14 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     {
         ULONG attributes;
         struct stat st;
+        ULONGLONG birth;
 
-        if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
+        if (get_file_info( unix_name, &st, &attributes, NULL, &birth ) == -1)
             status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
-            fill_file_info( &st, attributes, info, FileNetworkOpenInformation );
+            fill_file_info( &st, birth, attributes, info, FileNetworkOpenInformation );
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
@@ -4597,18 +4721,124 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     {
         ULONG attributes;
         struct stat st;
+        ULONGLONG birth;
 
-        if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
+        if (get_file_info( unix_name, &st, &attributes, NULL, &birth ) == -1)
             status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
-            status = fill_file_info( &st, attributes, info, FileBasicInformation );
+            status = fill_file_info( &st, birth, attributes, info, FileBasicInformation );
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
     free( nt_name.Buffer );
     return status;
+}
+
+
+/* A Unix FIFO or socket inherited on fds 0-2 is a plain file object in the server, but
+ * get_device_info() reports it as FILE_DEVICE_NAMED_PIPE and GetFileType() as
+ * FILE_TYPE_PIPE, so programs treat it as a pipe: libuv's uv_pipe_open() on
+ * process.stdout/stderr (Node, Electron) sets byte mode and blocking waits with
+ * SetNamedPipeHandleState(), reads stdin behind PeekNamedPipe() and queries
+ * FilePipeLocalInformation before flushing. The server rejects all of these for a file
+ * object, so they are answered here as for a byte-mode, blocking anonymous pipe. */
+static BOOL is_unix_pipe( int fd, enum server_fd_type type, struct stat *st )
+{
+    return type == FD_TYPE_CHAR && !fstat( fd, st ) && (S_ISFIFO( st->st_mode ) || S_ISSOCK( st->st_mode ));
+}
+
+static void unix_pipe_local_info( int fd, const struct stat *st, FILE_PIPE_LOCAL_INFORMATION *info )
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int flags = fcntl( fd, F_GETFL ), quota = 0, avail = 0, pending = 0;
+
+    if (S_ISSOCK( st->st_mode ))
+    {
+        socklen_t len = sizeof(quota);
+        getsockopt( fd, SOL_SOCKET, SO_SNDBUF, &quota, &len );
+#ifdef TIOCOUTQ  /* SIOCOUTQ: bytes not yet taken by the peer */
+        ioctl( fd, TIOCOUTQ, &pending );
+#endif
+        ioctl( fd, FIONREAD, &avail );
+    }
+    else
+    {
+#ifdef F_GETPIPE_SZ
+        quota = fcntl( fd, F_GETPIPE_SZ );
+#endif
+        ioctl( fd, FIONREAD, &pending );  /* one buffer for both ends */
+        avail = pending;
+    }
+    if (quota <= 0) quota = 4096;
+    if (pending < 0 || pending > quota) pending = quota;
+    if (avail < 0) avail = 0;
+
+    switch (flags != -1 ? flags & O_ACCMODE : O_RDWR)
+    {
+    case O_RDONLY: info->NamedPipeConfiguration = FILE_PIPE_INBOUND; break;
+    case O_WRONLY: info->NamedPipeConfiguration = FILE_PIPE_OUTBOUND; avail = 0; break;
+    default:       info->NamedPipeConfiguration = FILE_PIPE_FULL_DUPLEX; break;
+    }
+    info->NamedPipeType       = FILE_PIPE_TYPE_BYTE;
+    info->MaximumInstances    = 1;
+    info->CurrentInstances    = 1;
+    info->InboundQuota        = quota;
+    info->ReadDataAvailable   = avail;
+    info->OutboundQuota       = quota;
+    info->WriteQuotaAvailable = quota - pending;
+    info->NamedPipeState      = FILE_PIPE_CONNECTED_STATE;
+    if (info->NamedPipeConfiguration != FILE_PIPE_OUTBOUND && poll( &pfd, 1, 0 ) == 1 && (pfd.revents & POLLHUP))
+        info->NamedPipeState  = FILE_PIPE_CLOSING_STATE;  /* the writer is gone */
+    info->NamedPipeEnd        = FILE_PIPE_CLIENT_END;
+}
+
+/* FSCTL_PIPE_PEEK on a Unix FIFO or socket */
+static NTSTATUS unix_pipe_peek( int fd, const struct stat *st, void *out_buffer, ULONG out_size, ULONG_PTR *size )
+{
+    FILE_PIPE_PEEK_BUFFER *buffer = out_buffer;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int avail = 0;
+    ULONG count;
+
+    if (out_size < FIELD_OFFSET( FILE_PIPE_PEEK_BUFFER, Data )) return STATUS_INFO_LENGTH_MISMATCH;
+    if (ioctl( fd, FIONREAD, &avail ) == -1) return errno_to_status( errno );
+    if (avail <= 0)
+    {
+        /* nothing to read and no writer left: the pipe is broken, not empty */
+        avail = 0;
+        if (poll( &pfd, 1, 0 ) == 1 && (pfd.revents & POLLHUP)) return STATUS_PIPE_BROKEN;
+    }
+    count = min( (ULONG)avail, out_size - FIELD_OFFSET( FILE_PIPE_PEEK_BUFFER, Data ) );
+    if (count)
+    {
+        ssize_t ret = -1;
+
+        if (S_ISSOCK( st->st_mode )) ret = recv( fd, buffer->Data, count, MSG_PEEK | MSG_DONTWAIT );
+#ifdef __linux__
+        else
+        {
+            /* a FIFO cannot be peeked at; tee() copies its data into a scratch pipe without consuming it */
+            int scratch[2];
+
+            if (!pipe( scratch ))
+            {
+                ret = tee( fd, scratch[1], count, SPLICE_F_NONBLOCK );
+                if (ret > 0) ret = read( scratch[0], buffer->Data, ret );
+                close( scratch[0] );
+                close( scratch[1] );
+            }
+        }
+#endif
+        count = ret > 0 ? ret : 0;
+    }
+    buffer->NamedPipeState    = FILE_PIPE_CONNECTED_STATE;
+    buffer->ReadDataAvailable = avail;
+    buffer->NumberOfMessages  = 0;
+    buffer->MessageLength     = 0;
+    *size = FIELD_OFFSET( FILE_PIPE_PEEK_BUFFER, Data[count] );
+    return STATUS_SUCCESS;
 }
 
 
@@ -4700,11 +4930,13 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     };
 
     struct stat st;
+    ULONGLONG birth = 0;
     int fd, needs_close = FALSE;
     ULONG attr;
     unsigned int reparse_tag;
     unsigned int options;
     unsigned int status;
+    enum server_fd_type type;
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class);
 
@@ -4719,7 +4951,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     if (len < info_sizes[class])
         return io->Status = STATUS_INFO_LENGTH_MISMATCH;
 
-    if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
+    if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, &type, &options )))
     {
         if (status != STATUS_BAD_DEVICE_TYPE) return io->Status = status;
         return server_get_file_info( handle, io, ptr, len, class );
@@ -4728,22 +4960,22 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     switch (class)
     {
     case FileBasicInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, &birth ) == -1)
             status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
-            fill_file_info( &st, attr, ptr, class );
+            fill_file_info( &st, birth, attr, ptr, class );
         break;
     case FileStandardInformation:
         {
             FILE_STANDARD_INFORMATION *info = ptr;
 
-            if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+            if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, NULL ) == -1)
                 status = errno_to_status( errno );
             else
             {
-                fill_file_info( &st, attr, info, class );
+                fill_file_info( &st, 0, attr, info, class );
                 info->DeletePending = FALSE; /* FIXME */
             }
         }
@@ -4757,10 +4989,10 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileInternalInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, NULL ) == -1)
             status = errno_to_status( errno );
         else
-            fill_file_info( &st, attr, ptr, class );
+            fill_file_info( &st, 0, attr, ptr, class );
         break;
     case FileEaInformation:
         {
@@ -4769,22 +5001,22 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileEndOfFileInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, NULL ) == -1)
             status = errno_to_status( errno );
         else
-            fill_file_info( &st, attr, ptr, class );
+            fill_file_info( &st, 0, attr, ptr, class );
         break;
     case FileAllInformation:
         {
             FILE_ALL_INFORMATION *info = ptr;
 
-            if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+            if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, &birth ) == -1)
                 status = errno_to_status( errno );
             else
             {
                 LONG name_len = len - FIELD_OFFSET(FILE_ALL_INFORMATION, NameInformation.FileName);
 
-                fill_file_info( &st, attr, info, FileAllInformation );
+                fill_file_info( &st, birth, attr, info, FileAllInformation );
                 info->StandardInformation.DeletePending = FALSE; /* FIXME */
                 info->EaInformation.EaSize = 0;
                 info->AccessInformation.AccessFlags = 0;  /* FIXME */
@@ -4799,18 +5031,24 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     case FileNameInformation:
         {
             LONG name_len = len - FIELD_OFFSET(FILE_NAME_INFORMATION, FileName);
-            status = server_get_name_info( handle, ptr, &name_len );
+            if (is_unix_pipe( fd, type, &st ))  /* no name, like an anonymous pipe */
+            {
+                FILE_NAME_INFORMATION *info = ptr;
+                info->FileNameLength = 0;
+                name_len = 0;
+            }
+            else status = server_get_name_info( handle, ptr, &name_len );
             io->Information = offsetof( FILE_NAME_INFORMATION, FileName ) + name_len;
         }
         break;
     case FileNetworkOpenInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, &birth ) == -1)
             status = errno_to_status( errno );
         else
-            fill_file_info( &st, attr, ptr, FileNetworkOpenInformation );
+            fill_file_info( &st, birth, attr, ptr, FileNetworkOpenInformation );
         break;
     case FileIdInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, NULL, NULL ) == -1)
             status = errno_to_status( errno );
         else
         {
@@ -4825,7 +5063,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileAttributeTagInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag, NULL ) == -1)
             status = errno_to_status( errno );
         else
         {
@@ -4835,9 +5073,9 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileStatInformation:
-        if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag ) == -1)
+        if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag, &birth ) == -1)
             status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
         {
@@ -4845,8 +5083,8 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             FILE_BASIC_INFORMATION basic;
             FILE_STANDARD_INFORMATION std;
 
-            fill_file_info( &st, attr, &basic, FileBasicInformation );
-            fill_file_info( &st, attr, &std, FileStandardInformation );
+            fill_file_info( &st, birth, attr, &basic, FileBasicInformation );
+            fill_file_info( &st, birth, attr, &std, FileStandardInformation );
 
             info->FileId.QuadPart = st.st_ino;
             info->CreationTime   = basic.CreationTime;
@@ -4861,6 +5099,21 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             info->EffectiveAccess = FILE_ALL_ACCESS; /* FIXME */
         }
         break;
+    case FilePipeInformation:
+    case FilePipeLocalInformation:
+        if (is_unix_pipe( fd, type, &st ))
+        {
+            if (class == FilePipeInformation)
+            {
+                FILE_PIPE_INFORMATION *info = ptr;
+                info->ReadMode       = FILE_PIPE_BYTE_STREAM_MODE;
+                info->CompletionMode = FILE_PIPE_QUEUE_OPERATION;
+            }
+            else unix_pipe_local_info( fd, &st, ptr );
+            break;
+        }
+        if (needs_close) close( fd );
+        return server_get_file_info( handle, io, ptr, len, class );
     default:
         FIXME("Unsupported class (%d)\n", class);
         status = STATUS_NOT_IMPLEMENTED;
@@ -4885,11 +5138,12 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     int fd, needs_close = 0;
     unsigned int status = STATUS_SUCCESS;
     unsigned int access = (class == FileValidDataLengthInformation) ? FILE_WRITE_DATA : 0;
+    enum server_fd_type type = FD_TYPE_INVALID;
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class );
 
     if (class != FileCompletionInformation &&
-        (status = server_get_unix_fd( handle, access, &fd, &needs_close, NULL, NULL )))
+        (status = server_get_unix_fd( handle, access, &fd, &needs_close, &type, NULL )))
     {
         if (status != STATUS_BAD_DEVICE_TYPE) return io->Status = status;
         return server_set_file_info( handle, io, ptr, len, class );
@@ -4912,6 +5166,13 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             if (atime.QuadPart || mtime.QuadPart)
                 status = set_file_times( fd, &mtime, &atime );
 
+            /* 0 leaves the creation time unchanged, -1 and -2 only control automatic updates */
+            if (status == STATUS_SUCCESS && info->CreationTime.QuadPart > 0
+                && xattr_fset( fd, XATTR_CREATION_TIME, &info->CreationTime.QuadPart,
+                               sizeof(info->CreationTime.QuadPart) ) == -1 && errno != ENOTSUP)
+                WARN( "Failed to set extended attribute " XATTR_CREATION_TIME ". errno %d (%s)\n",
+                      errno, strerror( errno ) );
+
             if (status == STATUS_SUCCESS)
                 status = fd_set_file_info( fd, info->FileAttributes,
                                            unix_name && is_hidden_file( unix_name ));
@@ -4930,6 +5191,38 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 status = errno_to_status( errno );
         }
         else status = STATUS_INVALID_PARAMETER_3;
+        break;
+
+    case FilePipeInformation:
+        {
+            struct stat st;
+
+            /* Named pipe objects have no Unix fd and went to the server above. A FIFO or
+             * Unix socket inherited as a standard handle is a plain file object there,
+             * with no pipe state to set: answer for it as for an anonymous pipe. */
+            if (!is_unix_pipe( fd, type, &st ))
+            {
+                if (needs_close) close( fd );
+                return server_set_file_info( handle, io, ptr, len, class );
+            }
+
+            if (len >= sizeof(FILE_PIPE_INFORMATION))
+            {
+                FILE_PIPE_INFORMATION *info = ptr;
+
+                if ((info->CompletionMode | info->ReadMode) & ~1) status = STATUS_INVALID_PARAMETER;
+                /* a byte-mode blocking pipe already; message mode is what a byte-type pipe
+                 * refuses, and non-blocking mode would need O_NONBLOCK on a file description
+                 * the other end shares */
+                else if (info->ReadMode == FILE_PIPE_MESSAGE_MODE) status = STATUS_INVALID_PARAMETER;
+                else if (info->CompletionMode == FILE_PIPE_COMPLETE_OPERATION)
+                {
+                    FIXME( "non-blocking mode not supported on Unix pipe %p\n", handle );
+                    status = STATUS_NOT_SUPPORTED;
+                }
+            }
+            else status = STATUS_INFO_LENGTH_MISMATCH;
+        }
         break;
 
     case FileCompletionInformation:
@@ -6571,6 +6864,90 @@ static void ignore_server_ioctl_struct_holes( ULONG code, const void *in_buffer,
 }
 
 
+/* FSCTL_GET_REPARSE_POINT on a Unix symlink to a directory.  The server only knows the
+ * xattr-based reparse points created through FSCTL_SET_REPARSE_POINT; a native symlink is
+ * reported as IO_REPARSE_TAG_SYMLINK (get_file_info), so build the matching buffer here,
+ * where the link target can be mapped to an NT path. */
+static NTSTATUS get_unix_symlink_reparse_data( HANDLE handle, void *out_buffer, ULONG out_size,
+                                               ULONG_PTR *ret_size )
+{
+    const unsigned int header = FIELD_OFFSET( REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer );
+    char link[PATH_MAX + 1], *unix_name = NULL, *target = NULL;
+    WCHAR *nt_name = NULL, *print_name;
+    REPARSE_DATA_BUFFER *data;
+    unsigned int nt_len, print_len, total, copy;
+    NTSTATUS status = STATUS_NOT_A_REPARSE_POINT;
+    ssize_t len;
+
+    if (get_handle_link_unix_name( handle, &unix_name )) return STATUS_NOT_A_REPARSE_POINT;
+    if (is_drive_root_unix_name( unix_name ) || !is_unix_dir_symlink( unix_name )) goto done;
+    if ((len = readlink( unix_name, link, PATH_MAX )) < 0) goto done;
+    link[len] = 0;
+
+    if (link[0] == '/') target = strdup( link );
+    else  /* relative to the link's directory */
+    {
+        const char *slash = strrchr( unix_name, '/' );
+        size_t dir_len = slash ? slash - unix_name + 1 : 0;
+
+        if ((target = malloc( dir_len + len + 1 )))
+        {
+            memcpy( target, unix_name, dir_len );
+            strcpy( target + dir_len, link );
+        }
+    }
+    if (!target)
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+
+    status = unix_to_nt_file_name( target, &nt_name, FILE_OPEN );
+    if (!nt_name)
+    {
+        if (!status) status = STATUS_NOT_A_REPARSE_POINT;
+        goto done;
+    }
+    nt_len = wcslen( nt_name );
+    print_name = (nt_name[5] == ':') ? nt_name + 4 : nt_name;   /* \??\C:\dir -> C:\dir */
+    print_len = wcslen( print_name );
+    total = header + (nt_len + print_len) * sizeof(WCHAR);
+
+    if (out_size < header)
+    {
+        status = STATUS_BUFFER_TOO_SMALL;
+        goto done;
+    }
+    if (!(data = calloc( 1, total )))
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+    data->ReparseTag = IO_REPARSE_TAG_SYMLINK;
+    data->ReparseDataLength = total - FIELD_OFFSET( REPARSE_DATA_BUFFER, GenericReparseBuffer );
+    data->SymbolicLinkReparseBuffer.SubstituteNameOffset = 0;
+    data->SymbolicLinkReparseBuffer.SubstituteNameLength = nt_len * sizeof(WCHAR);
+    data->SymbolicLinkReparseBuffer.PrintNameOffset = nt_len * sizeof(WCHAR);
+    data->SymbolicLinkReparseBuffer.PrintNameLength = print_len * sizeof(WCHAR);
+    data->SymbolicLinkReparseBuffer.Flags = 0;
+    memcpy( data->SymbolicLinkReparseBuffer.PathBuffer, nt_name, nt_len * sizeof(WCHAR) );
+    memcpy( data->SymbolicLinkReparseBuffer.PathBuffer + nt_len, print_name, print_len * sizeof(WCHAR) );
+
+    copy = total < out_size ? total : out_size;
+    memcpy( out_buffer, data, copy );
+    *ret_size = copy;
+    status = (copy < total) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+    free( data );
+    TRACE( "%s -> %s\n", debugstr_a(unix_name), debugstr_w(nt_name) );
+
+done:
+    free( nt_name );
+    free( target );
+    free( unix_name );
+    return status;
+}
+
+
 /******************************************************************************
  *              NtFsControlFile   (NTDLL.@)
  */
@@ -6656,6 +7033,33 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
         TRACE("FSCTL_SET_SPARSE: Ignoring request\n");
         status = STATUS_SUCCESS;
         break;
+    case FSCTL_PIPE_PEEK:
+    {
+        enum server_fd_type type;
+        struct stat st;
+
+        if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, &type, NULL )))
+            return server_ioctl_file( handle, event, apc, apc_context, io, code,
+                                      in_buffer, in_size, out_buffer, out_size );
+        if (!is_unix_pipe( fd, type, &st ))
+        {
+            if (needs_close) close( fd );
+            return server_ioctl_file( handle, event, apc, apc_context, io, code,
+                                      in_buffer, in_size, out_buffer, out_size );
+        }
+        if (needs_close) close( fd );
+        /* the write end cannot peek */
+        if ((status = server_get_unix_fd( handle, FILE_READ_DATA, &fd, &needs_close, NULL, NULL ))) return status;
+        status = unix_pipe_peek( fd, &st, out_buffer, out_size, &size );
+        if (needs_close) close( fd );
+        break;
+    }
+    case FSCTL_GET_REPARSE_POINT:
+        status = get_unix_symlink_reparse_data( handle, out_buffer, out_size, &size );
+        if (status == STATUS_NOT_A_REPARSE_POINT)  /* xattr-based reparse points live in the server */
+            return server_ioctl_file( handle, event, apc, apc_context, io, code,
+                                      in_buffer, in_size, out_buffer, out_size );
+        break;
     default:
         return server_ioctl_file( handle, event, apc, apc_context, io, code,
                                   in_buffer, in_size, out_buffer, out_size );
@@ -6699,7 +7103,14 @@ NTSTATUS WINAPI NtFlushBuffersFileEx( HANDLE handle, ULONG flags, void *params, 
 
     if (!ret && (type == FD_TYPE_FILE || type == FD_TYPE_DIR || type == FD_TYPE_CHAR))
     {
-        if (fsync(fd)) ret = errno_to_status( errno );
+        if (fsync(fd))
+        {
+            struct stat st;
+            int err = errno;
+
+            /* a Unix pipe or socket has nothing to sync; fsync() fails with EINVAL on it */
+            if (err != EINVAL || !is_unix_pipe( fd, type, &st )) ret = errno_to_status( err );
+        }
         io->Status      = ret;
         io->Information = 0;
     }

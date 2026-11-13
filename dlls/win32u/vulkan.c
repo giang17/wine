@@ -2043,6 +2043,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
         struct surface *surface = swapchain->surface;
         client_surface_update( surface->client );
+        client_surface_wait( surface->client, FALSE );
     }
 
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
@@ -2054,6 +2055,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct surface *surface = swapchain->surface;
         RECT client_rect;
 
+        /* an offscreen surface is presented by copying its window, wait until the frame is there */
+        if (swapchain_res >= VK_SUCCESS) client_surface_wait( surface->client, TRUE );
         client_surface_present( surface->client );
 
         if (swapchain_res < VK_SUCCESS) continue;

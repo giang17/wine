@@ -305,6 +305,45 @@ RECT get_host_primary_monitor_rect(void)
     return rect;
 }
 
+/* _NET_WORKAREA is a single rectangle for the whole screen. With several monitors, a side
+ * of it that lies inside more than one monitor is taken to come from a panel on the monitor
+ * whose edge is nearest to it, and the other monitors keep their edge. */
+static BOOL get_monitor_work_area( const RECT *monitor_rect, const RECT *area, RECT *work_rect )
+{
+    unsigned int i, count;
+    RECT *rects, work = *monitor_rect;
+    int inset[4], other;
+
+    if ((count = xinerama_get_screen_rects( &rects )) < 2)
+    {
+        free( rects );
+        return FALSE;
+    }
+
+    inset[0] = area->left - monitor_rect->left;
+    inset[1] = area->top - monitor_rect->top;
+    inset[2] = monitor_rect->right - area->right;
+    inset[3] = monitor_rect->bottom - area->bottom;
+
+    for (i = 0; i < count; i++)
+    {
+        if ((other = area->left - rects[i].left) > 0 && other < inset[0]) inset[0] = 0;
+        if ((other = area->top - rects[i].top) > 0 && other < inset[1]) inset[1] = 0;
+        if ((other = rects[i].right - area->right) > 0 && other < inset[2]) inset[2] = 0;
+        if ((other = rects[i].bottom - area->bottom) > 0 && other < inset[3]) inset[3] = 0;
+    }
+    free( rects );
+
+    if (inset[0] > 0) work.left += inset[0];
+    if (inset[1] > 0) work.top += inset[1];
+    if (inset[2] > 0) work.right -= inset[2];
+    if (inset[3] > 0) work.bottom -= inset[3];
+    if (work.left >= work.right || work.top >= work.bottom) return FALSE;
+
+    *work_rect = work;
+    return TRUE;
+}
+
 RECT get_work_area(const RECT *monitor_rect)
 {
     Atom type;
@@ -349,7 +388,8 @@ RECT get_work_area(const RECT *monitor_rect)
             SetRect(&work_rect, work_area[0], work_area[1], work_area[0] + work_area[2],
                     work_area[1] + work_area[3]);
 
-            if (intersect_rect( &work_rect, &work_rect, monitor_rect ))
+            if (get_monitor_work_area( monitor_rect, &work_rect, &work_rect ) ||
+                intersect_rect( &work_rect, &work_rect, monitor_rect ))
             {
                 TRACE("work_rect:%s.\n", wine_dbgstr_rect(&work_rect));
                 XFree(work_area);

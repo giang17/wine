@@ -399,27 +399,23 @@ static void test_WSALookupService(void)
     ret = WSALookupServiceBeginW(NULL, 0, &handle);
     error = WSAGetLastError();
     ok(ret == SOCKET_ERROR, "WSALookupServiceBeginW should have failed\n");
-    todo_wine
     ok(error == WSAEFAULT, "expected 10014, got %ld\n", error);
 
     ret = WSALookupServiceBeginW(qs, 0, NULL);
     error = WSAGetLastError();
     ok(ret == SOCKET_ERROR, "WSALookupServiceBeginW should have failed\n");
-    todo_wine
     ok(error == WSAEFAULT, "expected 10014, got %ld\n", error);
 
     ret = WSALookupServiceBeginW(qs, 0, &handle);
     ok(ret == SOCKET_ERROR, "WSALookupServiceBeginW should have failed\n");
-    todo_wine ok(WSAGetLastError() == WSAEINVAL
+    ok(WSAGetLastError() == WSAEINVAL
             || broken(WSAGetLastError() == ERROR_INVALID_PARAMETER)
             || broken(WSAGetLastError() == WSASERVICE_NOT_FOUND) /* win10 1809 */,
             "got error %u\n", WSAGetLastError());
 
     ret = WSALookupServiceEnd(NULL);
     error = WSAGetLastError();
-    todo_wine
     ok(ret == SOCKET_ERROR, "WSALookupServiceEnd should have failed\n");
-    todo_wine
     ok(error == ERROR_INVALID_HANDLE, "expected 6, got %ld\n", error);
 
     /* standard network list query */
@@ -433,9 +429,7 @@ static void test_WSALookupService(void)
         return;
     }
 
-    todo_wine
     ok(!ret, "WSALookupServiceBeginW failed unexpectedly with error %ld\n", error);
-    todo_wine
     ok(handle != (HANDLE)0xdeadbeef, "Handle was not filled\n");
 
     offset = 0;

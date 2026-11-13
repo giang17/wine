@@ -65,8 +65,13 @@ typedef struct _IP_ADAPTER_INFO {
     BOOL HaveWins;
     IP_ADDR_STRING PrimaryWinsServer;
     IP_ADDR_STRING SecondaryWinsServer;
+#if defined(_WIN64) || defined(WINE_UNIX_LIB)
     time_t LeaseObtained;
     time_t LeaseExpires;
+#else
+    __time32_t LeaseObtained;
+    __time32_t LeaseExpires;
+#endif
 } IP_ADAPTER_INFO, *PIP_ADAPTER_INFO;
 
 typedef struct _IP_PER_ADAPTER_INFO {

@@ -1,0 +1,7 @@
+MODULE    = pwrshsip.dll
+IMPORTS   = crypt32 advapi32
+
+EXTRADLLFLAGS = -Wb,--prefer-native
+
+SOURCES = \
+	main.c

@@ -24,3 +24,4 @@
 #define STRING_INVALID_PATH             104
 #define STRING_USAGE                    105
 #define STRING_HELP                     106
+#define STRING_NO_INSTANCES             107

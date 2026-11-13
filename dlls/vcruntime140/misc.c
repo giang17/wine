@@ -54,3 +54,37 @@ int __cdecl __uncaught_exceptions(void)
 {
     return *__processing_throw();
 }
+
+#ifndef __i386__
+
+#define CXX_EXCEPTION 0xe06d7363
+
+EXCEPTION_DISPOSITION WINAPI __C_specific_handler( EXCEPTION_RECORD *rec, void *frame,
+                                                   CONTEXT *context, DISPATCHER_CONTEXT *dispatch );
+void CDECL terminate(void);
+
+/*********************************************************************
+ *              __C_specific_handler_noexcept
+ *
+ * SEH handler installed by MSVC for noexcept functions that contain
+ * __try scopes. Behaves like __C_specific_handler, except that a C++
+ * exception which no filter in this frame accepts terminates the
+ * process instead of propagating out of the noexcept frame.
+ */
+EXCEPTION_DISPOSITION WINAPI __C_specific_handler_noexcept( EXCEPTION_RECORD *rec, void *frame,
+                                                            CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
+{
+    EXCEPTION_DISPOSITION ret = __C_specific_handler( rec, frame, context, dispatch );
+
+    TRACE( "%p %p %p %p -> %u\n", rec, frame, context, dispatch, ret );
+
+    if (ret == ExceptionContinueSearch && rec->ExceptionCode == CXX_EXCEPTION
+        && !(rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)))
+    {
+        ERR( "C++ exception escaping a noexcept frame %p, terminating\n", frame );
+        terminate();
+    }
+    return ret;
+}
+
+#endif /* __i386__ */

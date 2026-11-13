@@ -461,7 +461,17 @@ static void set_winver(const struct win_version *version)
             swprintf(buffer, ARRAY_SIZE(buffer), L"%d", version->dwBuildNumber);
             set_reg_key(HKEY_LOCAL_MACHINE, szKeyNT, L"CurrentBuild", buffer);
             set_reg_key(HKEY_LOCAL_MACHINE, szKeyNT, L"CurrentBuildNumber", buffer);
-            swprintf(buffer, ARRAY_SIZE(buffer), L"Microsoft %s", version->szDescription);
+            /* Since Vista the NT ProductName has no "Microsoft" prefix (Windows 10
+             * 22H2: "Windows 10 Education"; "Microsoft Windows 10 Education" is the
+             * WMI caption), and installers test it with a prefix match on
+             * "Windows 10".  Windows 10 gets the value wine.inf installs, so that
+             * choosing it here restores the state of a fresh prefix. */
+            if (!wcscmp(version->szVersion, L"win10"))
+                swprintf(buffer, ARRAY_SIZE(buffer), L"Windows 10 Pro");
+            else if (version->dwMajorVersion >= 6)
+                swprintf(buffer, ARRAY_SIZE(buffer), L"%s", version->szDescription);
+            else
+                swprintf(buffer, ARRAY_SIZE(buffer), L"Microsoft %s", version->szDescription);
             set_reg_key(HKEY_LOCAL_MACHINE, szKeyNT, L"ProductName", buffer);
             set_reg_key(HKEY_LOCAL_MACHINE, szKeyProdNT, L"ProductType", version->szProductType);
             set_reg_key_dword(HKEY_LOCAL_MACHINE, szKeyWindNT, L"CSDVersion",

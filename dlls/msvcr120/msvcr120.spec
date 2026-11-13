@@ -2038,8 +2038,8 @@
 @ cdecl bsearch(ptr ptr long long ptr)
 @ cdecl bsearch_s(ptr ptr long long ptr ptr)
 @ cdecl btowc(long)
-@ stub cabs
-@ stub cabsf
+@ cdecl cabs(int128)
+@ cdecl cabsf(int64)
 @ stub cabsl
 @ stub cacos
 @ stub cacosf
@@ -2075,7 +2075,7 @@
 @ cdecl ceil(double)
 @ cdecl -arch=!i386 ceilf(float)
 @ cdecl -norelay cexp(int128)
-@ stub cexpf
+@ cdecl -norelay cexpf(int64)
 @ stub cexpl
 @ cdecl cimag(int128)
 @ cdecl cimagf(int64)
@@ -2089,8 +2089,8 @@
 @ stub clog10l
 @ stub clogf
 @ stub clogl
-@ stub conj
-@ stub conjf
+@ cdecl -norelay conj(int128)
+@ cdecl -norelay conjf(int64)
 @ stub conjl
 @ cdecl copysign(double double)
 @ cdecl copysignf(float float)
@@ -2099,7 +2099,7 @@
 @ cdecl -arch=!i386 cosf(float)
 @ cdecl cosh(double)
 @ cdecl -arch=!i386 coshf(float)
-@ stub cpow
+@ cdecl -norelay cpow(int128 int128)
 @ stub cpowf
 @ stub cpowl
 @ stub cproj
@@ -2115,7 +2115,7 @@
 @ stub csinhl
 @ stub csinl
 @ stub csqrt
-@ stub csqrtf
+@ cdecl -norelay csqrtf(int64)
 @ stub csqrtl
 @ stub ctan
 @ stub ctanf

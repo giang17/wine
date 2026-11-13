@@ -6419,6 +6419,132 @@ static void test_SetFileTime(void)
     CloseHandle(hfile);
 }
 
+static ULONGLONG creation_time_of( const WCHAR *path )
+{
+    WIN32_FILE_ATTRIBUTE_DATA data;
+
+    if (!GetFileAttributesExW( path, GetFileExInfoStandard, &data )) return 0;
+    return ((ULONGLONG)data.ftCreationTime.dwHighDateTime << 32) | data.ftCreationTime.dwLowDateTime;
+}
+
+static void create_test_file( const WCHAR *dir, const WCHAR *name, WCHAR *path )
+{
+    HANDLE file;
+    DWORD size;
+    BOOL ret;
+
+    lstrcpyW( path, dir );
+    lstrcatW( path, L"\\" );
+    lstrcatW( path, name );
+    file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, 0 );
+    ok( file != INVALID_HANDLE_VALUE, "failed to create %s, error %lu\n", debugstr_w(path), GetLastError() );
+    ret = WriteFile( file, "data", 4, &size, NULL );
+    ok( ret, "WriteFile error %lu\n", GetLastError() );
+    CloseHandle( file );
+}
+
+static void set_file_times( const WCHAR *path, const FILETIME *creation, const FILETIME *write )
+{
+    HANDLE file;
+    BOOL ret;
+
+    file = CreateFileW( path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0 );
+    ok( file != INVALID_HANDLE_VALUE, "failed to open %s, error %lu\n", debugstr_w(path), GetLastError() );
+    ret = SetFileTime( file, creation, NULL, write );
+    ok( ret, "SetFileTime error %lu\n", GetLastError() );
+    CloseHandle( file );
+}
+
+/* the creation time as measured on Windows 10 19045; every step uses a new name, because
+ * NTFS gives a file created under a recently deleted or renamed name the old creation time */
+static void test_file_creation_time(void)
+{
+    static const ULONGLONG time_x = 132223104000000000; /* 2020-01-01 00:00:00 UTC */
+    FILETIME ft = { (DWORD)time_x, (DWORD)(time_x >> 32) }, write;
+    WCHAR dir[MAX_PATH], path1[MAX_PATH], path2[MAX_PATH], path3[MAX_PATH];
+    ULONGLONG before, now, value;
+    HANDLE file;
+    DWORD size;
+    BOOL ret;
+
+    GetTempPathW( MAX_PATH, dir );
+    lstrcatW( dir, L"wine_ctime_dir" );
+    ret = CreateDirectoryW( dir, NULL );
+    ok( ret, "CreateDirectory error %lu\n", GetLastError() );
+
+    /* adding, renaming and replacing entries does not change a directory's creation time */
+    before = creation_time_of( dir );
+    Sleep( 20 );
+    create_test_file( dir, L"a", path1 );
+    lstrcpyW( path2, dir );
+    lstrcatW( path2, L"\\b" );
+    ret = MoveFileW( path1, path2 );
+    ok( ret, "MoveFile error %lu\n", GetLastError() );
+    create_test_file( dir, L"c", path3 );
+    ret = ReplaceFileW( path2, path3, NULL, 0, NULL, NULL );
+    ok( ret, "ReplaceFile error %lu\n", GetLastError() );
+    ok( creation_time_of( dir ) == before, "directory creation time changed\n" );
+    DeleteFileW( path2 );
+
+    /* a creation time set on a file or directory is returned */
+    set_file_times( dir, &ft, NULL );
+    ok( creation_time_of( dir ) == time_x, "got creation time %#I64x\n", creation_time_of( dir ) );
+    create_test_file( dir, L"d", path1 );
+    set_file_times( path1, &ft, NULL );
+    ok( creation_time_of( path1 ) == time_x, "got creation time %#I64x\n", creation_time_of( path1 ) );
+
+    /* it survives writing to the file */
+    file = CreateFileW( path1, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, 0 );
+    ok( file != INVALID_HANDLE_VALUE, "CreateFile error %lu\n", GetLastError() );
+    SetFilePointer( file, 0, NULL, FILE_END );
+    ret = WriteFile( file, "more", 4, &size, NULL );
+    ok( ret, "WriteFile error %lu\n", GetLastError() );
+    CloseHandle( file );
+    ok( creation_time_of( path1 ) == time_x, "got creation time %#I64x\n", creation_time_of( path1 ) );
+    DeleteFileW( path1 );
+
+    /* also when the last write time is set to the same value */
+    create_test_file( dir, L"e", path1 );
+    set_file_times( path1, &ft, &ft );
+    ok( creation_time_of( path1 ) == time_x, "got creation time %#I64x\n", creation_time_of( path1 ) );
+
+    /* and a rename */
+    lstrcpyW( path2, dir );
+    lstrcatW( path2, L"\\f" );
+    ret = MoveFileW( path1, path2 );
+    ok( ret, "MoveFile error %lu\n", GetLastError() );
+    ok( creation_time_of( path2 ) == time_x, "got creation time %#I64x\n", creation_time_of( path2 ) );
+
+    /* a copy gets its own creation time and the source's last write time */
+    lstrcpyW( path3, dir );
+    lstrcatW( path3, L"\\g" );
+    ret = CopyFileW( path2, path3, FALSE );
+    ok( ret, "CopyFile error %lu\n", GetLastError() );
+    GetSystemTimeAsFileTime( &write );
+    now = ((ULONGLONG)write.dwHighDateTime << 32) | write.dwLowDateTime;
+    value = creation_time_of( path3 );
+    /* file system and system clock differ in resolution, the copy may look slightly newer than now */
+    ok( value != time_x && (value > now ? value - now : now - value) < 600000000,
+        "got creation time %#I64x, now %#I64x\n", value, now );
+    file = CreateFileW( path3, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, 0 );
+    ret = GetFileTime( file, NULL, NULL, &write );
+    ok( ret, "GetFileTime error %lu\n", GetLastError() );
+    ok( !CompareFileTime( &write, &ft ), "got last write time %08lx%08lx\n", write.dwHighDateTime, write.dwLowDateTime );
+    CloseHandle( file );
+
+    /* ReplaceFile keeps the creation time of the replaced file */
+    create_test_file( dir, L"h", path1 );
+    ret = ReplaceFileW( path2, path1, NULL, 0, NULL, NULL );
+    ok( ret, "ReplaceFile error %lu\n", GetLastError() );
+    ok( creation_time_of( path2 ) == time_x, "got creation time %#I64x\n", creation_time_of( path2 ) );
+
+    DeleteFileW( path2 );
+    DeleteFileW( path3 );
+    ret = RemoveDirectoryW( dir );
+    ok( ret, "RemoveDirectory error %lu\n", GetLastError() );
+}
+
 static void test_hard_link(void)
 {
     char cwd[MAX_PATH], temp_dir[MAX_PATH], name_buffer[200], buffer[20];
@@ -7085,6 +7211,7 @@ START_TEST(file)
     test_file_readonly_access();
     test_find_file_stream();
     test_SetFileTime();
+    test_file_creation_time();
     test_ReOpenFile();
     test_hard_link();
     test_move_file();

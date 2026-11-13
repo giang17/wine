@@ -224,7 +224,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 110
+#define WINE_GDI_DRIVER_VERSION 111
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -265,6 +265,10 @@ struct client_surface_funcs
     void (*present)( struct client_surface *surface, HDC hdc );
     /* try to set the client surface color space directly for vulkan pass-through */
     BOOL (*set_color_space)( struct client_surface *surface, VkColorSpaceKHR color_space );
+    /* optional: let present() of an offscreen surface wait until the frame has reached the client window;
+     * called from render thread without the surfaces lock, before (presented = FALSE) and after
+     * (presented = TRUE) the host present */
+    void (*wait)( struct client_surface *surface, BOOL presented );
 };
 
 struct client_surface
@@ -449,6 +453,9 @@ struct user_driver_funcs
     UINT    (*pOpenGLInit)(UINT,const struct opengl_funcs *,const struct opengl_driver_funcs **);
     /* thread management */
     void    (*pThreadDetach)(void);
+    /* raw input: the calling thread's process has (TRUE) or no longer has (FALSE) the keyboard
+     * registered with RIDEV_INPUTSINK, so it wants keys while none of its windows is active */
+    void    (*pSetRawKeyboardSink)(BOOL);
 };
 
 W32KAPI void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version );

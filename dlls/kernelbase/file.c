@@ -599,8 +599,10 @@ static BOOL copy_file( const WCHAR *source, const WCHAR *dest, COPYFILE2_EXTENDE
     }
     ret = TRUE;
 done:
-    /* Maintain the timestamp of source file to destination file and read-only attribute */
+    /* Maintain the timestamp of source file to destination file and read-only attribute;
+     * the copy gets its own creation time, as on Windows */
     info.FileAttributes &= FILE_ATTRIBUTE_READONLY;
+    info.CreationTime.QuadPart = 0;
     NtSetInformationFile( h2, &io, &info, sizeof(info), FileBasicInformation );
     HeapFree( GetProcessHeap(), 0, buffer );
     CloseHandle( h1 );
@@ -2840,6 +2842,22 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReplaceFileW( const WCHAR *replaced, const WCHAR *
         else
             SetLastError( ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 );
         return FALSE;
+    }
+
+    /* the result keeps the creation time of the replaced file, as on Windows */
+    hReplacement = CreateFileW( replaced, FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL );
+    if (hReplacement != INVALID_HANDLE_VALUE)
+    {
+        FILE_BASIC_INFORMATION result;
+
+        if (!NtQueryInformationFile( hReplacement, &io, &result, sizeof(result), FileBasicInformation ))
+        {
+            result.CreationTime = info.CreationTime;
+            result.LastAccessTime.QuadPart = result.LastWriteTime.QuadPart = result.ChangeTime.QuadPart = 0;
+            NtSetInformationFile( hReplacement, &io, &result, sizeof(result), FileBasicInformation );
+        }
+        CloseHandle( hReplacement );
     }
     return TRUE;
 }

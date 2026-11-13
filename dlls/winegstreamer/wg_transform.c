@@ -302,7 +302,29 @@ static GstFlowReturn transform_sink_chain_cb(GstPad *pad, GstObject *parent, Gst
 static gboolean transform_src_query_latency(struct wg_transform *transform, GstQuery *query)
 {
     GST_LOG("transform %p, %"GST_PTR_FORMAT, transform, query);
-    gst_query_set_latency(query, transform->attrs.low_latency, 0, 0);
+
+    /* A transform has no clock and no consumer of its own: the caller pushes
+     * a sample and reads the next frame back right away, so a decoder that
+     * keeps frames in flight to pipeline decoding against display only
+     * delays the caller. The GstH264Decoder family asks upstream whether it
+     * is live before choosing that delay: nvh264dec keeps two extra frames
+     * for a non-live source and none for a live one. Report the transform as
+     * live regardless of MF_LOW_LATENCY. Measured with Cubase 15, which
+     * drives the H.264 decoder itself (issue 356): a frame came back four
+     * inputs late and now comes back two inputs late, and the application
+     * no longer restarts the decoder at every keyframe, which left its video
+     * player black for 0.7 s each time.
+     *
+     * gst-libav's avdec_* elements ask the same question and pick slice
+     * threading for a live source, so a single-slice stream decodes on one
+     * thread: 4.5 ms per 1080p frame and 11 ms per 4K frame on a 16-thread
+     * desktop, against 1.7 and 3.7 ms with frame threading -- whose output
+     * arrives thread-count minus one frames late, 11 to 16 frames with the
+     * 16 threads set_max_threads() allows (issue 359). A decoder that hands
+     * a synchronous caller its first frame after 17 inputs is the wrong
+     * trade for every application that drives the MFT itself; the price is
+     * paid only where neither NVDEC nor VA-API serves the H.264 MFT. */
+    gst_query_set_latency(query, TRUE, 0, 0);
     return true;
 }
 

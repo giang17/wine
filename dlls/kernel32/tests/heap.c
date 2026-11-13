@@ -3862,6 +3862,95 @@ static void test_HeapSummary(void)
     HeapDestroy( heap );
 }
 
+/* The LFH frontend leaves the content of a freed block alone, the backend heap writes its
+ * free-list links over the first 16 user bytes. Measured on Windows 10 19045: a size class up
+ * to 1K activates the frontend after ~2040 allocations or 18 live blocks; once the frontend is
+ * active, the classes up to 16K switch by the same counts (process heap and private heaps
+ * alike), 32K never. A private heap that only ever serves 2K blocks keeps them in the backend. */
+static BOOL freed_block_keeps_content( HANDLE heap, SIZE_T size, void *ptr )
+{
+    static const char pattern[16] = "WINE_TEST_LFH_01";
+    volatile UINT_PTR addr = (UINT_PTR)ptr; /* read back on purpose after HeapFree */
+    char copy[16];
+    memcpy( ptr, pattern, sizeof(pattern) );
+    memset( (char *)ptr + 16, 0xab, size - 16 );
+    HeapFree( heap, 0, ptr );
+    memcpy( copy, (const void *)addr, sizeof(copy) );
+    return !memcmp( copy, pattern, sizeof(pattern) );
+}
+
+static BOOL cycle_then_free( HANDLE heap, SIZE_T size, unsigned int cycles )
+{
+    void *ptr;
+    unsigned int i;
+    for (i = 0; i < cycles; i++)
+    {
+        ptr = HeapAlloc( heap, 0, size );
+        ok( !!ptr, "HeapAlloc failed\n" );
+        HeapFree( heap, 0, ptr );
+    }
+    ptr = HeapAlloc( heap, 0, size );
+    ok( !!ptr, "HeapAlloc failed\n" );
+    return freed_block_keeps_content( heap, size, ptr );
+}
+
+static void test_lfh_bins( HANDLE heap, BOOL is_process_heap )
+{
+    static const SIZE_T sizes[] = { 256, 2048, 8192, 16384 };
+    void *live[32];
+    SIZE_T i, j;
+    BOOL ret;
+
+    /* 256 first: it activates the frontend for the heap */
+    for (i = 0; i < ARRAY_SIZE(sizes); i++)
+    {
+        winetest_push_context( "size %Iu", sizes[i] );
+        ret = cycle_then_free( heap, sizes[i], 0x1000 );
+        ok( ret, "freed block was overwritten, size class not in the LFH\n" );
+        winetest_pop_context();
+    }
+
+    /* live blocks switch a bin as well, measured at 18 on the process heap */
+    if (is_process_heap)
+    {
+        for (j = 0; j < ARRAY_SIZE(live); j++) live[j] = HeapAlloc( heap, 0, 4096 );
+        ret = freed_block_keeps_content( heap, 4096, live[ARRAY_SIZE(live) - 1] );
+        ok( ret, "freed block was overwritten after %Iu live blocks of 4096 bytes\n", ARRAY_SIZE(live) );
+        for (j = 0; j < ARRAY_SIZE(live) - 1; j++) HeapFree( heap, 0, live[j] );
+    }
+
+    ret = cycle_then_free( heap, 32768, 0x1000 );
+    ok( !ret, "freed 32K block kept its content\n" );
+}
+
+static void test_lfh_activation(void)
+{
+    HANDLE heap;
+    BOOL ret;
+
+    winetest_push_context( "process heap" );
+    test_lfh_bins( GetProcessHeap(), TRUE );
+    winetest_pop_context();
+
+    heap = HeapCreate( 0, 0, 0 );
+    ok( !!heap, "HeapCreate failed, error %lu\n", GetLastError() );
+    winetest_push_context( "private heap" );
+    test_lfh_bins( heap, FALSE );
+    winetest_pop_context();
+    HeapDestroy( heap );
+
+    /* large blocks alone do not activate the frontend */
+    heap = HeapCreate( 0, 0, 0 );
+    ok( !!heap, "HeapCreate failed, error %lu\n", GetLastError() );
+    ret = cycle_then_free( heap, 2048, 0x1000 );
+    ok( !ret, "fresh private heap: freed 2K block kept its content without a small bin active\n" );
+    ret = cycle_then_free( heap, 256, 0x1000 );
+    ok( ret, "fresh private heap: freed 256 byte block was overwritten\n" );
+    ret = cycle_then_free( heap, 2048, 0x1000 );
+    ok( ret, "fresh private heap: freed 2K block was overwritten after the frontend became active\n" );
+    HeapDestroy( heap );
+}
+
 START_TEST(heap)
 {
     int argc;
@@ -3884,6 +3973,7 @@ START_TEST(heap)
     test_GlobalMemoryStatus();
     test_HeapSummary();
     test_heap_tail_zeroing( 0 );
+    test_lfh_activation();
 
     if (pRtlGetNtGlobalFlags)
     {

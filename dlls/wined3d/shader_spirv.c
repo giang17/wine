@@ -1306,6 +1306,18 @@ static void spirv_vertex_pipe_vk_vp_free(struct wined3d_device *device, struct w
 static const struct wined3d_state_entry_template spirv_vertex_pipe_vk_vp_states[] =
 {
     {STATE_SHADER(WINED3D_SHADER_TYPE_VERTEX),          {STATE_SHADER(WINED3D_SHADER_TYPE_VERTEX),          state_nop}},
+    {STATE_RENDER(WINED3D_RS_AMBIENTMATERIALSOURCE),    {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_COLORVERTEX),              {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_DIFFUSEMATERIALSOURCE),    {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_EMISSIVEMATERIALSOURCE),   {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_FOGENABLE),                {STATE_RENDER(WINED3D_RS_FOGENABLE),                state_nop}},
+    {STATE_RENDER(WINED3D_RS_LIGHTING),                 {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_LOCALVIEWER),              {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_NORMALIZENORMALS),         {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_RANGEFOGENABLE),           {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_SPECULARENABLE),           {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_SPECULARMATERIALSOURCE),   {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
+    {STATE_RENDER(WINED3D_RS_VERTEXBLEND),              {STATE_RENDER(WINED3D_RS_FOGENABLE),                NULL}},
     {0}, /* Terminate */
 };
 
@@ -1403,6 +1415,7 @@ static void spirv_fragment_pipe_vk_fp_free_context_data(struct wined3d_context *
 
 static const struct wined3d_state_entry_template spirv_fragment_pipe_vk_fp_states[] =
 {
+    {STATE_RENDER(WINED3D_RS_COLORKEYENABLE),    {STATE_RENDER(WINED3D_RS_COLORKEYENABLE),    state_nop}},
     {STATE_RENDER(WINED3D_RS_FOGVERTEXMODE),     {STATE_RENDER(WINED3D_RS_FOGVERTEXMODE),     state_nop}},
     {0}, /* Terminate */
 };

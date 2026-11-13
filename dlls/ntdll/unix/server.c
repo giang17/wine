@@ -38,6 +38,7 @@
 # include <pwd.h>
 #endif
 #include <signal.h>
+#include <sys/time.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -669,6 +670,10 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
         {
             /* FIXME: hack for debugging 32-bit process without a 64-bit ntdll */
             if (is_old_wow64() && func == (void *)0x7ffe1000) func = pDbgUiRemoteBreakin;
+            /* a 64-bit debugger breaks in at its own DbgUiRemoteBreakin, but a thread of a
+             * wow64 process starts in 32-bit code: use the one of the 32-bit ntdll */
+            else if (is_wow64() && func == pDbgUiRemoteBreakin && pWow64DbgUiRemoteBreakin)
+                func = pWow64DbgUiRemoteBreakin;
             attr->TotalLength = sizeof(buffer);
             attr->Attributes[0].Attribute    = PS_ATTRIBUTE_CLIENT_ID;
             attr->Attributes[0].Size         = sizeof(id);
@@ -1588,12 +1593,57 @@ static void init_teb_data( struct thread_data *data )
 
 
 /***********************************************************************
+ *           exit_watchdog
+ */
+static int exit_watchdog_status;
+
+static void exit_watchdog( int signal )
+{
+    _exit( exit_watchdog_status );
+}
+
+
+/***********************************************************************
  *           process_exit_wrapper
  *
  * Close server socket and exit process normally.
+ *
+ * exit() runs the destructors of the Unix libraries the process has
+ * loaded. A thread that terminate_process() killed with SIGQUIT in the
+ * middle of a malloc() or free() left the lock of its glibc arena taken:
+ * its pthread_exit() runs the TLS destructors, the first free() in one of
+ * them blocks on that lock, and a destructor here that frees a chunk of
+ * the same arena blocks as well (Mesa's GLSL builtins, allocated by the
+ * wined3d CS thread that compiled the shaders, freed by the main thread
+ * at exit). The server then SIGKILLs the process after 31/64 s and its
+ * exit status is 137 instead of what the application returned. Once
+ * exit() has had its time the watchdog ends the process with the status
+ * it was given; WINE_EXIT_WATCHDOG_MS sets the time, 0 disables it.
  */
 void process_exit_wrapper( int status )
 {
+    const char *env = getenv( "WINE_EXIT_WATCHDOG_MS" );
+    unsigned int ms = env ? strtoul( env, NULL, 10 ) : 300;
+
+    if (ms)
+    {
+        struct sigaction sig_act;
+        struct itimerval timer;
+        sigset_t set;
+
+        exit_watchdog_status = status;
+        memset( &sig_act, 0, sizeof(sig_act) );
+        sig_act.sa_handler = exit_watchdog;
+        sigemptyset( &sig_act.sa_mask );
+        sigaction( SIGALRM, &sig_act, NULL );
+        sigemptyset( &set );
+        sigaddset( &set, SIGALRM );
+        pthread_sigmask( SIG_UNBLOCK, &set, NULL );
+        memset( &timer, 0, sizeof(timer) );
+        timer.it_value.tv_sec = ms / 1000;
+        timer.it_value.tv_usec = (ms % 1000) * 1000;
+        setitimer( ITIMER_REAL, &timer, NULL );
+    }
     close( fd_socket );
     exit( status );
 }
