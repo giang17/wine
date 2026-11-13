@@ -2094,6 +2094,17 @@ This is the recommended branch. What it changes, by subsystem:
   KWin 5.27 the window comes back through Alt+Tab, a click on its task bar entry does not
   restore it (the same with Wine 11.20, which has the three commits). Only the Wayland driver
   is affected; the fork default is winex11 through Xwayland
+- **Fractional scaling under the Wayland driver (winewayland)**: backport of 1632129903c and
+  204d2fb3453 from Wine 11.12 (`wp_fractional_scale_v1`). The driver took the scale of a
+  surface from the DPI of the process, so on an output scaled by the compositor a window
+  was passed on at its pixel size in logical units and drawn larger and scaled up: a
+  900x600 window as 900x600 logical units on an output at 125 %, 1125x750 on the screen. It
+  now takes the scale the compositor announces per surface: the same window is 720x480
+  logical units and 900x600 pixels on the screen, a maximized window has the pixel size of
+  the output (1094x704 for 875x563 logical units), and the viewport of an OpenGL client
+  surface is scaled the same way. Measured from the protocol trace in a nested KWin 5.27 at
+  scale 1.25, with the same values as Wine 11.21; at scale 1 nothing changes. Only the
+  Wayland driver is affected (issue 506)
 - **Buffer swaps of windows that are not shown, under the Wayland driver (winewayland)**:
   with a swap interval other than zero `eglSwapBuffers()` waits for the frame callback of
   the previous swap — NVIDIA's egl-wayland without a timeout — and a compositor does not
