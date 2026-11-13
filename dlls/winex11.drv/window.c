@@ -1421,6 +1421,12 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
         TRACE( "window %p/%lx, requesting WM_TRANSIENT_FOR %lx (owner %p, group %lx)\n", data->hwnd, data->whole_window,
                owner_win, owner, group_leader );
     }
+    else if (!data->zorder_transient_for)
+    {
+        /* The window has no owner, or lost the one it had (wine-dev issue 589). The
+         * relation update_zorder_transient() gives an ownerless tool window stays. */
+        XDeleteProperty( data->display, data->whole_window, XA_WM_TRANSIENT_FOR );
+    }
 
     /* Only use dialog type for owned popups. Metacity allows making fullscreen
      * only normal windows, and doesn't handle correctly TRANSIENT_FOR hint for
