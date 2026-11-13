@@ -563,6 +563,20 @@ This is the recommended branch. What it changes, by subsystem:
   bug 60677) — on 11.0 no draw path reads the render info of a custom effect's transform
   nodes, and the rework turns the creation failure for a node that is no draw transform into
   an effect created without render info
+- **Backports from Wine 11.22** (three upstream commits, cherry-picked with their origin): the
+  Unix side of crypt32 opens a certificate file as a stream and closes it once —
+  `import_certs_from_file()` closed the descriptor with `fclose()` and
+  `import_certs_from_path()` closed the same number again, which hits whatever descriptor
+  another thread was given in between (crypt32); a host root certificate that cannot be added
+  to the cached store is skipped, where the code went on to set a property on and free a
+  certificate context it had not received (crypt32); and a resource lookup with an explicit
+  language ID that has no locale tries that ID, its neutral language and the neutral language
+  again — since the preferred-UI-language backport from Wine 11.17/11.18 such an ID dropped
+  out of the search list and `FindResourceEx()` failed (ntdll, Wine bug 60748). Measured with
+  `scripts/repro-1122-backports.sh`: a resource stored only under language `0x8301` was not
+  found (`ERROR_RESOURCE_LANG_NOT_FOUND`), now it is; opening the `ROOT` system store ended one
+  `close()` with `EBADF`, the second one on `/etc/ssl/certs/ca-certificates.crt` (strace), now
+  none; both probes give the same results on the Wine 11.22 build
 - **dwrite text layout, backport of the layout rework from Wine 11.1/11.2 and of `HitTestPoint()`
   from 11.21** (21 upstream commits by Nikolay Sivov, 14 for the code and 7 for the tests,
   cherry-picked with their origin; `dlls/dwrite/layout.c` is now identical to upstream master
