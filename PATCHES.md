@@ -2094,6 +2094,21 @@ This is the recommended branch. What it changes, by subsystem:
   rate, and vatSys ends after a clean close in 3 of 3 runs. A Vulkan swapchain in FIFO mode
   (DXVK with a sync interval) blocks in `vkQueuePresentKHR()` the same way and is not
   changed. Only the Wayland driver is affected (issue 510)
+- **Owned windows under the Wayland driver (winewayland)**: a managed window with an owner
+  was an `xdg_toplevel` unrelated to the toplevel of its owner — the driver never called
+  `xdg_toplevel_set_parent()` — so the compositor raised an activated owner above the
+  windows it owns: vatSys's VSCS, strip bays and Error Window went behind its maximized main
+  window. The driver now sets the nearest mapped owner as the parent, when the toplevel is
+  created and again for all windows of the process when a toplevel gets its first buffer or
+  goes away, so an owned window shown before its owner and an owner hidden and shown again
+  are covered. It keeps track of the parent the compositor has for each window and drops a
+  relation that would close a cycle (a protocol error) before setting a new one, as the
+  owner of a window can change without the driver being told. Measured on KWin 5.27 from
+  its window list: owned windows have their owner as parent and stay above it after it is
+  activated, also maximized; in vatSys the six owned windows and a dialog stay above the
+  main window. An owned window with `WS_EX_APPWINDOW` gets a parent too — Wayland has no
+  group transient as used under winex11 — and whether a task bar still lists it is not
+  measured. Only the Wayland driver is affected (issue 508)
 - **Scroll bar size (win32u)**: the default `ScrollHeight` and `ScrollWidth` are 17 px
   (-255 twips) as on Windows — measured on Windows 10 22H2, where
   `HKCU\Control Panel\Desktop\WindowMetrics` carries -255 and
