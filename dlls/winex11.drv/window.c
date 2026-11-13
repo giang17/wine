@@ -239,6 +239,18 @@ static int host_window_error( Display *display, XErrorEvent *event, void *arg )
     return (event->error_code == BadWindow);
 }
 
+/* whether an X window still exists: a BadWindow means it has been destroyed */
+static BOOL x_window_exists( Display *display, Window window )
+{
+    XWindowAttributes attr;
+    BOOL ret;
+
+    X11DRV_expect_error( display, host_window_error, NULL );
+    ret = XGetWindowAttributes( display, window, &attr ) != 0;
+    if (X11DRV_check_error()) ret = FALSE;
+    return ret;
+}
+
 struct host_window *get_host_window( Window window, BOOL create )
 {
     struct x11drv_thread_data *data = x11drv_thread_data();
@@ -2324,7 +2336,19 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
         !window_has_pending_wm_state( anchor, NormalState ) && !window_is_reparenting( anchor ) &&
         !thread_data->net_active_window_serial)
     {
-        *foreground = hwnd_from_window( thread_data->display, thread_data->current_state.net_active_window );
+        Window net_active = thread_data->current_state.net_active_window;
+
+        *foreground = hwnd_from_window( thread_data->display, net_active );
+        /* hwnd_from_window() resolves every X window it does not know to the desktop.  For a
+         * foreign client that is what the switch means, but the window manager can also still
+         * report a window that has been destroyed in the meantime: during the user32 win test
+         * KWin named an X window of the test process that no longer existed, right before
+         * reporting None.  Taken as a switch to a foreign client, it gave the desktop process
+         * the foreground, and the test could not take it back (win.c:3240).  A report of a
+         * window that no longer exists is stale; wait for the next one. */
+        if (*foreground == NtUserGetDesktopWindow() && net_active != root_window &&
+            !x_window_exists( thread_data->display, net_active ))
+            *foreground = 0;
         if (*foreground == old_foreground) *foreground = 0;
     }
 
