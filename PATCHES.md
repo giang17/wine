@@ -1281,6 +1281,14 @@ This is the recommended branch. What it changes, by subsystem:
   it. The user32 `win` test passes `win.c:10986` (`test_update_region`) in 3 of 3 runs instead
   of failing in every one, and the `msg` test goes from 115 to 101 failures with no new one
   (issue 587)
+- **winex11**: a null foreground follows the window manager to a foreign client: the desktop
+  window becomes the foreground. JUCE closes its `WS_EX_TOPMOST` menus only once
+  `GetForegroundWindow()` leaves the process, and with the foreground stuck at NULL the KM88
+  Editor's menus stayed above every other window (issue 85). A report of an X window that no
+  longer exists is ignored: during the user32 `win` test KWin named a destroyed window of the
+  test process right before `None`, the desktop process took the foreground and the test could
+  not take it back (`win.c:3240`, 8 of 14 runs before, 0 of 10 after). A null foreground still
+  follows the focus to `xmessage` (issue 587)
 - **win32u / winex11**: the window manager gets the application's minimum and maximum track
   size as `PMinSize`/`PMaxSize`. `set_size_hints()` sent them only for windows that are not
   resizable; a resizable window got position and gravity only, so the window manager shrank it
