@@ -1670,7 +1670,13 @@ This is the recommended branch. What it changes, by subsystem:
   earlier workarounds for the same bug (suppressed reentrant size-only
   `WM_WINDOWPOSCHANGED`, lifted `window == visible` decoration gate in winex11), both
   removed; transparent (0x00) surface init for ARGB popups; the system arrow is shown
-  again when an application hides the cursor and sets none; cursors are process-local in
+  again when an application hides the cursor and sets none; a new X window gets a shared
+  arrow cursor, so an embedded surface of another process (WebView2) that never sets one is
+  not left blank once the window manager reparents its toplevel — the arrow is created on
+  the shared display connection and synced before the window's own connection uses it,
+  since a flush alone let that `XDefineCursor` reach the server first and Xlib ended the
+  process with `BadCursor` at its first window (9 of 20 `wineboot` runs in an Arch Linux
+  container on Xvfb, 0 of 20 with the sync); cursors are process-local in
   Wine, so a `WM_WINE_SETCURSOR` for an out-of-process child window (WebView2, bridged
   plug-ins) arrived with a handle the receiving process rejected and the previous cursor
   stayed — the owner now publishes each cursor's first frame in a named section and the
