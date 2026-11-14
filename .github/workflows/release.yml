@@ -160,7 +160,8 @@ jobs:
           # What a target system has to provide: direct NEEDED entries and the glibc level.
           for f in "$R"/lib/wine/x86_64-unix/*.so "$R"/bin/wine "$R"/bin/wineserver; do
             objdump -p "$f" | awk '/NEEDED/ {print $2}'
-          done | sort -u > "$NAME.needed"
+          # libc/libm are everywhere, ntdll.so and win32u.so are Wine's own.
+          done | { grep -v -x -E 'libc\.so\.6|libm\.so\.6|ntdll\.so|win32u\.so' || true; } | sort -u > "$NAME.needed"
           if grep -E '^lib(av|sw)' "$NAME.needed"; then echo "::error::versioned FFmpeg sonames"; exit 1; fi
           objdump -T "$R"/lib/wine/x86_64-unix/*.so "$R"/bin/wine "$R"/bin/wineserver \
             | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 > "$NAME.glibc"
@@ -198,7 +199,7 @@ jobs:
             echo "Directly linked: $(tr '\n' ' ' < "$NAME.needed")"
             echo
             echo "Built without FFmpeg; media decoding goes through GStreamer. Keep DXVK out of the"
-            echo "prefix and Wine on Xwayland, see the Quick start in the README. A report from this"
+            echo "prefix and Wine on Xwayland, see \"before the first run\" in the README. A report from this"
             echo "build should include the output of \`wine --version\` and say that it is a release build."
           } > "$NAME.notes.md"
 
