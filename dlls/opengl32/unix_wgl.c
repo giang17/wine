@@ -1261,7 +1261,7 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
     else
     {
         const char *str = (const char *)funcs->p_glGetString( GL_EXTENSIONS );
-        size_t len = strlen( str );
+        size_t len;
         const char *p;
         char *ext;
         if (!str) str = "";
