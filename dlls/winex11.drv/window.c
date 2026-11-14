@@ -1421,10 +1421,13 @@ static void set_style_hints( struct x11drv_win_data *data, DWORD style, DWORD ex
         TRACE( "window %p/%lx, requesting WM_TRANSIENT_FOR %lx (owner %p, group %lx)\n", data->hwnd, data->whole_window,
                owner_win, owner, group_leader );
     }
-    else if (!data->zorder_transient_for)
+    else if (data->whole_window && !data->zorder_transient_for)
     {
         /* The window has no owner, or lost the one it had (wine-dev issue 589). The
-         * relation update_zorder_transient() gives an ownerless tool window stays. */
+         * relation update_zorder_transient() gives an ownerless tool window stays.
+         * set_wm_hints() also runs for a window without an X window (SetWindowIcons
+         * after SetParent): Xlib exits the process on the BadWindow a delete on
+         * window 0 returns, so only touch an existing window. */
         XDeleteProperty( data->display, data->whole_window, XA_WM_TRANSIENT_FOR );
     }
 
