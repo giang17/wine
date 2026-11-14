@@ -2280,7 +2280,8 @@ static BOOL win32u_wgl_context_reset( struct wgl_context *context, HDC hdc, stru
     context->driver_private = NULL;
     if (!hdc) return TRUE;
 
-    if ((format = get_dc_pixel_format( hdc )) <= 0 &&
+    /* a context that is created again keeps its format, the DC it was created with may be gone */
+    if ((format = context->format) <= 0 && (format = get_dc_pixel_format( hdc )) <= 0 &&
         (format = get_window_pixel_format( NtUserWindowFromDC( hdc ) )) <= 0)
     {
         if (!format) RtlSetLastWin32Error( ERROR_INVALID_PIXEL_FORMAT );
