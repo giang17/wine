@@ -714,6 +714,23 @@ This is the recommended branch. What it changes, by subsystem:
   and the following call for the second GUID returned 0 as well. A matching entry still
   returns 0, also through the 32-bit `uninstaller.exe`, which restarts the 64-bit one
   (issue 576)
+- **powershell**: Wine's `powershell.exe` is a stub that returns 0 for every command, and
+  installers that ask PowerShell yes/no questions took that as "yes" (the Native Access
+  installer looped on "Native Access is running"). The fork runs the subset installers and
+  launchers use and returns 1 for anything it did not execute: `Start-Process`/`start` (also
+  on the right of `$p =`/`$p +=`, with `-FilePath`, `-ArgumentList`, `-Verb`, `-WindowStyle`,
+  `-WorkingDirectory`, `-Wait`, `-PassThru`), `Wait-Process` and `New-Item -ItemType
+  Directory`, from `-Command`, `-File` or a bare command line; a script that started a
+  process returns the exit code of the first awaited process that failed (Native Access and
+  its NTKDaemon setup, Minimal Hub; issues 293, 314). It also answers version queries:
+  `$PSVersionTable.PSVersion`, `$Host.Version` and `(Get-Host).Version` with their members,
+  quoted strings, numbers and the `-f` operator are written to stdout as PowerShell
+  5.1.19041.6456 on Windows 10 22H2 formats them, and a `& { ... }` block runs its body.
+  Waves Central 17.1.5 asks `'{0}.{1}' -f $PSVersionTable.PSVersion.Major,
+  $PSVersionTable.PSVersion.Minor` at start and stopped at "Waves Central cannot access
+  PowerShell"; it now continues to its licence dialog. 14 of 16 query forms give the same
+  bytes and exit code as the reference VM; comparisons and `Write-Host` return 1 without
+  output (issue 595)
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
 - **ntdll**: the heap enabled the LFH frontend only for size classes up to 1K; blocks between
   1K and 16K stayed in the backend heap, whose free path writes the free-list links over the
