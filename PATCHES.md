@@ -731,6 +731,15 @@ This is the recommended branch. What it changes, by subsystem:
   PowerShell"; it now continues to its licence dialog. 14 of 16 query forms give the same
   bytes and exit code as the reference VM; comparisons and `Write-Host` return 1 without
   output (issue 595)
+- **taskkill**: `/t` takes a process for the parent only if it was not created after the
+  child. A process keeps the ID of a parent that has exited, and Wine hands freed IDs out
+  again: Waves Central was started by process 0020, which exited, and 0020 later went to
+  `instl.exe`, a child of Waves Central. The two parent IDs formed a cycle, and the
+  installer's `taskkill /im COSMOS.exe /t /f` walked it at 100 % CPU without end, so a
+  product installation stopped at "Closing COSMOS"; `taskkill /pid X /t` also terminated a
+  process whose stale parent ID was X. With a reproduced cycle `taskkill /t` now ends after
+  about 63 ms (before: not within 10 s, 4 of 4 runs), and a real parent/child tree is still
+  terminated (issue 596)
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
 - **ntdll**: the heap enabled the LFH frontend only for size classes up to 1K; blocks between
   1K and 16K stayed in the backend heap, whose free path writes the free-list links over the
