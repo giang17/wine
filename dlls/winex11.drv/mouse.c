@@ -209,9 +209,12 @@ Cursor get_default_cursor(void)
     if (!cursor)
     {
         Cursor new = XCreateFontCursor( gdi_display, XC_left_ptr );
-        /* flush so the cursor is known to the server before another display
-           connection (create_whole_window uses data->display) references it */
-        XFlush( gdi_display );
+        /* create_whole_window references the cursor through another display
+           connection (data->display), and the server does not order requests of
+           two connections: a flush alone let that XDefineCursor arrive first and
+           fail with BadCursor.  Sync, so the cursor exists before any thread can
+           see it. */
+        XSync( gdi_display, False );
         if (InterlockedCompareExchangePointer( (void **)&cursor, (void *)new, 0 ))
             XFreeCursor( gdi_display, new );
     }
