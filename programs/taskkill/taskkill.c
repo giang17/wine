@@ -37,6 +37,7 @@ static unsigned int task_count;
 static struct
 {
     PROCESSENTRY32W p;
+    ULONGLONG start_time;   /* creation time, 0 if it cannot be queried */
     BOOL matched;
     BOOL is_numeric;
 }
@@ -133,9 +134,23 @@ static BOOL CALLBACK pid_enum_proc(HWND hwnd, LPARAM lParam)
     return TRUE;
 }
 
+static ULONGLONG get_start_time(DWORD pid)
+{
+    FILETIME create, exit, kernel, user;
+    ULONGLONG ret = 0;
+    HANDLE process;
+
+    if (!(process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)))
+        return 0;
+    if (GetProcessTimes(process, &create, &exit, &kernel, &user))
+        ret = ((ULONGLONG)create.dwHighDateTime << 32) | create.dwLowDateTime;
+    CloseHandle(process);
+    return ret;
+}
+
 static BOOL enumerate_processes(void)
 {
-    unsigned int alloc_count = 128;
+    unsigned int alloc_count = 128, i;
     void *realloc_list;
     HANDLE snapshot;
 
@@ -166,6 +181,9 @@ static BOOL enumerate_processes(void)
         process_list[process_count].p.dwSize = sizeof(process_list[process_count].p);
     } while (Process32NextW(snapshot, &process_list[process_count].p));
     CloseHandle(snapshot);
+
+    for (i = 0; i < process_count; ++i)
+        process_list[i].start_time = get_start_time(process_list[i].p.th32ProcessID);
     return TRUE;
 }
 
@@ -251,6 +269,16 @@ static BOOL find_parent(unsigned int process_index, unsigned int *parent_index)
     {
         if (process_list[i].p.th32ProcessID == parent_id)
         {
+            /* The parent may have exited and its ID been given to a process
+             * started later, possibly a descendant of the child; that process
+             * is not the parent. */
+            if (process_list[i].start_time && process_list[process_index].start_time
+                && process_list[i].start_time > process_list[process_index].start_time)
+            {
+                WINE_TRACE("%04lx: parent id %04lx belongs to a newer process.\n",
+                           process_list[process_index].p.th32ProcessID, parent_id);
+                return FALSE;
+            }
             *parent_index = i;
             return TRUE;
         }
@@ -260,14 +288,16 @@ static BOOL find_parent(unsigned int process_index, unsigned int *parent_index)
 
 static void mark_child_processes(void)
 {
-    unsigned int i, parent;
+    unsigned int i, parent, depth;
 
     for (i = 0; i < process_count; ++i)
     {
         if (process_list[i].matched)
             continue;
         parent = i;
-        while (find_parent(parent, &parent))
+        /* A chain longer than the process list is a cycle of reused IDs
+         * (when creation times are not available). */
+        for (depth = 0; depth < process_count && find_parent(parent, &parent); ++depth)
         {
             if (process_list[parent].matched)
             {
