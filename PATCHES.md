@@ -1822,6 +1822,27 @@ This is the recommended branch. What it changes, by subsystem:
   their own window and reparent it into the host (yabridge, FL Studio's `ilbridge.exe`)
   render into a window of their own process and take the unchanged path; the test case for
   that (`test_other_process_parent()`) gives the same results before and after (issue 464)
+- **opengl32 / win32u**: a context that was passed to `wglShareLists()` works when the DC of
+  `wglCreateContext()` is gone. Wine 11.0 creates the destination context again on its next
+  use; `win32u_wgl_context_reset()` destroyed the driver context first and then looked the
+  pixel format up through the creation DC. After `ReleaseDC()` of that DC (a cache DC), with
+  its handle given to another window, or with its window destroyed, the lookup failed and
+  the context was left without driver context. `wglMakeCurrent()` then ran `strlen()` on the
+  NULL result of `glGetString( GL_EXTENSIONS )` inside the Unix call with the WGL lock held:
+  it returned FALSE, nothing was current, and the next WGL call of the process waited for
+  the lock forever. The editor of a Waves plug-in (API-550A, WaveShell1-VST3 17.1) in REAPER
+  stayed black and REAPER froze. Three changes: the context is created again with the pixel
+  format stored in it (what c62a2c3c810 from Wine 11.2 does, without its split of the driver
+  entry, which changes `struct opengl_funcs`); backport of ea502304ffb from Wine 11.2 (Rémi
+  Bernon): the tracked attributes are copied into the new context on a temporary window
+  instead of the creation DC — a clear colour set before `wglShareLists()` was lost once
+  the DC was released; and the extension string is checked before it is measured (code
+  replaced upstream in Wine 11.7). `sharelists.exe` (workspace `projects/wgl-sharelists-599`,
+  eight cases, 64- and 32-bit, llvmpipe): 4 of 8 cases failed before, three of them with a
+  teardown that never returned, the same with wine-stable 11.0; all 8 pass now, as on the
+  11.22 branch. Wine's `opengl32` test: 4998 executed, 37 todo, 0 failures before and after,
+  64- and 32-bit. The API-550A editor draws in REAPER, also after closing and reopening it
+  twice (`:99`, llvmpipe) (issue 599)
 - **wined3d**: a GDI present of a window below a top level of another process blits
   through a fresh cache DC instead of the one held since the swap chain was created.
   That DC keeps the device origin and visible region of the window's position at that
