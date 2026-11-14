@@ -1,375 +1,199 @@
-<h1 align="center">Wine with DirectComposition and Direct2D</h1>
+```text
+╔════════════════════════════════════════════════════════════════════════════╗
+║                                                                            ║
+║                            █   █ ▀█▀ █▄  █ █▀▀▀                            ║
+║                            █▄▀▄█  █  █ ▀▄█ █▀▀                             ║
+║                            ▀   ▀ ▀▀▀ ▀   ▀ ▀▀▀▀                            ║
+║                                                                            ║
+║         █▀▀▀▄ ▀▀▀▀▄ █▀▀▀▄ ▄█     ▄▀ █▀▀▀▄ ▄▀▀▀▀ ▄▀▀▀▄ █▄ ▄█ █▀▀▀▄          ║
+║         █   █ ▄▀▀▀  █   █  █   ▄▀   █   █ █     █   █ █ ▀ █ █▀▀▀           ║
+║         ▀▀▀▀  ▀▀▀▀▀ ▀▀▀▀  ▀▀▀ ▀     ▀▀▀▀   ▀▀▀▀  ▀▀▀  ▀   ▀ ▀              ║
+║                                                                            ║
+║                  Wine with DirectComposition and Direct2D                  ║
+║                                                                            ║
+║       Modern Windows software on Linux: built for DAWs and plugins,        ║
+║                running .NET and WebView2 applications too.                 ║
+║                                                                            ║
+╚════════════════════════════════════════════════════════════════════════════╝
 
-<p align="center">
-  <b>Modern Windows audio software on Linux.</b><br>
-  A Wine fork for the plugin and application GUIs that stock Wine cannot draw.
-</p>
+┌──[ release info ]──────────────────────────────────────────────────────────┐
+│  repository ...... github.com/giang17/wine                                 │
+│  stable .......... d2d1-dcomp-11.0 on Wine 11.0, default branch            │
+│  rolling ......... d2d1-dcomp-11.<N> on the newest WineHQ devel tag        │
+│  release builds .. x86_64 Linux, glibc 2.35+, both PE architectures        │
+│  license ......... GNU LGPL, the same as Wine                              │
+└────────────────────────────────────────────────────────────────────────────┘
 
-<p align="center">
-  <img alt="Base" src="https://img.shields.io/badge/base-Wine%2011.22%20devel-blue">
-  <img alt="Rolling devel" src="https://img.shields.io/badge/rolling%20devel-newest%2011.x%20tag-blue">
-  <img alt="Subsystems" src="https://img.shields.io/badge/modified%20subsystems-40%2B-informational">
-  <img alt="License" src="https://img.shields.io/badge/license-LGPL--2.1-green">
-</p>
+┌──[ about ]─────────────────────────────────────────────────────────────────┐
+│  Current Windows audio software draws its windows with DirectComposition,  │
+│  Direct2D, DirectWrite and DXGI: JUCE 8 and VSTGUI plugins,                │
+│  WebView2-based editors and the DAWs that host them. Stock Wine            │
+│  implements little of that stack, so these windows open black, flicker,    │
+│  lose their artwork, or the application stops before its first window.     │
+│  This fork implements the stack, fixes the Wine code around it from the    │
+│  X11 driver to the installers, and is in daily use for music production.   │
+│                                                                            │
+│  The same work carries applications outside audio: vatSys, an              │
+│  air-traffic-control radar client drawn with Direct2D; NinjaTrader, a WPF  │
+│  trading platform with a WebView2 chat; and, on the rolling branch, Power  │
+│  BI Desktop.                                                               │
+│                                                                            │
+│  PATCHES.md documents each change with its reason and measurements.        │
+└────────────────────────────────────────────────────────────────────────────┘
 
-<p align="center">
-  <a href="PATCHES.md">Full patch documentation</a> ·
-  <a href="#quick-start">Quick start</a> ·
-  <a href="#verifying-this-fork">Verifying this fork</a> ·
-  <a href="#which-branch">Which branch?</a> ·
-  <a href="#tested-applications">Tested applications</a>
-</p>
+┌──[ install ]───────────────────────────────────────────────────────────────┐
+│  RELEASE BUILDS                                                            │
+│  The Releases page carries a portable build of d2d1-dcomp-11.0 for x86_64  │
+│  Linux with both PE architectures. Unpack it into any directory and run    │
+│  it from there; the distribution's Wine stays untouched.                   │
+│                                                                            │
+│    $ sudo tar -C /opt -xf wine-d2d1-dcomp-<version>-x86_64.tar.xz          │
+│    $ WINEPREFIX=~/.wine-d2d1 \                                             │
+│        /opt/wine-d2d1-dcomp-<version>/bin/wine winecfg                     │
+│                                                                            │
+│  A build needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, current       │
+│  Fedora and Arch) and the libraries the distribution's own Wine package    │
+│  depends on, so installing that package is the simplest way to get them.   │
+│  On Arch the audio and media libraries are only optional dependencies of   │
+│  wine:                                                                     │
+│                                                                            │
+│    $ sudo pacman -S --needed wine alsa-lib libpulse \                      │
+│        gst-plugins-base-libs opencl-icd-loader libgphoto2 \                │
+│        vulkan-icd-loader                                                   │
+│                                                                            │
+│  Release builds have no FFmpeg support, so media decoding goes through     │
+│  GStreamer. They contain Wine only: no applications, plugins or            │
+│  installers.                                                               │
+│                                                                            │
+│  PACKAGES BY OTHERS                                                        │
+│    » Fedora 44 and 45: the COPR repository patrickl/wine-staging-dev       │
+│      builds the rolling branch with the wine-staging patchsets applied on  │
+│      top. A report from this package should say so.                        │
+│    » Arch Linux and CachyOS: mklnln/wine-d2d1-dcomp installs to            │
+│      /opt/wine-d2d1. Its source package builds the current                 │
+│      d2d1-dcomp-11.0, its binary package a fixed release build; compare    │
+│      its date before relying on it.                                        │
+│  Both are maintained by their authors, independently of this repository.   │
+│                                                                            │
+│  FROM SOURCE                                                               │
+│    $ git clone https://github.com/giang17/wine.git && cd wine              │
+│    $ git checkout d2d1-dcomp-11.22                                         │
+│    $ ./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64        │
+│    $ make -j$(nproc)                                                       │
+│    $ sudo make install                                                     │
+│                                                                            │
+│  Build both architectures, with the i686-w64-mingw32 and                   │
+│  x86_64-w64-mingw32 cross compilers: 32-bit hosts and plugins load d2d1,   │
+│  dcomp and dxgi directly.                                                  │
+└────────────────────────────────────────────────────────────────────────────┘
 
-> [!IMPORTANT]
-> **This repository holds source code and nothing else.**
-> There are no releases, no binary assets and no installers here — nothing to download and
-> run. The patches are compiled locally ([Quick start](#quick-start)), and the complete
-> difference from upstream Wine can be checked before building
-> ([Verifying this fork](#verifying-this-fork)).
->
-> **No application software is distributed here.** Every DAW, application and plugin shown
-> or listed on this page runs from a purchased licence or from the vendor's own demo or
-> trial version.
->
-> **This is a private project**, published so that the work reaches the Wine community
-> instead of staying on one machine. It is not affiliated with the Wine project, WineHQ or
-> CodeWeavers, nor with Steinberg, Image-Line, Ableton or any other vendor named here; all
-> product names are used only to say what was tested.
+┌──[ before the first run ]──────────────────────────────────────────────────┐
+│    » wine.inf belongs to the install. It carries the fork's registry       │
+│      defaults, among them the HideWineVersion entries that keep JUCE       │
+│      8.0.13+ plugins on Direct2D instead of their GDI fallback. make       │
+│      install and the release builds include it; DLLs copied by hand        │
+│      without it fail silently.                                             │
+│    » Leave DXVK out of the prefix. It replaces dxgi.dll and d3d11.dll,     │
+│      where the fork's composition swapchains live. PATCHES.md describes    │
+│      the per-application switch for a machine that needs DXVK elsewhere.   │
+│    » On Wayland, keep Wine on Xwayland, the default while DISPLAY is set.  │
+│      The fork's display-driver changes are in winex11.drv;                 │
+│      winewayland.drv is unmodified.                                        │
+└────────────────────────────────────────────────────────────────────────────┘
 
-## Why this fork exists
+┌──[ which branch ]──────────────────────────────────────────────────────────┐
+│  d2d1-dcomp-11.0      base wine-11.0                                       │
+│                       Most users. Stable, maintained, the default branch   │
+│                       and the source of the release builds.                │
+│                                                                            │
+│  d2d1-dcomp-11.<N>    base newest WineHQ devel tag                         │
+│                       Rolling-release setups. Rebased onto each devel tag  │
+│                       about every two weeks; always take the highest       │
+│                       number.                                              │
+└────────────────────────────────────────────────────────────────────────────┘
 
-Windows audio software stopped drawing itself with GDI years ago. Plugin frameworks —
-JUCE 8, VSTGUI, SynthEdit/GMPI — and the DAWs that host them now put their user interface
-on **DirectComposition** visual trees rendered with **Direct2D**, text through
-**DirectWrite**, presented through **DXGI** swapchains.
+┌──[ verify ]────────────────────────────────────────────────────────────────┐
+│  A release build: the checksum, and the attestation that the archive was   │
+│  built by .github/workflows/release.yml from the commit the release        │
+│  names.                                                                    │
+│                                                                            │
+│    $ sha256sum -c --ignore-missing wine-d2d1-dcomp-<version>.sha256        │
+│    $ gh attestation verify \                                               │
+│        wine-d2d1-dcomp-<version>-x86_64.tar.xz -R giang17/wine             │
+│                                                                            │
+│  The source: the branch descends from the upstream release tag, and the    │
+│  diff against that tag is the whole fork. Fetching the tag from upstream   │
+│  fails if the one in this repository differs.                              │
+│                                                                            │
+│    $ git fetch https://github.com/wine-mirror/wine.git tag wine-11.0       │
+│    $ git merge-base --is-ancestor wine-11.0 d2d1-dcomp-11.0 \              │
+│        && echo "descends from wine-11.0"                                   │
+│    $ git diff --stat wine-11.0 d2d1-dcomp-11.0                             │
+│    $ git diff wine-11.0 d2d1-dcomp-11.0 -- configure.ac .github            │
+│                                                                            │
+│  The last command shows the files most worth reading in full: the build    │
+│  configuration, where a fork could add something that runs before any      │
+│  Wine code does, and the workflows that make the release builds. A         │
+│  rolling branch is checked the same way against its own base tag.          │
+└────────────────────────────────────────────────────────────────────────────┘
 
-Stock Wine implements very little of that. The result is not a subtle rendering
-difference: plugin windows come up black, artwork and icons are missing, GUIs flicker,
-and some applications refuse to start at all because the graphics engine they build on
-never comes up.
+┌──[ what it changes ]───────────────────────────────────────────────────────┐
+│    » Direct2D: geometry, clipping, layers, effects and the bitmap paths    │
+│      plugin GUIs use.                                                      │
+│    » DirectComposition: devices, visual trees, surfaces and composition    │
+│      swapchains, composited inside the process.                            │
+│    » DirectWrite: rendering modes, font fallback, glyph caching and        │
+│      subpixel text.                                                        │
+│    » DXGI, Direct3D 11, WineD3D: composition swapchains, fences, GL        │
+│      resource reuse.                                                       │
+│    » Windows and input: layered and composited windows, popups and         │
+│      window-manager interaction in winex11.drv, win32u and wineserver.     │
+│    » Installers and runtime: msi, signed PowerShell scripts, shell links,  │
+│      crash dumps and the other pieces applications need to install and     │
+│      start.                                                                │
+│                                                                            │
+│  The applications tested on this fork, with what each one needs:           │
+│  PATCHES.md, section Tested Applications.                                  │
+└────────────────────────────────────────────────────────────────────────────┘
 
-This fork implements the missing pieces. It adds **over 30 000 lines to stock Wine**,
-reaching into more than 40 DLLs and programs, and it is used daily for music production
-rather than kept as a proof of concept.
+┌──[ reporting problems ]────────────────────────────────────────────────────┐
+│  Open an issue with the application and plugin framework, the output of    │
+│  wine --version, and whether Wine came from a release build, a package or  │
+│  an own build. A plugin GUI that stays black or looks like GDI is most     │
+│  often a host without its HideWineVersion entry; PATCHES.md explains the   │
+│  switch.                                                                   │
+└────────────────────────────────────────────────────────────────────────────┘
 
-The other part of the work fixes code that stock Wine already has: an endless loop in d2d1's
-Bézier handling that left Studio Pro 8 spinning at 100 % CPU after quitting, a crash in
-msi's feature costing that stopped the Cubase 13 installer before its first dialog, a lost
-wake-up in ntdll's address waits that stalled other threads for up to five seconds. Such fixes
-help every Windows application that reaches the same code, not only the ones listed here;
-seven fixes from this fork are already merged into upstream Wine.
+┌──[ upstream ]──────────────────────────────────────────────────────────────┐
+│  This is a fork of wine-mirror/wine, not a replacement for it, and a       │
+│  private project without affiliation to the Wine project, WineHQ,          │
+│  CodeWeavers or any software vendor. Wine's Clean-Room Guidelines do not   │
+│  accept LLM-generated code; the fork is developed with LLM assistance, so  │
+│  no merge requests go to WineHQ while that rule stands. Several earlier    │
+│  fixes from the fork are part of upstream Wine. Upstream's own README is   │
+│  kept as README.wine.                                                      │
+└────────────────────────────────────────────────────────────────────────────┘
 
+┌──[ credits ]───────────────────────────────────────────────────────────────┐
+│    » Subpixel text rendering: Cade (@shibco), shibco/ableton-linux pull    │
+│      request 155, reviewed there by @ClickSentinel                         │
+│    » --enable-archs packaging form for Bottles: @jibeape                   │
+└────────────────────────────────────────────────────────────────────────────┘
+
+┌──[ links ]─────────────────────────────────────────────────────────────────┐
+│  » releases                                                                │
+│      https://github.com/giang17/wine/releases                              │
+│  » patches                                                                 │
+│      https://github.com/giang17/wine/blob/d2d1-dcomp-11.0/PATCHES.md       │
+│  » issues                                                                  │
+│      https://github.com/giang17/wine/issues                                │
+│  » fedora copr                                                             │
+│      https://copr.fedorainfracloud.org/coprs/patrickl/wine-staging-dev/    │
+│  » arch pkgbuilds                                                          │
+│      https://github.com/mklnln/wine-d2d1-dcomp                             │
+│  » clean room                                                              │
+│      https://gitlab.winehq.org/wine/wine/-/wikis/Clean-Room-Guidelines     │
+└────────────────────────────────────────────────────────────────────────────┘
+
+                      ─────  giang17/wine  ·  GNU LGPL  ·  2026  ─────
 ```
-d2d1 · dcomp · dwrite · dxgi · d3d11 · wined3d · winex11.drv · win32u · uianimation
-dwmapi · ntdll · ole32 · msi · crypt32 · comdlg32 · shell32 · advapi32 · wintrust
-pwrshsip (new) · powershell.exe · winemenubuilder.exe · and more than twenty others
-```
-
-## What it looks like
-
-<table>
-<tr>
-<td width="240" align="center" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/nuendo15-crone-video.png" width="200" alt="Nuendo 15 with the demo project The Crone and its ProRes clip in the video player">
-</td>
-<td valign="top">
-  <b>Nuendo 15.0.30</b> (DComp + D2D1 + DirectWrite, as Cubase) — the demo project "The Crone" in playback: the video track with its thumbnails, the floating video player with the 10-bit ProRes 422 clip, the loudness curve, Foley tracks with automation lanes and the master meter in the right zone. The video player needs the d2d1 bitmap-format table from this fork; without <code>R10G10B10A2_UNORM</code> in <code>IsDxgiFormatSupported</code> it stays black.
-</td>
-</tr>
-<tr>
-<td width="240" align="center" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/cubase15-pro-mixconsole.png" width="200" alt="Cubase Pro 15 running on this fork">
-</td>
-<td valign="top">
-  <b>Cubase Pro 15.0.30</b> (DComp + D2D1 + DirectWrite) — the Cubase 14 demo project in playback: the arrangement, the MixConsole in the lower zone with live meters and the MediaBay on the right.
-</td>
-</tr>
-<tr>
-<td width="240" align="center" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/steinberg-tools-collage.png" width="200" alt="Steinberg Download Assistant, Activation Manager and Library Manager running on this fork">
-</td>
-<td valign="top">
-  <b>Steinberg's own tools</b> — the Download Assistant with Cubase Pro 15.0.30 and its content packages, the Activation Manager 1.9 with activated licences, and the Library Manager with 47 libraries (96.32 GB). Content updates in the Library Manager need the shell32 <code>IFileOperation::DeleteItem</code> implementation from this fork; with the stub a content update never completes.
-</td>
-</tr>
-<tr>
-<td width="240" align="center" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/serum2-fl-studio.png" width="200" alt="Serum 2 in FL Studio">
-</td>
-<td valign="top">
-  <b>Serum 2</b> (VSTGUI + DirectComposition) in FL Studio 2026 — three wavetable oscillators with their wavetable views, the filter response, the envelope, the Rössler chaos LFO and the arpeggiator all render.
-</td>
-</tr>
-<tr>
-<td width="240" align="center" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/studio-pro-8-video-splice.png" width="200" alt="Fender Studio Pro 8 with the video player and the Splice panel">
-</td>
-<td valign="top">
-  <b>Fender Studio Pro 8</b> (CCL: DXGI + DirectWrite + DComp) — the demo song in playback: arranger sections and the video track in the song view, the floating video player, the console with live meters and the Splice panel docked on the right. Without the <code>UIAnimationManager2</code> implementation from this fork it does not start at all.
-</td>
-</tr>
-<tr>
-<td width="240" align="center" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/fl-cloud-plugins.png" width="200" alt="FL Cloud plugin store in FL Studio">
-</td>
-<td valign="top">
-  <b>FL Cloud</b> in FL Studio — the plugin store browses with its artwork, products show as installed, and a download runs in place. Installing from it needs the AF_UNIX fixes from this fork.
-</td>
-</tr>
-<tr>
-<td width="240" align="center" valign="top">
-  <img src="https://raw.githubusercontent.com/giang17/wine/assets/readme-screenshots/eprom-fl-studio.png" width="200" alt="EPROM Memory Rites in FL Studio">
-</td>
-<td valign="top">
-  <b>EPROM — Memory Rites</b> (JUCE 8.0.13) in FL Studio 2026 — the preset header, the macro knobs, the artwork panel and the pad row render through JUCE; the splash and login screen before them go through WebView2.
-</td>
-</tr>
-</table>
-
-## Quick start
-
-```bash
-git clone https://github.com/giang17/wine.git
-cd wine
-git checkout d2d1-dcomp-11.22    # this branch; d2d1-dcomp-11.0 is the stable one
-./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64
-make -j$(nproc)
-sudo make install
-```
-
-Use a separate `--prefix` so your distribution's Wine stays untouched. Build **both**
-architectures: 32-bit hosts and plugins load `d2d1`, `dcomp` and `dxgi` directly, and a
-stale 32-bit half keeps running old code without anything visibly failing. This needs the
-`i686-w64-mingw32` cross compiler next to the x86_64 one.
-
-Three things are worth knowing before the first run, the first two explained in
-[PATCHES.md](PATCHES.md):
-
-- **`wine.inf` is part of the install.** It carries this fork's registry defaults,
-  including the `HideWineVersion` entries that keep JUCE 8.0.13+ plugins on the Direct2D
-  path instead of its Wine-detecting GDI fallback. Copying DLLs by hand without it fails
-  silently — the plugins simply keep rendering with GDI.
-- **Leave DXVK out of the prefix.** It replaces `dxgi.dll` and `d3d11.dll` there, and this
-  fork's composition-swapchain and DComp popup handling live in `dxgi` — an application
-  that uses them then runs on DXVK's stack instead. Nothing here needs it, and it brought
-  no speed-up in the setup this fork is developed on. If DXVK is needed for something else
-  on the same machine, PATCHES.md has the per-application switch; the whole trio
-  `d3d11,dxgi,d3d10core` has to move together.
-- **On a Wayland desktop, keep Wine on Xwayland.** That is Wine's default as long as
-  `DISPLAY` is set (driver order `mac,x11,wayland`). Together with the previous point this
-  is the configuration the fork is developed and tested in: winex11 with Wine's own
-  Direct3D. Every display-driver change of the fork is in `winex11.drv`, while
-  `winewayland.drv` is unmodified. Starting with `DISPLAY` unset selects Wine's own Wayland
-  driver, on Plasma recognisable by Wine-drawn blue title bars, and the fork's driver-level
-  fixes do not apply there. In a short test on Plasma 6, Serum 2's drag image came out
-  black, WebView2 content embedded from another process (FL Cloud) stayed black, and
-  rendering was noticeably slower.
-
-Details, tuning and font setup: **[PATCHES.md](PATCHES.md)**. Steinberg Cubase 15,
-Nuendo 15 and Dorico 6, from the Download Assistant to a running project:
-**[documentation/steinberg-setup-guide.md](documentation/steinberg-setup-guide.md)**.
-
-### Prebuilt package for Fedora
-
-Patrick packages this fork for Fedora in the COPR repository
-[patrickl/wine-staging-dev](https://copr.fedorainfracloud.org/coprs/patrickl/wine-staging-dev/),
-built from the spec at [codeberg.org/MusicProduction/wine](https://codeberg.org/MusicProduction/wine).
-Two differences from a build of this repository are worth knowing:
-
-- **It follows the rolling branch**, not `d2d1-dcomp-11.0`, and is synced with it as new
-  commits land, so it can lag behind the newest devel tag.
-- **It is built on wine-staging.** The fork's stack is applied first and the staging
-  patchsets on top of it, without the nine that change the same files as this fork:
-  DirectComposition, AF_UNIX, two wined3d sets, `ntdll-Hide_Wine_Exports`,
-  `user32-recursive-activation`, `winex11-Window_Style`,
-  `sapi-ISpObjectToken-CreateInstance` and `kernel32-CopyFileEx`. For
-  `user32-recursive-activation`, which edits the same `set_active_window()` this fork
-  changes, the fork carries its own version of the fix (Wine bug 46274). The last three
-  have no counterpart in this fork, so three staging fixes are missing from the package:
-  the window attributes of layered windows that are also `WS_EX_COMPOSITED` (Wine bug
-  37876), `ISpObjectToken::CreateInstance()` for `ISpAudio` (Wine bug 49641), and the
-  progress callback of `CopyFileEx()`, through which an application follows or cancels a
-  copy (Wine bugs 22692 and 22690). A report from this package should say so.
-
-The same repository carries yabridge, yabridge-tui, pipewire-wineasio, pipeasio, winetricks
-and wine-mono. Builds are for Fedora 44 and Fedora 45, x86_64.
-
-### Packages for Arch Linux and CachyOS
-
-[mklnln/wine-d2d1-dcomp](https://github.com/mklnln/wine-d2d1-dcomp) provides PKGBUILDs
-that install this fork to `/opt/wine-d2d1` next to the system Wine, together with a
-`WINELOADER` dispatcher for yabridge that routes only selected prefixes to the patched
-build. The packages are maintained by their author, independently of this repository, and
-are not on the AUR; they are installed from that repository.
-
-- **The source package (`PKGBUILD`)** builds the current `d2d1-dcomp-11.0` at build time.
-  Rebuilding it picks up new fixes.
-- **The prebuilt package (`PKGBUILD-bin`)** installs a fixed release build. Compare its
-  release date with this branch before relying on it, and prefer the source package for
-  current fixes. A report from either package should include the output of `wine --version`.
-
-## Verifying this fork
-
-GitHub records this repository as a fork of
-[wine-mirror/wine](https://github.com/wine-mirror/wine), so nothing here has to be taken on
-trust: the full history is checkable against the upstream release it was built on. Upstream
-supplies the base tag, so add it as a remote first — this repository carries only the
-tags up to `wine-11.5`.
-
-```bash
-git remote add upstream https://github.com/wine-mirror/wine.git
-git fetch upstream --tags
-
-# BASE is the branch's base tag: wine-11.0 for d2d1-dcomp-11.0,
-# the matching wine-11.<N> for a rolling branch.
-BASE=wine-11.0
-
-# Does this branch descend from the released tag, or from a rewritten history?
-git merge-base --is-ancestor $BASE HEAD && echo "descends from $BASE"
-
-# Every commit added on top of it, and the complete diff
-git log --oneline $BASE..HEAD
-git diff --stat $BASE..HEAD
-```
-
-That diff is the whole of what this fork adds, and this command sorts it by area, so the
-shape is visible without reading it line by line:
-
-```bash
-git diff --name-only $BASE..HEAD | cut -d/ -f1 | sort | uniq -c | sort -rn
-```
-
-On `d2d1-dcomp-11.0` the weight sits in `dlls/`, followed by `include/` and `scripts/`,
-then `programs/` and `server/`, with single files for the loader's `wine.inf.in`, the font
-setup guide, `.gitignore` and the documents at the top level.
-
-The only remaining entries are `configure` and `configure.ac`, and those are worth reading
-in full, because the build system is where a fork could hide something that runs before any
-of the code does:
-
-```bash
-git diff $BASE..HEAD -- configure.ac
-```
-
-On `d2d1-dcomp-11.0` it holds three changes and no more: detection for the X Damage
-extension, two `WINE_CONFIG_MAKEFILE` lines for the modules this fork adds (`pwrshsip` and
-`windows.security.authentication.web.core`), and a `--match 'wine-*'` argument on the
-`git describe` call that stamps the version string, so that a working or backup tag closer
-to HEAD than the release tag cannot end up in a built binary's reported version. The
-generated `configure` mirrors those same three and nothing else.
-
-Rolling branches are rebased onto each new devel tag rather than merged, so their history
-is rewritten by design; the same check against the newer `BASE` applies to each of them.
-
-## Which branch?
-
-| Branch | Base | For whom |
-|---|---|---|
-| **`d2d1-dcomp-11.0`** | `wine-11.0` stable | **Most users.** The full stack on the stable release, actively maintained. This is the default branch. |
-| **`d2d1-dcomp-11.<N>`** | newest WineHQ devel tag | **Rolling-release users** (`wine-tkg-dev` and similar). The same stack rebased onto the newest devel tag roughly every two weeks. Always take the **highest-numbered** `d2d1-dcomp-11.*` branch; lower numbers are superseded snapshots. Plugin-tested before each push. |
-| `d2d1-v6` | `wine-11.0` | **Deprecated** since 2026-05-03. The original upstream-targeted D2D1-only series, kept for reference. |
-
-## Tested applications
-
-Everything below is exercised on this fork, not inferred from code. The long form — what
-exactly each one needs, and what breaks without it — is in
-[PATCHES.md](PATCHES.md#tested-applications).
-
-| Application | Framework | Status |
-|---|---|---|
-| **Steinberg Cubase Pro 15.0.30** | Custom (DComp + D2D1 + DirectWrite), WebView2 Hub | Installs through Steinberg's own bootstrapper and runs: project window, MixConsole with live meters, Hub. Installing needs the `msi` feature-cost fix (the setup crashed before its first dialog) and the Script SIP for signed PowerShell — without `pwrshsip`/`wintrust` the installer stops at "preinstall.ps1 … not trusted". Starting needs the `Windows.Globalization.Calendar` runtime class, without which `headtracking.dll` aborts behind the licence splash, and the `comdlg32` folder-dialog fix, without which the Hub reports the project folder as read-only. The window itself needs the dcomp virtual-surface resize and child-surface readback work — and the d2d1 WIC target fix, without which the MixConsole level meters stay empty |
-| **Steinberg Nuendo 15.0.30** | Custom (as Cubase) | The Ambisonics Mixing and Audio Post Production templates and the demo project "The Crone" open and play; the Ambisonics template brings up the MixConsole with the 3OA bus and the VST MultiPanner. The ProRes 422 demo clip (10-bit, decoded by Steinberg's own `VideoCodec-Apple-ProRes.dll`) plays in the video player, which needs the d2d1 bitmap-format table from this fork — without `R10G10B10A2_UNORM` in `IsDxgiFormatSupported` the engine never builds its 10-bit upload path and the player stays black. Needs the `ucrtbase` complex-math functions from this fork — without them the template aborts while the MultiPanner loads |
-| **Steinberg Groove Agent 5 / Groove Agent SE 6**, **HALion 7**, **Dorico 5**, **The Grand 3** | Steinberg framework (DComp + D2D1 + DXGI); Dorico: Qt 6.5 | Run as standalone applications. Groove Agent 5 needs the DXGI tooltip-popup and `Present1` scroll-rectangle fixes — without them its tooltips turn black and scrolling the kit list leaves stale thumbnails. The Grand 3 needs the dcomp restore of a surface-root frame lost before `ShowWindow`, without which its toolbar stays black until hovered. The Anima 3D wavetable view needs offscreen rendering for hidden top-level windows (measured in HALion Sonic 7). Desktop and start-menu shortcuts of the MSI-installed applications need the shell32 long-path fix, without which The Grand 3 reports "Skin file skins/skin.srf not found" |
-| **Serum 2** (VST3 in Reaper) | VSTGUI + DComp | Fully functional — all waveform views, envelopes, presets, per-pixel-alpha drag bitmaps |
-| **Korg Trinity / Prophecy** (VST3) | JUCE 8.0.13 / 8.0.12 + DComp | Fully functional on the DComp path |
-| **Pianoteq 9** (standalone + VST3) | JUCE 8.0.10 + DComp | Fully functional |
-| **Ableton Live 12** (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — decorations, move/resize, fullscreen, Splice view |
-| **VirtualDJ 2026** | Custom skin engine (D3D11 flip-model swapchains) | Runs — decks, browser, skin relayout while the window is being resized. Needs the wined3d GL present for flip-model swapchains without a BGR back buffer, without which both windows stay black, and the wined3d shared between the DXGI factories, without which the skin re-lays out only seconds after a resize |
-| **FL Studio 2026** | Custom | Runs without xruns at 64 samples / 48 kHz; Cloud plugins install and stream |
-| **Fender Studio Pro 8** | CCL (DXGI + DWrite + DComp) | Fully functional — needs the `UIAnimationManager2` implementation to start at all |
-| **EPROM — Memory Rites**, **Minimal Audio Current / Evoke / Lucid** (VST3) | JUCE 8.0.13 (+ WebView2) | Fully functional with the `HideWineVersion` entry |
-| **Native Access 3.25.2**, **Kontakt 8 Player** | Electron/Chromium, InstallAware/MSI | Install, sign in and run — need the `powershell` and `msi` fixes from this fork |
-| **VProm3** (VST3) | SynthEdit/GMPI + D2D1 | Fully functional, correct colours (needs the Color Management effect) |
-| **SynthEdit 1.5** | Custom engine (D2D1 + winex11 client surfaces) | Fully functional — the MDI canvas draws completely and stays stable through menus, resizes and moves |
-| **UVI Portal**, **Minimal Hub** | WebView2, Tauri v2 | Install, sign in and update products; Minimal Hub needs the schannel `DecryptMessage` fix for incomplete messages, which this branch carries — without it its `oauth/token` request stops after a partial response and the app waits forever |
-
-## What the fork changes
-
-One line per area; [PATCHES.md](PATCHES.md) has the reasoning, the measurements and the
-switches for each.
-
-- **D2D1** — geometry pipeline (arcs, constrained Delaunay triangulation, miter limits,
-  shader antialiasing, correct stroke joins, cubic Bézier subdivision), PushLayer stencil
-  clipping, layers on opaque targets, Color Management effect and sRGB formats for
-  SynthEdit/GMPI, Gaussian blur, bitmap-brush WRAP/MIRROR, line batching (Serum 2's
-  wavetable view: 1 060 ms → about 80 ms)
-- **DComp** — `IDCompositionDesktopDevice` with a D2D1 bitmap rendering path, dirty-rect
-  clipping, `IDCompositionDevice3/4/5`, composition and dynamic textures, D3D11 BeginDraw,
-  rootless visual trees composited at ~60 Hz, cross-process targets, backdrop capture, and
-  leaf visuals composited into the frame instead of blitted after it (Studio Pro's
-  playhead: missing in 14.9 % of frames before, 0.0 % after)
-- **DirectWrite** — `NATURAL_SYMMETRIC` rendering mode, `IDWriteFontSet::GetMatchingFonts`,
-  font fallback for Miscellaneous Symbols and Geometric Shapes, a glyph cache that
-  outlives the fontface (a 25 s resize re-rasterised 196 distinct glyphs 111 598 times
-  before), and ClearType-style subpixel text
-- **DXGI / D3D11 / WineD3D** — composition swapchains, FLIP_SEQUENTIAL preservation, DComp
-  popup handling, monitored fences, `ID3D11Fence` with CPU timeline semantics, GL buffer
-  recycling (70 % RSS reduction), GL present for top-level windows
-- **winex11 / dwmapi / win32u** — DComp window support, per-pixel alpha for GPU-painted
-  layered windows, correct handling of ownerless tool-window popups (sticky, wrongly
-  decorated plugin menus on KDE), no black expose flash while a client window renders
-  offscreen
-- **Everything an installer needs** — `msi` string pool and feature cost, Script SIP for
-  signed PowerShell (`pwrshsip`, `wintrust`, `msisip`), a usable `powershell.exe`,
-  `IShellLink::GetPath` short paths, `MiniDumpWriteDump` module lists.
-  Unglamorous, but it is the difference between an application that installs and one that
-  does not
-
-## Running in the wild
-
-Independent reports in this repository's issue tracker cover three GPU vendors — NVIDIA,
-AMD (RADV) and Intel integrated graphics — Arch/CachyOS installations, Hyprland on Wayland
-next to X11 sessions, and Bitwig hosting plugins through yabridge as well as standalone
-applications.
-
-One of them ([#5](https://github.com/giang17/wine/issues/5)) is worth reading as a
-comparison: for that application stock Wine 11.12 produced a 1×1 black window, three DXVK
-versions each aborted during graphics initialisation, and this fork's builtin
-`dxgi`/`d3d11` brought up a working, responsive GUI. Another
-([#3](https://github.com/giang17/wine/issues/3)) runs JUCE 8 plugins on an Intel iGPU with
-no discrete GPU at all.
-
-The fork is also the base of [shibco/ableton-linux](https://github.com/shibco/ableton-linux),
-which builds Ableton Live 12 production setups on top of it.
-
-## Relationship to upstream Wine
-
-This is a fork of [wine-mirror/wine](https://github.com/wine-mirror/wine), not a
-replacement for it. Its fixes stay here: Wine's
-[Clean-Room Guidelines](https://gitlab.winehq.org/wine/wine/-/wikis/Clean-Room-Guidelines) do
-not accept LLM-generated code, the fork is developed with LLM assistance, and no merge
-requests are submitted to WineHQ while that rule stands. Several earlier fixes were merged
-upstream. The large DirectComposition and Direct2D work is rebased onto every devel tag and
-tested against real plugins every two weeks.
-
-The upstream Wine README — build requirements, configuration, documentation, where to get
-support for Wine itself — is kept unchanged as **[README.wine](README.wine)**.
-
-## Problems, questions, contributions
-
-Open an [issue](https://github.com/giang17/wine/issues). For a rendering problem the two
-most useful things are the application and plugin framework involved, and whether the
-`HideWineVersion` entry applies to your host — with JUCE 8.0.13 and newer that one
-switch decides whether the plugin renders with Direct2D or falls back to GDI, and the GDI
-fallback is what a "the GUI is black" report usually turns out to be.
-
-## Credits
-
-- Subpixel text rendering: Cade ([@shibco](https://github.com/shibco)),
-  `shibco/ableton-linux` pull request 155, reviewed there by @ClickSentinel
-- `--enable-archs` packaging form for Bottles: @jibeape
-- Related discussion: [yabridge#413](https://github.com/robbert-vdh/yabridge/issues/413)
-
-## License
-
-Same as Wine — GNU LGPL. See [LICENSE](LICENSE).
