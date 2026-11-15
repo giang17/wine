@@ -762,6 +762,16 @@ This is the recommended branch. What it changes, by subsystem:
   same exit code and the same tree afterwards (names, sizes, attributes, write times) as
   robocopy on Windows 10 22H2, with the 64-bit and the 32-bit program; the console output is
   English and follows robocopy's layout without being byte-identical (issues 597, 598)
+- **ntdll / kernelbase / wineserver**: the hidden and system attributes of a file stay where
+  Windows keeps them. `SetFileTime()` (`FileBasicInformation` with `FileAttributes` 0, which
+  means "unchanged") removed them and made a read-only file writable; `CopyFile()` dropped
+  them from the copy; together with read-only they were never stored, because the extended
+  attribute `user.DOSATTRIB` cannot be written to a file without write permission; and a
+  read-only file could not be opened with `FILE_WRITE_ATTRIBUTES` (`ERROR_ACCESS_DENIED`),
+  so `SetFileTime()` on it failed. wine-stable 11.0 gives the same results as the fork did.
+  A test program with 33 cases gives the result of Windows 10 22H2 in 32 of them (before:
+  14), 64- and 32-bit. Not changed: `CopyFile()` over a hidden file from a source that is
+  not hidden succeeds, Windows refuses it with `ERROR_ACCESS_DENIED` (issue 600)
 - **ntdll**: MADV_FREE for MEM_RESET (improved page reclaim behaviour)
 - **ntdll**: the heap enabled the LFH frontend only for size classes up to 1K; blocks between
   1K and 16K stayed in the backend heap, whose free path writes the free-list links over the
