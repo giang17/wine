@@ -15018,6 +15018,7 @@ static void test_afunix(void)
 {
     SOCKET listener, client, server = 0;
     SOCKADDR_UN addr = { AF_UNIX, "test_afunix.sock" };
+    SOCKADDR_UN nodirAddr = { AF_UNIX, "test_afunix_nodir\\test.sock" };
     char serverBuf[] = "ws2_32/AF_UNIX socket test";
     char clientBuf[sizeof(serverBuf)] = { 0 };
     char path[MAX_PATH];
@@ -15150,6 +15151,30 @@ static void test_afunix(void)
     ok(ret, "DeleteFileA on socket file failed: %lu\n", GetLastError());
     ok(GetFileAttributesA(addr.sun_path) == INVALID_FILE_ATTRIBUTES,
         "%s still exists\n", debugstr_a(addr.sun_path));
+
+    /* Connect to a path without a socket file, blocking and nonblocking */
+    client = socket(AF_UNIX, SOCK_STREAM, 0);
+    ok(client != INVALID_SOCKET, "Could not create Unix socket: %lu\n", GetLastError());
+    ret = connect(client, (SOCKADDR *)&addr, sizeof(addr));
+    ok(ret == SOCKET_ERROR, "connect() to a missing path succeeded\n");
+    ok(GetLastError() == WSAECONNREFUSED, "wrong error %lu\n", GetLastError());
+    closesocket(client);
+    client = socket(AF_UNIX, SOCK_STREAM, 0);
+    ok(client != INVALID_SOCKET, "Could not create Unix socket: %lu\n", GetLastError());
+    ret = ioctlsocket(client, FIONBIO, &one);
+    ok(!ret, "Could not set AF_UNIX socket to nonblocking: %lu\n", GetLastError());
+    ret = connect(client, (SOCKADDR *)&addr, sizeof(addr));
+    ok(ret == SOCKET_ERROR, "connect() to a missing path succeeded\n");
+    ok(GetLastError() == WSAECONNREFUSED, "wrong error %lu\n", GetLastError());
+    closesocket(client);
+
+    /* Connect to a path whose directory does not exist */
+    client = socket(AF_UNIX, SOCK_STREAM, 0);
+    ok(client != INVALID_SOCKET, "Could not create Unix socket: %lu\n", GetLastError());
+    ret = connect(client, (SOCKADDR *)&nodirAddr, sizeof(nodirAddr));
+    ok(ret == SOCKET_ERROR, "connect() below a missing directory succeeded\n");
+    ok(GetLastError() == WSAENETDOWN, "wrong error %lu\n", GetLastError());
+    closesocket(client);
 
     /* Test different path types (relative, NT, etc.) */
     test_afunix_path( addr.sun_path );

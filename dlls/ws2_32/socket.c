@@ -1446,7 +1446,11 @@ int WINAPI connect( SOCKET s, const struct sockaddr *addr, int len )
         unix_path = wine_get_unix_file_name(sun_pathW);
         free(sun_pathW);
         if (!unix_path)
+        {
+            /* the directory of the path does not exist; Windows fails with WSAENETDOWN */
+            SetLastError(WSAENETDOWN);
             return SOCKET_ERROR;
+        }
         unix_varargs_size = strlen(unix_path);
     }
 
