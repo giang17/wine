@@ -5805,7 +5805,7 @@ static void test_address_list_sort(void)
     char in_buffer[FIELD_OFFSET(SOCKET_ADDRESS_LIST, Address[4])], out_buffer[sizeof(in_buffer)];
     SOCKET_ADDRESS_LIST *in = (SOCKET_ADDRESS_LIST *)in_buffer, *out = (SOCKET_ADDRESS_LIST *)out_buffer;
     SOCKADDR_IN6 addrs[4] = {{0}}, *sorted;
-    unsigned int i, j, found, pos_v4_loopback = ~0u, pos_v4_testnet = ~0u;
+    unsigned int i, j, found, pos_v4_loopback = ~0u;
     char str[64];
     DWORD size;
     SOCKET s;
@@ -5865,7 +5865,6 @@ static void test_address_list_sort(void)
             if (!memcmp(&sorted->sin6_addr, &addrs[j].sin6_addr, sizeof(IN6_ADDR))) found++;
         ok(found == 1, "Address %u is not one of the input addresses.\n", i);
         if (!memcmp(&sorted->sin6_addr, &v4_loopback, sizeof(IN6_ADDR))) pos_v4_loopback = i;
-        if (!memcmp(&sorted->sin6_addr, &v4_testnet, sizeof(IN6_ADDR))) pos_v4_testnet = i;
         trace("%u: %s\n", i, inet_ntop(AF_INET6, &sorted->sin6_addr, str, sizeof(str)));
     }
 
@@ -5873,11 +5872,10 @@ static void test_address_list_sort(void)
     sorted = (SOCKADDR_IN6 *)out->Address[0].lpSockaddr;
     ok(!memcmp(&sorted->sin6_addr, &loopback, sizeof(IN6_ADDR)), "Expected ::1 first, got %s.\n",
        inet_ntop(AF_INET6, &sorted->sin6_addr, str, sizeof(str)));
-    /* same precedence and label, but link-local scope sorts before global scope (rule 8) */
+    /* The IPv4 loopback is always kept. Its place relative to a global IPv4 address depends on
+     * the network: Windows 10 sorts a reachable global address first and the loopback first
+     * only when there is no route. */
     ok(pos_v4_loopback != ~0u, "::ffff:127.0.0.1 was dropped.\n");
-    if (pos_v4_testnet != ~0u)
-        ok(pos_v4_loopback < pos_v4_testnet, "Expected ::ffff:127.0.0.1 (%u) before ::ffff:192.0.2.1 (%u).\n",
-           pos_v4_loopback, pos_v4_testnet);
 
     /* sorting in place gives the same result */
     size = 0xdeadbeef;
