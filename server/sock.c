@@ -2906,6 +2906,10 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
             }
         }
 
+        /* Linux fails a connect to a path without a file with ENOENT; Windows refuses the connection. */
+        if (ret < 0 && errno == ENOENT && sock->family == WS_AF_UNIX)
+            errno = ECONNREFUSED;
+
         if (sock->family == WS_AF_UNIX && *addr->sa_data)
             fchdir(server_dir_fd);
 
