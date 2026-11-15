@@ -2104,7 +2104,10 @@ This is the recommended branch. What it changes, by subsystem:
   reparse point by GetFileAttributes and can be opened and queried through CreateFile with
   FSCTL_GET_REPARSE_POINT, and an address carrying only the family (namelen 2) is accepted
   and leaves the socket unnamed, as measured on Windows. With these the ws2_32 AF_UNIX
-  conformance tests run at all (upstream they skip) and pass. Needed by applications that talk to a local helper over a Unix socket;
+  conformance tests run at all (upstream they skip) and pass. A connect to a path without a
+  socket file fails with WSAECONNREFUSED and one below a missing directory with WSAENETDOWN,
+  blocking and nonblocking, as measured on Windows 10 22H2 (before: WSAEINVAL and error 2;
+  FL Cloud Plugins probes its install helper this way and logged error 10022). Needed by applications that talk to a local helper over a Unix socket;
   FL Studio's Cloud plugins install normally instead of spinning on a socket that never
   appears
 - **WebSocket Protocol Component (websocket)**: `websocket.dll` implements the client and
