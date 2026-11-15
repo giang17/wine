@@ -767,8 +767,12 @@ BOOL WINAPI IsValidDpiAwarenessContext( DPI_AWARENESS_CONTEXT context )
  */
 BOOL WINAPI SetProcessDPIAware(void)
 {
+    DWORD err = GetLastError();
+
     TRACE("\n");
-    NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_SYSTEM_AWARE, 0 );
+    /* once the process awareness is set this fails with ERROR_ACCESS_DENIED; the call still
+     * succeeds, and Windows leaves the last error alone */
+    if (!NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_SYSTEM_AWARE, 0 )) SetLastError( err );
     return TRUE;
 }
 

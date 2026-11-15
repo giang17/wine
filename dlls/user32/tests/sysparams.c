@@ -3975,6 +3975,14 @@ static void test_SetProcessDpiAwarenessContext( ULONG arg )
         ok( ctx == expect_ctx, "got %p\n", ctx );
     }
 
+    /* SetProcessDPIAware() succeeds without changing the context or the last error */
+    SetLastError( 0xdeadbeef );
+    ret = pSetProcessDPIAware();
+    ok( ret, "SetProcessDPIAware failed\n" );
+    ok( GetLastError() == 0xdeadbeef, "got %#lx\n", GetLastError() );
+    ctx = pGetThreadDpiAwarenessContext();
+    ok( ctx == expect_ctx, "got %p\n", ctx );
+
     /* thread DPI context overrides process DPI context */
     ctx = pGetThreadDpiAwarenessContext();
     ok( ctx == expect_ctx, "got %p\n", ctx );
