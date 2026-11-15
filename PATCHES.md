@@ -1954,7 +1954,9 @@ This is the recommended branch. What it changes, by subsystem:
 - **ws2_32**: `SIO_ADDRESS_LIST_SORT` was undefined and every call got WSAEOPNOTSUPP;
   Chromium issues it for every resolution that returns an IPv6 address and discards the
   result on failure (FL Studio 2026's WebView2 hit it 35 times in 18 minutes). Addresses
-  are sorted per RFC 6724 §6 with the default policy table
+  are sorted per RFC 6724 §6 with the default policy table. Known difference: with a
+  reachable IPv4 network Windows 10 22H2 sorts a global IPv4 address before 127.0.0.1, the
+  fork sorts the loopback first (rule 8); the test no longer asserts that order (issue 603)
 - **iphlpapi**: `GetAdaptersInfo()` reported one `IP_ADDR_STRING` more than needed for
   every IPv4 address of the host, loopback's included. Windows 10 reports the adapters
   times `sizeof(IP_ADAPTER_INFO)` plus one `IP_ADDR_STRING` only for each address of an
