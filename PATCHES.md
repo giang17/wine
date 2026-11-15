@@ -768,7 +768,8 @@ This is the recommended branch. What it changes, by subsystem:
   them from the copy; together with read-only they were never stored, because the extended
   attribute `user.DOSATTRIB` cannot be written to a file without write permission; and a
   read-only file could not be opened with `FILE_WRITE_ATTRIBUTES` (`ERROR_ACCESS_DENIED`),
-  so `SetFileTime()` on it failed. wine-stable 11.0 gives the same results as the fork did.
+  so `SetFileTime()` on it failed. wine-stable 11.0 gives the same results as the fork did;
+  upstream solved the last point in Wine 11.22 (`1a796c367ca`), the other three are open there.
   A test program with 33 cases gives the result of Windows 10 22H2 in 32 of them (before:
   14), 64- and 32-bit. Not changed: `CopyFile()` over a hidden file from a source that is
   not hidden succeeds, Windows refuses it with `ERROR_ACCESS_DENIED` (issue 600)
