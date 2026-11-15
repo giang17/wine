@@ -6129,7 +6129,9 @@ void sysparams_init(void)
 
     if (app_compat_flags)
     {
-        if (strstr( app_compat_flags, "HIGHDPIAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_SYSTEM_AWARE, 0 );
+        /* the "Application" choice of the high DPI override on Windows 10; the process is
+         * per monitor aware (version 1), not system aware */
+        if (strstr( app_compat_flags, "HIGHDPIAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_PER_MONITOR_AWARE, 0 );
         if (strstr( app_compat_flags, "DPIUNAWARE" )) NtUserSetProcessDpiAwarenessContext( NTUSER_DPI_UNAWARE, 0 );
     }
     free( app_compat_flags );
