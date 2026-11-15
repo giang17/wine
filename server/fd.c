@@ -1983,6 +1983,13 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
                 fd->unix_fd = open( name, O_RDONLY | (flags & ~(O_TRUNC | O_CREAT | O_EXCL)), *mode );
         }
 
+        /* The attributes and times of a read-only file can be written: retry read-only
+         * if no data is going to be written. The owner can change both through such a
+         * file descriptor. */
+        if (errno == EACCES && rw_mode != O_RDONLY && !(flags & (O_CREAT | O_TRUNC))
+            && !(access & (FILE_WRITE_DATA | FILE_APPEND_DATA)))
+            fd->unix_fd = open( name, O_RDONLY | flags, *mode );
+
         /* POSIX requires that open(2) throws EOPNOTSUPP when `path` is a Unix
          * socket. *BSD throws EOPNOTSUPP in this case and the additional case of
          * O_SHLOCK or O_EXLOCK being passed when `path` resides on a filesystem
