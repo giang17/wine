@@ -44,7 +44,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(powershell);
  * the -f format operator -- by writing the value to stdout the way
  * PowerShell 5.1 formats it.  Applications check the version before they use
  * PowerShell at all.  A script that only produces values succeeds only if
- * every statement in it was understood. */
+ * every statement in it was understood.
+ *
+ * And it answers the size of a directory tree, which applications ask for as
+ * "Get-ChildItem -Recurse <path> | Measure-Object -Sum Length |
+ * Select-Object -ExpandProperty Sum" (usually with the aliases ls, measure
+ * and select), also as "(... | measure -s Length).Sum". */
 
 /* The PowerShell that ships with Windows 10 22H2 (19045.6456). */
 static const LONG ps_version[4] = { 5, 1, 19041, 6456 };
@@ -56,7 +61,9 @@ struct script
     DWORD failure;          /* exit code of the first awaited process that failed */
     BOOL started;           /* at least one process was started */
     BOOL printed;           /* at least one value was written to stdout */
+    BOOL executed;          /* at least one statement ran without writing a value */
     BOOL skipped;           /* at least one statement was not executed */
+    BOOL failed;            /* the last statement ended with an error */
 };
 
 static WCHAR *strip_quotes( WCHAR *str )
@@ -483,6 +490,179 @@ static void output_value( const struct value *v )
     write_output( buf );
 }
 
+/* A parameter name, which PowerShell accepts shortened to an unambiguous prefix. */
+static BOOL is_param( const WCHAR *word, const WCHAR *name, size_t min_len )
+{
+    size_t len = wcslen( word );
+
+    return len >= min_len && len <= wcslen( name ) && !wcsnicmp( word, name, len );
+}
+
+struct tree_size
+{
+    ULONGLONG sum;      /* bytes in the files */
+    ULONGLONG files;
+    BOOL any;           /* something was listed, a file or a directory */
+};
+
+/* What Get-ChildItem lists below a directory: hidden entries only with -Force,
+ * and nothing below a hidden directory.  Links to directories are listed but
+ * not followed. */
+static void measure_directory( const WCHAR *dir, BOOL recurse, BOOL force, struct tree_size *size )
+{
+    size_t len = wcslen( dir );
+    WIN32_FIND_DATAW data;
+    HANDLE find;
+    WCHAR *path;
+
+    if (!(path = malloc( (len + 3) * sizeof(WCHAR) ))) return;
+    wcscpy( path, dir );
+    wcscpy( path + len, L"\\*" );
+    find = FindFirstFileW( path, &data );
+    free( path );
+    if (find == INVALID_HANDLE_VALUE) return;
+
+    do
+    {
+        if (!wcscmp( data.cFileName, L"." ) || !wcscmp( data.cFileName, L".." )) continue;
+        if (!force && (data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN)) continue;
+        size->any = TRUE;
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            size->files++;
+            size->sum += ((ULONGLONG)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+        }
+        else if (recurse && !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        {
+            if (!(path = malloc( (len + wcslen( data.cFileName ) + 2) * sizeof(WCHAR) ))) continue;
+            wcscpy( path, dir );
+            path[len] = '\\';
+            wcscpy( path + len + 1, data.cFileName );
+            measure_directory( path, recurse, force, size );
+            free( path );
+        }
+    } while (FindNextFileW( find, &data ));
+    FindClose( find );
+}
+
+/* Get-ChildItem [-Recurse] [-Force] [-Path] <path> | Measure-Object -Sum [-Property] Length,
+ * followed by "| Select-Object -ExpandProperty Sum" or wrapped as "( ... ).Sum";
+ * Count instead of Sum gives the number of files, and without either the
+ * measurement is written as a list.  Returns FALSE, without running anything,
+ * for every other statement. */
+static BOOL run_size_query( struct script *s, const WCHAR *stmt )
+{
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    struct tree_size size = { 0 };
+    BOOL recurse = FALSE, force = FALSE, sum = FALSE, length = FALSE, ret = FALSE;
+    const WCHAR *member = NULL;
+    WCHAR *copy, *text, *path = NULL, *tok[32], buf[160];
+    int n, i = 0;
+    size_t len;
+
+    if (!(copy = wcsdup( stmt ))) return FALSE;
+    text = copy;
+    len = wcslen( text );
+    while (len && is_space( text[len - 1] )) text[--len] = 0;
+
+    if (text[0] == '(')
+    {
+        if (len > 5 && !wcsicmp( text + len - 5, L").Sum" )) member = L"Sum";
+        else if (len > 7 && !wcsicmp( text + len - 7, L").Count" )) member = L"Count";
+        else goto done;
+        text[len - wcslen( member ) - 2] = 0;
+        text++;
+    }
+
+    n = tokenize( text, tok, ARRAY_SIZE(tok) );
+    if (n == ARRAY_SIZE(tok)) goto done;
+
+    /* Get-ChildItem */
+    if (i >= n || (wcsicmp( tok[i], L"Get-ChildItem" ) && wcsicmp( tok[i], L"gci" )
+                   && wcsicmp( tok[i], L"ls" ) && wcsicmp( tok[i], L"dir" ))) goto done;
+    for (i++; i < n && wcscmp( tok[i], L"|" ); i++)
+    {
+        if (is_param( tok[i], L"-Recurse", 2 )) recurse = TRUE;
+        else if (is_param( tok[i], L"-Force", 3 )) force = TRUE;
+        else if (is_param( tok[i], L"-Path", 2 ) || is_param( tok[i], L"-LiteralPath", 2 ))
+        {
+            if (path || ++i >= n || !wcscmp( tok[i], L"|" )) goto done;
+            path = tok[i];
+        }
+        else if (tok[i][0] == '-' || path) goto done;
+        else path = tok[i];
+    }
+    if (!path || i++ >= n) goto done;
+
+    /* Measure-Object */
+    if (i >= n || (wcsicmp( tok[i], L"Measure-Object" ) && wcsicmp( tok[i], L"measure" ))) goto done;
+    for (i++; i < n && wcscmp( tok[i], L"|" ); i++)
+    {
+        if (is_param( tok[i], L"-Sum", 2 )) sum = TRUE;
+        else if (is_param( tok[i], L"-Property", 2 ))
+        {
+            if (length || ++i >= n || wcsicmp( tok[i], L"Length" )) goto done;
+            length = TRUE;
+        }
+        else if (!length && !wcsicmp( tok[i], L"Length" )) length = TRUE;
+        else goto done;
+    }
+    if (!sum || !length) goto done;
+
+    /* Select-Object -ExpandProperty */
+    if (!member && i >= n) member = L"";  /* the measurement itself, as a list */
+    else if (!member)
+    {
+        if (++i + 3 != n) goto done;
+        if (wcsicmp( tok[i], L"Select-Object" ) && wcsicmp( tok[i], L"select" )) goto done;
+        if (!is_param( tok[i + 1], L"-ExpandProperty", 4 )) goto done;
+        if (!wcsicmp( tok[i + 2], L"Sum" )) member = L"Sum";
+        else if (!wcsicmp( tok[i + 2], L"Count" )) member = L"Count";
+        else goto done;
+    }
+    else if (i != n) goto done;
+
+    ret = TRUE;
+    len = wcslen( path );
+    while (len > 3 && (path[len - 1] == '\\' || path[len - 1] == '/')) path[--len] = 0;
+    WINE_TRACE( "size of %s, recurse %d, force %d\n", wine_dbgstr_w(path), recurse, force );
+
+    /* a path that does not exist gives no output and no error */
+    if (GetFileAttributesExW( path, GetFileExInfoStandard, &info ))
+    {
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            measure_directory( path, recurse, force, &size );
+        else
+        {
+            size.any = TRUE;
+            size.files = 1;
+            size.sum = ((ULONGLONG)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+        }
+    }
+
+    if (size.files)
+    {
+        if (!*member)
+            swprintf( buf, ARRAY_SIZE(buf), L"\r\n\r\nCount    : %I64u\r\nAverage  : \r\nSum      : %I64u\r\n"
+                      L"Maximum  : \r\nMinimum  : \r\nProperty : Length\r\n\r\n\r\n\r\n", size.files, size.sum );
+        else
+            swprintf( buf, ARRAY_SIZE(buf), L"%I64u\r\n", !wcscmp( member, L"Sum" ) ? size.sum : size.files );
+        write_output( buf );
+        s->printed = TRUE;
+    }
+    else if (size.any)
+    {
+        /* only directories: Measure-Object finds no Length to add up */
+        fputws( L"Measure-Object : The property \"Length\" cannot be found in the input for any objects.\n", stderr );
+        s->failed = TRUE;
+    }
+    else s->executed = TRUE;
+
+done:
+    free( copy );
+    return ret;
+}
+
 /* One pipeline segment: an optional "$var =" / "$var +=" followed by the
  * command and its parameters, already split into words. */
 static void run_command( struct script *s, int argc, WCHAR *argv[] )
@@ -518,6 +698,7 @@ static void run_statement( struct script *s, WCHAR *stmt )
     WCHAR *tok[64];
     int n, i, start = 0;
 
+    s->failed = FALSE;
     if (parse_expression( stmt, &value ))
     {
         WINE_TRACE( "value %s\n", wine_dbgstr_w(stmt) );
@@ -525,6 +706,7 @@ static void run_statement( struct script *s, WCHAR *stmt )
         s->printed = TRUE;
         return;
     }
+    if (run_size_query( s, stmt )) return;
 
     n = tokenize( stmt, tok, ARRAY_SIZE(tok) );
     for (i = 0; i <= n; i++)
@@ -598,8 +780,10 @@ static int script_result( struct script *s )
      * these as yes/no probes, and a blanket 0 traps them in impossible states
      * (e.g. "app is running, close it"). */
     if (s->started) return s->failure;
+    /* Like PowerShell, report whether the last statement succeeded. */
+    if (s->failed) return 1;
     /* Values alone count only if nothing else in the script was skipped. */
-    if (s->printed && !s->skipped) return 0;
+    if ((s->printed || s->executed) && !s->skipped) return 0;
     return 1;
 }
 
