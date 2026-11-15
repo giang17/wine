@@ -822,10 +822,15 @@ This is the recommended branch. What it changes, by subsystem:
   `bt all` — killed it with a page fault on execute access at an address like
   `0xffbb11b0`. A 64-bit debugger creates its break-in thread at its own
   `DbgUiRemoteBreakin`, and a thread of a wow64 process starts in 32-bit code, so it ran at
-  the low half of the 64-bit address (upstream as well; only the old wow64 had a
-  workaround). The target process now starts that thread at the `DbgUiRemoteBreakin` of its
-  32-bit ntdll. A 32-bit program in `Sleep()` and vatSys 1.4.20 (78 threads) survive
-  `bt all` and an attach/detach; 64-bit processes and the automatic crash handler, which
+  the low half of the 64-bit address (only the old wow64 had a workaround). Backport of
+  a9dd4878b14 from Wine 11.22 (Alexandre Julliard, Wine bug 59803): a thread whose entry
+  point lies above 4 GB stays in 64-bit code, and the break-in thread is created without
+  the thread attach notifications. It replaces the fork's earlier fix, which started the
+  thread at the `DbgUiRemoteBreakin` of the 32-bit ntdll; winedbg now shows the break-in
+  thread of a 32-bit process at the start of `RtlUserThreadStart`. A 32-bit program in
+  `Sleep()` survives `bt all`, an attach/detach and an attach with the 32-bit winedbg,
+  vatSys 1.4.20 (86 threads) `bt all` and an attach/detach; without the fix the 32-bit
+  program dies in 2 of 2 steps. 64-bit processes and the automatic crash handler, which
   does not attach this way, are unchanged
 - **ntdll (file creation time)**: `struct stat` has no birth time on Linux, and Wine reported
   the modification time as `CreationTime` — for a directory that moves whenever an entry is
