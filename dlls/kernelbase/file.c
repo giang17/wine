@@ -599,9 +599,10 @@ static BOOL copy_file( const WCHAR *source, const WCHAR *dest, COPYFILE2_EXTENDE
     }
     ret = TRUE;
 done:
-    /* Maintain the timestamp of source file to destination file and read-only attribute;
-     * the copy gets its own creation time, as on Windows */
-    info.FileAttributes &= FILE_ATTRIBUTE_READONLY;
+    /* Maintain the timestamp and the attributes of the source file, also for a
+     * destination file that existed; the copy gets its own creation time, as on Windows */
+    info.FileAttributes &= FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    info.FileAttributes |= FILE_ATTRIBUTE_ARCHIVE;
     info.CreationTime.QuadPart = 0;
     NtSetInformationFile( h2, &io, &info, sizeof(info), FileBasicInformation );
     HeapFree( GetProcessHeap(), 0, buffer );
