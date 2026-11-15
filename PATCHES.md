@@ -2172,7 +2172,11 @@ This is the recommended branch. What it changes, by subsystem:
   creates the four strip bay devices again (six `DXGID3D10CreateDevice` instead of two)
   and leaves no panel in the parking window. Windows created before the process awareness
   is set follow it once it is set since the next entry, so the reparenting succeeds
-  without a layer as well
+  without a layer as well. The `HIGHDPIAWARE` layer (the "Application" choice of the high
+  DPI override) makes the process per monitor aware, version 1 (`0x12`), as measured on
+  Windows 10 22H2 in 32 and 64 bit (`projects/dpi-layer-507`); Wine made it system aware.
+  `SetProcessDPIAware()` returns TRUE without changing the last error once the awareness
+  is set, by a layer or an earlier call; it left `ERROR_ACCESS_DENIED` behind
 - **DPI awareness of windows created before the process sets it (win32u, server)**: a
   window created while the process DPI awareness is still unset takes the awareness once
   the process sets it, as on Windows. Measured on Windows 10 22H2
