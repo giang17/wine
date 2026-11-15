@@ -1826,10 +1826,8 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
 }
 
 
-static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
+static int fd_write_dos_attrib( int fd, UINT attr, BOOL force_set )
 {
-    /* we only store the HIDDEN and SYSTEM attributes */
-    attr &= XATTR_ATTRIBS_MASK;
     if (force_set || attr != 0)
     {
         /* encode the attributes in Samba 3 ASCII format. Samba 4 has extended
@@ -1840,6 +1838,31 @@ static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
         return xattr_fset( fd, SAMBA_XATTR_DOS_ATTRIB, data, len );
     }
     else return xattr_fremove( fd, SAMBA_XATTR_DOS_ATTRIB );
+}
+
+
+static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
+{
+    struct stat st;
+    int ret;
+
+    /* we only store the HIDDEN and SYSTEM attributes */
+    attr &= XATTR_ATTRIBS_MASK;
+    ret = fd_write_dos_attrib( fd, attr, force_set );
+
+    /* A user extended attribute can only be written to a file its owner may
+     * write to; a read-only file gets the permission for the time of the call. */
+    if (ret == -1 && errno == EACCES && !fstat( fd, &st ) && !(st.st_mode & 0200)
+        && !fchmod( fd, st.st_mode | 0200 ))
+    {
+        int saved_errno;
+
+        ret = fd_write_dos_attrib( fd, attr, force_set );
+        saved_errno = errno;
+        fchmod( fd, st.st_mode );
+        errno = saved_errno;
+    }
+    return ret;
 }
 
 
@@ -5419,7 +5442,8 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 WARN( "Failed to set extended attribute " XATTR_CREATION_TIME ". errno %d (%s)\n",
                       errno, strerror( errno ) );
 
-            if (status == STATUS_SUCCESS)
+            /* 0 leaves the attributes unchanged */
+            if (status == STATUS_SUCCESS && info->FileAttributes)
                 status = fd_set_file_info( fd, info->FileAttributes,
                                            unix_name && is_hidden_file( unix_name ));
 
