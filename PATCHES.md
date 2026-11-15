@@ -729,8 +729,17 @@ This is the recommended branch. What it changes, by subsystem:
   Waves Central 17.1.5 asks `'{0}.{1}' -f $PSVersionTable.PSVersion.Major,
   $PSVersionTable.PSVersion.Minor` at start and stopped at "Waves Central cannot access
   PowerShell"; it now continues to its licence dialog. 14 of 16 query forms give the same
-  bytes and exit code as the reference VM; comparisons and `Write-Host` return 1 without
-  output (issue 595)
+  bytes as the reference VM and 13 also the same exit code: comparisons and `Write-Host`
+  return 1 without output, and a script with a statement the subset skipped returns 1 where
+  PowerShell reports the last statement (issue 595). It answers the size of a directory tree
+  as well: `Get-ChildItem [-Recurse] [-Force] <path> | Measure-Object -Sum Length`, with the
+  aliases `ls`, `gci`, `dir`, `measure`, `select` and shortened parameter names, followed by
+  `| Select-Object -ExpandProperty Sum` or written as `( ... ).Sum`, writes the sum of the
+  file sizes (`Count`: the number of files; hidden entries only with `-Force`). Waves
+  Central asks for its cache size with `ls -r "<dir>" | measure -s Length | Select
+  -ExpandProperty Sum` and takes anything but a number for 0; the subset returned 1 without
+  output. 21 calls give the same stdout bytes and exit code as PowerShell 5.1 on Windows 10
+  22H2, 64- and 32-bit (issue 601)
 - **taskkill**: `/t` takes a process for the parent only if it was not created after the
   child. A process keeps the ID of a parent that has exited, and Wine hands freed IDs out
   again: Waves Central was started by process 0020, which exited, and 0020 later went to
