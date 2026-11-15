@@ -1855,6 +1855,20 @@ This is the recommended branch. What it changes, by subsystem:
   their own window and reparent it into the host (yabridge, FL Studio's `ilbridge.exe`)
   render into a window of their own process and take the unchanged path; the test case for
   that (`test_other_process_parent()`) gives the same results before and after (issue 464)
+- **win32u / winex11**: backport of the commit of upstream merge request 12489 (Jason A.
+  Donenfeld, `4d351f5d3cd`, not merged as of 15.11.2026): the driver gets a `pFlushDisplay`
+  entry, `XFlush( gdi_display )` in winex11, that win32u calls when it flushes the window
+  surfaces and when a DC is released; `WINE_GDI_DRIVER_VERSION` goes to 110 on this branch.
+  GDI calls on a DC without a window surface — a child window inside a top-level of another
+  process — queue X requests that only `X11DRV_ProcessEvents()` flushed, and since Wine
+  10.17 (`d3cb94b543e`) win32u calls it only when the thread's own X connection has events.
+  The output of such a child stayed in the Xlib buffer of its process until that held
+  16 KB or the process exited: a second process that fills its child with `FillRect()`
+  every 32 ms showed 5.2 s after the first fill or, in some runs, at once (the delay follows
+  `XLIBBUFFERSIZE`: 0.5 to 0.6 s with 2 KB, 2.6 s with 8 KB). With the change it shows
+  0.1 s after the first fill in 5 of 5 runs; Windows 10 22H2 shows it at its one reading
+  after 3.5 s in 3 of 3 runs (`scripts/repro-433-layered-target.sh` in the workspace, place
+  `childg`; issue 604)
 - **opengl32 / win32u**: a context that was passed to `wglShareLists()` works when the DC of
   `wglCreateContext()` is gone. Wine 11.0 creates the destination context again on its next
   use; `win32u_wgl_context_reset()` destroyed the driver context first and then looked the
