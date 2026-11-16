@@ -5388,7 +5388,7 @@ static BOOL d2d_geometry_shared_bezier_caps(struct d2d_geometry *geometry, BOOL 
         for (j = i + 1; j < count; ++j)
         {
             cb = &caps[j];
-            if (cb->p[0].x - ca->p[0].x > 1e-4f * fmaxf(1.0f, fabsf(ca->p[0].x)))
+            if (cb->p[0].x - ca->p[0].x > d2d_point_tolerance(&ca->p[0]))
                 break;
             if (cb->group != cb->ordinal)
                 continue;
@@ -5418,7 +5418,7 @@ static BOOL d2d_geometry_shared_bezier_caps(struct d2d_geometry *geometry, BOOL 
         for (j = i; j < count; ++j)
         {
             cb = &caps[j];
-            if (cb->p[0].x - ca->p[0].x > 1e-4f * fmaxf(1.0f, fabsf(ca->p[0].x)))
+            if (cb->p[0].x - ca->p[0].x > d2d_point_tolerance(&ca->p[0]))
                 break;
             if (cb->group != ca->ordinal)
                 continue;
