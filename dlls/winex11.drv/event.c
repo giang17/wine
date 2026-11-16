@@ -377,6 +377,12 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
 
     if (!data) return FALSE;
     if (data->current_event) mask = 0;  /* don't process nested events */
+    else if (data->wm_state_update_hwnd)
+    {
+        HWND hwnd = data->wm_state_update_hwnd;
+        data->wm_state_update_hwnd = 0;
+        window_flush_wm_state_update( hwnd );
+    }
 
     for (count = 0; XCheckIfEvent( data->display, &event, filter_event, (XPointer)(UINT_PTR)mask ); count++)
     {
