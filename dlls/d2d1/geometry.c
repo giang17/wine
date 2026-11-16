@@ -3874,11 +3874,34 @@ static BOOL d2d_segments_adjacent(const struct d2d_segment_desc *a,
 }
 
 
+static BOOL d2d_geometry_intersect_segment_descs(struct d2d_geometry *geometry,
+        struct d2d_geometry_intersections *intersections, const struct d2d_segment_desc *desc_i,
+        const struct d2d_segment_desc *desc_j)
+{
+    if (d2d_vertex_type_is_bezier(desc_j->type))
+    {
+        if (d2d_vertex_type_is_bezier(desc_i->type))
+            return d2d_geometry_intersect_bezier_bezier(geometry, intersections,
+                    &desc_i->idx, 0.0f, 1.0f, &desc_j->idx, 0.0f, 1.0f);
+        return d2d_geometry_intersect_bezier_line(geometry, intersections, &desc_j->idx, &desc_i->idx);
+    }
+    if (d2d_vertex_type_is_bezier(desc_i->type))
+        return d2d_geometry_intersect_bezier_line(geometry, intersections, &desc_i->idx, &desc_j->idx);
+    return d2d_geometry_intersect_line_line(geometry, intersections, &desc_i->idx, &desc_j->idx);
+}
+
 /* Intersect the geometry's segments with themselves. For small segment
  * counts (< 16), use the straightforward O(n^2) approach. For larger
  * geometries, build a uniform spatial grid and only test segment pairs
- * that share at least one grid cell. */
-static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
+ * that share at least one grid cell.
+ *
+ * The grid leaves out the pairs of adjacent segments and the pairs whose
+ * bounds lie apart, which the loop for small geometries tests, and an
+ * adjacent pair of curves can come out of that test with a crossing next to
+ * the shared vertex. "part" asks for the pairs of the grid whatever the
+ * size: the geometry is a group of figures of a path that goes by the grid
+ * as a whole, see d2d_path_geometry_close_groups(). */
+static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry, BOOL part)
 {
     struct d2d_geometry_intersections intersections = {0};
     const struct d2d_figure *figure_p, *figure_q;
@@ -3911,7 +3934,7 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
         }
     }
 
-    if (segment_capacity >= 16)
+    if (segment_capacity >= 16 || part)
     {
         /* --- Step 2: Build segment descriptors with per-segment AABBs --- */
         segment_descs = calloc(segment_capacity, sizeof(*segment_descs));
@@ -4050,44 +4073,30 @@ static BOOL d2d_geometry_intersect_self(struct d2d_geometry *geometry)
                                 &segment_descs[j].bounds))
                             continue;
 
-                        /* Perform actual intersection test */
-                        {
-                            const struct d2d_segment_desc *desc_j = &segment_descs[j];
-
-                            if (d2d_vertex_type_is_bezier(desc_j->type))
-                            {
-                                if (d2d_vertex_type_is_bezier(desc_i->type))
-                                {
-                                    if (!d2d_geometry_intersect_bezier_bezier(geometry,
-                                            &intersections, &desc_i->idx, 0.0f, 1.0f,
-                                            &desc_j->idx, 0.0f, 1.0f))
-                                        goto done;
-                                }
-                                else
-                                {
-                                    if (!d2d_geometry_intersect_bezier_line(geometry,
-                                            &intersections, &desc_j->idx, &desc_i->idx))
-                                        goto done;
-                                }
-                            }
-                            else
-                            {
-                                if (d2d_vertex_type_is_bezier(desc_i->type))
-                                {
-                                    if (!d2d_geometry_intersect_bezier_line(geometry,
-                                            &intersections, &desc_i->idx, &desc_j->idx))
-                                        goto done;
-                                }
-                                else
-                                {
-                                    if (!d2d_geometry_intersect_line_line(geometry,
-                                            &intersections, &desc_i->idx, &desc_j->idx))
-                                        goto done;
-                                }
-                            }
-                        }
+                        if (!d2d_geometry_intersect_segment_descs(geometry, &intersections,
+                                desc_i, &segment_descs[j]))
+                            goto done;
                     }
                 }
+            }
+        }
+    }
+    else if (part && segment_descs)
+    {
+        /* The pairs the grid would test. */
+        size_t i, j;
+
+        for (i = 0; i < segment_count; ++i)
+        {
+            for (j = 0; j < i; ++j)
+            {
+                if (d2d_segments_adjacent(&segment_descs[i], &segment_descs[j], geometry))
+                    continue;
+                if (!d2d_rect_check_overlap(&segment_descs[i].bounds, &segment_descs[j].bounds))
+                    continue;
+                if (!d2d_geometry_intersect_segment_descs(geometry, &intersections,
+                        &segment_descs[i], &segment_descs[j]))
+                    goto done;
             }
         }
     }
@@ -6259,6 +6268,308 @@ static BOOL d2d_path_geometry_defer_fill(struct d2d_geometry *geometry)
     return TRUE;
 }
 
+/* The steps that turn the figures of a path into its fill. */
+static HRESULT d2d_path_geometry_close_figures(struct d2d_geometry *geometry, BOOL part)
+{
+    HRESULT hr;
+
+    if (!d2d_geometry_intersect_self(geometry, part))
+        return E_FAIL;
+    if (FAILED(hr = d2d_geometry_resolve_beziers(geometry)))
+        return hr;
+    return d2d_path_geometry_triangulate(geometry);
+}
+
+/* Closing a path by its groups of figures.
+ *
+ * Figures whose bounds lie apart cannot cross each other, share a curve
+ * segment or contain one another, so the fill of a path is the fills of its
+ * groups of figures with overlapping bounds put together. Close() ran its
+ * steps over the whole path, and the triangulation then spans all of it:
+ * the divide and conquer merges the figures across the gaps between them,
+ * the faces in the gaps are built, classified and thrown away, and every
+ * step pays for the size of the path. Minimal Audio Current's Cluster Delay
+ * tap display fills thirty-two paths of 28 to 320 rounded rectangles per
+ * frame, three quarters of them standing alone and the rest in groups of at
+ * most ten; closing them took 70 ms per frame (wine-dev issue 610).
+ *
+ * The figures are grouped by their bounds, each group goes through the
+ * steps as a path of its own, and the fills are appended. The bounds used
+ * here include the control points and a margin of the tolerance within
+ * which d2d_bezier_segments_coincide() takes two curve segments for the
+ * same, so no step can see across groups; touching bounds count as
+ * overlapping. The figures of a group keep their order, and
+ * d2d_geometry_intersect_self() tests the segment pairs it tests on the
+ * whole path, so the figures come out as before. The triangles can differ
+ * where the Delaunay criterion has no preference (four points on a
+ * circle), and with them which slivers along the outline count as inside.
+ *
+ * Paths of fewer than D2D_FILL_GROUPS_MIN_FIGURES figures, and paths too
+ * small for the grid of d2d_geometry_intersect_self(), are closed whole as
+ * before; WINE_D2D_FILL_GROUPS=0 does that for all paths. */
+#define D2D_FILL_GROUPS_MIN_FIGURES 16
+
+static BOOL d2d_fill_groups_enabled(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_GROUPS", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+struct d2d_figure_box
+{
+    D2D1_RECT_F box;
+    size_t idx;
+};
+
+static int __cdecl d2d_figure_box_compare(const void *a, const void *b)
+{
+    const struct d2d_figure_box *ba = a, *bb = b;
+
+    if (ba->box.left != bb->box.left)
+        return ba->box.left < bb->box.left ? -1 : 1;
+    return ba->idx < bb->idx ? -1 : ba->idx > bb->idx;
+}
+
+/* An empty figure gets a box that overlaps nothing. */
+static BOOL d2d_figure_get_group_box(const struct d2d_figure *figure, D2D1_RECT_F *box)
+{
+    float margin;
+    size_t i;
+
+    box->left = box->top = FLT_MAX;
+    box->right = box->bottom = -FLT_MAX;
+    if (!figure->vertex_count)
+        return TRUE;
+    for (i = 0; i < figure->vertex_count; ++i)
+        d2d_rect_expand(box, &figure->vertices[i]);
+    for (i = 0; i < figure->bezier_control_count; ++i)
+        d2d_rect_expand(box, &figure->bezier_controls[i]);
+    if (!d2d_rect_is_finite(box))
+        return FALSE;
+    /* d2d_point_approx_equal() allows 1e-4 times the larger coordinate of
+     * one of the two points. */
+    margin = 1e-4f * fmaxf(1.0f, fmaxf(fmaxf(fabsf(box->left), fabsf(box->right)),
+            fmaxf(fabsf(box->top), fabsf(box->bottom))));
+    box->left -= margin;
+    box->top -= margin;
+    box->right += margin;
+    box->bottom += margin;
+    return d2d_rect_is_finite(box);
+}
+
+static size_t d2d_figure_group_find(size_t *parent, size_t i)
+{
+    while (parent[i] != i)
+    {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    return i;
+}
+
+/* Returns for every figure the number of its group, the groups numbered by
+ * their first figure, or NULL if the path is a single group or grouping it
+ * is not worth it. */
+static size_t *d2d_path_geometry_group_figures(const struct d2d_geometry *geometry, size_t *group_count)
+{
+    size_t count = geometry->u.path.figure_count, i, j, k, active_count = 0, tests = 0, budget;
+    size_t *parent = NULL, *active = NULL, *group = NULL;
+    struct d2d_figure_box *boxes = NULL;
+
+    *group_count = 0;
+    if (!(boxes = malloc(count * sizeof(*boxes))) || !(parent = malloc(count * sizeof(*parent)))
+            || !(active = malloc(count * sizeof(*active))))
+        goto done;
+    for (i = 0; i < count; ++i)
+    {
+        if (!d2d_figure_get_group_box(&geometry->u.path.figures[i], &boxes[i].box))
+            goto done;
+        boxes[i].idx = i;
+        parent[i] = i;
+    }
+    qsort(boxes, count, sizeof(*boxes), d2d_figure_box_compare);
+
+    /* Sweep along x: a figure is tested against those that reach its left
+     * side. Figures stacked on top of each other all do; the path is closed
+     * whole when that gets out of hand. */
+    budget = 64 * count;
+    for (i = 0; i < count; ++i)
+    {
+        const D2D1_RECT_F *b = &boxes[i].box;
+
+        if (b->left > b->right)
+            continue;
+        for (j = 0; j < active_count;)
+        {
+            const D2D1_RECT_F *a = &boxes[active[j]].box;
+
+            if (a->right < b->left)
+            {
+                active[j] = active[--active_count];
+                continue;
+            }
+            if (++tests > budget)
+                goto done;
+            if (a->top <= b->bottom && a->bottom >= b->top)
+            {
+                size_t ra = d2d_figure_group_find(parent, boxes[active[j]].idx);
+                size_t rb = d2d_figure_group_find(parent, boxes[i].idx);
+
+                /* The root of a group is its first figure. */
+                if (ra != rb)
+                    parent[max(ra, rb)] = min(ra, rb);
+            }
+            ++j;
+        }
+        active[active_count++] = i;
+    }
+
+    if (!(group = malloc(count * sizeof(*group))))
+        goto done;
+    for (i = 0, k = 0; i < count; ++i)
+    {
+        if ((j = d2d_figure_group_find(parent, i)) == i)
+            group[i] = k++;
+        else
+            group[i] = group[j];
+    }
+    *group_count = k;
+    if (k < 2)
+    {
+        free(group);
+        group = NULL;
+    }
+
+done:
+    free(boxes);
+    free(parent);
+    free(active);
+    return group;
+}
+
+static void d2d_fill_free_triangles(struct d2d_fill *fill);
+
+/* Returns FALSE if the path was not closed by groups; the caller closes it
+ * whole then. */
+static BOOL d2d_path_geometry_close_groups(struct d2d_geometry *geometry, HRESULT *hr)
+{
+    size_t count = geometry->u.path.figure_count, group_count, i, j, g, n, vertices_size = 0;
+    size_t *group, *start = NULL, *members = NULL;
+    struct d2d_fill *fill = &geometry->fill;
+    struct d2d_geometry sub;
+
+    if (count < D2D_FILL_GROUPS_MIN_FIGURES || !d2d_fill_groups_enabled())
+        return FALSE;
+
+    /* The groups take the segment pairs of the grid in
+     * d2d_geometry_intersect_self(), which the path as a whole has to be
+     * large enough for. */
+    for (i = 0, n = 0; i < count && n < 16; ++i)
+    {
+        const struct d2d_figure *figure = &geometry->u.path.figures[i];
+
+        for (j = 0; j < figure->vertex_count && n < 16; ++j)
+        {
+            if (figure->vertex_types[j] != D2D_VERTEX_TYPE_END)
+                ++n;
+        }
+    }
+    if (n < 16)
+        return FALSE;
+
+    if (!(group = d2d_path_geometry_group_figures(geometry, &group_count)))
+        return FALSE;
+
+    memset(&sub, 0, sizeof(sub));
+    sub.u.path.fill_mode = geometry->u.path.fill_mode;
+    if (!(start = calloc(group_count + 2, sizeof(*start))) || !(members = malloc(count * sizeof(*members)))
+            || !(sub.u.path.figures = malloc(count * sizeof(*sub.u.path.figures))))
+    {
+        free(group);
+        free(start);
+        free(members);
+        return FALSE;
+    }
+    for (i = 0; i < count; ++i)
+        ++start[group[i] + 2];
+    for (g = 0; g < group_count; ++g)
+        start[g + 2] += start[g + 1];
+    for (i = 0; i < count; ++i)
+        members[start[group[i] + 1]++] = i;
+    /* The members of group g are now members[start[g]] to members[start[g + 1] - 1]. */
+
+    *hr = S_OK;
+    for (g = 0; g < group_count && SUCCEEDED(*hr); ++g)
+    {
+        /* The figures move into the scratch path and back. */
+        n = start[g + 1] - start[g];
+        for (j = 0; j < n; ++j)
+            sub.u.path.figures[j] = geometry->u.path.figures[members[start[g] + j]];
+        sub.u.path.figure_count = n;
+        memset(&sub.fill, 0, sizeof(sub.fill));
+
+        *hr = d2d_path_geometry_close_figures(&sub, TRUE);
+
+        for (j = 0; j < n; ++j)
+            geometry->u.path.figures[members[start[g] + j]] = sub.u.path.figures[j];
+
+        if (SUCCEEDED(*hr) && (sub.fill.vertex_count || sub.fill.bezier_vertex_count))
+        {
+            if (!d2d_array_reserve((void **)&fill->vertices, &vertices_size,
+                    fill->vertex_count + sub.fill.vertex_count, sizeof(*fill->vertices))
+                    || !d2d_array_reserve((void **)&fill->faces, &fill->faces_size,
+                    fill->face_count + sub.fill.face_count, sizeof(*fill->faces))
+                    || !d2d_array_reserve((void **)&fill->bezier_vertices, &fill->bezier_vertices_size,
+                    fill->bezier_vertex_count + sub.fill.bezier_vertex_count, sizeof(*fill->bezier_vertices)))
+            {
+                ERR("Failed to grow the fill arrays.\n");
+                *hr = E_OUTOFMEMORY;
+            }
+            else
+            {
+                if (sub.fill.vertex_count)
+                    memcpy(&fill->vertices[fill->vertex_count], sub.fill.vertices,
+                            sub.fill.vertex_count * sizeof(*fill->vertices));
+                for (j = 0; j < sub.fill.face_count; ++j)
+                {
+                    struct d2d_face *face = &fill->faces[fill->face_count + j];
+
+                    face->v[0] = sub.fill.faces[j].v[0] + fill->vertex_count;
+                    face->v[1] = sub.fill.faces[j].v[1] + fill->vertex_count;
+                    face->v[2] = sub.fill.faces[j].v[2] + fill->vertex_count;
+                }
+                if (sub.fill.bezier_vertex_count)
+                    memcpy(&fill->bezier_vertices[fill->bezier_vertex_count], sub.fill.bezier_vertices,
+                            sub.fill.bezier_vertex_count * sizeof(*fill->bezier_vertices));
+                fill->vertex_count += sub.fill.vertex_count;
+                fill->face_count += sub.fill.face_count;
+                fill->bezier_vertex_count += sub.fill.bezier_vertex_count;
+            }
+        }
+        free(sub.fill.vertices);
+        free(sub.fill.faces);
+        free(sub.fill.bezier_vertices);
+    }
+
+    if (FAILED(*hr))
+    {
+        d2d_fill_free_triangles(fill);
+        free(fill->bezier_vertices);
+        fill->bezier_vertices = NULL;
+        fill->bezier_vertices_size = 0;
+        fill->bezier_vertex_count = 0;
+    }
+    free(sub.u.path.figures);
+    free(group);
+    free(start);
+    free(members);
+    return TRUE;
+}
+
 static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *iface)
 {
     struct d2d_geometry *geometry = impl_from_ID2D1GeometrySink(iface);
@@ -6327,11 +6638,9 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
         }
     }
 
-    if (!d2d_geometry_intersect_self(geometry))
-        goto done;
-    if (FAILED(hr = d2d_geometry_resolve_beziers(geometry)))
-        goto done;
-    if (FAILED(hr = d2d_path_geometry_triangulate(geometry)))
+    if (!d2d_path_geometry_close_groups(geometry, &hr))
+        hr = d2d_path_geometry_close_figures(geometry, FALSE);
+    if (FAILED(hr))
         goto done;
 
     if (SUCCEEDED(hr) && key.data && !key.failed)
@@ -11113,7 +11422,7 @@ static HRESULT d2d_path_geometry_tessellate_clipped(struct d2d_geometry *geometr
 
     d2d_path_geometry_remove_collinear_vertices(&tmp);
     /* No curves, so there is nothing for d2d_geometry_resolve_beziers() to do. */
-    if (!d2d_geometry_intersect_self(&tmp))
+    if (!d2d_geometry_intersect_self(&tmp, FALSE))
         goto done;
     if (FAILED(hr = d2d_path_geometry_triangulate(&tmp)))
         goto done;
@@ -11160,7 +11469,7 @@ static void d2d_path_geometry_fill_ensure(struct d2d_geometry *geometry, const D
     if (whole)
     {
         hr = E_OUTOFMEMORY;
-        if (d2d_geometry_intersect_self(geometry) && SUCCEEDED(hr = d2d_geometry_resolve_beziers(geometry)))
+        if (d2d_geometry_intersect_self(geometry, FALSE) && SUCCEEDED(hr = d2d_geometry_resolve_beziers(geometry)))
             hr = d2d_path_geometry_triangulate(geometry);
     }
     else
