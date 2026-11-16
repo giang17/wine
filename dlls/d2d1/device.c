@@ -2030,6 +2030,8 @@ struct d2d_fill_aa_seam
     UINT32 start;
     float c1, c2;
     BOOL chord;
+    /* Of a chord: where the tangents at its two ends meet. */
+    D2D1_POINT_2F control;
 };
 
 static float d2d_fill_aa_line_distance(const D2D1_POINT_2F *p, const D2D1_POINT_2F *a, const D2D1_POINT_2F *b)
@@ -2268,6 +2270,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                         seams[slot].c1 = 4.0f * sag;
                         seams[slot].c2 = -4.0f * sag;
                         seams[slot].chord = TRUE;
+                        seams[slot].control = *p1;
                     }
                     else if (curves[c][i].texcoord.sign > 0.0f && !c && b == 1)
                     {
@@ -2334,6 +2337,185 @@ static BOOL d2d_fill_aa_seam_params(const struct d2d_fill *fill, const struct d2
     return TRUE;
 }
 
+/* The outline edges next to an edge of the outline.
+ *
+ * A triangle of the fill mesh is antialiased against its own outline edges:
+ * each of its three weights is linear over the triangle, the pixel shader
+ * divides it by the length of its gradient and takes the smallest coverage,
+ * and the weight of an edge inside the fill is a constant that never limits
+ * it. An outline edge that belongs to the next triangle and passes a pixel
+ * within half a pixel is not seen, so where the border between two triangles
+ * runs flat along the outline the pixels beside it come out too bright: the
+ * fan of a bar 2 wide in Minimal Audio Current's tap display divides two
+ * pieces of a cap along a line to the centre of the bar, and the two pixels
+ * below the cap were drawn at 255 for a coverage of 244 (wine-dev issue 616).
+ *
+ * The weight of an interior edge can be any linear function, so it carries
+ * the distance to the line of the outline edge that meets the triangle's
+ * own outline edge at their common vertex. That is done where the outline
+ * turns towards the fill at that vertex and at the far end of the
+ * neighbouring edge, and the triangle lies on the inner side of the line:
+ * the fill around the triangle then lies inside both half planes, and the
+ * smaller of the two coverages is still an upper bound of the coverage of
+ * the pixel. For a neighbour that is the chord of a curve the line is the
+ * tangent of the curve at the vertex.
+ *
+ * Only the triangles of a fan get it, as d2d_figure_fill_fan() in geometry.c
+ * makes them for a convex figure (d2d_fill_aa_mark_fans()). On the faces of
+ * the triangulation the same weights darkened single pixels of glyph paths,
+ * where the outline turns away from the fill a few edges on (22 of 422
+ * changed pixels of 450 glyphs more than 16 of 255 worse, 86 better).
+ * WINE_D2D_FILL_AA_NEIGHBOURS=0 disables the weights. */
+static BOOL d2d_fill_aa_neighbours(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_NEIGHBOURS", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+struct d2d_fill_aa_outline
+{
+    const struct d2d_fill *fill;
+    const UINT64 *edge_keys;
+    const BYTE *edge_curve;
+    const struct d2d_fill_aa_seam *seams;
+    size_t map_size;
+    /* The two outline neighbours of every vertex, plus one, and their
+     * number, which is more than two where figures touch. */
+    UINT32 *nb;
+    BYTE *nb_cnt;
+};
+
+static void d2d_fill_aa_outline_add(struct d2d_fill_aa_outline *o, UINT32 a, UINT32 b)
+{
+    if (o->nb_cnt[a] < 2)
+        o->nb[2 * a + o->nb_cnt[a]] = b + 1;
+    if (o->nb_cnt[a] < 3)
+        ++o->nb_cnt[a];
+}
+
+static BOOL d2d_fill_aa_outline_other(const struct d2d_fill_aa_outline *o, UINT32 a, UINT32 b, UINT32 *other)
+{
+    if (o->nb_cnt[a] != 2)
+        return FALSE;
+    if (o->nb[2 * a] == b + 1)
+        *other = o->nb[2 * a + 1] - 1;
+    else if (o->nb[2 * a + 1] == b + 1)
+        *other = o->nb[2 * a] - 1;
+    else
+        return FALSE;
+    return *other != b;
+}
+
+/* For the triangle (k, a, b) with the outline edge (a, b): the half plane of
+ * the outline edge that ends in a, as the unit normal n pointing into it,
+ * so that n . (p - a) is the distance of p from its line. own_control is
+ * the control point of (a, b) if that is the chord of a curve. */
+static BOOL d2d_fill_aa_neighbour_plane(const struct d2d_fill_aa_outline *o, UINT32 k, UINT32 a, UINT32 b,
+        const D2D1_POINT_2F *own_control, D2D1_POINT_2F *n, float *dist_k, float *dist_b)
+{
+    const D2D1_POINT_2F *v = o->fill->vertices, *pa = &v[a], *pb = &v[b], *pk = &v[k], *t;
+    float dx, dy, len, tol, side_k, side_t;
+    UINT32 x, w, lo, hi, slot;
+    UINT64 key;
+
+    if (!d2d_fill_aa_outline_other(o, a, b, &x))
+        return FALSE;
+
+    lo = min(a, x);
+    hi = max(a, x);
+    key = ((UINT64)lo << 32) + hi + 1u;
+    slot = d2d_fill_aa_edge_slot(key, o->map_size);
+    while (o->edge_keys[slot] != key)
+        slot = d2d_fill_aa_next_slot(slot, o->map_size);
+
+    t = &v[x];
+    if (o->edge_curve[slot])
+    {
+        /* A seam whose curve is not known. */
+        if (o->seams[slot].start == ~0u)
+            return FALSE;
+        if (o->seams[slot].chord)
+            t = &o->seams[slot].control;
+    }
+
+    tol = 1e-4f * (fabsf(pk->x - pa->x) + fabsf(pk->y - pa->y) + fabsf(pb->x - pa->x) + fabsf(pb->y - pa->y));
+
+    /* The outline turns towards the fill at a: the point it comes from lies
+     * on the side of (a, b) the triangle lies on. */
+    side_k = (pb->x - pa->x) * (pk->y - pa->y) - (pb->y - pa->y) * (pk->x - pa->x);
+    side_t = (pb->x - pa->x) * (t->y - pa->y) - (pb->y - pa->y) * (t->x - pa->x);
+    if (side_k < 0.0f)
+    {
+        side_k = -side_k;
+        side_t = -side_t;
+    }
+    if (!(side_k > 0.0f) || !(side_t >= 0.0f))
+        return FALSE;
+
+    dx = pa->x - t->x;
+    dy = pa->y - t->y;
+    if (!((len = sqrtf(dx * dx + dy * dy)) > 0.0f))
+        return FALSE;
+    n->x = -dy / len;
+    n->y = dx / len;
+    *dist_k = n->x * (pk->x - pa->x) + n->y * (pk->y - pa->y);
+    if (*dist_k < 0.0f)
+    {
+        n->x = -n->x;
+        n->y = -n->y;
+        *dist_k = -*dist_k;
+    }
+    *dist_b = n->x * (pb->x - pa->x) + n->y * (pb->y - pa->y);
+    if (!(*dist_k > tol) || !(*dist_b >= -tol))
+        return FALSE;
+
+    /* The curve of the triangle's own edge stays inside. */
+    if (own_control && !(n->x * (own_control->x - pa->x) + n->y * (own_control->y - pa->y) >= -tol))
+        return FALSE;
+
+    /* So does the other end of the neighbouring edge, and what follows it. */
+    if (!(n->x * (v[x].x - pa->x) + n->y * (v[x].y - pa->y) >= -tol))
+        return FALSE;
+    if (!d2d_fill_aa_outline_other(o, x, a, &w))
+        return FALSE;
+    if (!(n->x * (v[w].x - pa->x) + n->y * (v[w].y - pa->y) >= -tol))
+        return FALSE;
+
+    return TRUE;
+}
+
+/* Marks the faces of the fans: runs of consecutive faces around the same
+ * first vertex whose opposite edges follow each other and close. The caller
+ * checks that those edges lie on the outline and the vertex does not. */
+static void d2d_fill_aa_mark_fans(const struct d2d_fill *fill, BYTE *fan)
+{
+    const struct d2d_face *f = fill->faces;
+    size_t fc = fill->face_count, i, j, k;
+
+    for (i = 0; i < fc; i = j)
+    {
+        BOOL forward = TRUE, backward = TRUE;
+
+        for (j = i + 1; j < fc && f[j].v[0] == f[i].v[0]; ++j)
+        {
+            if (f[j].v[1] != f[j - 1].v[2])
+                forward = FALSE;
+            if (f[j].v[2] != f[j - 1].v[1])
+                backward = FALSE;
+        }
+        if (j - i < 3)
+            continue;
+        if (!(forward && f[i].v[1] == f[j - 1].v[2]) && !(backward && f[i].v[2] == f[j - 1].v[1]))
+            continue;
+        for (k = i; k < j; ++k)
+            fan[k] = 1;
+    }
+}
+
 /* Build and draw fill-AA geometry. Returns TRUE on success, FALSE if caller should fall back. */
 /* Fill-edge AA: per-face vertices with boundary edge weights + skirt expansion.
  * Inner triangles: bary coords identify boundary edges.
@@ -2355,6 +2537,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
         const struct d2d_geometry *geometry, const struct d2d_fill *fill,
         struct d2d_fill_aa_vertex **out, size_t *out_count)
 {
+    struct d2d_fill_aa_outline outline = {0};
+    BOOL neighbours = d2d_fill_aa_neighbours();
+    BYTE *fan = NULL;
     struct d2d_fill_aa_vertex *expanded;
     BYTE *on_outline;
     struct d2d_fill_aa_seam *seams;
@@ -2444,9 +2629,35 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     on_outline = calloc(fill->vertex_count, sizeof(*on_outline));
     if (!expanded || !on_outline)
     {
+        free(expanded);
         free(on_outline);
         free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
         return FALSE;
+    }
+
+    /* Without the neighbours the triangles keep their own edges only. */
+    if (neighbours)
+    {
+        outline.nb = calloc(fill->vertex_count, 2 * sizeof(*outline.nb));
+        outline.nb_cnt = calloc(fill->vertex_count, sizeof(*outline.nb_cnt));
+        fan = calloc(fc, sizeof(*fan));
+        if (!outline.nb || !outline.nb_cnt || !fan)
+        {
+            free(outline.nb);
+            free(outline.nb_cnt);
+            free(fan);
+            outline.nb = NULL;
+            outline.nb_cnt = NULL;
+            fan = NULL;
+            neighbours = FALSE;
+        }
+        else
+            d2d_fill_aa_mark_fans(fill, fan);
+        outline.fill = fill;
+        outline.edge_keys = edge_keys;
+        outline.edge_curve = edge_curve;
+        outline.seams = seams;
+        outline.map_size = map_size;
     }
 
     /* The fill vertices that lie on the outline: both ends of a straight boundary
@@ -2467,6 +2678,11 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
                 slot = d2d_fill_aa_next_slot(slot, map_size);
             if (edge_cnt[slot] != 1)
                 continue;
+            if (neighbours)
+            {
+                d2d_fill_aa_outline_add(&outline, a, b_v);
+                d2d_fill_aa_outline_add(&outline, b_v, a);
+            }
             if (!edge_curve[slot] || (seams[slot].start != ~0u && seams[slot].chord))
                 on_outline[a] = on_outline[b_v] = 1;
             else if (seams[slot].start == a || seams[slot].start == b_v)
@@ -2479,6 +2695,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     {
         const struct d2d_face *f = &fill->faces[i];
         float w[3][3], t[3][3], c1[3], c2[3];
+        UINT32 slots[3];
         int j, e;
 
         for (e = 0; e < 3; e++)
@@ -2491,6 +2708,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
 
             while (edge_keys[slot] != key)
                 slot = d2d_fill_aa_next_slot(slot, map_size);
+            slots[e] = slot;
             c1[e] = c2[e] = 0.0f;
             t[e][0] = t[e][1] = t[e][2] = 0.0f;
             /* The weight of a boundary edge runs from 0 on the edge to 1 at the
@@ -2509,6 +2727,43 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
                         && d2d_fill_aa_seam_params(fill, f, e, &seams[slot], t[e], &c1[e], &c2[e]);
             for (j = 0; j < 3; j++)
                 w[e][j] = ramp ? (j == e ? 1.0f : 0.0f) : 10.0f;
+        }
+
+        /* The interior edges take the outline edges next to the triangle's
+         * own; see d2d_fill_aa_neighbours(). */
+        if (neighbours && fan[i] && edge_cnt[slots[0]] == 1 && edge_cnt[slots[1]] == 2
+                && edge_cnt[slots[2]] == 2 && !on_outline[f->v[0]])
+        {
+            BOOL taken[3] = {FALSE, FALSE, FALSE};
+
+            for (e = 0; e < 3; e++)
+            {
+                const D2D1_POINT_2F *own_control = NULL;
+                int end;
+
+                if (edge_cnt[slots[e]] != 1)
+                    continue;
+                if (edge_curve[slots[e]] && seams[slots[e]].start != ~0u && seams[slots[e]].chord)
+                    own_control = &seams[slots[e]].control;
+
+                /* The edge is (a, b) with a = v[e + 1] and b = v[e + 2]; the
+                 * interior edge that ends in a is the one opposite b. */
+                for (end = 0; end < 2; end++)
+                {
+                    int ia = (e + 1 + end) % 3, ib = (e + 2 - end) % 3;
+                    D2D1_POINT_2F n;
+                    float dk, db;
+
+                    if (edge_cnt[slots[ib]] == 1 || taken[ib])
+                        continue;
+                    if (!d2d_fill_aa_neighbour_plane(&outline, f->v[e], f->v[ia], f->v[ib], own_control, &n, &dk, &db))
+                        continue;
+                    w[ib][e] = dk;
+                    w[ib][ia] = 0.0f;
+                    w[ib][ib] = db;
+                    taken[ib] = TRUE;
+                }
+            }
         }
 
         for (j = 0; j < 3; j++)
@@ -2616,6 +2871,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     free(edge_curve);
     free(seams);
     free(on_outline);
+    free(outline.nb);
+    free(outline.nb_cnt);
+    free(fan);
 
     *out = expanded;
     *out_count = expanded_count;
