@@ -2298,48 +2298,158 @@ static int __cdecl d2d_cdt_compare_vertices(const void *a, const void *b)
 
 /* Determine whether a given point is inside the geometry, using the current
  * fill mode rule. */
-static BOOL d2d_path_geometry_point_inside(const struct d2d_geometry *geometry,
-        const D2D1_POINT_2F *probe, BOOL triangles_only)
+/* The crossings of a ray from the probe with the edges of one figure, added
+ * to the score of d2d_path_geometry_point_inside(). */
+static void d2d_figure_point_inside_score(const struct d2d_geometry *geometry, const struct d2d_figure *figure,
+        const D2D1_POINT_2F *probe, BOOL triangles_only, unsigned int *score)
 {
     const D2D1_POINT_2F *p0, *p1;
     D2D1_POINT_2F v_p, v_probe;
-    unsigned int score;
-    size_t i, j, last;
+    size_t j, last;
 
-    for (i = 0, score = 0; i < geometry->u.path.figure_count; ++i)
+    if (probe->x < figure->bounds.left || probe->x > figure->bounds.right
+            || probe->y < figure->bounds.top || probe->y > figure->bounds.bottom)
+        return;
+
+    last = figure->vertex_count - 1;
+    if (!triangles_only)
     {
-        const struct d2d_figure *figure = &geometry->u.path.figures[i];
-
-        if (probe->x < figure->bounds.left || probe->x > figure->bounds.right
-                || probe->y < figure->bounds.top || probe->y > figure->bounds.bottom)
+        while (last && figure->vertex_types[last] == D2D_VERTEX_TYPE_NONE)
+            --last;
+    }
+    p0 = &figure->vertices[last];
+    for (j = 0; j <= last; ++j)
+    {
+        if (!triangles_only && figure->vertex_types[j] == D2D_VERTEX_TYPE_NONE)
             continue;
 
-        last = figure->vertex_count - 1;
-        if (!triangles_only)
+        p1 = &figure->vertices[j];
+        d2d_point_subtract(&v_p, p1, p0);
+        d2d_point_subtract(&v_probe, probe, p0);
+
+        if ((probe->y < p0->y) != (probe->y < p1->y) && v_probe.x < v_p.x * (v_probe.y / v_p.y))
         {
-            while (last && figure->vertex_types[last] == D2D_VERTEX_TYPE_NONE)
-                --last;
+            if (geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE || (probe->y < p0->y))
+                ++*score;
+            else
+                --*score;
         }
-        p0 = &figure->vertices[last];
-        for (j = 0; j <= last; ++j)
-        {
-            if (!triangles_only && figure->vertex_types[j] == D2D_VERTEX_TYPE_NONE)
-                continue;
 
-            p1 = &figure->vertices[j];
-            d2d_point_subtract(&v_p, p1, p0);
-            d2d_point_subtract(&v_probe, probe, p0);
+        p0 = p1;
+    }
+}
 
-            if ((probe->y < p0->y) != (probe->y < p1->y) && v_probe.x < v_p.x * (v_probe.y / v_p.y))
-            {
-                if (geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE || (probe->y < p0->y))
-                    ++score;
-                else
-                    --score;
-            }
+static BOOL d2d_path_geometry_point_inside(const struct d2d_geometry *geometry,
+        const D2D1_POINT_2F *probe, BOOL triangles_only)
+{
+    unsigned int score;
+    size_t i;
 
-            p0 = p1;
-        }
+    for (i = 0, score = 0; i < geometry->u.path.figure_count; ++i)
+        d2d_figure_point_inside_score(geometry, &geometry->u.path.figures[i], probe, triangles_only, &score);
+
+    return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
+}
+
+/* The figures of a path sorted by the left side of their bounds, each with the
+ * greatest right side among itself and the figures before it. A probe can only
+ * lie within the bounds of a figure that starts at or left of it, and going
+ * back from the last such figure the search ends where that greatest right
+ * side lies left of the probe: no figure further back reaches it. A point
+ * inside test over a path of many small figures looked at the bounds of every
+ * figure for every probe. Figures whose bounds are not finite are kept at the
+ * front and never end the search. The bounds of a figure grow when a vertex
+ * outside them is inserted; the index is built again then, and given up for
+ * the walk over all figures if that happens often. */
+#define D2D_FIGURE_INDEX_MIN_FIGURES 16
+#define D2D_FIGURE_INDEX_MAX_BUILDS 8
+
+struct d2d_figure_index_entry
+{
+    size_t figure_idx;
+    float left;
+    float max_right;
+};
+
+struct d2d_figure_index
+{
+    struct d2d_figure_index_entry *entries;
+    size_t count;
+    unsigned int builds;
+    BOOL valid;
+};
+
+static int __cdecl d2d_figure_index_entry_compare(const void *a, const void *b)
+{
+    const struct d2d_figure_index_entry *ea = a, *eb = b;
+
+    return (ea->left > eb->left) - (ea->left < eb->left);
+}
+
+static BOOL d2d_rect_is_finite(const D2D1_RECT_F *rect)
+{
+    return isfinite(rect->left) && isfinite(rect->top) && isfinite(rect->right) && isfinite(rect->bottom);
+}
+
+static void d2d_figure_index_build(struct d2d_figure_index *index, const struct d2d_geometry *geometry)
+{
+    float max_right = -INFINITY;
+    size_t i;
+
+    index->valid = FALSE;
+    if (geometry->u.path.figure_count < D2D_FIGURE_INDEX_MIN_FIGURES
+            || index->builds >= D2D_FIGURE_INDEX_MAX_BUILDS)
+        return;
+    if (!index->entries && !(index->entries = malloc(geometry->u.path.figure_count * sizeof(*index->entries))))
+        return;
+
+    index->count = geometry->u.path.figure_count;
+    for (i = 0; i < index->count; ++i)
+    {
+        const struct d2d_figure *figure = &geometry->u.path.figures[i];
+        BOOL finite = d2d_rect_is_finite(&figure->bounds);
+
+        index->entries[i].figure_idx = i;
+        index->entries[i].left = finite ? figure->bounds.left : -INFINITY;
+        index->entries[i].max_right = finite ? figure->bounds.right : INFINITY;
+    }
+    qsort(index->entries, index->count, sizeof(*index->entries), d2d_figure_index_entry_compare);
+    for (i = 0; i < index->count; ++i)
+    {
+        max_right = max(max_right, index->entries[i].max_right);
+        index->entries[i].max_right = max_right;
+    }
+    ++index->builds;
+    index->valid = TRUE;
+}
+
+/* d2d_path_geometry_point_inside() over the figures the index yields. */
+static BOOL d2d_figure_index_point_inside(struct d2d_figure_index *index, const struct d2d_geometry *geometry,
+        const D2D1_POINT_2F *probe, BOOL triangles_only)
+{
+    unsigned int score = 0;
+    size_t lo, hi, mid;
+
+    if (!index->valid)
+        d2d_figure_index_build(index, geometry);
+    if (!index->valid)
+        return d2d_path_geometry_point_inside(geometry, probe, triangles_only);
+
+    /* A probe whose x is not a number crosses no edge, and none is found. */
+    for (lo = 0, hi = index->count; lo < hi;)
+    {
+        mid = lo + (hi - lo) / 2;
+        if (index->entries[mid].left <= probe->x)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    while (lo--)
+    {
+        if (index->entries[lo].max_right < probe->x)
+            break;
+        d2d_figure_point_inside_score(geometry, &geometry->u.path.figures[index->entries[lo].figure_idx],
+                probe, triangles_only, &score);
     }
 
     return geometry->u.path.fill_mode == D2D1_FILL_MODE_ALTERNATE ? score & 1 : score;
@@ -2360,13 +2470,32 @@ struct d2d_fill_edge
     const struct d2d_figure *figure;
 };
 
+/* The edges of one figure in a row. The runs of a row are sorted like the
+ * entries of struct d2d_figure_index. */
+struct d2d_fill_edge_run
+{
+    const struct d2d_figure *figure;
+    const struct d2d_fill_edge *first, *end;
+    float left;
+    float max_right;
+};
+
 struct d2d_fill_edge_rows
 {
     struct d2d_fill_edge *edges;
     size_t *row_start;
+    struct d2d_fill_edge_run *runs;
+    size_t *run_start;
     size_t row_count;
     float top, bottom;
 };
+
+static int __cdecl d2d_fill_edge_run_compare(const void *a, const void *b)
+{
+    const struct d2d_fill_edge_run *ra = a, *rb = b;
+
+    return (ra->left > rb->left) - (ra->left < rb->left);
+}
 
 static size_t d2d_fill_edge_rows_row(const struct d2d_fill_edge_rows *rows, float y)
 {
@@ -2401,11 +2530,13 @@ static void d2d_fill_edge_rows_cleanup(struct d2d_fill_edge_rows *rows)
 {
     free(rows->edges);
     free(rows->row_start);
+    free(rows->runs);
+    free(rows->run_start);
 }
 
 static BOOL d2d_fill_edge_rows_init(struct d2d_fill_edge_rows *rows, const struct d2d_geometry *geometry)
 {
-    size_t i, j, r, first, last, edge_count = 0, entry_count, largest;
+    size_t i, j, r, first, last, edge_count = 0, entry_count, largest, run_count;
     const struct d2d_figure *figure;
     size_t *cursor = NULL;
 
@@ -2502,38 +2633,93 @@ static BOOL d2d_fill_edge_rows_init(struct d2d_fill_edge_rows *rows, const struc
     }
     free(cursor);
 
+    /* The edges of a figure lie together in a row. */
+    for (i = 0, run_count = 0; i < entry_count; ++i)
+    {
+        if (!i || rows->edges[i].figure != rows->edges[i - 1].figure)
+            ++run_count;
+    }
+    /* A figure that ends one row and starts the next is two runs. */
+    run_count += rows->row_count;
+    if (!(rows->runs = malloc(run_count * sizeof(*rows->runs)))
+            || !(rows->run_start = malloc((rows->row_count + 1) * sizeof(*rows->run_start))))
+    {
+        ERR("Failed to allocate fill edge runs.\n");
+        d2d_fill_edge_rows_cleanup(rows);
+        return FALSE;
+    }
+    for (r = 0, run_count = 0; r < rows->row_count; ++r)
+    {
+        struct d2d_fill_edge_run *run = NULL;
+        float max_right = -INFINITY;
+
+        rows->run_start[r] = run_count;
+        for (i = rows->row_start[r]; i < rows->row_start[r + 1]; ++i)
+        {
+            const struct d2d_fill_edge *e = &rows->edges[i];
+
+            if (!run || run->figure != e->figure)
+            {
+                BOOL finite = d2d_rect_is_finite(&e->figure->bounds);
+
+                run = &rows->runs[run_count++];
+                run->figure = e->figure;
+                run->first = e;
+                run->left = finite ? e->figure->bounds.left : -INFINITY;
+                run->max_right = finite ? e->figure->bounds.right : INFINITY;
+            }
+            run->end = e + 1;
+        }
+        qsort(&rows->runs[rows->run_start[r]], run_count - rows->run_start[r], sizeof(*rows->runs),
+                d2d_fill_edge_run_compare);
+        for (i = rows->run_start[r]; i < run_count; ++i)
+        {
+            max_right = max(max_right, rows->runs[i].max_right);
+            rows->runs[i].max_right = max_right;
+        }
+    }
+    rows->run_start[rows->row_count] = run_count;
+
     return TRUE;
 }
 
 /* d2d_path_geometry_point_inside(geometry, probe, TRUE) over the edges of the
- * probe's row. */
+ * probe's row, for the figures whose bounds can hold the probe. */
 static BOOL d2d_fill_edge_rows_point_inside(const struct d2d_geometry *geometry,
         const struct d2d_fill_edge_rows *rows, const D2D1_POINT_2F *probe)
 {
-    const struct d2d_fill_edge *e, *end;
+    const struct d2d_fill_edge_run *runs, *run;
+    const struct d2d_fill_edge *e;
     D2D1_POINT_2F v_p, v_probe;
     unsigned int score = 0;
-    size_t r;
+    size_t r, lo, hi, mid;
 
     r = d2d_fill_edge_rows_row(rows, probe->y);
-    for (e = &rows->edges[rows->row_start[r]], end = &rows->edges[rows->row_start[r + 1]]; e < end;)
+    runs = &rows->runs[rows->run_start[r]];
+    for (lo = 0, hi = rows->run_start[r + 1] - rows->run_start[r]; lo < hi;)
     {
-        /* The edges of a figure lie together in a row; the figure's bounds
-         * are checked once for the run, as for the figure in
-         * d2d_path_geometry_point_inside(). */
-        const struct d2d_figure *figure = e->figure;
-        const struct d2d_fill_edge *run_end = e + 1;
+        mid = lo + (hi - lo) / 2;
+        if (runs[mid].left <= probe->x)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    while (lo--)
+    {
+        const struct d2d_figure *figure;
 
-        while (run_end < end && run_end->figure == figure)
-            ++run_end;
+        run = &runs[lo];
+        if (run->max_right < probe->x)
+            break;
+
+        /* The figure's bounds are checked once for the run, as for the
+         * figure in d2d_path_geometry_point_inside(). */
+        figure = run->figure;
         if (probe->x < figure->bounds.left || probe->x > figure->bounds.right
                 || probe->y < figure->bounds.top || probe->y > figure->bounds.bottom)
-        {
-            e = run_end;
             continue;
-        }
 
-        for (; e < run_end; ++e)
+        for (e = run->first; e < run->end; ++e)
         {
             d2d_point_subtract(&v_p, e->p1, e->p0);
             d2d_point_subtract(&v_probe, probe, e->p0);
@@ -5599,6 +5785,7 @@ oom:
 static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
 {
     size_t bezier_idx, i, ordinal, emitted, initial;
+    struct d2d_figure_index index = {0};
     struct d2d_segment_idx idx_p;
     struct d2d_curve_vertex *b;
     const D2D1_POINT_2F *p[3];
@@ -5652,10 +5839,15 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
         i = idx_p.vertex_idx + 1;
         if (d2d_quadratic_is_degenerate(p[0], p[1], &figure->vertices[i == figure->vertex_count ? 0 : i]))
             continue;
-        if (d2d_path_geometry_point_inside(geometry, p[1], FALSE))
+        if (d2d_figure_index_point_inside(&index, geometry, p[1], FALSE))
         {
+            D2D1_RECT_F bounds = figure->bounds;
+
             sign = 1.0f;
             d2d_figure_insert_vertex(figure, i, *p[1]);
+            /* The index holds the bounds of the figures. */
+            if (memcmp(&bounds, &figure->bounds, sizeof(bounds)))
+                index.valid = FALSE;
             /* Inserting a vertex potentially invalidates p[0]. */
             p[0] = &figure->vertices[idx_p.vertex_idx];
             ++i;
@@ -5673,6 +5865,7 @@ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
 
     geometry->fill.bezier_vertex_count = bezier_idx * 3;
     free(emit);
+    free(index.entries);
     return S_OK;
 }
 
