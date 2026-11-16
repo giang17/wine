@@ -2767,9 +2767,12 @@ for native DLLs), sets the same three overrides under
 `DXVK_CONFIG_FILE` in `HKCU\Environment` at a `dxvk.conf` — DXVK reads that file from the
 working directory otherwise, and hosts like REAPER change theirs before the first D3D
 call. Moving the trio together is the predictable choice, since a partial override runs
-one implementation's D3D11 against the other's DXGI; single overrides have worked here
-(EZ Keys 2 with `d3d10core=n`, Korg Modwave and Opsix with `d3d11=n`), but that
-combination is not something this branch tests. Two things not to read as "DXVK is not
+one implementation's D3D11 against the other's DXGI; a single override has worked here
+(EZ Keys 2 with `d3d10core=n`), but that combination is not something this branch tests.
+Korg's modwave native and opsix native, listed here before with `d3d11=n`, need no DXVK:
+opsix native 1.3.0 presents through `wglSwapBuffers` (JUCE's OpenGL context) and modwave
+native 1.4.2 loads neither `d2d1` nor `d3d11`, as standalones and as VST3 in REAPER, with
+the builtins of this branch. Two things not to read as "DXVK is not
 active": DXVK's HUD appears only in an image DXVK presents itself, and none of the
 plug-ins measured here let it — EZ Keys 2 draws through a Direct2D DC render target and a
 GDI blit, Serum 2 through a DComp surface and this branch's blit, JUCE 8 plug-ins through
