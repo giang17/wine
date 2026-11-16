@@ -3596,32 +3596,37 @@ static BOOL d2d_grid_init(struct d2d_grid *grid, const D2D_RECT_F *total_bounds,
     return TRUE;
 }
 
+static size_t d2d_grid_clamp_cell(double f, size_t count)
+{
+    /* A slightly negative coordinate (float drift at the min edge) clamps to
+     * cell 0, as does a NaN, which a range that overflows float produces;
+     * anything at or past the far edge clamps to the last cell. Comparing
+     * before the conversion keeps values a size_t cannot hold out of it. */
+    if (!(f >= 0.0))
+        return 0;
+    if (f >= (double)count)
+        return count - 1;
+    return (size_t)f;
+}
+
+/* Map an AABB to the range of grid cells it covers. The mapping is monotonic
+ * in each coordinate, so two boxes that overlap or touch share a cell. */
+static void d2d_grid_get_cell_range(const struct d2d_grid *grid, const D2D_RECT_F *bounds,
+        size_t *cx0, size_t *cy0, size_t *cx1, size_t *cy1)
+{
+    *cx0 = d2d_grid_clamp_cell((bounds->left   - grid->origin_x) / grid->cell_w, grid->cols);
+    *cy0 = d2d_grid_clamp_cell((bounds->top    - grid->origin_y) / grid->cell_h, grid->rows);
+    *cx1 = d2d_grid_clamp_cell((bounds->right  - grid->origin_x) / grid->cell_w, grid->cols);
+    *cy1 = d2d_grid_clamp_cell((bounds->bottom - grid->origin_y) / grid->cell_h, grid->rows);
+}
+
 static BOOL d2d_grid_insert(struct d2d_grid *grid, size_t segment_idx,
         const D2D_RECT_F *bounds)
 {
     size_t cx0, cy0, cx1, cy1, cx, cy, cell_idx;
-    double fx0, fy0, fx1, fy1;
     struct d2d_grid_entry *entry;
 
-    /* Map AABB to grid cell range. Compute as signed doubles first: a slightly
-     * negative coordinate (float drift at the min edge) must clamp to cell 0,
-     * not wrap to a huge size_t (which the upper-bound clamp below would then
-     * fold to cols-1/rows-1, mis-bucketing boundary-heavy inputs). */
-    fx0 = (bounds->left   - grid->origin_x) / grid->cell_w;
-    fy0 = (bounds->top    - grid->origin_y) / grid->cell_h;
-    fx1 = (bounds->right  - grid->origin_x) / grid->cell_w;
-    fy1 = (bounds->bottom - grid->origin_y) / grid->cell_h;
-
-    cx0 = fx0 < 0.0 ? 0 : (size_t)fx0;
-    cy0 = fy0 < 0.0 ? 0 : (size_t)fy0;
-    cx1 = fx1 < 0.0 ? 0 : (size_t)fx1;
-    cy1 = fy1 < 0.0 ? 0 : (size_t)fy1;
-
-    /* Clamp the upper bound to grid extents (handles floating-point edge cases) */
-    if (cx0 >= grid->cols) cx0 = grid->cols - 1;
-    if (cy0 >= grid->rows) cy0 = grid->rows - 1;
-    if (cx1 >= grid->cols) cx1 = grid->cols - 1;
-    if (cy1 >= grid->rows) cy1 = grid->rows - 1;
+    d2d_grid_get_cell_range(grid, bounds, &cx0, &cy0, &cx1, &cy1);
 
     for (cy = cy0; cy <= cy1; ++cy)
     {
@@ -4885,12 +4890,11 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
 
     /* Two control triangles whose bounding boxes lie strictly apart share no
      * point, so neither the edge crossings nor the containment tests below
-     * can find one. The caller tries every pair of Bézier segments in the
-     * geometry against each other; for the glyph outlines a JUCE application
-     * draws as paths that is up to several thousand pairs per path, nearly
-     * all of them far apart, and the full test below took half of Close().
-     * Boxes that touch keep the full test, as does a non-finite coordinate,
-     * for which no comparison here holds. */
+     * can find one. The caller leaves out the pairs that are apart when it
+     * collects them, with the same comparison (d2d_bezier_pieces_apart());
+     * this test catches the pairs that come apart as their triangles are
+     * split. Boxes that touch keep the full test, as does a non-finite
+     * coordinate, for which no comparison here holds. */
     if (max(a[0]->x, max(a[1]->x, a[2]->x)) < min(b[0]->x, min(b[1]->x, b[2]->x))
             || max(b[0]->x, max(b[1]->x, b[2]->x)) < min(a[0]->x, min(a[1]->x, a[2]->x))
             || max(a[0]->y, max(a[1]->y, a[2]->y)) < min(b[0]->y, min(b[1]->y, b[2]->y))
@@ -5204,128 +5208,410 @@ static BOOL d2d_quadratic_is_degenerate(const D2D1_POINT_2F *p0, const D2D1_POIN
 #define D2D_BEZIER_MAX_SEGMENT_FACTOR 16
 #define D2D_BEZIER_MIN_SEGMENT_BUDGET 4096
 
-/* The subdivision depth of every Bézier segment, in the order in which
- * d2d_geometry_get_next_bezier_segment_idx() visits them. A split leaves the
- * first half at the segment's position and inserts the second half right
- * after it, so the array is kept in step with the figure arrays. */
-struct d2d_bezier_depths
+/* A Bézier segment of the overlap pass. The pieces form a list in the order
+ * in which d2d_geometry_get_next_bezier_segment_idx() visits the segments. A
+ * split leaves the first half at the segment's position and links the second
+ * half right after it. */
+struct d2d_bezier_piece
 {
-    unsigned char *depth;
-    size_t size;
-    size_t count;
+    struct d2d_segment_idx idx;     /* Kept in step with the figure arrays. */
+    D2D_RECT_F bounds;              /* Of the control triangle. */
+    size_t next;                    /* SIZE_MAX at the end of the list. */
+    size_t stamp;                   /* The last query that collected the piece. */
+    unsigned char depth;            /* Subdivision depth. */
+    BOOL unbounded;                 /* Has a coordinate that is not finite. */
 };
 
-static BOOL d2d_bezier_depths_split(struct d2d_bezier_depths *depths, size_t idx)
+struct d2d_bezier_candidate
 {
-    if (!d2d_array_reserve((void **)&depths->depth, &depths->size, depths->count + 1, sizeof(*depths->depth)))
-    {
-        ERR("Failed to grow Bézier depth array.\n");
-        return FALSE;
-    }
+    size_t figure_idx;
+    size_t vertex_idx;
+    size_t piece;
+};
 
-    memmove(&depths->depth[idx + 2], &depths->depth[idx + 1], (depths->count - idx - 1) * sizeof(*depths->depth));
-    depths->depth[idx + 1] = ++depths->depth[idx];
-    ++depths->count;
+/* Below this number of pieces the list is walked instead of a grid built. */
+#define D2D_BEZIER_GRID_MIN_PIECES 32
+/* Grid entries allowed per piece before the cells are made larger. */
+#define D2D_BEZIER_GRID_MAX_COVER 16
+
+struct d2d_bezier_pieces
+{
+    struct d2d_bezier_piece *pieces;
+    size_t size;
+    size_t count;
+
+    BOOL use_grid;
+    struct d2d_grid grid;           /* The pieces with finite coordinates. */
+    size_t *unbounded;              /* The others. */
+    size_t unbounded_size;
+    size_t unbounded_count;
+
+    struct d2d_bezier_candidate *candidates;
+    size_t candidates_size;
+    size_t candidate_count;
+    size_t query;
+};
+
+static void d2d_bezier_pieces_cleanup(struct d2d_bezier_pieces *pieces)
+{
+    if (pieces->use_grid)
+        d2d_grid_destroy(&pieces->grid);
+    free(pieces->unbounded);
+    free(pieces->candidates);
+    free(pieces->pieces);
+}
+
+/* The bounds are computed exactly as d2d_geometry_check_bezier_overlap()
+ * computes them, so that d2d_bezier_pieces_apart() rejects the pairs that
+ * function rejects by its bounding box test, and no others. */
+static void d2d_bezier_piece_update(const struct d2d_geometry *geometry, struct d2d_bezier_piece *piece)
+{
+    const struct d2d_figure *figure = &geometry->u.path.figures[piece->idx.figure_idx];
+    const D2D1_POINT_2F *a[3];
+
+    a[0] = &figure->vertices[piece->idx.vertex_idx];
+    a[1] = &figure->bezier_controls[piece->idx.control_idx];
+    a[2] = &figure->vertices[piece->idx.vertex_idx + 1];
+
+    piece->bounds.left = min(a[0]->x, min(a[1]->x, a[2]->x));
+    piece->bounds.right = max(a[0]->x, max(a[1]->x, a[2]->x));
+    piece->bounds.top = min(a[0]->y, min(a[1]->y, a[2]->y));
+    piece->bounds.bottom = max(a[0]->y, max(a[1]->y, a[2]->y));
+    piece->unbounded = !isfinite(a[0]->x) || !isfinite(a[0]->y) || !isfinite(a[1]->x)
+            || !isfinite(a[1]->y) || !isfinite(a[2]->x) || !isfinite(a[2]->y);
+}
+
+static BOOL d2d_bezier_pieces_apart(const struct d2d_bezier_piece *a, const struct d2d_bezier_piece *b)
+{
+    return a->bounds.right < b->bounds.left || b->bounds.right < a->bounds.left
+            || a->bounds.bottom < b->bounds.top || b->bounds.bottom < a->bounds.top;
+}
+
+static BOOL d2d_bezier_piece_precedes(const struct d2d_bezier_piece *a, const struct d2d_bezier_piece *b)
+{
+    if (a->idx.figure_idx != b->idx.figure_idx)
+        return a->idx.figure_idx < b->idx.figure_idx;
+    return a->idx.vertex_idx < b->idx.vertex_idx;
+}
+
+static BOOL d2d_bezier_pieces_register(struct d2d_bezier_pieces *pieces, size_t idx)
+{
+    const struct d2d_bezier_piece *piece = &pieces->pieces[idx];
+
+    if (!pieces->use_grid)
+        return TRUE;
+
+    if (!piece->unbounded)
+        return d2d_grid_insert(&pieces->grid, idx, &piece->bounds);
+
+    if (!d2d_array_reserve((void **)&pieces->unbounded, &pieces->unbounded_size,
+            pieces->unbounded_count + 1, sizeof(*pieces->unbounded)))
+        return FALSE;
+    pieces->unbounded[pieces->unbounded_count++] = idx;
 
     return TRUE;
 }
 
-static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+static BOOL d2d_bezier_pieces_init(struct d2d_bezier_pieces *pieces, struct d2d_geometry *geometry, size_t count)
 {
-    struct d2d_segment_idx idx_p, idx_q;
-    struct d2d_bezier_depths depths = {0};
-    size_t ord_p, ord_q, budget, initial;
-    struct d2d_curve_vertex *b;
-    const D2D1_POINT_2F *p[3];
-    struct d2d_figure *figure;
-    size_t bezier_idx, i, ordinal, emitted;
-    BOOL *emit;
+    size_t i, bounded = 0, covered, cx0, cy0, cx1, cy1;
+    struct d2d_bezier_piece *piece;
+    struct d2d_segment_idx idx;
+    D2D_RECT_F total = {0};
 
-    if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
-        return S_OK;
+    memset(pieces, 0, sizeof(*pieces));
+    if (!(pieces->pieces = calloc(count, sizeof(*pieces->pieces))))
+        return FALSE;
+    pieces->size = pieces->count = count;
 
-    depths.count = 1;
-    while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
-        ++depths.count;
-    if (!(depths.depth = calloc(depths.count, sizeof(*depths.depth))))
+    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx);
+    for (i = 0; i < count; ++i)
     {
-        ERR("Failed to allocate Bézier depth array.\n");
-        return E_OUTOFMEMORY;
-    }
-    depths.size = initial = depths.count;
-    budget = max(initial * D2D_BEZIER_MAX_SEGMENT_FACTOR, D2D_BEZIER_MIN_SEGMENT_BUDGET);
-
-    /* Split overlapping bezier control triangles. */
-    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
-    ord_p = 0;
-    while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
-    {
-        ++ord_p;
-        d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_q);
-        ord_q = 0;
-        while (ord_q < ord_p)
+        piece = &pieces->pieces[i];
+        piece->idx = idx;
+        piece->next = i + 1 < count ? i + 1 : SIZE_MAX;
+        d2d_bezier_piece_update(geometry, piece);
+        if (!piece->unbounded)
         {
-            while (d2d_geometry_check_bezier_overlap(geometry, &idx_p, &idx_q))
+            if (!bounded++)
+                total = piece->bounds;
+            else
             {
-                BOOL split_q = fabsf(d2d_geometry_bezier_ccw(geometry, &idx_q))
-                        > fabsf(d2d_geometry_bezier_ccw(geometry, &idx_p));
-
-                if (depths.depth[ord_p] >= D2D_BEZIER_MAX_SPLIT_DEPTH
-                        || depths.depth[ord_q] >= D2D_BEZIER_MAX_SPLIT_DEPTH)
-                    break;
-                if (depths.count >= budget)
-                {
-                    WARN("Bézier segment budget of %Iu exhausted, leaving control triangles overlapping.\n", budget);
-                    break;
-                }
-
-                /* Split the other segment if the larger one cannot be split
-                 * any further, and leave the pair alone if neither can: the
-                 * loop would otherwise insert the same point forever, growing
-                 * the figure until memory runs out. */
-                if (!d2d_geometry_bezier_split_progresses(geometry, split_q ? &idx_q : &idx_p))
-                {
-                    split_q = !split_q;
-                    if (!d2d_geometry_bezier_split_progresses(geometry, split_q ? &idx_q : &idx_p))
-                        break;
-                }
-
-                if (split_q)
-                {
-                    if (!d2d_geometry_split_bezier(geometry, &idx_q) || !d2d_bezier_depths_split(&depths, ord_q))
-                    {
-                        free(depths.depth);
-                        return E_OUTOFMEMORY;
-                    }
-                    ++ord_p;
-                    if (idx_p.figure_idx == idx_q.figure_idx)
-                    {
-                        ++idx_p.vertex_idx;
-                        ++idx_p.control_idx;
-                    }
-                }
-                else
-                {
-                    if (!d2d_geometry_split_bezier(geometry, &idx_p) || !d2d_bezier_depths_split(&depths, ord_p))
-                    {
-                        free(depths.depth);
-                        return E_OUTOFMEMORY;
-                    }
-                }
+                total.left = min(total.left, piece->bounds.left);
+                total.top = min(total.top, piece->bounds.top);
+                total.right = max(total.right, piece->bounds.right);
+                total.bottom = max(total.bottom, piece->bounds.bottom);
             }
-            d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_q);
-            ++ord_q;
+        }
+        d2d_geometry_get_next_bezier_segment_idx(geometry, &idx);
+    }
+
+    if (bounded < D2D_BEZIER_GRID_MIN_PIECES || !d2d_grid_init(&pieces->grid, &total, bounded))
+        return TRUE;
+    pieces->use_grid = TRUE;
+
+    /* A control triangle is entered into every cell its bounds cover. With
+     * many large triangles on top of each other that is the number of pieces
+     * times the number of cells; enlarge the cells until the entries are a
+     * small multiple of the pieces, down to a single cell, which tests every
+     * pair again. */
+    for (;;)
+    {
+        for (i = 0, covered = 0; i < count; ++i)
+        {
+            if (pieces->pieces[i].unbounded)
+                continue;
+            d2d_grid_get_cell_range(&pieces->grid, &pieces->pieces[i].bounds, &cx0, &cy0, &cx1, &cy1);
+            covered += (cx1 - cx0 + 1) * (cy1 - cy0 + 1);
+        }
+        if (covered <= bounded * D2D_BEZIER_GRID_MAX_COVER || (pieces->grid.cols == 1 && pieces->grid.rows == 1))
+            break;
+        cx0 = max(pieces->grid.cols / 2, 1);
+        cy0 = max(pieces->grid.rows / 2, 1);
+        pieces->grid.cell_w *= (float)pieces->grid.cols / (float)cx0;
+        pieces->grid.cell_h *= (float)pieces->grid.rows / (float)cy0;
+        pieces->grid.cols = cx0;
+        pieces->grid.rows = cy0;
+    }
+
+    for (i = 0; i < count; ++i)
+    {
+        if (!d2d_bezier_pieces_register(pieces, i))
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOL d2d_bezier_pieces_add_candidate(struct d2d_bezier_pieces *pieces, size_t idx)
+{
+    struct d2d_bezier_candidate *candidate;
+
+    if (!d2d_array_reserve((void **)&pieces->candidates, &pieces->candidates_size,
+            pieces->candidate_count + 1, sizeof(*pieces->candidates)))
+        return FALSE;
+
+    candidate = &pieces->candidates[pieces->candidate_count++];
+    candidate->figure_idx = pieces->pieces[idx].idx.figure_idx;
+    candidate->vertex_idx = pieces->pieces[idx].idx.vertex_idx;
+    candidate->piece = idx;
+
+    return TRUE;
+}
+
+static int d2d_bezier_candidate_compare(const void *a, const void *b)
+{
+    const struct d2d_bezier_candidate *ca = a, *cb = b;
+
+    if (ca->figure_idx != cb->figure_idx)
+        return ca->figure_idx < cb->figure_idx ? -1 : 1;
+    if (ca->vertex_idx != cb->vertex_idx)
+        return ca->vertex_idx < cb->vertex_idx ? -1 : 1;
+    return 0;
+}
+
+/* Collect the pieces before piece p whose bounds are not apart from those of
+ * p, in list order. */
+static BOOL d2d_bezier_pieces_collect(struct d2d_bezier_pieces *pieces, size_t p)
+{
+    const struct d2d_bezier_piece *piece_p = &pieces->pieces[p], *piece_q;
+    size_t cx0, cy0, cx1, cy1, cx, cy, i, q;
+
+    pieces->candidate_count = 0;
+
+    /* A coordinate that is not finite fails every comparison, so such a
+     * piece is apart from none. */
+    if (!pieces->use_grid || piece_p->unbounded)
+    {
+        for (q = 0; q != p; q = pieces->pieces[q].next)
+        {
+            if (!d2d_bezier_pieces_apart(piece_p, &pieces->pieces[q])
+                    && !d2d_bezier_pieces_add_candidate(pieces, q))
+                return FALSE;
+        }
+        return TRUE;
+    }
+
+    ++pieces->query;
+    d2d_grid_get_cell_range(&pieces->grid, &piece_p->bounds, &cx0, &cy0, &cx1, &cy1);
+    for (cy = cy0; cy <= cy1; ++cy)
+    {
+        for (cx = cx0; cx <= cx1; ++cx)
+        {
+            for (i = pieces->grid.cells[cy * pieces->grid.cols + cx]; i != SIZE_MAX; i = pieces->grid.entries[i].next)
+            {
+                q = pieces->grid.entries[i].segment_idx;
+                piece_q = &pieces->pieces[q];
+                if (piece_q->stamp == pieces->query)
+                    continue;
+                pieces->pieces[q].stamp = pieces->query;
+                if (d2d_bezier_piece_precedes(piece_q, piece_p) && !d2d_bezier_pieces_apart(piece_p, piece_q)
+                        && !d2d_bezier_pieces_add_candidate(pieces, q))
+                    return FALSE;
+            }
         }
     }
+    for (i = 0; i < pieces->unbounded_count; ++i)
+    {
+        q = pieces->unbounded[i];
+        piece_q = &pieces->pieces[q];
+        if (d2d_bezier_piece_precedes(piece_q, piece_p) && !d2d_bezier_pieces_apart(piece_p, piece_q)
+                && !d2d_bezier_pieces_add_candidate(pieces, q))
+            return FALSE;
+    }
+
+    qsort(pieces->candidates, pieces->candidate_count, sizeof(*pieces->candidates), d2d_bezier_candidate_compare);
+
+    return TRUE;
+}
+
+static BOOL d2d_bezier_pieces_split(struct d2d_bezier_pieces *pieces, struct d2d_geometry *geometry, size_t idx)
+{
+    struct d2d_bezier_piece *piece, *half;
+    size_t i, half_idx;
+
+    if (!d2d_array_reserve((void **)&pieces->pieces, &pieces->size, pieces->count + 1, sizeof(*pieces->pieces)))
+    {
+        ERR("Failed to grow Bézier piece array.\n");
+        return FALSE;
+    }
+
+    piece = &pieces->pieces[idx];
+    if (!d2d_geometry_split_bezier(geometry, &piece->idx))
+        return FALSE;
+
+    half_idx = pieces->count++;
+    half = &pieces->pieces[half_idx];
+    half->idx.figure_idx = piece->idx.figure_idx;
+    half->idx.vertex_idx = piece->idx.vertex_idx + 1;
+    half->idx.control_idx = piece->idx.control_idx + 1;
+    half->stamp = 0;
+    half->depth = ++piece->depth;
+    half->next = piece->next;
+    piece->next = half_idx;
+
+    /* The split inserted a vertex and a control point into the figure. */
+    for (i = half->next; i != SIZE_MAX && pieces->pieces[i].idx.figure_idx == piece->idx.figure_idx;
+            i = pieces->pieces[i].next)
+    {
+        ++pieces->pieces[i].idx.vertex_idx;
+        ++pieces->pieces[i].idx.control_idx;
+    }
+
+    d2d_bezier_piece_update(geometry, piece);
+    d2d_bezier_piece_update(geometry, half);
+
+    return d2d_bezier_pieces_register(pieces, half_idx);
+}
+
+/* Split overlapping Bézier control triangles.
+ *
+ * Every piece is tested against the pieces before it, in order, and the
+ * larger triangle of an overlapping pair is split until the pair no longer
+ * overlaps. d2d_geometry_check_bezier_overlap() finds no overlap between two
+ * triangles whose bounds are apart, and both halves of a split lie within
+ * the triangle that was split, so a pair that is apart stays apart whatever
+ * is split later. Such pairs are left out here: a grid over the bounds
+ * yields the earlier pieces that share a cell with a piece, which are then
+ * visited in the order the full pass over all pairs would visit them. The
+ * splits are those of the full pass; what is saved are the tests, which for
+ * a path of many small figures were nearly all between pieces far apart: for
+ * a path of 3,400 pieces, the corners of 320 rounded rectangles next to each
+ * other, the pass over 5.7 million pairs took about 40 ms, and takes under
+ * 2 ms for the pairs that share a cell. */
+static HRESULT d2d_geometry_split_bezier_overlaps(struct d2d_geometry *geometry, size_t initial)
+{
+    struct d2d_bezier_pieces pieces;
+    size_t budget, i, p, q, stop;
+    BOOL split_q;
+
+    if (!d2d_bezier_pieces_init(&pieces, geometry, initial))
+        goto oom;
+    budget = max(initial * D2D_BEZIER_MAX_SEGMENT_FACTOR, D2D_BEZIER_MIN_SEGMENT_BUDGET);
+
+    for (p = pieces.pieces[0].next; p != SIZE_MAX; p = pieces.pieces[p].next)
+    {
+        if (!d2d_bezier_pieces_collect(&pieces, p))
+            goto oom;
+
+        for (i = 0; i < pieces.candidate_count; ++i)
+        {
+            /* The halves split off a piece follow it in the list and are
+             * tested against p as well, up to the piece that followed it
+             * before. */
+            q = pieces.candidates[i].piece;
+            stop = pieces.pieces[q].next;
+            do
+            {
+                while (d2d_geometry_check_bezier_overlap(geometry, &pieces.pieces[p].idx, &pieces.pieces[q].idx))
+                {
+                    split_q = fabsf(d2d_geometry_bezier_ccw(geometry, &pieces.pieces[q].idx))
+                            > fabsf(d2d_geometry_bezier_ccw(geometry, &pieces.pieces[p].idx));
+
+                    if (pieces.pieces[p].depth >= D2D_BEZIER_MAX_SPLIT_DEPTH
+                            || pieces.pieces[q].depth >= D2D_BEZIER_MAX_SPLIT_DEPTH)
+                        break;
+                    if (pieces.count >= budget)
+                    {
+                        WARN("Bézier segment budget of %Iu exhausted, leaving control triangles overlapping.\n", budget);
+                        break;
+                    }
+
+                    /* Split the other segment if the larger one cannot be split
+                     * any further, and leave the pair alone if neither can: the
+                     * loop would otherwise insert the same point forever, growing
+                     * the figure until memory runs out. */
+                    if (!d2d_geometry_bezier_split_progresses(geometry, &pieces.pieces[split_q ? q : p].idx))
+                    {
+                        split_q = !split_q;
+                        if (!d2d_geometry_bezier_split_progresses(geometry, &pieces.pieces[split_q ? q : p].idx))
+                            break;
+                    }
+
+                    if (!d2d_bezier_pieces_split(&pieces, geometry, split_q ? q : p))
+                        goto oom;
+                }
+                q = pieces.pieces[q].next;
+            } while (q != stop);
+        }
+    }
+
     if (TRACE_ON(d2d))
     {
         unsigned int max_depth = 0;
 
-        for (i = 0; i < depths.count; ++i)
-            max_depth = max(max_depth, depths.depth[i]);
-        TRACE("Split %Iu Bézier segments into %Iu, maximum depth %u.\n", initial, depths.count, max_depth);
+        for (i = 0; i < pieces.count; ++i)
+            max_depth = max(max_depth, pieces.pieces[i].depth);
+        TRACE("Split %Iu Bézier segments into %Iu, maximum depth %u.\n", initial, pieces.count, max_depth);
     }
-    free(depths.depth);
+    d2d_bezier_pieces_cleanup(&pieces);
+    return S_OK;
+
+oom:
+    ERR("Failed to allocate memory for the Bézier pieces.\n");
+    d2d_bezier_pieces_cleanup(&pieces);
+    return E_OUTOFMEMORY;
+}
+
+static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+{
+    size_t bezier_idx, i, ordinal, emitted, initial;
+    struct d2d_segment_idx idx_p;
+    struct d2d_curve_vertex *b;
+    const D2D1_POINT_2F *p[3];
+    struct d2d_figure *figure;
+    BOOL *emit;
+    HRESULT hr;
+
+    if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
+        return S_OK;
+
+    initial = 1;
+    while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
+        ++initial;
+
+    if (FAILED(hr = d2d_geometry_split_bezier_overlaps(geometry, initial)))
+        return hr;
 
     if (!d2d_geometry_shared_bezier_caps(geometry, &emit, &emitted))
         return E_OUTOFMEMORY;
