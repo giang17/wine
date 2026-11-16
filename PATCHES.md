@@ -1629,8 +1629,9 @@ This is the recommended branch. What it changes, by subsystem:
   with the square of the number of pieces; a second loop, which counts the members of each group
   of coincident pieces in `d2d_geometry_shared_bezier_caps()`, walked to the end of the sorted
   array once per group. Minimal Audio Current 2.4.1 fills, in the tap display of its Cluster
-  Delay (preset "Leslied"), sixteen paths per frame, eight of them holding the rounded
-  rectangles of all taps so far, up to 320 figures and 3,384 quadratic pieces: its editor ran
+  Delay (preset "Leslied"), thirty-two paths per frame in two groups of sixteen, eight of each
+  group holding the rounded rectangles of all taps so far, up to 320 figures and 3,384
+  quadratic pieces: its editor ran
   at 4.3-6.5 fps in REAPER with the main thread at 96-100 %, 87 % of that thread's samples in
   d2d1 and about 60 % of those in the pair pass (issue 609). Two control triangles whose bounds
   are apart do not overlap, and both halves of a split lie within the triangle that was split,
