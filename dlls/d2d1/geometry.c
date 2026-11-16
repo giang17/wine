@@ -3464,25 +3464,73 @@ static BOOL d2d_geometry_intersect_bezier_line(struct d2d_geometry *geometry,
     return TRUE;
 }
 
-/* Two quadratic segments describe the same curve, possibly traversed in
- * opposite directions. The tolerance is a fraction of a DIP well below anything
- * rasterisation resolves, scaled with the coordinate magnitude so that float
- * rounding in the caller's own conversion (a cubic converted twice into the
- * same quadratics) does not defeat the test. */
+/* The tolerance within which two points of curve segments count as the same:
+ * a fraction of a DIP well below anything rasterisation resolves, scaled with
+ * the coordinate magnitude so that float rounding in the caller's own
+ * conversion (a cubic converted twice into the same quadratics) does not
+ * defeat the test. */
+static float d2d_point_tolerance(const D2D1_POINT_2F *p)
+{
+    return 1e-4f * fmaxf(1.0f, fmaxf(fabsf(p->x), fabsf(p->y)));
+}
+
 static BOOL d2d_point_approx_equal(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b)
 {
-    float eps = 1e-4f * fmaxf(1.0f, fmaxf(fabsf(a->x), fabsf(a->y)));
+    float eps = d2d_point_tolerance(a);
 
     return fabsf(a->x - b->x) <= eps && fabsf(a->y - b->y) <= eps;
 }
 
+static BOOL d2d_point_within(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b, float limit)
+{
+    return fabsf(a->x - b->x) <= limit && fabsf(a->y - b->y) <= limit;
+}
+
+/* The larger side of the bounds of a control triangle. */
+static float d2d_bezier_segment_extent(const D2D1_POINT_2F *const p[3])
+{
+    float w = max(p[0]->x, max(p[1]->x, p[2]->x)) - min(p[0]->x, min(p[1]->x, p[2]->x));
+    float h = max(p[0]->y, max(p[1]->y, p[2]->y)) - min(p[0]->y, min(p[1]->y, p[2]->y));
+
+    return max(w, h);
+}
+
+/* Two quadratic segments describe the same curve, possibly traversed in
+ * opposite directions: their points lie within the tolerance of
+ * d2d_point_tolerance(), and within a thousandth of the size of the smaller
+ * segment.
+ *
+ * The second bound keeps apart what merely lies close together. The
+ * tolerance grows with the coordinate, 0.0256 at x 256, and the two sides of
+ * a figure thinner than that are not an arc and its reverse, nor are the
+ * neighbouring pieces of a curve that was split down to that size the same
+ * piece. Taken for coincident, the two arcs of a figure 2 wide and 0.036 high
+ * at x 254 got no curve triangles and were not split against each other,
+ * although their control triangles overlap at the tips of the figure, where
+ * its first and last point lie one float apart; the chords then crossed,
+ * the triangulation cut one constraint with the other, and the figure was
+ * filled without its ends and with a triangle reaching its neighbour.
+ * Segments that do run along each other differ by far less than a
+ * thousandth of their size: the stroke caps shared between figures, which
+ * this test is for, are identical. */
 static BOOL d2d_bezier_segments_coincide(const D2D1_POINT_2F *const p[3], const D2D1_POINT_2F *const q[3])
 {
+    BOOL same, reverse;
+    float limit;
+
     if (!d2d_point_approx_equal(p[1], q[1]))
         return FALSE;
-    if (d2d_point_approx_equal(p[0], q[0]) && d2d_point_approx_equal(p[2], q[2]))
+    same = d2d_point_approx_equal(p[0], q[0]) && d2d_point_approx_equal(p[2], q[2]);
+    reverse = d2d_point_approx_equal(p[0], q[2]) && d2d_point_approx_equal(p[2], q[0]);
+    if (!same && !reverse)
+        return FALSE;
+
+    limit = 1e-3f * min(d2d_bezier_segment_extent(p), d2d_bezier_segment_extent(q));
+    if (!d2d_point_within(p[1], q[1], limit))
+        return FALSE;
+    if (same && d2d_point_within(p[0], q[0], limit) && d2d_point_within(p[2], q[2], limit))
         return TRUE;
-    return d2d_point_approx_equal(p[0], q[2]) && d2d_point_approx_equal(p[2], q[0]);
+    return reverse && d2d_point_within(p[0], q[2], limit) && d2d_point_within(p[2], q[0], limit);
 }
 
 /* Whether the segments p0-p1 and q0-q1 cross or touch. Collinear segments do
@@ -5076,7 +5124,7 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
     const struct d2d_figure *figure;
     D2D1_POINT_2F v_q[3], v_p, v_qp;
     unsigned int i, j, score;
-    float ccw_a, ccw_b;
+    float ccw_a, ccw_b, eps;
     float det, t;
 
     figure = &geometry->u.path.figures[idx_p->figure_idx];
@@ -5119,6 +5167,14 @@ static BOOL d2d_geometry_check_bezier_overlap(struct d2d_geometry *geometry,
      * same curve, leaving slivers between them. Keep them identical instead;
      * their curve triangles then cancel or add exactly. */
     if (d2d_bezier_segments_coincide(a, b))
+        return FALSE;
+
+    /* Two triangles no larger than the tolerance of d2d_point_tolerance() stay
+     * as they are: what overlaps there is below that tolerance, and the
+     * pieces of curves that cross or run along each other would otherwise
+     * all be split on to the depth limit. */
+    eps = d2d_point_tolerance(a[0]);
+    if (d2d_bezier_segment_extent(a) <= eps && d2d_bezier_segment_extent(b) <= eps)
         return FALSE;
 
     d2d_point_subtract(&v_q[0], b[1], b[0]);
