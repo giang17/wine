@@ -1778,7 +1778,10 @@ This is the recommended branch. What it changes, by subsystem:
   ellipse or a pill as a path of its own closes in less than 0.5 µs instead of 3-7 µs, faster
   than the fill cache finds it, which such a path no longer enters. The d2d1 tests fail at
   the same 26 lines on x86_64 and i386; 350,000 paths of the three geometry fuzzers close
-  without a hang, a crash or a failed `Close()`. The frame rate in the host was not measured.
+  without a hang, a crash or a failed `Close()`. Current's editor in REAPER (project state of
+  issue 610, Direct2D renderer) runs at 17.1-18.7 fps, mean 17.9, and at 14.5-16.6, mean
+  15.6, with the switch off in the same binary (two runs of 30 s each, in turn); the REAPER
+  main thread takes 77 % of a core instead of 83-84 %.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
