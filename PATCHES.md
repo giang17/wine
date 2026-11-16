@@ -1740,6 +1740,45 @@ This is the recommended branch. What it changes, by subsystem:
   1.8 ms; paths of 4,000 glyph or polygon segments take what they took. The d2d1 tests fail at
   the same 30 places on x86_64 and i386; 100,000 paths of the three geometry fuzzers close
   without a hang or a failed `Close()`.
+- **d2d1**: a convex figure that stands alone is filled with a fan. `Close()` took every path
+  through the self-intersection pass, the overlap pass of the control triangles and the
+  constrained Delaunay triangulation, although a convex figure has nothing for them to find:
+  its segments do not cross, its control triangles lie outside its chords next to each other,
+  and no triangulation has to find out which side of an edge is inside. In Minimal Audio
+  Current's Cluster Delay tap display 1,710 of the 3,024 rounded rectangles of a frame stand
+  alone once the paths are closed by their groups, and closing them took 15.2 ms of the
+  46.6 ms of a frame (issue 614). A path of one figure, and a group of one figure of a larger
+  path, is now tested for convexity and filled with a fan around the mean of its vertices, one
+  triangle per edge, plus the curve triangle of every curve segment; the figure is left as it
+  is. The test uses the exact orientation predicate and is strict: the outline turns the same
+  way from every edge to the next and goes around once, the mean of the vertices lies inside
+  every edge, and every control point lies outside its own chord and not outside the two
+  neighbouring edges. A line of a float or two does not count as an edge: in 18 % of the
+  figures the corners take up the whole height of the rounded rectangle and the straight side
+  left between them comes out one float long and pointing backwards. What fails the test
+  goes through the steps as before, as do polygons of three or four vertices;
+  `WINE_D2D_FILL_FAN=0` disables the fan. A probe build closed every figure the fan fills the
+  old way as well: on the 384 paths of twelve captured frames the fan fills all 20,522 figures
+  that stand alone, and for the 16,865 without a line of one float the figure after `Close()`
+  and the curve triangles are the same byte for byte; the 3,657 others came out of the old way
+  with 18 to 40 vertices instead of 10 and 16 to 38 curve triangles instead of 8. Sampled
+  against the winding numbers of the input, the fill of the 384 paths is wrong at 2,370 of
+  10.45 million points instead of 2,371, that of 3,000 random paths of one convex or nearly
+  convex figure at 45,431 of 13.8 million instead of 46,801. Rendered in original size, the 32
+  paths of a frame differ in 2,226 of 627,768 pixels; against the coverage computed from the
+  input the old way is off by more than 64 of 255 in 41 of them and the fan in 10, because at
+  a bar with sides of one float the old way left out whole pixels of the edge (0 drawn for a
+  coverage of 93 to 109). The sum of the errors over those pixels is 29,403 with the fan and
+  27,830 without: a triangle antialiases its own edge only, and the fan divides two pieces of
+  a cap along a line to the centre of the bar, so the pixels beside it come out up to 23 of
+  255 too bright. Sixteen rounded rectangles, pills, ellipses and a hexagon are closer to a
+  rendering sixteen times the size scaled down than before (sum of the errors 1,598 instead
+  of 1,923 in original size), a 64-gon 113 instead of 4,239. Closing the paths of the twelve
+  frames takes 35.5-36.0 ms per frame instead of 49.0-49.7 ms; a rounded rectangle, an
+  ellipse or a pill as a path of its own closes in less than 0.5 µs instead of 3-7 µs, faster
+  than the fill cache finds it, which such a path no longer enters. The d2d1 tests fail at
+  the same 26 lines on x86_64 and i386; 350,000 paths of the three geometry fuzzers close
+  without a hang, a crash or a failed `Close()`. The frame rate in the host was not measured.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
