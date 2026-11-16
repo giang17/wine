@@ -1762,6 +1762,18 @@ static void window_set_net_wm_state( struct x11drv_win_data *data, UINT new_stat
     /* we ignore and override previous _NET_WM_STATE update requests */
     if (old_state == new_state) return; /* states are the same, nothing to update */
 
+    /* win32u is applying a state change of the window manager (X11DRV_GetWindowStateUpdates) and
+     * the application may place the window several times on the way: Electron answers SC_RESTORE
+     * with a SetWindowPlacement to its own normal bounds before the rect of the window manager
+     * is applied.  A request made from such an intermediate rect (fullscreen, if it covers the
+     * monitor) reaches the window manager after the fact and is carried out against the final
+     * state.  Only the result is requested, once the thread processes events again. */
+    if (x11drv_thread_data()->wm_state_update_hwnd == data->hwnd)
+    {
+        TRACE( "window %p/%lx is applying a window manager state change, delaying request\n", data->hwnd, data->whole_window );
+        return;
+    }
+
     if (window_needs_net_wm_state_change_delay( data ))
     {
         TRACE( "window %p/%lx is updating config/_MOTIF_WM_HINTS, delaying request\n", data->hwnd, data->whole_window );
@@ -2386,6 +2398,7 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
 
         *state_cmd = window_update_client_state( data );
         *swp_flags = window_update_client_config( data );
+        if (*state_cmd) thread_data->wm_state_update_hwnd = hwnd;
         *rect = window_rect_from_visible( &data->rects, data->current_state.rect );
         /* the pointer left this window onto a decoration the X server cannot see (X11DRV_LeaveNotify)
          * and the window manager is moving the window under it: move the stale pointer position
@@ -2501,11 +2514,25 @@ void window_wm_state_notify( struct x11drv_win_data *data, unsigned long serial,
     else if (!data->wm_state_serial) NtUserRemoveProp( data->hwnd, focus_time_prop );
 }
 
+/* win32u has applied the state change of the window manager, send what was held back meanwhile */
+void window_flush_wm_state_update( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+
+    if (!(data = get_win_data( hwnd ))) return;
+    window_set_wm_state( data, data->desired_state.wm_state, data->desired_state.activate );
+    window_set_net_wm_state( data, data->desired_state.net_wm_state );
+    window_set_mwm_hints( data, &data->desired_state.mwm_hints );
+    window_set_config( data, data->desired_state.rect, FALSE );
+    release_win_data( data );
+}
+
 void window_net_wm_state_notify( struct x11drv_win_data *data, unsigned long serial, UINT value )
 {
     UINT *desired = &data->desired_state.net_wm_state, *pending = &data->pending_state.net_wm_state, *current = &data->current_state.net_wm_state;
     unsigned long *expect_serial = &data->net_wm_state_serial;
     UINT requested = *expect_serial ? *pending : *current;
+    BOOL dropped = data->fullscreen_dropped_serial && serial >= data->fullscreen_dropped_serial;
     const char *expected, *received, *prefix;
 
     prefix = wine_dbg_sprintf( "window %p/%lx ", data->hwnd, data->whole_window );
@@ -2517,8 +2544,19 @@ void window_net_wm_state_notify( struct x11drv_win_data *data, unsigned long ser
         return;
     if (value & (1 << NET_WM_STATE_MAXIMIZED)) data->unmaximize_retry = FALSE;
     /* a fullscreen state we did not ask for is the window manager's own, remember it until it is gone */
-    if (!(value & (1 << NET_WM_STATE_FULLSCREEN))) data->wm_fullscreen = FALSE;
-    else if (!(requested & (1 << NET_WM_STATE_FULLSCREEN)))
+    if (!(value & (1 << NET_WM_STATE_FULLSCREEN)))
+    {
+        data->wm_fullscreen = FALSE;
+        if (dropped) data->fullscreen_dropped_serial = 0;
+    }
+    else if (requested & (1 << NET_WM_STATE_FULLSCREEN)) /* nothing to do */;
+    else if (dropped)
+    {
+        /* the answer to a fullscreen request we gave up on (X11DRV_WindowPosChanged) */
+        TRACE( "window %p/%lx fullscreen from our dropped request %lu\n", data->hwnd, data->whole_window,
+               data->fullscreen_dropped_serial );
+    }
+    else
     {
         TRACE( "window %p/%lx fullscreen set by the window manager\n", data->hwnd, data->whole_window );
         data->wm_fullscreen = TRUE;
@@ -3519,6 +3557,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     data->configure_serial = 0;
     data->net_wm_icon_serial = 0;
     data->wm_fullscreen = FALSE;
+    data->fullscreen_dropped_serial = 0;
     data->reparenting = 0;
 
     if (data->xic)
@@ -4380,6 +4419,10 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         WARN( "win %p/%lx dropping unacknowledged _NET_WM_STATE %#x/%lu, resyncing to %#x\n",
               hwnd, data->whole_window, data->pending_state.net_wm_state,
               data->net_wm_state_serial, data->current_state.net_wm_state );
+        /* the window manager may still act on the request: a fullscreen state that shows up at
+         * or after its serial is ours, not the window manager's own */
+        if ((data->pending_state.net_wm_state & ~data->current_state.net_wm_state) & (1 << NET_WM_STATE_FULLSCREEN))
+            data->fullscreen_dropped_serial = data->net_wm_state_serial;
         data->net_wm_state_serial = 0;
         data->pending_state.net_wm_state = data->current_state.net_wm_state;
     }

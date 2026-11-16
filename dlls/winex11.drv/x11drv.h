@@ -432,6 +432,7 @@ struct x11drv_thread_data
     struct display_state current_state;       /* display state tracking the current X11 state */
     unsigned long net_active_window_serial;   /* serial of last pending _NET_ACTIVE_WINDOW request */
     HWND     stale_leave_hwnd;     /* window the pointer left onto a decoration the X server cannot see (Xwayland): its position is stale */
+    HWND     wm_state_update_hwnd; /* window whose state change by the window manager win32u is applying: its _NET_WM_STATE requests wait for the result */
     POINT    stale_leave_rel;      /* where the pointer is kept instead, relative to that window's X window, just outside it */
 };
 
@@ -719,6 +720,7 @@ struct x11drv_win_data
     BOOL          configure_retry;     /* the pending configure request follows such a change and may be re-issued once */
     BOOL          unmaximize_retry;    /* _NET_WM_STATE_MAXIMIZED was cleared at our request, the first config the window manager sends on its own may be answered once */
     BOOL          wm_fullscreen;       /* _NET_WM_STATE_FULLSCREEN was set by the window manager on its own, not at our request */
+    unsigned long fullscreen_dropped_serial; /* serial of a dropped _NET_WM_STATE request that asked for fullscreen */
     Window        map_predecessor;     /* owned WS_EX_APPWINDOW: X window of the win32 predecessor when the map was requested */
     HWND          zorder_transient_child; /* ownerless tool window above this one that update_zorder_transient() made transient for it */
     Window        zorder_transient_for;   /* X window update_zorder_transient() made this window transient for, 0 if none */
@@ -756,6 +758,7 @@ extern Window init_clip_window(void);
 extern void window_set_user_time( struct x11drv_win_data *data, Time time, BOOL init );
 extern UINT get_window_net_wm_state( Display *display, Window window );
 extern void make_window_embedded( struct x11drv_win_data *data );
+extern void window_flush_wm_state_update( HWND hwnd );
 extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap,
                                     BOOL offscreen );
 extern void set_expose_background_suppressed( HWND hwnd, BOOL suppress );
