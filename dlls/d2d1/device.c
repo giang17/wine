@@ -2114,6 +2114,23 @@ static BOOL d2d_curve_is_flat(const struct d2d_curve_vertex *v, const float *m)
     return fabsf(qx * py - qy * px) / l < 0.0625f;
 }
 
+/* The slot at which the search for an edge starts in the edge map of the fill
+ * antialiasing. The key of an edge is (lo << 32) + hi + 1 for its two vertex
+ * indices, and most edges of a triangulation join vertices with indices close
+ * to each other: taken modulo the map size, the keys of a mesh fall into runs
+ * of adjacent slots, and the linear search behind a run walks to its end. The
+ * multiplication spreads them; the upper half of the product, scaled to the
+ * map size, needs no division. */
+static UINT32 d2d_fill_aa_edge_slot(UINT64 key, size_t map_size)
+{
+    return (((key * 0x9e3779b97f4a7c15ull) >> 32) * map_size) >> 32;
+}
+
+static UINT32 d2d_fill_aa_next_slot(UINT32 slot, size_t map_size)
+{
+    return slot + 1 == map_size ? 0 : slot + 1;
+}
+
 /* Mark the mesh edges that run along a curve segment.
  *
  * The tessellation puts the corners of every curve triangle on figure vertices,
@@ -2224,10 +2241,10 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                     lo = idx[a] < idx[b] ? idx[a] : idx[b];
                     hi = idx[a] < idx[b] ? idx[b] : idx[a];
                     key = ((UINT64)lo << 32) + hi + 1u;
-                    slot = key % map_size;
+                    slot = d2d_fill_aa_edge_slot(key, map_size);
                     while (probe < map_size && edge_keys[slot] && edge_keys[slot] != key)
                     {
-                        slot = (slot + 1) % map_size;
+                        slot = d2d_fill_aa_next_slot(slot, map_size);
                         ++probe;
                     }
                     if (probe == map_size)
@@ -2376,11 +2393,11 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             UINT32 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
             UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
             UINT64 key = ((UINT64)lo << 32) + hi + 1u;
-            UINT32 slot = key % map_size;
+            UINT32 slot = d2d_fill_aa_edge_slot(key, map_size);
             size_t probe = 0;
             while (probe < map_size && edge_keys[slot] && edge_keys[slot] != key)
             {
-                slot = (slot + 1) % map_size;
+                slot = d2d_fill_aa_next_slot(slot, map_size);
                 probe++;
             }
             if (probe == map_size)
@@ -2444,10 +2461,10 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             UINT32 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
             UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
             UINT64 key = ((UINT64)lo << 32) + hi + 1u;
-            UINT32 slot = key % map_size;
+            UINT32 slot = d2d_fill_aa_edge_slot(key, map_size);
 
             while (edge_keys[slot] != key)
-                slot = (slot + 1) % map_size;
+                slot = d2d_fill_aa_next_slot(slot, map_size);
             if (edge_cnt[slot] != 1)
                 continue;
             if (!edge_curve[slot] || (seams[slot].start != ~0u && seams[slot].chord))
@@ -2469,11 +2486,11 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             UINT32 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
             UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
             UINT64 key = ((UINT64)lo << 32) + hi + 1u;
-            UINT32 slot = key % map_size;
+            UINT32 slot = d2d_fill_aa_edge_slot(key, map_size);
             BOOL ramp;
 
             while (edge_keys[slot] != key)
-                slot = (slot + 1) % map_size;
+                slot = d2d_fill_aa_next_slot(slot, map_size);
             c1[e] = c2[e] = 0.0f;
             t[e][0] = t[e][1] = t[e][2] = 0.0f;
             /* The weight of a boundary edge runs from 0 on the edge to 1 at the
@@ -2526,12 +2543,12 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             UINT32 ai = f->v[(e + 1) % 3], bi = f->v[(e + 2) % 3];
             UINT32 lo = ai < bi ? ai : bi, hi = ai < bi ? bi : ai;
             UINT64 key = ((UINT64)lo << 32) + hi + 1u;
-            UINT32 slot = key % map_size;
+            UINT32 slot = d2d_fill_aa_edge_slot(key, map_size);
             D2D1_POINT_2F pa, pb, pc, edge_dir, outward;
             float dot_test, edge_len;
 
             while (edge_keys[slot] != key)
-                slot = (slot + 1) % map_size;
+                slot = d2d_fill_aa_next_slot(slot, map_size);
             /* Skip interior edges, curve seams and already-processed boundary edges. */
             if (edge_cnt[slot] != 1 || edge_curve[slot] || edge_processed[slot]) continue;
 
