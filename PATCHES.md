@@ -1427,7 +1427,31 @@ This is the recommended branch. What it changes, by subsystem:
   run); `PMinSize` goes out for every resizable window, `PMaxSize` only when the application set a
   maximum. Measured with `scripts/repro-521-min-track-size.c` (minimum 400x300) on kwin_x11: an
   interactive corner drag left the X window at 92x41 against win32's 400x300 before (19 `mismatch
-  config` warnings), and at 392x266 — the minimum less the frame — after, no mismatch.
+  config` warnings), and at 392x266 — the minimum less the frame — after, no mismatch. A
+  `ptMaxTrackSize` of 32767 or more on both axes counts as no maximum (on one axis it is that
+  limit): Chromium and Electron answer `INT_MAX` instead of leaving the default, mapping that
+  size from the window position left the `int` range, and the maximum came out anywhere down to
+  the minimum — the window manager got minimum = maximum, took `_NET_WM_ACTION_RESIZE` away and
+  kept the window at that size, also when maximizing (Waves COSMOS 17 fixed at 320x500, 1057 of
+  1236 hint requests; the repro with `INT_MAX`: "maximum size: 392 by 2147483642" after a corner
+  drag before, no maximum after, a real maximum of 900x900 still arrives as 892x866; issue 607)
+- **winex11**: `_NET_WM_STATE` requests wait while a state change of the window manager is
+  applied. When the window manager changes a window's state, win32u sends the matching
+  `WM_SYSCOMMAND` and the application may place its window several times on the way: Electron
+  answers `SC_RESTORE` with a `SetWindowPlacement()` to its own remembered normal bounds before
+  the window manager's rect is applied. If those bounds cover a monitor, the intermediate rect
+  asked for `_NET_WM_STATE_FULLSCREEN`; the request was dropped a moment later but the window
+  manager still carried it out, the late answer was taken for a fullscreen the window manager
+  had set on its own, and that state is kept on every maximize. Waves COSMOS 17 (normal bounds
+  saved as the full monitor) ended up fullscreen after a drag on the title bar of its maximized
+  window and could no longer be moved, resized or brought out of fullscreen. The driver now
+  marks the window whose state command win32u is applying, records the desired state only, and
+  sends the result once the thread processes events again; a fullscreen state at or after the
+  serial of a dropped fullscreen request no longer counts as the window manager's own. Measured
+  with COSMOS on kwin_x11 (`scripts/608-cosmos-unmaximize-run.sh` in the workspace): the drag
+  ended in FULLSCREEN without move and resize actions before, as a normal 1280x720 window with
+  both in 3 of 3 runs after; fullscreen set by the window manager on a maximized window and
+  Ableton Live's F11 round trip keep their results (issue 608)
 - **wineserver**: hit tests and rectangle mapping work at negative screen coordinates when the
   window's DPI differs from the monitor's. `scale_dpi()` (`server/user.h`) multiplied the
   signed coordinate by an unsigned DPI, so a negative value wrapped around (−780 at 120 → 96
@@ -2726,6 +2750,7 @@ these were developed against, but they are not specific to it.
 | Power BI Desktop 2.158 | .NET Framework 4.8 WinForms + WebView2 (report views, title bar) + IE web browser control (dialogs); Analysis Services engine `msmdsrv.exe` | Runs on the devel branch only: the local NTLM sign-in to the Analysis Services engine needs Wine 11.17 or later, on `d2d1-dcomp-11.0` the start ends in "Authentication failed". Also needs native .NET Framework 4.8 (`winetricks dotnet48`), Gecko for the IE control and `ntlm_auth` from Samba's winbind package (the daemon need not run). Then: the untitled report with its semantic model, the options and error dialogs, move, resize and maximize without flicker or black frames, clean exit; importing the sample workbook and editing it in the classic Power Query editor ("Transform data") work; publishing was not tried. Needs from this branch: `NtImpersonateAnonymousToken()`, the Windows Runtime metadata files (without them the start fails on `Windows.Storage.Streams.IInputStreamReference`), the dcomp clipping of covered `WS_EX_TRANSPARENT` hosts and the hold of an absent swap-chain leaf, the wineserver fixes for the surface flush over foreign children and for the sibling list during an unlink, the winex11 capture during a window-manager move, the IE flex minimum and the canvas text measuring in mshtml, and the `uiribbon` framework start-up. `Windows.System.Launcher` and `IStorageItemProperties` are defined in no IDL yet |
 | Waves Central 17.1.5 | Electron | Installs, starts, signs in and installs products (the Waves Ultimate demo, 254 plug-in bundles). Needs the `powershell` and `taskkill` patches from this branch: without the version queries it stops at start with "Waves Central cannot access PowerShell", and `taskkill /t` could leave the product installation stuck at "Closing COSMOS". Its cache cleanup ("Clear cache") calls `robocopy.exe`, a stub in upstream Wine; with the `robocopy` of this branch it removes the download cache (6.3 GB down to 3.5 MB in the measured run), keeps the two server folders, and Waves Central restarts |
 | Waves V17 plug-ins (VST3 in Reaper) | Waves framework (WaveShell + WavesLib); the editor draws through OpenGL (measured for API-550A) | The editors draw, also side by side and after closing and reopening them — checked with API-550A, Abbey Road Reel ADT Live and CLA Guitars; audio passes and the meter moves (checked with the Clavinet instrument, stereo). Needs the `wglShareLists()` patches from this branch: without them the editor stayed black and REAPER froze. Checked with the demo licence, which mutes the audio periodically |
+| Waves COSMOS Sample Finder 17 | Electron 36, frameless window | The window resizes at edges and corners, maximizes, restores and moves, also by dragging the title bar of the maximized window (checked on KWin X11; the sample analysis itself is not checked). Needs the size hint and window state patches from this branch: it answers `WM_GETMINMAXINFO` with a maximum of `INT_MAX`, which fixed the window at its minimum size, and a drag on the maximized window left it fullscreen. |
 
 ## Font Setup
 
