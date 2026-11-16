@@ -1715,6 +1715,31 @@ This is the recommended branch. What it changes, by subsystem:
   runs at 15.8-17.3 fps with that preset, 13.1-14.7 with the switch off in the same session
   (REAPER main thread at 84 % of a core both times). The largest single item left in d2d1 is
   the fill antialiasing mesh.
+- **d2d1**: two curve segments count as the same curve only within a thousandth of their
+  size. The test that spares identical arcs the intersection pass and the splitting of their
+  control triangles, and gives them one curve triangle or none (the stroke caps JUCE puts into
+  two figures of a path), compared their points within 1e-4 of the coordinate, 0.0256 at x 256.
+  The two sides of a figure thinner than that passed it as well, and so did the neighbouring
+  pieces of a curve that was split down to that size. In Minimal Audio Current's Cluster Delay
+  tap display a bar 2 wide and 0.036 high at x 254 was filled without its two ends and with a
+  triangle that reached the bar above it (visible 300 times enlarged): the first and the last
+  point of the figure lie one float apart, the two arcs at each tip counted as an arc and its
+  reverse and were left unsplit, their chords crossed, and the triangulation cut one constraint
+  with the other. Moved to x 1254 the bars lost all their curve triangles and a tenth of their
+  area (issue 611). The points now also have to lie within a thousandth of the size of the
+  smaller segment; two control triangles that are both no larger than the tolerance are still
+  not split against each other, which the old test did on the side. The search for the members
+  of a group of coincident segments looked within 1e-4 of x where the point test allows 1e-4 of
+  the larger of x and y: a pill at x 7 to 19, y 17 to 23 and its reverse moved by 0.001 fill
+  nothing but slivers, and the curve triangles of one cap were filled; it uses the tolerance
+  of the point test now. Sampled against the winding numbers of the input, the fill of 64 paths
+  of two captured frames of Current is wrong at 376 of 1.74 million points instead of 5,970,
+  that of 600 random paths of thin and stacked rounded rectangles at 2,020 of 799,488 instead
+  of 8,065. Closing the paths of twelve captured frames takes 47.2 ms per frame instead of
+  43.2 ms, with 16 % more curve triangles, the arrow icon of issue 458 2.3 ms instead of
+  1.8 ms; paths of 4,000 glyph or polygon segments take what they took. The d2d1 tests fail at
+  the same 30 places on x86_64 and i386; 100,000 paths of the three geometry fuzzers close
+  without a hang or a failed `Close()`.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
