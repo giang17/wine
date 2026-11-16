@@ -1683,6 +1683,38 @@ This is the recommended branch. What it changes, by subsystem:
   of 320 in 10.6 ms instead of 12.9 ms. Current's editor runs at 12.5-14.7 fps with that
   preset (10.6-12.6 before, 4.3-6.5 before issue 609); what is left is mostly the constrained
   Delaunay triangulation of the paths, 44 % of the time in d2d1, with no local fix.
+- **d2d1**: a path of many figures is closed by its groups of figures that lie apart, not as
+  one triangulation. `Close()` ran self-intersection, the overlap of control triangles and the
+  constrained Delaunay triangulation over the whole path, so the triangulation spanned the gaps
+  between the figures: it merged them across the gaps, built and classified the faces there and
+  threw them away. In a 30-s capture of the sink input of Minimal Audio Current's Cluster Delay
+  tap display (preset "Leslied", thirty-two paths of 28 to 320 rounded rectangles per frame)
+  77 % of the figures overlap no other figure with their bounds and the largest group has ten
+  (issue 610). Figures whose bounds lie apart cannot cross, share a curve segment or contain
+  each other; they are now grouped by their bounds (control points included, with a margin of
+  the tolerance within which two curve segments count as the same), each group goes through
+  the steps as a path of its own, and the fills are appended. The self-intersection pass tests
+  the segment pairs it tests on the whole path, so the figures come out the same. Paths of
+  fewer than 16 figures are closed whole as before, `WINE_D2D_FILL_GROUPS=0` does that for
+  every path. Two sort orders that left ties to chance (coincident curve segments with the
+  same x, crossings at the same parameter) are fixed first, without which the same figures
+  gave different curve triangles depending on the path around them; and the duplicate fill
+  vertices are removed in one pass instead of moving the array for each (1,280 overlapping
+  rounded rectangles close in 129 ms instead of 165 ms). The result is not the same triangles:
+  a probe build closed all 21,432 paths of the capture both ways, and the figures, fill
+  vertices and curve triangles are identical byte for byte, while the triangles differ in 8,339
+  of the 9,306 paths closed by groups, where the Delaunay criterion has no preference and in
+  which slivers along the outline count as inside. The filled area differs by 2e-8 in the
+  median and 3.5e-4 at most, relative; rendered at eight times the size, the 32 paths of a
+  frame differ in 650 pixels altogether. On random paths of degenerate figures in 2 to 12
+  clusters, sampled against the winding numbers of their input, the groups fill 956,318 of 94
+  million sample points wrongly and the whole path 1,461,210. The d2d1 tests fail at the same
+  30 places on x86_64 and i386; 350,000 paths of the three geometry fuzzers (one of them new,
+  for clusters of figures) close without a hang, a crash or a failed `Close()`. Closing the
+  paths of twelve captured frames takes 45.0 ms per frame instead of 70.5 ms; Current's editor
+  runs at 15.8-17.3 fps with that preset, 13.1-14.7 with the switch off in the same session
+  (REAPER main thread at 84 % of a core both times). The largest single item left in d2d1 is
+  the fill antialiasing mesh.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
