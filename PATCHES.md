@@ -1782,6 +1782,32 @@ This is the recommended branch. What it changes, by subsystem:
   issue 610, Direct2D renderer) runs at 17.1-18.7 fps, mean 17.9, and at 14.5-16.6, mean
   15.6, with the switch off in the same binary (two runs of 30 s each, in turn); the REAPER
   main thread takes 77 % of a core instead of 83-84 %.
+- **d2d1**: the triangles of a fan know the neighbouring outline edges in the fill
+  antialiasing. Every triangle of the fill mesh is antialiased against its own outline edges:
+  each of its three weights is linear over the triangle, the pixel shader turns it into a
+  distance in pixels and takes the smallest coverage, and the weight of an edge inside the
+  fill was a constant. An outline edge of the next triangle that passes a pixel within half a
+  pixel was not seen. The fan of the entry above divides two pieces of a cap of a narrow bar
+  along a line to the centre of the bar, nearly parallel to them: in a bar 2 wide and 7.6
+  high of Minimal Audio Current's tap display the two pixels below the upper cap came out at
+  255 and the two above the lower cap at 247, for 244 and 224 in a rendering sixteen times
+  the size scaled down (issue 616). The weight of an interior edge now carries the distance
+  to the line of the outline edge that meets the triangle's own at their common vertex, the
+  tangent at that vertex for the chord of a curve, where the outline turns towards the fill
+  there and the triangle lies on the inner side of the line; shader and vertex layout are
+  unchanged. Only the triangles of a fan get it: applied to all triangles the weights
+  darkened single pixels of glyph paths (22 of 422 changed pixels more than 16 of 255
+  worse, 163 drawn for a coverage of 254), and with the fan rule 450 glyphs are
+  pixel-identical. `WINE_D2D_FILL_AA_NEIGHBOURS=0` disables the weights. The four pixels of
+  the bar come out at 253 and 235. Sum of the errors against the scaled-down rendering, in
+  original size: 129 bars of the capture 8,603 instead of 10,303 (8,817 without the fan),
+  sixteen rounded rectangles, pills, ellipses, a hexagon and a 64-gon 1,534 instead of 1,710.
+  Against the coverage computed from the input the 32 paths of a captured frame change in
+  1,521 pixels, 1,482 of them closer to it and 39 further away by at most 8 of 255; the sum
+  of the errors falls from 23,034 to 15,553, and against the same paths closed without the
+  fan it is 30,923 for 36,831 over 2,815 pixels. Building the meshes of twelve frames takes
+  164 ms instead of 158 ms; Current's editor in REAPER runs at 17.4-17.5 fps with the weights
+  and at 17.6 without. The d2d1 tests fail at the same 26 lines on x86_64 and i386.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
