@@ -6324,11 +6324,278 @@ static BOOL d2d_path_geometry_defer_fill(struct d2d_geometry *geometry)
     return TRUE;
 }
 
+/* Filling a convex figure that stands alone.
+ *
+ * The steps of Close() look for what a convex figure cannot have: its
+ * segments do not cross, its control triangles lie outside its chords and
+ * next to each other, and no triangulation has to find out which side of an
+ * edge is inside. A rounded rectangle or an ellipse still went through the
+ * self-intersection pass, the overlap pass and the constrained Delaunay
+ * triangulation, whose incircle test falls through to exact arithmetic for
+ * every four vertices of a symmetric figure that lie on one circle. Of the
+ * rounded rectangles in Minimal Audio Current's Cluster Delay tap display 57 %
+ * stand alone in their path, and closing them took 15 ms of a frame
+ * (wine-dev issue 614).
+ *
+ * Such a figure is filled with a fan around the mean of its vertices, one
+ * triangle per edge, and one curve triangle per curve segment with the sign
+ * of a control point outside the fill. The figure is left as it is. The fan
+ * is around a point inside the figure and not around one of its vertices so
+ * that every edge of the outline gets a triangle that reaches into the
+ * figure: the fill antialiasing ramps an edge within the triangle it belongs
+ * to, and a fan around a vertex puts the two edges next to that vertex into
+ * triangles as thin as the first curve piece behind them.
+ *
+ * The test is exact (d2d_point_ccw()) and strict, and what fails it goes
+ * through the steps as before:
+ *
+ *   - The outline turns the same way from every edge to the next, and the
+ *     direction of its edges goes around once: with turns of less than half
+ *     a revolution each, the sign of the x component then changes exactly
+ *     twice. Runs of collinear vertices fail this.
+ *   - The mean of the vertices lies inside every edge, which it does unless
+ *     the figure is only a few floats thick.
+ *   - Every control point lies outside its own chord, or on it to within the
+ *     tolerance below which d2d_geometry_resolve_beziers() emits no curve
+ *     triangle, and not outside the two neighbouring edges. The area outside
+ *     one edge of a convex polygon and inside its two neighbours meets no
+ *     such area of another edge, so no two control triangles overlap.
+ *
+ * A line of a float or two between two vertices does not count as an edge
+ * in these tests; the turn is taken across it, at both of its ends. In 18 %
+ * of the rounded rectangles above the corners take up the whole height, and
+ * the straight side left between two corners comes out one float long and
+ * pointing backwards (y + radius and y + height - radius round differently),
+ * which by the letter makes the outline cross itself there. The steps split
+ * the control triangles at such a tip against each other down to the
+ * tolerance; here the line gets a triangle of the fan like every edge, and
+ * the two control triangles next to it overlap by that float.
+ *
+ * A polygon of three or four vertices is one or two triangles either way and
+ * is left to the triangulation, which also keeps
+ * d2d_geometry_fill_is_simple() true for a rectangle. WINE_D2D_FILL_FAN=0
+ * disables the fan. */
+static BOOL d2d_fill_fan_enabled(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_FAN", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+/* Whether the edge from vertex i is a line of a float or two: no longer than
+ * two to four floats of its largest coordinate. */
+static BOOL d2d_figure_edge_is_tiny(const struct d2d_figure *figure, size_t n, size_t i)
+{
+    const D2D1_POINT_2F *a = &figure->vertices[i], *b = &figure->vertices[i + 1 == n ? 0 : i + 1];
+    float limit;
+
+    if (figure->vertex_types[i] != D2D_VERTEX_TYPE_LINE)
+        return FALSE;
+    limit = 2.0f * FLT_EPSILON * max(max(fabsf(a->x), fabsf(a->y)), max(fabsf(b->x), fabsf(b->y)));
+    return fabsf(a->x - b->x) <= limit && fabsf(a->y - b->y) <= limit;
+}
+
+/* n is the number of vertices without the copy of the first one that ends a
+ * figure closed by its last segment. Returns the orientation of the figure as
+ * the sign d2d_point_ccw() has for its vertices, the centre of the fan and
+ * the number of curve triangles. */
+static BOOL d2d_figure_is_convex(const struct d2d_figure *figure, size_t n, float *orientation,
+        D2D1_POINT_2F *centre, size_t *curve_count)
+{
+    const D2D1_POINT_2F *v = figure->vertices, *p0, *p1, *q;
+    size_t i, j, k, c, edges = 0, changes = 0;
+    int sign, first = 0, last = 0;
+    float s = 0.0f, turn, sum_x, sum_y;
+
+    /* Summed as offsets from the first vertex: the coordinates of a small
+     * figure far from the origin leave few bits for its extent. */
+    sum_x = sum_y = 0.0f;
+    for (i = 1; i < n; ++i)
+    {
+        sum_x += v[i].x - v[0].x;
+        sum_y += v[i].y - v[0].y;
+    }
+    centre->x = v[0].x + sum_x / (float)n;
+    centre->y = v[0].y + sum_y / (float)n;
+
+    *curve_count = 0;
+    for (i = 0, c = 0; i < n; ++i)
+    {
+        q = NULL;
+        if (d2d_vertex_type_is_bezier(figure->vertex_types[i]))
+        {
+            if (c == figure->bezier_control_count)
+                return FALSE;
+            q = &figure->bezier_controls[c++];
+        }
+        else if (figure->vertex_types[i] != D2D_VERTEX_TYPE_LINE)
+            return FALSE;
+        else if (d2d_figure_edge_is_tiny(figure, n, i))
+            continue;
+        ++edges;
+
+        /* The turn from this edge to the next one, at both ends of what lies
+         * between them. Both walks end at this edge at the latest. */
+        p0 = &v[i];
+        p1 = &v[i + 1 == n ? 0 : i + 1];
+        for (j = i + 1 == n ? 0 : i + 1; d2d_figure_edge_is_tiny(figure, n, j); j = j + 1 == n ? 0 : j + 1)
+            ;
+        turn = d2d_point_ccw(p0, p1, &v[j + 1 == n ? 0 : j + 1]);
+        if (s == 0.0f)
+        {
+            if (turn > 0.0f)
+                s = 1.0f;
+            else if (turn < 0.0f)
+                s = -1.0f;
+            else
+                return FALSE;
+        }
+        if (!(s * turn > 0.0f))
+            return FALSE;
+        if (p1 != &v[j] && !(s * d2d_point_ccw(p0, &v[j], &v[j + 1 == n ? 0 : j + 1]) > 0.0f))
+            return FALSE;
+
+        if ((sign = (p1->x > p0->x) - (p1->x < p0->x)))
+        {
+            if (!first)
+                first = sign;
+            else if (sign != last)
+                ++changes;
+            last = sign;
+        }
+
+        if (!(s * d2d_point_ccw(p0, p1, centre) > 0.0f))
+            return FALSE;
+
+        if (!q)
+            continue;
+        for (k = i ? i - 1 : n - 1; d2d_figure_edge_is_tiny(figure, n, k); k = k ? k - 1 : n - 1)
+            ;
+        if (!(s * d2d_point_ccw(&v[k], &v[k + 1 == n ? 0 : k + 1], q) >= 0.0f))
+            return FALSE;
+        if (!(s * d2d_point_ccw(&v[j], &v[j + 1 == n ? 0 : j + 1], q) >= 0.0f))
+            return FALSE;
+        if (d2d_quadratic_is_degenerate(p0, q, p1))
+            continue;
+        if (!(s * d2d_point_ccw(p0, p1, q) < 0.0f))
+            return FALSE;
+        ++*curve_count;
+    }
+    if (c != figure->bezier_control_count)
+        return FALSE;
+    if (last != first)
+        ++changes;
+    if (edges < 3 || changes != 2)
+        return FALSE;
+
+    *orientation = s;
+    return TRUE;
+}
+
+static BOOL d2d_figure_fill_fan(const struct d2d_figure *figure, size_t n, struct d2d_fill *fill, HRESULT *hr)
+{
+    const D2D1_POINT_2F *p0, *p1, *q;
+    struct d2d_curve_vertex *b;
+    size_t i, c, curve_count;
+    D2D1_POINT_2F centre;
+    float orientation;
+
+    if (!d2d_figure_is_convex(figure, n, &orientation, &centre, &curve_count))
+        return FALSE;
+
+    *hr = E_OUTOFMEMORY;
+    if (!(fill->vertices = malloc((n + 1) * sizeof(*fill->vertices))))
+        return TRUE;
+    if (!d2d_array_reserve((void **)&fill->faces, &fill->faces_size, n, sizeof(*fill->faces))
+            || (curve_count && !(fill->bezier_vertices = calloc(3 * curve_count, sizeof(*fill->bezier_vertices)))))
+    {
+        ERR("Failed to allocate the fill of a convex figure.\n");
+        free(fill->vertices);
+        fill->vertices = NULL;
+        return TRUE;
+    }
+
+    memcpy(fill->vertices, figure->vertices, n * sizeof(*fill->vertices));
+    fill->vertices[n] = centre;
+    fill->vertex_count = n + 1;
+
+    /* Wound like the faces of the triangulation. */
+    for (i = 0; i < n; ++i)
+    {
+        if (orientation > 0.0f)
+            d2d_face_set(&fill->faces[i], n, i, i + 1 == n ? 0 : i + 1);
+        else
+            d2d_face_set(&fill->faces[i], n, i + 1 == n ? 0 : i + 1, i);
+    }
+    fill->face_count = n;
+
+    for (i = 0, c = 0, b = fill->bezier_vertices; i < n; ++i)
+    {
+        if (!d2d_vertex_type_is_bezier(figure->vertex_types[i]))
+            continue;
+        q = &figure->bezier_controls[c++];
+        p0 = &figure->vertices[i];
+        p1 = &figure->vertices[i + 1 == n ? 0 : i + 1];
+        if (d2d_quadratic_is_degenerate(p0, q, p1))
+            continue;
+        d2d_curve_vertex_set(&b[0], p0, 0.0f, 0.0f, -1.0f);
+        d2d_curve_vertex_set(&b[1], q, 0.5f, 0.0f, -1.0f);
+        d2d_curve_vertex_set(&b[2], p1, 1.0f, 1.0f, -1.0f);
+        b += 3;
+    }
+    fill->bezier_vertex_count = 3 * curve_count;
+
+    *hr = S_OK;
+    return TRUE;
+}
+
+/* Returns FALSE if the path is not a single convex figure; it goes through
+ * the steps of d2d_path_geometry_close_figures() then. Close() tries this for
+ * a path of one figure before it looks into the fill cache, which takes
+ * longer than the fan and would keep an entry for every such path. */
+static BOOL d2d_path_geometry_fill_convex_figure(struct d2d_geometry *geometry, HRESULT *hr)
+{
+    const struct d2d_figure *figure;
+    BOOL ret;
+    size_t n;
+#ifdef __i386__
+    unsigned int control_word_x87;
+#endif
+
+    if (geometry->u.path.figure_count != 1 || !d2d_fill_fan_enabled())
+        return FALSE;
+    figure = &geometry->u.path.figures[0];
+    if (figure->flags & D2D_FIGURE_FLAG_HOLLOW)
+        return FALSE;
+    n = figure->vertex_count;
+    if (n && figure->vertex_types[n - 1] == D2D_VERTEX_TYPE_END)
+        --n;
+    if (n < 3 || (n < 5 && !figure->bezier_control_count))
+        return FALSE;
+
+    /* The predicates are exact in single precision only, see
+     * d2d_path_geometry_triangulate(). */
+#ifdef __i386__
+    control_word_x87 = _controlfp(0, 0);
+    _controlfp(_PC_24, _MCW_PC);
+#endif
+    ret = d2d_figure_fill_fan(figure, n, &geometry->fill, hr);
+#ifdef __i386__
+    _controlfp(control_word_x87, _MCW_PC);
+#endif
+    return ret;
+}
+
 /* The steps that turn the figures of a path into its fill. */
 static HRESULT d2d_path_geometry_close_figures(struct d2d_geometry *geometry, BOOL part)
 {
     HRESULT hr;
 
+    if (part && d2d_path_geometry_fill_convex_figure(geometry, &hr))
+        return hr;
     if (!d2d_geometry_intersect_self(geometry, part))
         return E_FAIL;
     if (FAILED(hr = d2d_geometry_resolve_beziers(geometry)))
@@ -6682,6 +6949,9 @@ static HRESULT STDMETHODCALLTYPE d2d_geometry_sink_Close(ID2D1GeometrySink *ifac
         hr = S_OK;
         goto done;
     }
+
+    if (d2d_path_geometry_fill_convex_figure(geometry, &hr))
+        goto done;
 
     if (d2d_fill_cache_enabled())
     {
