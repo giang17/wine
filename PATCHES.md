@@ -1653,6 +1653,36 @@ This is the recommended branch. What it changes, by subsystem:
   of 1,280 in 325 ms instead of 2.1 s. Current's editor runs at 10.6-12.6 fps with that preset;
   what is left of the frame is spread over the fill antialiasing mesh, the faces of the
   triangulation and the triangulation itself, not addressed here.
+- **d2d1**: closing and filling a path of hundreds of small figures looks only at the figures
+  near a point, and the edge map of the fill antialiasing spreads its keys. After the pair pass
+  of issue 609 the frame of Minimal Audio Current's Cluster Delay tap display (thirty-two paths
+  per frame, up to 320 rounded rectangles each) was spread over three places that scaled with
+  the number of figures or suffered from it (issue 610). The classification of the faces of
+  the triangulation and the test of each Bézier control point in
+  `d2d_geometry_resolve_beziers()` skip a figure whose bounds do not hold the probe, but looked
+  at every figure to find that out; the figures, and the runs of a figure's edges in each row of
+  the edge table, are now sorted by the left side of their bounds with the greatest right side
+  so far, a binary search finds the last one that starts at or left of the probe, and the walk
+  back ends where that greatest right side lies left of it. Every figure visited gets the same
+  bounds test and edge loop as before and the crossings are summed, so the result is the same;
+  the index is rebuilt when an inserted control point grows the bounds of a figure, and paths
+  of fewer than 16 figures keep the walk over all figures.
+  `d2d_device_context_fill_aa_expand()` looks every edge of the fill mesh up in an
+  open-addressing map keyed by `(lo << 32) + hi + 1`; the search started at the key modulo the
+  map size, and the search loops of the first two passes alone were 10 % of the time in d2d1.
+  It now starts at the upper half of the product of the key and 2^64 / phi, scaled to the map
+  size; the map is only read by key, so the mesh is the same. A probe build computed old and
+  new results side by side: no difference in 24,000 fill meshes of that view (and 116,000 of
+  another), in every face and control point probe of about 40 s of each view, and in 400,000
+  paths of the geometry fuzzers. The renders of the test paths are pixel-identical, the d2d1
+  tests fail at the same 30 places on x86_64 and i386, the fuzzers run 300,000 paths without a
+  hang, a crash or a failed `Close()`. In 15-s profiles of the REAPER main thread the fill
+  antialiasing mesh goes from 2,058 to 1,079 samples, the face classification from 1,925 to
+  683 (plus 304 for the row table with its runs), the control point test from 562 to about
+  370; a path of 1,280 overlapping rounded rectangles closes in 166 ms instead of 325 ms, one
+  of 320 in 10.6 ms instead of 12.9 ms. Current's editor runs at 12.5-14.7 fps with that
+  preset (10.6-12.6 before, 4.3-6.5 before issue 609); what is left is mostly the constrained
+  Delaunay triangulation of the paths, 44 % of the time in d2d1, with no local fix.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
