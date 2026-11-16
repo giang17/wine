@@ -1118,7 +1118,7 @@ static void set_size_hints( struct x11drv_win_data *data, DWORD style )
                 size_hints->min_width = max( track.min_track.x - frame_w, 1 );
                 size_hints->min_height = max( track.min_track.y - frame_h, 1 );
                 size_hints->flags |= PMinSize;
-                if (track.max_track.x && track.max_track.y)
+                if (track.max_track.x > 0 && track.max_track.y > 0)
                 {
                     size_hints->max_width = max( track.max_track.x - frame_w, size_hints->min_width );
                     size_hints->max_height = max( track.max_track.y - frame_h, size_hints->min_height );

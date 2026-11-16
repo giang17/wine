@@ -4774,6 +4774,16 @@ static BOOL get_min_max_track( HWND hwnd, struct get_min_max_track_params *param
     params->min_track.x = rect.right - rect.left;
     params->min_track.y = rect.bottom - rect.top;
     params->max_track.x = params->max_track.y = 0;
+
+    /* An application without a maximum may answer with a huge ptMaxTrackSize instead of leaving
+     * the default (Chromium: INT_MAX).  Added to the window position such a size leaves the int
+     * range and the mapped size comes out anywhere down to the minimum, which makes the window
+     * fixed-size for the window manager.  Nothing beyond 32767 pixels can be an X window: on
+     * both axes that is no maximum, on one axis it is that limit. */
+    if (max_track.x >= 32767 && max_track.y >= 32767) max_track.x = max_track.y = 0;
+    max_track.x = min( max_track.x, 32767 );
+    max_track.y = min( max_track.y, 32767 );
+
     if (max_track.x || max_track.y)
     {
         SetRect( &rect, pos.x, pos.y, pos.x + max_track.x, pos.y + max_track.y );
