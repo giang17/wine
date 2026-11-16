@@ -5151,9 +5151,12 @@ static BOOL d2d_geometry_shared_bezier_caps(struct d2d_geometry *geometry, BOOL 
         ca = &caps[i];
         if (ca->group != ca->ordinal)
             continue;
+        /* The members of a group were found within the tolerance above. */
         for (j = i; j < count; ++j)
         {
             cb = &caps[j];
+            if (cb->p[0].x - ca->p[0].x > 1e-4f * fmaxf(1.0f, fabsf(ca->p[0].x)))
+                break;
             if (cb->group != ca->ordinal)
                 continue;
             net += cb->reversed == ca->reversed ? 1 : -1;
