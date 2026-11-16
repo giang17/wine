@@ -4213,17 +4213,16 @@ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
         j += geometry->u.path.figures[i].vertex_count;
     }
 
-    /* Sort vertices, eliminate duplicates. */
+    /* Sort vertices, eliminate duplicates. The vertices that stay move down
+     * behind the last one kept; moving the rest of the array for every
+     * duplicate was quadratic for a path of many figures that share points. */
     qsort(vertices, vertex_count, sizeof(*vertices), d2d_cdt_compare_vertices);
-    for (i = 1; i < vertex_count; ++i)
+    for (i = 1, j = 1; i < vertex_count; ++i)
     {
-        if (!memcmp(&vertices[i - 1], &vertices[i], sizeof(*vertices)))
-        {
-            --vertex_count;
-            memmove(&vertices[i], &vertices[i + 1], (vertex_count - i) * sizeof(*vertices));
-            --i;
-        }
+        if (memcmp(&vertices[j - 1], &vertices[i], sizeof(*vertices)))
+            vertices[j++] = vertices[i];
     }
+    vertex_count = j;
 
     if (vertex_count < 3)
     {
