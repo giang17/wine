@@ -3299,6 +3299,13 @@ static int __cdecl d2d_geometry_intersections_compare(const void *a, const void 
         return i0->vertex_idx - i1->vertex_idx;
     if (i0->t != i1->t)
         return i0->t > i1->t ? 1 : -1;
+    /* Two segments that cross a third at the same parameter give two points
+     * that differ in their last bits. Which of them is inserted first, or
+     * kept, must not depend on the order the crossings were found in. */
+    if (i0->p.x != i1->p.x)
+        return i0->p.x > i1->p.x ? 1 : -1;
+    if (i0->p.y != i1->p.y)
+        return i0->p.y > i1->p.y ? 1 : -1;
     return 0;
 }
 
@@ -5244,7 +5251,13 @@ static int d2d_bezier_cap_compare(const void *a, const void *b)
 
     if (ca->p[0].x < cb->p[0].x)
         return -1;
-    return ca->p[0].x > cb->p[0].x;
+    if (ca->p[0].x > cb->p[0].x)
+        return 1;
+    /* Coincidence is a matter of tolerance and not transitive, so which
+     * segments form a group depends on the order they are looked at in.
+     * Segments with the same x are common (the two ends of a symmetric
+     * shape), and qsort() left their order to chance. */
+    return ca->ordinal < cb->ordinal ? -1 : ca->ordinal > cb->ordinal;
 }
 
 /* Coincident curve segments of different figures keep the same control
