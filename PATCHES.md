@@ -1623,6 +1623,35 @@ This is the recommended branch. What it changes, by subsystem:
   outline renders pixel-identical to the one built in `EndFigure()` (checked with the threshold
   at 2,048 on strokes of 4,000 and 16,000 vertices), the images of issues 444 and 449 are
   pixel-identical, the d2d1 tests unchanged on x86_64 and i386.
+- **d2d1**: closing a path with thousands of Bézier pieces no longer tests every pair of them
+  for overlapping control triangles. `d2d_geometry_resolve_beziers()` started again at the first
+  piece for each piece and walked the vertex types of the figures to the next, so the pass grew
+  with the square of the number of pieces; a second loop, which counts the members of each group
+  of coincident pieces in `d2d_geometry_shared_bezier_caps()`, walked to the end of the sorted
+  array once per group. Minimal Audio Current 2.4.1 fills, in the tap display of its Cluster
+  Delay (preset "Leslied"), sixteen paths per frame, eight of them holding the rounded
+  rectangles of all taps so far, up to 320 figures and 3,384 quadratic pieces: its editor ran
+  at 4.3-6.5 fps in REAPER with the main thread at 96-100 %, 87 % of that thread's samples in
+  d2d1 and about 60 % of those in the pair pass (issue 609). Two control triangles whose bounds
+  are apart do not overlap, and both halves of a split lie within the triangle that was split,
+  so a pair that is apart stays apart: the pass now keeps the pieces in a list with their
+  position and bounds, enters them into the grid of the self-intersection pass and tests a
+  piece against the earlier pieces that share a cell with it, in the order of the full pass
+  (paths of fewer than 32 pieces walk the list, a piece with a coordinate that is not finite is
+  tested against all others, the cells grow until the entries are at most 16 per piece). The
+  member loop stops at the tolerance within which the groups were formed. The results are the
+  same: a probe build ran the old and the new code on the same figures and compared them byte
+  for byte, with no difference: vertices, vertex types and control points after the pair pass
+  in 3,936 closes of 100 pieces or more in Current and in more than 300,000 paths of the two
+  geometry fuzzers, the pieces that get a curve triangle in 3,200 closes and 160,000 paths.
+  The renders of the test paths are pixel-identical, the d2d1 tests fail at the same 30 places
+  on x86_64 and i386, and the fuzzers run 100,000 float and 100,000 integer paths without a
+  hang, a crash or a failed `Close()`. On Current's paths the pair pass takes 1.6 ms instead
+  of 53 ms for 3,000-3,499 pieces; a path of 320 overlapping rounded rectangles
+  (`scripts/repro-609-roundrect-bars.py`, workspace) closes in 12.9 ms instead of 52.4 ms, one
+  of 1,280 in 325 ms instead of 2.1 s. Current's editor runs at 10.6-12.6 fps with that preset;
+  what is left of the frame is spread over the fill antialiasing mesh, the faces of the
+  triangulation and the triangulation itself, not addressed here.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
