@@ -260,6 +260,23 @@ have_fonts=1
 for f in "${REQUIRED[@]}"; do
     [ -f "$FONTDIR/$f" ] || have_fonts=0
 done
+# The copies also need a value under the Fonts key.  win32u loads a file in the
+# Fonts directory without one, but it then drops the host copy of the same face
+# and takes its value out of the Fonts key (update_external_font_keys()), and
+# DirectWrite builds its system collection from that key alone: Noto Sans
+# Symbols2 has one face, so the family was gone and U+2600 mapped to no font,
+# U+25CF to DejaVu Sans (measured 2026-11-17).
+fonts_key_has_file() {  # <file name>: is it the data of a value under the Fonts key?
+    FK_FILE="$1" awk '
+        index($0, "[Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Fonts]") == 1 {f=1; next}
+        f && /^\[/ {exit}
+        f && index(tolower($0), "=\"" tolower(ENVIRON["FK_FILE"]) "\"") {found=1; exit}
+        END {exit !found}' "$SYSREG" 2>/dev/null
+}
+fonts_registered=1
+for f in "${REQUIRED[@]}"; do
+    fonts_key_has_file "$f" || fonts_registered=0
+done
 # Look inside the FontLink\SystemLink key and check for BOTH entries this script
 # writes.  Grepping the whole of system.reg for a font name does not work: Wine
 # registers every system font under Windows\CurrentVersion\Fonts, so even an
@@ -408,7 +425,9 @@ have_uifont=0
 
 echo "Current state of the prefix:"
 printf '  %-34s %s\n' "fonts in windows/Fonts" \
-    "$( [ "$have_fonts" -eq 1 ] && echo present || echo missing )"
+    "$( if [ "$have_fonts" -eq 0 ]; then echo missing; \
+        elif [ "$fonts_registered" -eq 0 ]; then echo "present, not under the Fonts key — DirectWrite does not list them"; \
+        else echo present; fi )"
 printf '  %-34s %s\n' "MS Core Fonts" "$mscore_state"
 printf '  %-34s %s\n' "FontLink symbol fallback" \
     "$( [ "$have_link" -eq 1 ] && echo present || echo missing )"
@@ -447,7 +466,7 @@ fi
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     echo
-    if [ "$have_fonts" -eq 1 ] && [ "$have_link" -eq 1 ] && [ "$have_rendering" -eq 1 ] &&
+    if [ "$have_fonts" -eq 1 ] && [ "$fonts_registered" -eq 1 ] && [ "$have_link" -eq 1 ] && [ "$have_rendering" -eq 1 ] &&
        [ "$mangled_links" -eq 0 ] && [ "$have_uifont" -eq 1 ] && [ "$have_subst" -eq 1 ] &&
        [ "$have_mscore" -eq 1 ]; then
         echo "Font setup is complete."
@@ -475,13 +494,19 @@ echo "  saved as *.reg.bak-$stamp"
 echo
 echo "Copying fonts into the prefix..."
 copied=0
+# Each copy gets a value under the Fonts key (see fonts_key_has_file above).  The
+# value name is built from the file name, not from the full name of the face:
+# the value of the displaced host copy is named after the full name ("DejaVu
+# Sans (TrueType)"), and Wine deletes that name from the Fonts key at its next
+# start.
+reg_lines=()
 for f in "${REQUIRED[@]}"; do
     src=$(find_font "$f")
     cp -f "$src" "$FONTDIR/$f" && copied=$((copied + 1))
+    fonts_key_has_file "$f" || reg_lines+=("\"${f%.ttf} (TrueType)\"=\"${f}\"")
 done
 
 # MS Core Fonts live in one directory per distribution; derive it from arial.
-reg_lines=()
 subst_lines=()
 arial=""
 if [ "$DO_MSCORE" -eq 1 ]; then
