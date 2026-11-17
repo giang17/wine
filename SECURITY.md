@@ -1,69 +1,123 @@
-# Security policy
+```text
++============================================================================+
+|                                                                            |
+|                 #### ####  #### #   # ####  ### ##### #   #                |
+|                #     #    #     #   # #   #  #    #    # #                 |
+|                 ###  ###  #     #   # ####   #    #     #                  |
+|                    # #    #     #   # #  #   #    #     #                  |
+|                ####  ####  ####  ###  #   # ###   #     #                  |
+|                                                                            |
+|                      Security policy of giang17/wine                       |
+|                  Wine with DirectComposition and Direct2D                  |
+|                                                                            |
++============================================================================+
 
-## What this repository distributes
++--[ policy info ]-----------------------------------------------------------+
+|  repository ...... github.com/giang17/wine                                 |
+|  report to ....... private vulnerability reporting, Security tab           |
+|  maintained ...... d2d1-dcomp-11.0, highest 11.<N>, newest release         |
+|  response ........ as time allows, single maintainer                       |
++----------------------------------------------------------------------------+
 
-Source code, and nothing else. There are no releases, no binary assets, no installers and
-no prebuilt libraries here. Anything produced from this repository is compiled locally by
-the person who runs `configure` and `make`. A download link claiming to offer a built
-version of this fork did not come from this repository.
++--[ what this repository distributes ]--------------------------------------+
+|  Source code on its branches, and release builds on the Releases page. A   |
+|  release build is made only by .github/workflows/release.yml on GitHub's   |
+|  runners, from the commit of d2d1-dcomp-11.0 that the release names, and   |
+|  carries a build provenance attestation. Nothing in a release is uploaded  |
+|  by hand.                                                                  |
+|                                                                            |
+|  An archive that fails the checksum or the attestation check in            |
+|  README.md, section verify, is not what this repository published. A       |
+|  download offered elsewhere as a release of this fork is genuine only if   |
+|  it passes the same two checks. Packages built by others (README.md,       |
+|  section install) are maintained by their authors.                         |
+|                                                                            |
+|  The assets/* branches hold PNG images and Markdown descriptions of them,  |
+|  and nothing else.                                                         |
++----------------------------------------------------------------------------+
 
-The screenshots in [README.md](README.md) are hosted on the `assets/readme-screenshots`
-branch, which holds PNG images and a README describing them, and nothing else. No
-application software is distributed here.
++--[ in scope ]--------------------------------------------------------------+
+|  This is a fork of wine-mirror/wine. It adds a DirectComposition           |
+|  implementation and changes Direct2D, DirectWrite, DXGI, WineD3D, winex11  |
+|  and further modules up to the installers. The changed surface is exactly  |
+|  what git diff wine-11.0 d2d1-dcomp-11.0 reports (README.md, section       |
+|  verify).                                                                  |
+|                                                                            |
+|    * A vulnerability in code this fork adds or changes.                    |
+|    * A change in this fork that widens what stock Wine exposes. Reports    |
+|      of this kind are wanted.                                              |
+|    * A release build that does not match the commit or the attestation it  |
+|      names, and weaknesses in the workflow that builds the releases.       |
++----------------------------------------------------------------------------+
 
-## What is in scope
++--[ out of scope ]----------------------------------------------------------+
+|    * Vulnerabilities in upstream Wine. They belong to the Wine project,    |
+|      which takes reports at bugs.winehq.org. Reporting one here delays     |
+|      the fix, because nothing in this repository reaches upstream users.   |
+|      The test that settles it: if stock Wine of the same version behaves   |
+|      the same way, it is upstream.                                         |
+|    * The system libraries a release build links; each release lists them   |
+|      in its notes. They come from the distribution and are fixed there.    |
+|    * Windows software reaching the user's files. Wine runs Windows         |
+|      programs with the privileges of the user who starts them and maps     |
+|      the host filesystem into the prefix, so malware run under Wine can    |
+|      reach that user's files. That follows from how Wine works, not from   |
+|      this fork, and reports of it are closed as out of scope.              |
+|    * Packages built by others, unless the problem is in this fork's code;  |
+|      those go to their maintainers.                                        |
++----------------------------------------------------------------------------+
 
-This is a fork of [wine-mirror/wine](https://github.com/wine-mirror/wine). It adds a
-DirectComposition implementation together with changes to Direct2D, DirectWrite, DXGI,
-WineD3D, winex11 and roughly forty other modules. The changed surface is exactly what
-`git diff wine-11.0..HEAD` reports on the branch in question; see
-[Verifying this fork](README.md#verifying-this-fork).
++--[ supported ]-------------------------------------------------------------+
+|  d2d1-dcomp-11.0      Maintained. Fixes land here first, and the release   |
+|                       builds are made from it.                             |
+|                                                                            |
+|  d2d1-dcomp-11.<N>    The highest number is maintained and rebased onto    |
+|                       each WineHQ devel tag. Lower numbers are superseded  |
+|                       snapshots, not updated.                              |
+|                                                                            |
+|  release builds       The newest one. A fix arrives in a new release;      |
+|                       earlier releases are not rebuilt.                    |
+|                                                                            |
+|  d2d1-v6              Deprecated since 2026-05-03, not updated.            |
+|                                                                            |
+|  Fixes are not backported to superseded branches or earlier releases. The  |
+|  upgrade path is the maintained branch of the same line, or the newest     |
+|  release build.                                                            |
++----------------------------------------------------------------------------+
 
-- A vulnerability in **code this fork adds or changes** belongs here.
-- A vulnerability in **upstream Wine** belongs to the Wine project, which has its own
-  process. It is reported at <https://bugs.winehq.org/> and developed at
-  <https://gitlab.winehq.org/wine/wine>. Reporting it here delays the fix, because
-  nothing in this repository reaches upstream users.
++--[ reporting ]-------------------------------------------------------------+
+|  Reports go through GitHub's private vulnerability reporting on the        |
+|  Security tab of this repository, which keeps them non-public until a fix  |
+|  exists.                                                                   |
+|                                                                            |
+|  A report is most useful with the branch and commit or the release name,   |
+|  the module, and a way to reproduce it. A minimal proof of concept that    |
+|  shows the condition is preferable to a working exploit.                   |
+|                                                                            |
+|  Anything that is not a vulnerability belongs in the issue tracker; see    |
+|  CONTRIBUTING.md.                                                          |
++----------------------------------------------------------------------------+
 
-If it is not clear which of the two applies, the test that settles it is whether stock
-Wine of the same version shows the same behaviour. If it does, it is upstream.
++--[ expectations ]----------------------------------------------------------+
+|  This is a single-maintainer fork of a large project, maintained           |
+|  alongside other work. There is no guaranteed response time and no         |
+|  embargo process beyond keeping a report private until it is fixed.        |
+|  Reports are answered as time allows, and credit is given in the commit    |
+|  message unless the reporter asks otherwise.                               |
++----------------------------------------------------------------------------+
 
-## Supported branches
++--[ links ]-----------------------------------------------------------------+
+|  * report a vulnerability                                                  |
+|      https://github.com/giang17/wine/security/advisories/new               |
+|  * security tab                                                            |
+|      https://github.com/giang17/wine/security                              |
+|  * releases                                                                |
+|      https://github.com/giang17/wine/releases                              |
+|  * issues                                                                  |
+|      https://github.com/giang17/wine/issues                                |
+|  * wine bugzilla                                                           |
+|      https://bugs.winehq.org/                                              |
++----------------------------------------------------------------------------+
 
-| Branch | Status |
-|---|---|
-| `d2d1-dcomp-11.0` | Maintained. Fixes land here first. |
-| highest-numbered `d2d1-dcomp-11.<N>` | Maintained, rebased onto each new WineHQ devel tag. |
-| lower-numbered `d2d1-dcomp-11.<N>` | Superseded snapshots, kept for reference, not updated. |
-| `d2d1-v6` | Deprecated since 2026-05-03, not updated. |
-
-Fixes are not backported to superseded branches. Moving to the maintained branch of the
-same line is the upgrade path.
-
-## Reporting
-
-Open a report through GitHub's private vulnerability reporting on the
-[Security tab](https://github.com/giang17/wine/security) of this repository. That keeps
-the report non-public until a fix exists.
-
-A report is most useful with the branch and commit it was found on, the module, and a way
-to reproduce it. Where a proof of concept exists, a minimal one that demonstrates the
-condition is preferable to a working exploit.
-
-For anything that is not a vulnerability, the ordinary
-[issue tracker](https://github.com/giang17/wine/issues) is the right place; see
-[CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Expectations
-
-This is a single-maintainer fork of a large project, maintained alongside other work.
-There is no guaranteed response time and no embargo process beyond keeping a report
-private until it is fixed. Reports are answered as time allows, and credit is given in the
-commit message unless the reporter asks otherwise.
-
-One class of report is out of scope here by construction. Wine runs Windows software with
-the privileges of the user who starts it, and a Wine prefix maps the host filesystem into
-the guest, so Windows malware executed under Wine can reach the user's files. That follows
-from how Wine works rather than from anything this fork changes, and reports of it are
-closed as out of scope. Reports that this fork **widens** what stock Wine exposes are in
-scope and are wanted.
+                      -----  giang17/wine  |  GNU LGPL  |  2026  -----
+```
