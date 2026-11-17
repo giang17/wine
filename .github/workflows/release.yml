@@ -98,6 +98,53 @@ jobs:
           { echo "sha=$sha"; echo "version=$version"; echo "name=$name"; } >> "$GITHUB_OUTPUT"
           echo "$name ($sha)"
 
+      # A lost runner takes the whole log of the job with it, that of completed steps too;
+      # what remains is the list of steps with their start and end times. The build is
+      # therefore split into steps whose times show how far it got, and each step prints
+      # what the runner had before and after, for a build that is slow but finishes.
+      - name: Runner resources
+        run: |
+          set -eu
+          cat > "$RUNNER_TEMP/make-step" <<'EOF'
+          #!/bin/bash
+          # make-step <ERE>: make, in build/ on all cores, those prerequisites of the target
+          # 'all' that match the regular expression, with a line on load, memory and disk
+          # before and after. make-step --all: the whole default goal. make-step --resources:
+          # only the line. The prerequisites of 'all' and not the directory targets: those
+          # build more than 'all' does (dlls/wineandroid.drv/all also builds the Android
+          # package, with tools a Linux build system does not have).
+          set -u
+          res() {
+            awk -v t="$(date -u +%H:%M:%SZ)" -v n="$(nproc)" \
+                -v l="$(cut -d' ' -f1-3 /proc/loadavg)" \
+                -v d="$(df -h --output=avail . | tail -1 | tr -d ' ')" '
+              /^MemTotal:/ {mt = $2} /^MemAvailable:/ {ma = $2}
+              /^SwapTotal:/ {st = $2} /^SwapFree:/ {sf = $2}
+              END {printf "%s  %d cores, load %s, memory %d of %d MiB available, swap used %d MiB, disk %s free\n",
+                   t, n, l, ma / 1024, mt / 1024, (st - sf) / 1024, d}' /proc/meminfo
+          }
+          case "${1-}" in
+            --resources) res; exit 0 ;;
+            --all) targets=() ;;
+            ?*)
+              mapfile -t targets < <(awk '/^all: / {f = 1} f {print; if (!/\\$/) exit}' build/Makefile \
+                | tr ' \\' '\n\n' | grep -E "$1" || true)
+              # An empty list would make the default goal, the whole build, in this step.
+              if [ ${#targets[@]} -eq 0 ]; then echo "::warning::no make targets match $1"; exit 0; fi
+              echo "${#targets[@]} make target(s) matching $1" ;;
+            *) echo "usage: make-step <ERE> | --all | --resources" >&2; exit 2 ;;
+          esac
+          res
+          start=$SECONDS
+          make -C build -j"$(nproc)" "${targets[@]}" >/dev/null
+          rc=$?
+          res
+          echo "make: $((SECONDS - start)) s, exit $rc"
+          exit $rc
+          EOF
+          chmod +x "$RUNNER_TEMP/make-step"
+          "$RUNNER_TEMP/make-step" --resources
+
       - name: Configure
         run: |
           set -eu
@@ -111,8 +158,36 @@ jobs:
           echo "--- configure notices (optional libraries not found)"
           grep -E '^configure: ' ../configure.out | grep -v -E 'creating|Finished' || true
 
-      - name: Build
-        run: make -C build -j"$(nproc)" >/dev/null
+      # Every file the Makefile builds carries its full dependencies (tools, generated headers,
+      # import libraries), so each part builds on its own; the last step makes whatever is
+      # left, so a target missed here is still built.
+      - name: Build tools
+        run: |
+          "$RUNNER_TEMP/make-step" '^tools/'
+
+      - name: Build dlls a-d
+        run: |
+          "$RUNNER_TEMP/make-step" '^dlls/[a-d]'
+
+      - name: Build dlls e-m
+        run: |
+          "$RUNNER_TEMP/make-step" '^dlls/[e-m]'
+
+      - name: Build dlls n-v
+        run: |
+          "$RUNNER_TEMP/make-step" '^dlls/[n-v]'
+
+      - name: Build dlls w-z
+        run: |
+          "$RUNNER_TEMP/make-step" '^dlls/[w-z]'
+
+      - name: Build programs
+        run: |
+          "$RUNNER_TEMP/make-step" '^programs/'
+
+      - name: Build the rest
+        run: |
+          "$RUNNER_TEMP/make-step" --all
 
       - name: Install and pack
         env:
