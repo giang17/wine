@@ -1808,6 +1808,42 @@ This is the recommended branch. What it changes, by subsystem:
   fan it is 30,923 for 36,831 over 2,815 pixels. Building the meshes of twelve frames takes
   164 ms instead of 158 ms; Current's editor in REAPER runs at 17.4-17.5 fps with the weights
   and at 17.6 without. The d2d1 tests fail at the same 26 lines on x86_64 and i386.
+- **d2d1**: a part of a fill thinner than a pixel is drawn by the area it covers of each
+  pixel. The coverage of a fragment of the fill mesh is the smallest of the areas the outline
+  edges of its triangle leave of the pixel, each taken as if it were the only edge; two
+  edges on opposite sides of a figure that pass through the same pixel leave less than
+  either. In Minimal Audio Current's tap display a bar 2 wide and 0.09 high, whose long
+  edges lie 0.03 and 0.06 from the pixel centre, came out at 134 of 255 for a coverage of 21,
+  and a second bar 0.045 high, 0.1 below that centre, added 102 for 10 through the skirt of
+  its upper edge: the two pixels they share were drawn at 182 and 181 for 31 and 21
+  (issue 615). The connected parts of the fill mesh that lie within a strip 1.5 pixels wide
+  are now clipped to the pixels they touch, triangle by triangle, and drawn as one quad per
+  pixel in place of their triangles and skirts; the weight of the quad rises by 1 from left
+  to right and is the area less a half at the centre, which the pixel shader turns into
+  that area, so shaders and vertex layout are unchanged. The curve triangles along such a
+  part are added as their curves cut into chords and left out of the curve pass, and a
+  pixel that several such parts of one fill reach is drawn once with the sum. A curve
+  triangle belongs to the part both ends of its curve lie on, the neighbouring vertex
+  standing for one the triangulation left out of the mesh a float or two away; if a curve
+  triangle that is drawn cannot be assigned, no part of the fill is drawn this way.
+  `WINE_D2D_FILL_AA_THIN=0` disables it, and the 384 paths of twelve captured frames then
+  render pixel for pixel as before. The two pixels come out at 30 and 18; the path they
+  belong to sums to 9,488 grey values for 9,358 (15,613 before) with no pixel more than 64
+  too bright (40 before). Over the 384 paths 47,643 pixels change: against the coverage at
+  16 by 128 points per pixel the sum of the errors is 89,801 for 1,034,007, 45,060 pixels
+  are closer and 2,583 farther, and 1 pixel is more than 64 too bright for 2,136. 2,087
+  figures of those frames below 1.6 high, each on its own, against the areas computed from
+  the input: 12,373 for 131,528. 600 paths of thin and stacked rounded rectangles: 12,338
+  for 347,510; 1,000 paths of one convex figure: 6,636 for 164,491; 270 glyphs of DejaVu
+  Sans at 6, 9 and 13 pixels: 417 for 7,995 at 396 pixels. Where the new value is farther
+  from the coverage, a second figure reaches into the pixel whose share is not drawn (a
+  bar 2 wide and 2.4 high leaves a pixel beside the flank of its cap at 0 for a coverage
+  of 61, before and after), which the excess of the thin figure had made up for. Left as
+  they are: parts of more than 256 vertices or 256 pixels, such as a line thinner than a
+  pixel and longer than that. On the NVIDIA card the pixels differ from llvmpipe by 2 of
+  255 at most, and filling the 32 paths of a frame takes 20.1 to 20.2 ms at best for 20.0
+  to 20.9. The d2d1 tests fail at the same lines before and after on x86_64 (30 failures),
+  and at those lines on i386.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
