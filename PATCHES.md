@@ -2104,7 +2104,9 @@ This is the recommended branch. What it changes, by subsystem:
   11.22 branch. Wine's `opengl32` test: 4998 executed, 37 todo, 0 failures before and after,
   64- and 32-bit. The API-550A editor draws in REAPER, also after closing and reopening it
   twice (`:99`, llvmpipe) (issue 599)
-- **winex11**: the GLX calls whose X errors are caught run without the display lock. Creating
+- **winex11**: the GLX calls whose X errors are caught run without the display lock. This is
+  the GLX path, which winex11 takes with `UseEGL`=`N` or without libEGL; with EGL, the
+  default, the test program below runs 60 s with 2 and with 8 threads. Creating
   a context (`x11drv_context_create()`) and setting the swap interval
   (`set_swap_interval()`) made their GLX call between `X11DRV_expect_error()` and
   `X11DRV_check_error()`, which keep `gdi_display` locked with `XLockDisplay()`. The GL
@@ -2113,7 +2115,8 @@ This is the recommended branch. What it changes, by subsystem:
   With Mesa, which sends through xcb, a thread in `glXCreateWindow()` had asked Xlib to hand
   back the socket and waited for the display lock, and the thread in
   `glXCreateContextAttribsARB()` waited for the socket: the d2d1 tests, which create devices
-  on some twenty threads, hung in 2 of 70 runs on Xvfb with llvmpipe, every other thread
+  on some twenty threads, hung in 2 of 70 runs on Xvfb with llvmpipe (prefix with
+  `UseEGL`=`N`), every other thread
   queued behind `wgl_lock`, the user lock of win32u and `XGetDefault()` (issue 617). With the
   NVIDIA driver `glXMakeContextCurrent()` waited for the display lock while
   `glXSwapIntervalEXT()` under it waited for a lock of the driver. The display lock is now
@@ -2122,7 +2125,7 @@ This is the recommended branch. What it changes, by subsystem:
   with a pixel format and a context, clear once and release both
   (`scripts/repro-617-glx-context-race.c` in the workspace) got stuck on Xvfb with 8 threads
   after 12 to 20 s in 3 of 3 runs and now runs three times 60 s with about 11,100 rounds each;
-  on the NVIDIA card (580.178.04) 2 threads got stuck after 4 to 8 rounds in 3 of 3 runs and
+  on the NVIDIA card (580.178.04, `UseEGL`=`N`) 2 threads got stuck after 4 to 8 rounds in 3 of 3 runs and
   now make 3,217 rounds in 30 s, 8 threads got stuck after 3 rounds and now run twice 90 s
   with 7,515 and 8,128 rounds. A context of version 9.9 is still refused and the swap
   interval still set on both, and the d2d1 tests ran 40 times in a row without a hang.
