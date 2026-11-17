@@ -536,8 +536,12 @@ static BOOL is_window_managed( HWND hwnd, UINT swp_flags, BOOL fullscreen )
      * Fender Studio Pro 8's video player and plug-in windows (CCLShadowWindowClass, style
      * 0x9e000000, ex style 0) hid its save query that way (wine-dev issue 568).  Menus,
      * tooltips, drop-down lists, drag images and the popups of JUCE, FL Studio, Ableton Live
-     * and WebView2 carry at least one of these extended styles and stay unmanaged. */
+     * and WebView2 carry at least one of these extended styles and stay unmanaged.
+     * Wine's own popup menus (class #32768) are owned WS_POPUP windows with ex style 0 when
+     * created and only become topmost when shown; managed, the first click into one activates
+     * it, the owner loses the activation and the menu closes before the item is chosen. */
     if ((style & WS_POPUP) && NtUserGetWindowRelative( hwnd, GW_OWNER ) &&
+        NtUserGetClassLongW( hwnd, GCW_ATOM ) != 32768 /* POPUPMENU_CLASS_ATOM */ &&
         !(ex_style & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)))
     {
         TRACE( "%p: owned application popup %08x/%08x is managed\n", hwnd, style, ex_style );
