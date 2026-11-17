@@ -15,7 +15,8 @@ scripts/wine-font-setup.sh --prefix ~/.wine --check
 scripts/wine-font-setup.sh --prefix ~/.wine --segoe-from /path/to/Windows/Fonts
 ```
 
-The last form also installs Segoe UI from a copy you provide (section 2b).
+The last form also installs Segoe UI, and Malgun Gothic for FL Studio's flat sign,
+from a copy you provide (section 2b).
 
 This guide explains what the script sets and why, shows the manual commands, and
 covers the one thing it deliberately leaves out (the Serum 2 tooltip font).
@@ -293,6 +294,20 @@ their framework looks Segoe UI up in the DirectWrite system collection and crash
 in `hubservice.dll` when it is missing
 ([Steinberg setup guide](steinberg-setup-guide.md)).
 
+From the same directory `--segoe-from` takes `malgun.ttf` (Malgun Gothic) when it is
+there, and `--check` reports whether the prefix has it. FL Studio 2026 needs that file
+for the flat sign (♭, U+266D) in the chord names of the piano roll's chord progression
+tool. FL draws that text with its own font code, not through DirectWrite or GDI, and
+opens the fonts by file name: `C:\windows\Fonts\segoeui.ttf` for the interface, and
+for a glyph that file lacks a fixed list of further files — `msyh.ttc`, `malgun.ttf`,
+`batang.ttc`, `msgothic.ttc`, `arial.ttf`, `tahoma.ttf`, `seguiemj.ttf`. Segoe UI has
+no flat sign, on Windows 10 `malgun.ttf` is the first file of that list that has one,
+and a Wine prefix has none of them, so every flat shows as a box. Font substitutes,
+fontconfig aliases and Wine's DirectWrite fallback are not on that path. Measured
+2026-11-17 with FL Studio 26.1.7: genuine `segoeui.ttf` alone shows ♯ and boxes for
+♭, with genuine `malgun.ttf` added both symbols render (wine-dev issue 618).
+`msgothic.ttc` (MS Gothic) has ♭ as well; the script does not copy it.
+
 The six values by hand:
 
 ```bash
@@ -344,7 +359,7 @@ for v in CaptionFont SmCaptionFont MenuFont StatusFont MessageFont IconFont; do
 done
 ```
 
-**Summary:** five rendering paths, five separate fixes:
+**Summary:** six rendering paths, six separate fixes:
 
 | Path | Font | Fix |
 |------|------|-----|
@@ -353,3 +368,4 @@ done
 | GDI (native Win32 menus) | Tahoma → DejaVu Sans | FontLink registry → Noto Sans Symbols2 |
 | Serum 2 tooltips | BitPDisp-10 (proprietary) | DejaVu Sans Mono with a renamed family |
 | System UI font (menus, dialogs — Win32, Qt, VSTGUI) | Tahoma 8pt = Wine's clone | `WindowMetrics` → Segoe UI 9pt once the family is in the prefix (2b) |
+| FL Studio 2026 own font code (files opened by name) | `segoeui.ttf`, then `malgun.ttf` and further files | genuine `malgun.ttf` into `Fonts/` via `--segoe-from` (2b) |

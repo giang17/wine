@@ -40,7 +40,9 @@
 #      ships with no distribution, so the script takes the files from a
 #      directory you point it at — C:\Windows\Fonts of a Windows installation
 #      you are licensed to use — and copies and registers them.  Steinberg's
-#      current applications (Cubase 15, Nuendo 15) crash without it.
+#      current applications (Cubase 15, Nuendo 15) crash without it.  From the
+#      same directory it takes Malgun Gothic (malgun.ttf), the file FL Studio
+#      2026 draws the flat sign of its chord names from (issue 618).
 #
 # Fonts are located through fontconfig, so distribution paths do not matter.
 #
@@ -74,7 +76,7 @@
 #   --segoe-from DIR  copy the Segoe UI family (segoeui*.ttf, segui*.ttf, under
 #                   their Windows file names) from DIR into the prefix and
 #                   register it (step 5), e.g. the Windows/Fonts directory of a
-#                   mounted Windows partition
+#                   mounted Windows partition; malgun.ttf too, if DIR has it
 #
 # Exit codes: 0 done / 1 usage or prefix error / 2 required fonts not installed
 #             3 setup incomplete (only with --check)
@@ -178,13 +180,26 @@ command -v fc-list >/dev/null 2>&1 || {
 # partition mounted through ntfs3 or ntfs-3g may report "SEGOEUI.TTF".  Only the
 # Windows file names are recognised, because the checks below look for
 # segoeui.ttf by name.
+#
+# Malgun Gothic comes from the same directory when it is there.  FL Studio 2026
+# draws its text with its own font code and opens the files by NAME: the UI
+# font is C:\windows\Fonts\segoeui.ttf, and a glyph missing from it is taken
+# from a fixed list of further files (msyh.ttc, malgun.ttf, batang.ttc,
+# msgothic.ttc, arial.ttf, tahoma.ttf, seguiemj.ttf).  Segoe UI has no flat sign
+# (U+266D); on Windows 10 malgun.ttf is the first file of that list that has
+# one, and with none of them in the prefix every flat of the piano roll's chord
+# names is a box — no family substitute or fallback in Wine is on that path
+# (issue 618, measured 2026-11-17).  Optional: without it the run goes on.
 segoe_sources=()
+malgun_source=""
 if [ -n "$SEGOE_FROM" ]; then
     [ -d "$SEGOE_FROM" ] || {
         echo "ERROR: --segoe-from: not a directory: $SEGOE_FROM" >&2; exit 1; }
     for f in "$SEGOE_FROM"/*; do
         b=${f##*/}
-        [ -f "$f" ] && [[ "${b,,}" =~ ^(segoeui|segui)[a-z]*\.ttf$ ]] && segoe_sources+=("$f")
+        [ -f "$f" ] || continue
+        [[ "${b,,}" =~ ^(segoeui|segui)[a-z]*\.ttf$ ]] && segoe_sources+=("$f")
+        [ "${b,,}" = malgun.ttf ] && malgun_source=$f
     done
     printf '%s\n' "${segoe_sources[@]##*/}" | grep -qix 'segoeui.ttf' || {
         echo "ERROR: --segoe-from: no segoeui.ttf in $SEGOE_FROM" >&2
@@ -313,6 +328,12 @@ have_segoe=0
 [ -f "$FONTDIR/segoeui.ttf" ] && grep -q '^"Segoe UI (TrueType)"=' "$SYSREG" 2>/dev/null \
     && have_segoe=1
 
+# Malgun Gothic (see --segoe-from above): reported, like Segoe UI, but never
+# counted as a gap — only applications that open malgun.ttf by name need it.
+# FL Studio checks the FILE, so that is what counts here, not the Fonts key.
+have_malgun=0
+[ -n "$(prefix_font malgun.ttf)" ] && have_malgun=1
+
 # DirectWrite family substitutes (issue 384).  Applications hardcode the UI
 # families every Windows ships — KORG Legacy Cell asks DirectWrite for Meiryo UI —
 # and JUCE 5 to 7 answer a missing family with family 0 of the collection, i.e.
@@ -399,6 +420,9 @@ printf '  %-34s %s\n' "SystemLink values well-formed" \
 printf '  %-34s %s\n' "Segoe UI (Steinberg applications)" \
     "$( [ "$have_segoe" -eq 1 ] && echo present \
         || echo "absent — Cubase 15 Hub crashes without it; install with --segoe-from DIR" )"
+printf '  %-34s %s\n' "Malgun Gothic (FL Studio flats)" \
+    "$( [ "$have_malgun" -eq 1 ] && echo present \
+        || echo "absent — FL Studio 2026 draws U+266D as a box; install with --segoe-from DIR" )"
 printf '  %-34s %s\n' "DirectWrite family substitutes" \
     "$( [ "$have_subst" -eq 1 ] && echo "present (${#SUBST_FAMILIES[@]} UI families -> Segoe UI)" \
         || echo "missing ($n_subst of ${#SUBST_FAMILIES[@]})" )"
@@ -575,6 +599,19 @@ done
 if [ "$n_segoe" -gt 0 ]; then
     echo "  Segoe UI: $n_segoe file(s) from $SEGOE_FROM"
     have_segoe=1        # registered below, before the system UI font step reads it
+fi
+# Malgun Gothic under the value name Windows gives it.  FL Studio only needs the
+# file; the Fonts key entry lets DirectWrite list the family too, as on Windows.
+# The FontSubstitutes entry "Malgun Gothic" -> "Segoe UI" (step 4a2) stays: GDI
+# and this branch's dwrite consult it only for a family that is not installed.
+if [ -n "$malgun_source" ]; then
+    if cp -f "$malgun_source" "$FONTDIR/malgun.ttf"; then
+        copied=$((copied + 1)); have_malgun=1
+        reg_lines+=('"Malgun Gothic (TrueType)"="malgun.ttf"')
+        echo "  Malgun Gothic: malgun.ttf from $SEGOE_FROM (FL Studio's flat sign)"
+    fi
+elif [ -n "$SEGOE_FROM" ]; then
+    echo "  Malgun Gothic: no malgun.ttf in $SEGOE_FROM — FL Studio 2026 keeps drawing U+266D as a box"
 fi
 echo "  $copied font file(s) copied"
 
