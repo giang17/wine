@@ -197,6 +197,14 @@ chain needs the fallback fonts in the prefix and two registry entries.
 cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ~/.wine/drive_c/windows/Fonts/
 cp /usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf ~/.wine/drive_c/windows/Fonts/
 
+# ... and under the Fonts key (DirectWrite lists its system fonts from there).
+# Without the two values Wine drops the host copies of both faces over the files
+# above, and the family Noto Sans Symbols2 is gone for DirectWrite:
+wine reg add "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" \
+  /v "DejaVuSans (TrueType)" /t REG_SZ /d "DejaVuSans.ttf" /f
+wine reg add "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" \
+  /v "NotoSansSymbols2-Regular (TrueType)" /t REG_SZ /d "NotoSansSymbols2-Regular.ttf" /f
+
 # Tahoma (menu font) -> DejaVu Sans (arrows) + Noto Sans Symbols2 (stars),
 # placed BEFORE Wine's standard CJK fallbacks so they are tried first:
 wine reg add \
@@ -351,6 +359,8 @@ Start Serum 2 in Reaper and check:
 wine reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "Tahoma" /f
 wine reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\FontLink\\SystemLink" /v "DejaVu Sans" /f
 rm -f ~/.wine/drive_c/windows/Fonts/DejaVuSans.ttf ~/.wine/drive_c/windows/Fonts/NotoSansSymbols2-Regular.ttf
+wine reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" /v "DejaVuSans (TrueType)" /f
+wine reg delete "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" /v "NotoSansSymbols2-Regular (TrueType)" /f
 
 # system UI font back to Wine's default (Tahoma 8pt), or restore user.reg.bak-<stamp>
 LF=f5ffffff0000000000000000000000009001000000000001000000005400610068006f006d00610000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
