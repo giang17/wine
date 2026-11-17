@@ -1011,6 +1011,44 @@ static void x11drv_surface_destroy( struct opengl_drawable *base )
     if (gl->drawable) pglXDestroyWindow( gdi_display, gl->drawable );
 }
 
+/* Catching the X error of a GLX call.
+ *
+ * X11DRV_expect_error() keeps the display locked with XLockDisplay() until
+ * X11DRV_check_error(), so that no other thread sends a request in between.
+ * A GLX call must not be made under that lock. The GL library takes a lock
+ * of its own and then sends its request, and another thread that is inside
+ * the library at that moment waits for the display lock with the library's
+ * lock held:
+ *
+ *   - Mesa sends through xcb. A thread in glXCreateWindow() that has just
+ *     asked Xlib to hand back the socket waits in Xlib for the display
+ *     lock, and the thread that holds it waits in
+ *     glXCreateContextAttribsARB() for the socket to finish moving. The
+ *     d2d1 tests, which create devices on twenty threads, hung in 2 of 70
+ *     runs on Xvfb.
+ *   - With the NVIDIA driver glXMakeContextCurrent() waits for the display
+ *     lock while glXSwapIntervalEXT() under that lock waits for the lock
+ *     glXMakeContextCurrent() holds. Two threads that each create a window
+ *     and a context and clear once hung after a handful of rounds.
+ *
+ * The display lock is therefore released for the call. The error callback
+ * stays installed and the mutex of X11DRV_expect_error() stays held, so
+ * the calls made this way still follow one another; an error of another
+ * thread's request is taken for the expected one only if it is a GLX error
+ * (GLXErrorHandler()). wine-dev issue 617. */
+static void glx_expect_error(void)
+{
+    X11DRV_expect_error( gdi_display, GLXErrorHandler, NULL );
+    XUnlockDisplay( gdi_display );
+}
+
+static int glx_check_error(void)
+{
+    XSync( gdi_display, False );
+    XLockDisplay( gdi_display );
+    return X11DRV_check_error();
+}
+
 static BOOL set_swap_interval( struct gl_drawable *gl, int interval )
 {
     BOOL ret = TRUE;
@@ -1020,10 +1058,9 @@ static BOOL set_swap_interval( struct gl_drawable *gl, int interval )
     switch (swap_control_method)
     {
     case GLX_SWAP_CONTROL_EXT:
-        X11DRV_expect_error(gdi_display, GLXErrorHandler, NULL);
+        glx_expect_error();
         pglXSwapIntervalEXT( gdi_display, gl->drawable, interval );
-        XSync(gdi_display, False);
-        ret = !X11DRV_check_error();
+        ret = !glx_check_error();
         break;
 
     case GLX_SWAP_CONTROL_MESA:
@@ -1377,10 +1414,9 @@ static BOOL x11drv_context_create( int format, void *share, const int *attribLis
         }
     }
 
-    X11DRV_expect_error(gdi_display, GLXErrorHandler, NULL);
+    glx_expect_error();
     *context = create_glxcontext( format, share, attribList ? glx_attribs : NULL );
-    XSync(gdi_display, False);
-    if ((err = X11DRV_check_error()) || !*context)
+    if ((err = glx_check_error()) || !*context)
     {
         /* In the future we should convert the GLX error to a win32 one here if needed */
         WARN("Context creation failed (error %#x).\n", err);
