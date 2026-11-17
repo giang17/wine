@@ -2020,6 +2020,36 @@ static size_t d2d_fill_aa_find_vertex(const struct d2d_fill *fill,
     return ~(size_t)0;
 }
 
+/* The vertex of the mesh an end of a curve lies on, or a fill vertex that is
+ * not in the mesh, or ~0.
+ *
+ * A vertex that lies a float or two from another one can be left out of the
+ * mesh: the slivers along the line between the two count as outside, and the
+ * outline runs through the other one. Rounded rectangles have such lines
+ * where two corners take up a whole side (y + radius and y + height - radius
+ * round differently), and so has a figure closed by its last segment a float
+ * away from its start. The vertices are sorted, so the two are close in the
+ * array as well; the one that is in the mesh stands for the other. */
+static size_t d2d_fill_aa_find_mesh_vertex(const struct d2d_fill *fill, const UINT32 *vertex_map,
+        size_t vertex_map_size, const BYTE *used, const D2D1_POINT_2F *p)
+{
+    size_t idx = d2d_fill_aa_find_vertex(fill, vertex_map, vertex_map_size, p), j;
+    float limit;
+    int d;
+
+    if (idx == ~(size_t)0 || used[idx])
+        return idx;
+    limit = 2.0f * FLT_EPSILON * max(fabsf(p->x), fabsf(p->y));
+    for (d = 1; d <= 8; ++d)
+    {
+        j = d & 1 ? idx + (d + 1) / 2 : idx - d / 2;
+        if (j < fill->vertex_count && used[j] && fabsf(fill->vertices[j].x - p->x) <= limit
+                && fabsf(fill->vertices[j].y - p->y) <= limit)
+            return j;
+    }
+    return idx;
+}
+
 /* Where a curve runs relative to a mesh edge it shares a triangle with: off the
  * edge by c1 * t + c2 * t^2 in geometry units, t running from the vertex start
  * (0) to the other end of the edge (1). start is ~0u for a seam without it.
@@ -2155,16 +2185,21 @@ static UINT32 d2d_fill_aa_next_slot(UINT32 slot, size_t map_size)
  * curve starts tangent at its end point and departs as (h / 4) * t^2, h being the
  * distance of the other end point from that edge.
  *
+ * curve_ends, if not NULL, receives for every curve triangle, the Béziers
+ * before the arcs, the vertices of the mesh the two ends of its curve lie on,
+ * if both do; see d2d_fill_aa_find_mesh_vertex(). The caller sets it to ~0u.
+ *
  * Returns FALSE if the marking could not be completed. Half-marked data is
  * worse than none — an unmarked seam would get a skirt and be drawn twice — so
  * the caller falls back to the plain fill in that case. */
 static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
         const UINT64 *edge_keys, BYTE *edge_curve, struct d2d_fill_aa_seam *seams, size_t map_size,
-        const float *m)
+        const float *m, UINT32 *curve_ends)
 {
     const struct d2d_curve_vertex *curves[2];
     size_t counts[2], vertex_map_size, i, c;
     UINT32 *vertex_map;
+    BYTE *used;
 
     curves[0] = fill->bezier_vertices;
     counts[0] = fill->bezier_vertex_count;
@@ -2172,8 +2207,16 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
     counts[1] = fill->arc_vertex_count;
 
     vertex_map_size = fill->vertex_count * 2 + 16;
-    if (!(vertex_map = calloc(vertex_map_size, sizeof(*vertex_map))))
+    vertex_map = calloc(vertex_map_size, sizeof(*vertex_map));
+    used = calloc(fill->vertex_count, sizeof(*used));
+    if (!vertex_map || !used)
+    {
+        free(vertex_map);
+        free(used);
         return FALSE;
+    }
+    for (i = 0; i < fill->face_count; ++i)
+        used[fill->faces[i].v[0]] = used[fill->faces[i].v[1]] = used[fill->faces[i].v[2]] = 1;
 
     for (i = 0; i < fill->vertex_count; ++i)
     {
@@ -2190,6 +2233,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
         if (probe == vertex_map_size)
         {
             free(vertex_map);
+            free(used);
             return FALSE;
         }
         if (!vertex_map[slot])
@@ -2203,6 +2247,20 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
             const D2D1_POINT_2F *p0, *p1, *p2;
             size_t idx[3], missing = 0;
             int a, b;
+
+            if (curve_ends)
+            {
+                size_t e0 = d2d_fill_aa_find_mesh_vertex(fill, vertex_map, vertex_map_size, used,
+                        &curves[c][i].position);
+                size_t e2 = d2d_fill_aa_find_mesh_vertex(fill, vertex_map, vertex_map_size, used,
+                        &curves[c][i + 2].position);
+
+                if (e0 != ~(size_t)0 && e2 != ~(size_t)0 && used[e0] && used[e2])
+                {
+                    curve_ends[2 * ((c ? counts[0] / 3 : 0) + i / 3)] = e0;
+                    curve_ends[2 * ((c ? counts[0] / 3 : 0) + i / 3) + 1] = e2;
+                }
+            }
 
             if (!c && d2d_curve_is_flat(&curves[c][i], m))
                 continue;
@@ -2227,6 +2285,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                 ERR("%Iu of 3 curve triangle corners are not fill vertices, "
                         "the curve seams cannot be identified.\n", missing);
                 free(vertex_map);
+                free(used);
                 return FALSE;
             }
 
@@ -2252,6 +2311,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                     if (probe == map_size)
                     {
                         free(vertex_map);
+                        free(used);
                         return FALSE;
                     }
                     if (edge_keys[slot] != key)
@@ -2292,6 +2352,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
     }
 
     free(vertex_map);
+    free(used);
     return TRUE;
 }
 
@@ -2516,6 +2577,517 @@ static void d2d_fill_aa_mark_fans(const struct d2d_fill *fill, BYTE *fan)
     }
 }
 
+/* A part of a fill thinner than a pixel.
+ *
+ * The coverage of a fragment is the smallest of the areas its triangle's
+ * outline edges leave of the pixel, each taken as if that edge were the only
+ * one. For two edges on opposite sides of a figure that pass through the same
+ * pixel that is not the area between them: a pixel centre inside a bar 0.09
+ * high lies within 0.05 of both long edges, each of them leaves a little more
+ * than half of the pixel, and the pixel came out at 134 of 255 for a coverage
+ * of 21. A centre just outside got what the nearer edge leaves, 102 for a bar
+ * 0.045 high at a distance of 0.1 (Minimal Audio Current's tap display,
+ * wine-dev issue 615).
+ *
+ * The area a fill covers of a pixel is the sum of the areas its triangles
+ * cover of it, and a triangle is clipped to a pixel in four steps. So for a
+ * connected part of the fill mesh that lies within a strip
+ * D2D_FILL_AA_THIN_WIDTH pixels wide, the pixels it touches are computed
+ * here, and each is drawn as a quad of its own instead of the triangles and
+ * skirts of that part: the quad covers the pixel, and its one weight rises by
+ * 1 per pixel from left to right and is the area less a half at the centre,
+ * which the pixel shader turns into that area. Outside such a strip two
+ * opposite edges do not meet in one pixel.
+ *
+ * The curve triangles along such a part belong to its area: the piece
+ * between a curve and its chord where the control point lies outside the
+ * fill, the piece between the curve and its two control edges where it lies
+ * inside. They are added as the triangles of the curve cut into chords, the
+ * flat ones included, which the fill otherwise draws as their chord
+ * (d2d_curve_is_flat()), and the curve triangles are not drawn.
+ *
+ * Left as they are: a part of more than D2D_FILL_AA_THIN_MAX_VERTICES
+ * vertices, one whose bounds hold more than D2D_FILL_AA_THIN_MAX_CELLS pixels
+ * or that touches more than D2D_FILL_AA_THIN_MAX_PIXELS, and one with an
+ * arc whose corner lies inside the fill. WINE_D2D_FILL_AA_THIN=0 leaves all
+ * of them. */
+#define D2D_FILL_AA_THIN_WIDTH 1.5
+#define D2D_FILL_AA_THIN_MAX_VERTICES 256
+#define D2D_FILL_AA_THIN_MAX_CELLS 4096
+#define D2D_FILL_AA_THIN_MAX_PIXELS 256
+#define D2D_FILL_AA_THIN_MAX_CHORDS 16
+
+static BOOL d2d_fill_aa_thin(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_THIN", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+struct d2d_fill_aa_pixel
+{
+    int x, y;
+    float coverage;
+};
+
+/* The mapping from geometry space to render target pixels with its
+ * translation, pixel i covering [i, i + 1]: px = m[0] * x + m[1] * y + m[2],
+ * py = m[3] * x + m[4] * y + m[5]. */
+static void d2d_device_context_get_pixel_transform(const struct d2d_device_context *context,
+        const D2D1_MATRIX_3X2_F *g, double *m)
+{
+    double sx = context->desc.dpiX / 96.0f, sy = context->desc.dpiY / 96.0f;
+    D2D1_MATRIX_3X2_F t = *g;
+
+    d2d_matrix_multiply(&t, &context->drawing_state.transform);
+    m[0] = sx * t._11;
+    m[1] = sx * t._21;
+    m[2] = sx * t._31;
+    m[3] = sy * t._12;
+    m[4] = sy * t._22;
+    m[5] = sy * t._32;
+}
+
+/* Clips a convex polygon to one side of an axis-parallel line, which adds at
+ * most one vertex; out has room for D2D_FILL_AA_THIN_CLIP_SIZE of them, more
+ * than a triangle clipped to a pixel has. Returns the number of vertices
+ * written. */
+#define D2D_FILL_AA_THIN_CLIP_SIZE 16
+static size_t d2d_fill_aa_clip_polygon(const double (*in)[2], size_t count, unsigned int axis, double bound,
+        BOOL below, double (*out)[2])
+{
+    size_t i, n = 0;
+
+    for (i = 0; i < count; ++i)
+    {
+        const double *p = in[i], *q = in[i + 1 == count ? 0 : i + 1];
+        double dp = below ? bound - p[axis] : p[axis] - bound;
+        double dq = below ? bound - q[axis] : q[axis] - bound;
+
+        if (n + 2 > D2D_FILL_AA_THIN_CLIP_SIZE)
+            break;
+        if (dp >= 0.0)
+        {
+            out[n][0] = p[0];
+            out[n][1] = p[1];
+            ++n;
+        }
+        if ((dp >= 0.0) != (dq >= 0.0))
+        {
+            double t = dp / (dp - dq);
+
+            out[n][0] = p[0] + t * (q[0] - p[0]);
+            out[n][1] = p[1] + t * (q[1] - p[1]);
+            out[n][axis] = bound;
+            ++n;
+        }
+    }
+    return n;
+}
+
+/* Adds the area the triangle t covers of each pixel to grid, a map of
+ * cw x ch pixels from (gx, gy). */
+static void d2d_fill_aa_add_triangle(const double (*t)[2], int gx, int gy, int cw, int ch, double *grid)
+{
+    double row[2][D2D_FILL_AA_THIN_CLIP_SIZE][2], cell[2][D2D_FILL_AA_THIN_CLIP_SIZE][2];
+    double left, right, top, bottom, area;
+    int x, y, x0, x1, y0, y1;
+    size_t i, k, n;
+
+    top = min(t[0][1], min(t[1][1], t[2][1]));
+    bottom = max(t[0][1], max(t[1][1], t[2][1]));
+    y0 = max((int)floor(top), gy);
+    y1 = min((int)floor(bottom), gy + ch - 1);
+    for (y = y0; y <= y1; ++y)
+    {
+        n = d2d_fill_aa_clip_polygon(t, 3, 1, y, FALSE, row[0]);
+        n = d2d_fill_aa_clip_polygon(row[0], n, 1, y + 1.0, TRUE, row[1]);
+        if (n < 3)
+            continue;
+        left = right = row[1][0][0];
+        for (i = 1; i < n; ++i)
+        {
+            left = min(left, row[1][i][0]);
+            right = max(right, row[1][i][0]);
+        }
+        x0 = max((int)floor(left), gx);
+        x1 = min((int)floor(right), gx + cw - 1);
+        for (x = x0; x <= x1; ++x)
+        {
+            k = d2d_fill_aa_clip_polygon(row[1], n, 0, x, FALSE, cell[0]);
+            k = d2d_fill_aa_clip_polygon(cell[0], k, 0, x + 1.0, TRUE, cell[1]);
+            if (k < 3)
+                continue;
+            area = 0.0;
+            for (i = 0; i < k; ++i)
+            {
+                const double *a = cell[1][i], *b = cell[1][i + 1 == k ? 0 : i + 1];
+
+                area += (a[0] - x) * (b[1] - y) - (b[0] - x) * (a[1] - y);
+            }
+            grid[(size_t)(y - gy) * cw + (x - gx)] += 0.5 * fabs(area);
+        }
+    }
+}
+
+static int __cdecl d2d_fill_aa_pixel_compare(const void *a, const void *b)
+{
+    const struct d2d_fill_aa_pixel *pa = a, *pb = b;
+
+    if (pa->y != pb->y)
+        return pa->y < pb->y ? -1 : 1;
+    return pa->x < pb->x ? -1 : pa->x > pb->x;
+}
+
+/* Two parts that reach into the same pixel cover the sum of their areas of
+ * it. Drawn as two quads they would be blended, which comes out darker: two
+ * bars 0.385 high in one pixel row gave 158 for a coverage of 196. */
+static size_t d2d_fill_aa_merge_pixels(struct d2d_fill_aa_pixel *pixels, size_t count)
+{
+    size_t i, n;
+
+    if (!count)
+        return 0;
+    qsort(pixels, count, sizeof(*pixels), d2d_fill_aa_pixel_compare);
+    for (i = 1, n = 0; i < count; ++i)
+    {
+        if (pixels[i].x == pixels[n].x && pixels[i].y == pixels[n].y)
+            pixels[n].coverage = min(pixels[n].coverage + pixels[i].coverage, 1.0f);
+        else
+            pixels[++n] = pixels[i];
+    }
+    return n + 1;
+}
+
+static UINT32 d2d_fill_aa_find_part(UINT32 *parent, UINT32 i)
+{
+    while (parent[i] != i)
+    {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    return i;
+}
+
+/* The corners of curve triangle v in pixels and the number of chords its
+ * curve is cut into, which leaves them within 1/64 of a pixel of it. The
+ * curve is farthest from its chord half way to the control point for a
+ * Bézier and sqrt(2) - 1 of the way for an arc. */
+static unsigned int d2d_fill_aa_curve_chords(const struct d2d_curve_vertex *v, BOOL arc, const double *m,
+        double (*q)[2])
+{
+    double dx, dy, l, sag;
+    unsigned int k;
+
+    for (k = 0; k < 3; ++k)
+    {
+        q[k][0] = m[0] * v[k].position.x + m[1] * v[k].position.y + m[2];
+        q[k][1] = m[3] * v[k].position.x + m[4] * v[k].position.y + m[5];
+    }
+    dx = q[2][0] - q[0][0];
+    dy = q[2][1] - q[0][1];
+    if (!((l = sqrt(dx * dx + dy * dy)) > 0.0))
+        return 1;
+    sag = (arc ? 0.41421356 : 0.5) * fabs(dx * (q[1][1] - q[0][1]) - dy * (q[1][0] - q[0][0])) / l;
+    /* Negated so that a distance that is not a number ends up with one chord. */
+    if (!(sag > 1.0 / 64.0))
+        return 1;
+    if (!(sag < D2D_FILL_AA_THIN_MAX_CHORDS * D2D_FILL_AA_THIN_MAX_CHORDS / 64.0))
+        return D2D_FILL_AA_THIN_MAX_CHORDS;
+    return (unsigned int)ceil(sqrt(64.0 * sag));
+}
+
+/* Point i of count on the curve of a curve triangle with the corners q. The
+ * arc is the quarter of an ellipse that touches the two edges at the corner
+ * q[1] in q[0] and q[2]. */
+static void d2d_fill_aa_curve_point(const double (*q)[2], BOOL arc, unsigned int i, unsigned int count, double *p)
+{
+    double t = (double)i / count, a, b, c;
+
+    if (arc)
+    {
+        a = 1.0 - sin(t * M_PI / 2.0);
+        b = 1.0 - cos(t * M_PI / 2.0);
+        p[0] = q[1][0] - a * (q[1][0] - q[0][0]) - b * (q[1][0] - q[2][0]);
+        p[1] = q[1][1] - a * (q[1][1] - q[0][1]) - b * (q[1][1] - q[2][1]);
+        return;
+    }
+    a = (1.0 - t) * (1.0 - t);
+    b = 2.0 * t * (1.0 - t);
+    c = t * t;
+    p[0] = a * q[0][0] + b * q[1][0] + c * q[2][0];
+    p[1] = a * q[0][1] + b * q[1][1] + c * q[2][1];
+}
+
+/* Marks the faces of the parts of the fill that are drawn by their pixels and
+ * appends those pixels; see d2d_fill_aa_thin(). m is the pixel transform and
+ * mf its linear part as d2d_curve_is_flat() takes it. curve_ends is what
+ * d2d_fill_aa_mark_curve_edges() returns, and curve_skip receives the curve
+ * triangles that are not to be drawn; both are NULL for a fill without
+ * curves. */
+static void d2d_fill_aa_mark_thin(const struct d2d_device_context *context, const struct d2d_fill *fill,
+        const UINT64 *edge_keys, const BYTE *edge_cnt, size_t map_size,
+        const double *m, const float *mf, const UINT32 *curve_ends, BYTE *curve_skip, BYTE *thin,
+        struct d2d_fill_aa_pixel **pixels, size_t *pixel_count, size_t *pixels_size)
+{
+    size_t bezier_count = fill->bezier_vertex_count / 3, curve_count = bezier_count + fill->arc_vertex_count / 3;
+    int target_w = context->pixel_size.width, target_h = context->pixel_size.height;
+    UINT32 *parent, *head, *next, *stamp, *curve_head = NULL, *curve_next = NULL, serial = 0, r;
+    size_t vc = fill->vertex_count, fc = fill->face_count, i, k, n;
+    const struct d2d_face *f = fill->faces;
+    double *grid;
+
+    if (!curve_ends || !curve_skip)
+        curve_count = 0;
+
+    parent = malloc(vc * sizeof(*parent));
+    head = calloc(vc, sizeof(*head));
+    next = malloc(fc * sizeof(*next));
+    stamp = calloc(vc, sizeof(*stamp));
+    grid = malloc(D2D_FILL_AA_THIN_MAX_CELLS * sizeof(*grid));
+    if (curve_count)
+    {
+        curve_head = calloc(vc, sizeof(*curve_head));
+        curve_next = malloc(curve_count * sizeof(*curve_next));
+    }
+    if (!parent || !head || !next || !stamp || !grid || vc >= 1u << 22
+            || (curve_count && (!curve_head || !curve_next)))
+        goto done;
+
+    /* The parts: faces that share a vertex. head and next hold face indices
+     * plus one. */
+    for (i = 0; i < vc; ++i)
+        parent[i] = i;
+    for (i = 0; i < fc; ++i)
+    {
+        UINT32 a = d2d_fill_aa_find_part(parent, f[i].v[0]), b;
+
+        for (k = 1; k < 3; ++k)
+        {
+            if ((b = d2d_fill_aa_find_part(parent, f[i].v[k])) != a)
+                parent[b] = a;
+        }
+    }
+    for (i = fc; i--;)
+    {
+        r = d2d_fill_aa_find_part(parent, f[i].v[0]);
+        next[i] = head[r];
+        head[r] = i + 1;
+    }
+    /* The curve triangles of a part, likewise: those whose curve ends on two
+     * of its vertices. A curve triangle that is drawn and whose part is not
+     * known would be drawn on top of the pixels of that part, so nothing is
+     * drawn by its pixels then. */
+    for (i = curve_count; i--;)
+    {
+        if (curve_ends[2 * i] == ~0u || (r = d2d_fill_aa_find_part(parent, curve_ends[2 * i]))
+                != d2d_fill_aa_find_part(parent, curve_ends[2 * i + 1]))
+        {
+            if (i >= bezier_count || !d2d_curve_is_flat(&fill->bezier_vertices[3 * i], mf))
+                goto done;
+            continue;
+        }
+        curve_next[i] = curve_head[r];
+        curve_head[r] = i + 1;
+    }
+
+    for (r = 0; r < vc; ++r)
+    {
+        double p[D2D_FILL_AA_THIN_MAX_VERTICES][2], left, top, right, bottom, width = DBL_MAX, area = 0.0;
+        UINT32 edges[3 * D2D_FILL_AA_THIN_MAX_VERTICES][2];
+        size_t vertex_count = 0, edge_count = 0, count;
+        int gx, gy, cw = 0, ch = 0;
+        BOOL ok = TRUE;
+
+        if (!head[r])
+            continue;
+        ++serial;
+
+        /* The vertices of the part in pixels and its outline edges. stamp
+         * holds the number of the part and the place of the vertex in p. */
+        for (i = head[r]; i && ok; i = next[i - 1])
+        {
+            int e;
+
+            for (e = 0; e < 3; ++e)
+            {
+                UINT32 a = f[i - 1].v[(e + 1) % 3], b = f[i - 1].v[(e + 2) % 3], c = f[i - 1].v[e], slot;
+                UINT64 key = ((UINT64)min(a, b) << 32) + max(a, b) + 1u;
+
+                if (stamp[c] >> 9 != serial)
+                {
+                    const D2D1_POINT_2F *v = &fill->vertices[c];
+
+                    if (vertex_count == D2D_FILL_AA_THIN_MAX_VERTICES)
+                    {
+                        ok = FALSE;
+                        break;
+                    }
+                    stamp[c] = (serial << 9) | vertex_count;
+                    p[vertex_count][0] = m[0] * v->x + m[1] * v->y + m[2];
+                    p[vertex_count][1] = m[3] * v->x + m[4] * v->y + m[5];
+                    ++vertex_count;
+                }
+
+                slot = d2d_fill_aa_edge_slot(key, map_size);
+                while (edge_keys[slot] != key)
+                    slot = d2d_fill_aa_next_slot(slot, map_size);
+                if (edge_cnt[slot] != 1)
+                    continue;
+                if (edge_count == ARRAY_SIZE(edges))
+                {
+                    ok = FALSE;
+                    break;
+                }
+                edges[edge_count][0] = a;
+                edges[edge_count][1] = b;
+                ++edge_count;
+            }
+        }
+        if (!ok || !edge_count)
+            continue;
+
+        left = right = p[0][0];
+        top = bottom = p[0][1];
+        for (k = 1; k < vertex_count; ++k)
+        {
+            left = min(left, p[k][0]);
+            right = max(right, p[k][0]);
+            top = min(top, p[k][1]);
+            bottom = max(bottom, p[k][1]);
+        }
+
+        /* The curve triangles of the part reach as far as their control
+         * points. An arc with its corner inside the fill is not handled. */
+        for (i = curve_count ? curve_head[r] : 0; i; i = curve_next[i - 1])
+        {
+            BOOL arc = i - 1 >= bezier_count;
+            const struct d2d_curve_vertex *v = arc ? &fill->arc_vertices[3 * (i - 1 - bezier_count)]
+                    : &fill->bezier_vertices[3 * (i - 1)];
+            double q[3][2];
+
+            if (arc && v->texcoord.sign > 0.0f)
+                break;
+            d2d_fill_aa_curve_chords(v, arc, m, q);
+            left = min(left, q[1][0]);
+            right = max(right, q[1][0]);
+            top = min(top, q[1][1]);
+            bottom = max(bottom, q[1][1]);
+        }
+        if (i)
+            continue;
+        /* Negated so that coordinates that are not numbers end up here. */
+        if (!(fabs(left) < 1.0e6) || !(fabs(right) < 1.0e6) || !(fabs(top) < 1.0e6) || !(fabs(bottom) < 1.0e6))
+            continue;
+
+        /* What lies within a strip is no larger than the strip is wide times
+         * the diagonal of the bounds. */
+        for (i = head[r]; i; i = next[i - 1])
+        {
+            const double *a = p[stamp[f[i - 1].v[0]] & 511], *b = p[stamp[f[i - 1].v[1]] & 511];
+            const double *c = p[stamp[f[i - 1].v[2]] & 511];
+
+            area += 0.5 * fabs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
+        }
+        if (!(area <= D2D_FILL_AA_THIN_WIDTH * sqrt((right - left) * (right - left) + (bottom - top) * (bottom - top))))
+            continue;
+
+        /* The part lies within a strip along one of its outline edges. With
+         * no edge longer than a thousandth of a pixel it is a point. */
+        ok = FALSE;
+        for (k = 0; k < edge_count && !(width < D2D_FILL_AA_THIN_WIDTH); ++k)
+        {
+            const double *a = p[stamp[edges[k][0]] & 511], *b = p[stamp[edges[k][1]] & 511];
+            double dx = b[0] - a[0], dy = b[1] - a[1], l = sqrt(dx * dx + dy * dy), w = 0.0;
+
+            if (!(l > 1.0e-3))
+                continue;
+            ok = TRUE;
+            for (n = 0; n < vertex_count; ++n)
+                w = max(w, fabs(dx * (p[n][1] - a[1]) - dy * (p[n][0] - a[0])) / l);
+            width = min(width, w);
+        }
+        if (ok && !(width < D2D_FILL_AA_THIN_WIDTH))
+            continue;
+
+        gx = max((int)floor(left), 0);
+        gy = max((int)floor(top), 0);
+        if ((int)floor(right) >= gx && (int)floor(bottom) >= gy && gx < target_w && gy < target_h)
+        {
+            cw = min((int)floor(right), target_w - 1) - gx + 1;
+            ch = min((int)floor(bottom), target_h - 1) - gy + 1;
+            if ((size_t)cw * ch > D2D_FILL_AA_THIN_MAX_CELLS)
+                continue;
+            memset(grid, 0, (size_t)cw * ch * sizeof(*grid));
+            for (i = head[r]; i; i = next[i - 1])
+            {
+                double t[3][2];
+
+                for (k = 0; k < 3; ++k)
+                {
+                    t[k][0] = p[stamp[f[i - 1].v[k]] & 511][0];
+                    t[k][1] = p[stamp[f[i - 1].v[k]] & 511][1];
+                }
+                d2d_fill_aa_add_triangle(t, gx, gy, cw, ch, grid);
+            }
+            for (i = curve_count ? curve_head[r] : 0; i; i = curve_next[i - 1])
+            {
+                BOOL arc = i - 1 >= bezier_count;
+                const struct d2d_curve_vertex *v = arc ? &fill->arc_vertices[3 * (i - 1 - bezier_count)]
+                        : &fill->bezier_vertices[3 * (i - 1)];
+                double q[3][2], t[3][2];
+                unsigned int chords, c;
+
+                /* Around the first corner for a piece between the curve and
+                 * its chord, around the control point for one between the
+                 * curve and the control edges. */
+                chords = d2d_fill_aa_curve_chords(v, arc, m, q);
+                t[0][0] = q[v->texcoord.sign > 0.0f][0];
+                t[0][1] = q[v->texcoord.sign > 0.0f][1];
+                for (c = v->texcoord.sign > 0.0f ? 0 : 1; c < chords; ++c)
+                {
+                    d2d_fill_aa_curve_point(q, arc, c, chords, t[1]);
+                    d2d_fill_aa_curve_point(q, arc, c + 1, chords, t[2]);
+                    d2d_fill_aa_add_triangle(t, gx, gy, cw, ch, grid);
+                }
+            }
+        }
+
+        /* A pixel covered by less than a quarter of a step of an 8 bit
+         * channel is left out. */
+        for (k = 0, count = 0; k < (size_t)cw * ch; ++k)
+            count += grid[k] > 0.001;
+        if (count > D2D_FILL_AA_THIN_MAX_PIXELS
+                || !d2d_array_reserve((void **)pixels, pixels_size, *pixel_count + count, sizeof(**pixels)))
+            continue;
+        for (k = 0; k < (size_t)cw * ch; ++k)
+        {
+            if (!(grid[k] > 0.001))
+                continue;
+            (*pixels)[*pixel_count].x = gx + k % cw;
+            (*pixels)[*pixel_count].y = gy + k / cw;
+            (*pixels)[*pixel_count].coverage = min(grid[k], 1.0);
+            ++*pixel_count;
+        }
+        for (i = head[r]; i; i = next[i - 1])
+            thin[i - 1] = 1;
+        for (i = curve_count ? curve_head[r] : 0; i; i = curve_next[i - 1])
+            curve_skip[i - 1] = 1;
+    }
+
+done:
+    free(parent);
+    free(head);
+    free(next);
+    free(stamp);
+    free(grid);
+    free(curve_head);
+    free(curve_next);
+}
+
 /* Build and draw fill-AA geometry. Returns TRUE on success, FALSE if caller should fall back. */
 /* Fill-edge AA: per-face vertices with boundary edge weights + skirt expansion.
  * Inner triangles: bary coords identify boundary edges.
@@ -2532,15 +3104,23 @@ struct d2d_fill_aa_vertex
 /* Builds the antialiased fill mesh of a geometry under the current transform:
  * the vertex array the D2D_SHAPE_TYPE_FILL_AA shaders take. Returns FALSE when
  * the fill has nothing to antialias or the mesh cannot be built; the plain
- * triangle path draws the geometry then. The caller frees *out. */
+ * triangle path draws the geometry then. *curve_skip receives NULL or, for
+ * every curve triangle of the fill, the Béziers before the arcs, whether the
+ * mesh draws its area and it is not to be drawn; see d2d_fill_aa_thin(). The
+ * caller frees *out and *curve_skip. */
 static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, const struct d2d_fill *fill,
-        struct d2d_fill_aa_vertex **out, size_t *out_count)
+        struct d2d_fill_aa_vertex **out, size_t *out_count, BYTE **curve_skip)
 {
+    size_t curve_count = (fill->bezier_vertex_count + fill->arc_vertex_count) / 3;
+    UINT32 *curve_ends = NULL;
     struct d2d_fill_aa_outline outline = {0};
     BOOL neighbours = d2d_fill_aa_neighbours();
-    BYTE *fan = NULL;
+    size_t pixel_count = 0, pixels_size = 0, thin_count = 0;
+    struct d2d_fill_aa_pixel *pixels = NULL;
+    BYTE *fan = NULL, *thin = NULL;
     struct d2d_fill_aa_vertex *expanded;
+    double pm[6], pdet;
     BYTE *on_outline;
     struct d2d_fill_aa_seam *seams;
     size_t fc = fill->face_count;
@@ -2550,6 +3130,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     BYTE *edge_cnt, *edge_processed, *edge_curve;
     float m[4];
 
+    *curve_skip = NULL;
     d2d_device_context_get_pixel_matrix(render_target, &geometry->transform, m);
 
     /* Use 6x multiplier to keep load factor ≤ 50%, preventing open-addressing loops
@@ -2600,9 +3181,11 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
      * side. The fill ramps towards a seam by the distance to the curve instead,
      * which is where the inner half of the ramp has to come from wherever the
      * curve triangle is thinner than half a pixel. */
-    if ((fill->bezier_vertex_count || fill->arc_vertex_count)
-            && !d2d_fill_aa_mark_curve_edges(fill, edge_keys, edge_curve, seams, map_size, m))
+    if (curve_count && d2d_fill_aa_thin() && (curve_ends = malloc(curve_count * 2 * sizeof(*curve_ends))))
+        memset(curve_ends, 0xff, curve_count * 2 * sizeof(*curve_ends));
+    if (curve_count && !d2d_fill_aa_mark_curve_edges(fill, edge_keys, edge_curve, seams, map_size, m, curve_ends))
     {
+        free(curve_ends);
         free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
         return FALSE;
     }
@@ -2619,18 +3202,46 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     /* Nothing to antialias; the plain path draws exactly the same pixels more cheaply. */
     if (!boundary_count && !seam_count)
     {
+        free(curve_ends);
         free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
         return FALSE;
     }
 
-    /* Allocate: inner triangles (3 per face) + skirt quads (6 per boundary edge). */
-    expanded_count = fc * 3 + boundary_count * 6;
+    if (neighbours && (fan = calloc(fc, sizeof(*fan))))
+        d2d_fill_aa_mark_fans(fill, fan);
+
+    /* The parts that are drawn by their pixels; see d2d_fill_aa_thin(). */
+    d2d_device_context_get_pixel_transform(render_target, &geometry->transform, pm);
+    pdet = pm[0] * pm[4] - pm[1] * pm[3];
+    if (curve_ends)
+        *curve_skip = calloc(curve_count, sizeof(**curve_skip));
+    /* Without the means to leave out the curve triangles of a part they
+     * would be drawn on top of its pixels. */
+    if (d2d_fill_aa_thin() && fabs(pdet) > 1.0e-12 && (!curve_count || *curve_skip)
+            && (thin = calloc(fc, sizeof(*thin))))
+    {
+        d2d_fill_aa_mark_thin(render_target, fill, edge_keys, edge_cnt, map_size, pm, m,
+                curve_ends, *curve_skip, thin, &pixels, &pixel_count, &pixels_size);
+        pixel_count = d2d_fill_aa_merge_pixels(pixels, pixel_count);
+        for (i = 0; i < fc; ++i)
+            thin_count += thin[i];
+    }
+
+    /* Allocate: inner triangles (3 per face) + skirt quads (6 per boundary edge)
+     * + pixel quads (6 per pixel). */
+    expanded_count = (fc - thin_count) * 3 + boundary_count * 6 + pixel_count * 6;
     expanded = calloc(expanded_count, sizeof(*expanded));
     on_outline = calloc(fill->vertex_count, sizeof(*on_outline));
     if (!expanded || !on_outline)
     {
         free(expanded);
         free(on_outline);
+        free(fan);
+        free(thin);
+        free(pixels);
+        free(curve_ends);
+        free(*curve_skip);
+        *curve_skip = NULL;
         free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
         return FALSE;
     }
@@ -2640,19 +3251,14 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     {
         outline.nb = calloc(fill->vertex_count, 2 * sizeof(*outline.nb));
         outline.nb_cnt = calloc(fill->vertex_count, sizeof(*outline.nb_cnt));
-        fan = calloc(fc, sizeof(*fan));
         if (!outline.nb || !outline.nb_cnt || !fan)
         {
             free(outline.nb);
             free(outline.nb_cnt);
-            free(fan);
             outline.nb = NULL;
             outline.nb_cnt = NULL;
-            fan = NULL;
             neighbours = FALSE;
         }
-        else
-            d2d_fill_aa_mark_fans(fill, fan);
         outline.fill = fill;
         outline.edge_keys = edge_keys;
         outline.edge_curve = edge_curve;
@@ -2691,12 +3297,16 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     }
 
     /* Pass 2: build inner triangle vertices with edge weights. */
+    vi = 0;
     for (i = 0; i < fc; i++)
     {
         const struct d2d_face *f = &fill->faces[i];
         float w[3][3], t[3][3], c1[3], c2[3];
         UINT32 slots[3];
         int j, e;
+
+        if (thin && thin[i])
+            continue;
 
         for (e = 0; e < 3; e++)
         {
@@ -2766,9 +3376,8 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             }
         }
 
-        for (j = 0; j < 3; j++)
+        for (j = 0; j < 3; j++, vi++)
         {
-            vi = i * 3 + j;
             expanded[vi].pos = fill->vertices[f->v[j]];
             expanded[vi].u = w[0][j];
             expanded[vi].v = w[1][j];
@@ -2788,11 +3397,13 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     }
 
     /* Pass 3: build skirt quads along boundary edges. */
-    vi = fc * 3;
     for (i = 0; i < fc; i++)
     {
         const struct d2d_face *f = &fill->faces[i];
         int e;
+
+        if (thin && thin[i])
+            continue;
         for (e = 0; e < 3; e++)
         {
             UINT32 ai = f->v[(e + 1) % 3], bi = f->v[(e + 2) % 3];
@@ -2864,7 +3475,30 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             edge_processed[slot] = 1;
         }
     }
+
+    /* The pixels of the thin figures: a quad over each, with a weight that
+     * rises by 1 per pixel from left to right and is the coverage less a half
+     * at the centre. */
+    for (i = 0; i < pixel_count && vi + 6 <= expanded_count; ++i)
+    {
+        static const unsigned int corners[6] = {0, 1, 2, 1, 3, 2};
+        unsigned int k;
+
+        for (k = 0; k < 6; ++k, ++vi)
+        {
+            double px = pixels[i].x + (corners[k] & 1) - pm[2], py = pixels[i].y + (corners[k] >> 1) - pm[5];
+
+            expanded[vi].pos.x = (pm[4] * px - pm[1] * py) / pdet;
+            expanded[vi].pos.y = (pm[0] * py - pm[3] * px) / pdet;
+            expanded[vi].u = pixels[i].coverage - 1.0f + (corners[k] & 1);
+            expanded[vi].v = 10.0f;
+            expanded[vi].s = 10.0f;
+        }
+    }
     expanded_count = vi; /* actual count (may be less if degenerate edges skipped) */
+    free(thin);
+    free(pixels);
+    free(curve_ends);
     free(edge_keys);
     free(edge_cnt);
     free(edge_processed);
@@ -2882,14 +3516,14 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
 
 static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, const struct d2d_fill *fill,
-        struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BYTE **curve_skip)
 {
     struct d2d_fill_aa_vertex *expanded;
     size_t expanded_count;
     ID3D11Buffer *vb;
     HRESULT hr;
 
-    if (!d2d_device_context_fill_aa_expand(render_target, geometry, fill, &expanded, &expanded_count))
+    if (!d2d_device_context_fill_aa_expand(render_target, geometry, fill, &expanded, &expanded_count, curve_skip))
         return FALSE;
 
     if (FAILED(hr = d2d_device_context_get_scratch_buffer(render_target,
@@ -2899,6 +3533,8 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
             expanded, &vb)))
     {
         free(expanded);
+        free(*curve_skip);
+        *curve_skip = NULL;
         return FALSE;
     }
     free(expanded);
@@ -2985,10 +3621,13 @@ static unsigned int d2d_curve_add_skirt(struct d2d_curve_vertex *out, const stru
  * lies inside (the triangle fills towards the control point). Flat Bézier
  * triangles are left out altogether, the fill draws their chord.
  *
+ * skip, if not NULL, marks the triangles whose area the fill mesh draws; see
+ * d2d_fill_aa_thin().
+ *
  * Returns a newly allocated vertex array, or NULL to draw the triangles as they are. */
 static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d_device_context *context,
         const struct d2d_geometry *geometry, const struct d2d_curve_vertex *v, size_t count, size_t *out_count,
-        BOOL beziers)
+        BOOL beziers, const BYTE *skip)
 {
     struct d2d_curve_vertex *out;
     float m[4], inv[4], det;
@@ -3008,7 +3647,7 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
 
     for (i = 0; i + 2 < count; i += 3)
     {
-        if (beziers && d2d_curve_is_flat(&v[i], m))
+        if ((skip && skip[i / 3]) || (beziers && d2d_curve_is_flat(&v[i], m)))
             continue;
         memcpy(&out[n], &v[i], 3 * sizeof(*out));
         n += 3;
@@ -3030,15 +3669,19 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
 
 static void d2d_device_context_draw_curves(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, const struct d2d_curve_vertex *vertices, size_t count,
-        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL beziers)
+        struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL beziers, const BYTE *skip)
 {
     struct d2d_curve_vertex *expanded = NULL;
     ID3D11Buffer *vb;
     HRESULT hr;
 
     if (render_target->drawing_state.antialiasMode == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
-            && (expanded = d2d_device_context_curve_skirts(render_target, geometry, vertices, count, &count, beziers)))
+            && (expanded = d2d_device_context_curve_skirts(render_target, geometry, vertices, count, &count,
+            beziers, skip)))
         vertices = expanded;
+    /* Without the copy the triangles to leave out would be drawn as well. */
+    else if (skip)
+        count = 0;
     if (!count)
     {
         free(expanded);
@@ -3195,7 +3838,7 @@ done:
  * d2d_device_context_draw_curves() gives them. */
 static BOOL d2d_device_context_fill_batch_add_curves(struct d2d_device_context *context,
         const struct d2d_geometry *geometry, const struct d2d_curve_vertex *vertices, size_t count,
-        BOOL beziers, unsigned int *start, unsigned int *added)
+        BOOL beziers, const BYTE *skip, unsigned int *start, unsigned int *added)
 {
     struct d2d_fill_batch *batch = &context->fill_batch;
     struct d2d_curve_vertex *expanded;
@@ -3205,8 +3848,11 @@ static BOOL d2d_device_context_fill_batch_add_curves(struct d2d_device_context *
     if (!count)
         return TRUE;
 
-    if ((expanded = d2d_device_context_curve_skirts(context, geometry, vertices, count, &count, beziers)))
+    if ((expanded = d2d_device_context_curve_skirts(context, geometry, vertices, count, &count, beziers, skip)))
         vertices = expanded;
+    /* Without the copy the triangles to leave out would be added as well. */
+    else if (skip)
+        count = 0;
     if (!count)
     {
         free(expanded);
@@ -3244,6 +3890,7 @@ static BOOL d2d_device_context_batch_fill(struct d2d_device_context *context,
     struct d2d_fill_aa_vertex *expanded;
     size_t expanded_count, curve_mark;
     struct d2d_fill_run *run;
+    BYTE *curve_skip;
 
     if (!brush || brush->type != D2D_BRUSH_TYPE_SOLID || opacity_brush
             || context->target.type != D2D_TARGET_BITMAP || batch->flushing
@@ -3261,7 +3908,7 @@ static BOOL d2d_device_context_batch_fill(struct d2d_device_context *context,
             || memcmp(&batch->geometry_transform, &geometry->transform, sizeof(batch->geometry_transform))))
         d2d_device_context_flush_fills(context);
 
-    if (!d2d_device_context_fill_aa_expand(context, geometry, fill, &expanded, &expanded_count))
+    if (!d2d_device_context_fill_aa_expand(context, geometry, fill, &expanded, &expanded_count, &curve_skip))
         return FALSE;
 
     if (!d2d_array_reserve((void **)&batch->fill_vertices, &batch->fill_vertices_size,
@@ -3270,19 +3917,23 @@ static BOOL d2d_device_context_batch_fill(struct d2d_device_context *context,
             batch->run_count + 1, sizeof(*batch->runs)))
     {
         free(expanded);
+        free(curve_skip);
         return FALSE;
     }
 
     curve_mark = batch->curve_vertex_count;
     if (!d2d_device_context_fill_batch_add_curves(context, geometry, fill->bezier_vertices,
-            fill->bezier_vertex_count, TRUE, &bezier_start, &bezier_count)
+            fill->bezier_vertex_count, TRUE, curve_skip, &bezier_start, &bezier_count)
             || !d2d_device_context_fill_batch_add_curves(context, geometry, fill->arc_vertices,
-            fill->arc_vertex_count, FALSE, &arc_start, &arc_count))
+            fill->arc_vertex_count, FALSE, curve_skip ? curve_skip + fill->bezier_vertex_count / 3 : NULL,
+            &arc_start, &arc_count))
     {
         batch->curve_vertex_count = curve_mark;
         free(expanded);
+        free(curve_skip);
         return FALSE;
     }
+    free(curve_skip);
 
     if (!batch->run_count)
     {
@@ -3341,6 +3992,7 @@ static void d2d_device_context_fill_geometry_data(struct d2d_device_context *ren
         const struct d2d_geometry *geometry, const struct d2d_fill *fill,
         struct d2d_brush *brush, struct d2d_brush *opacity_brush)
 {
+    BYTE *curve_skip = NULL;
     HRESULT hr;
 
     if (d2d_device_context_batch_fill(render_target, geometry, fill, brush, opacity_brush))
@@ -3373,7 +4025,7 @@ static void d2d_device_context_fill_geometry_data(struct d2d_device_context *ren
     if (fill->face_count
             && render_target->drawing_state.antialiasMode == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
     {
-        if (!d2d_device_context_fill_triangles_aa(render_target, geometry, fill, brush, opacity_brush))
+        if (!d2d_device_context_fill_triangles_aa(render_target, geometry, fill, brush, opacity_brush, &curve_skip))
             d2d_device_context_fill_triangles(render_target, fill, brush, opacity_brush);
     }
     else if (fill->face_count)
@@ -3383,12 +4035,14 @@ static void d2d_device_context_fill_geometry_data(struct d2d_device_context *ren
 
     if (fill->bezier_vertex_count)
         d2d_device_context_draw_curves(render_target, geometry, fill->bezier_vertices,
-                fill->bezier_vertex_count, brush, opacity_brush, TRUE);
+                fill->bezier_vertex_count, brush, opacity_brush, TRUE, curve_skip);
 
     if (fill->arc_vertex_count
             && SUCCEEDED(d2d_device_context_update_ps_cb(render_target, brush, opacity_brush, FALSE, TRUE)))
         d2d_device_context_draw_curves(render_target, geometry, fill->arc_vertices,
-                fill->arc_vertex_count, brush, opacity_brush, FALSE);
+                fill->arc_vertex_count, brush, opacity_brush, FALSE,
+                curve_skip ? curve_skip + fill->bezier_vertex_count / 3 : NULL);
+    free(curve_skip);
 }
 
 static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
