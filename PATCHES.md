@@ -3022,7 +3022,7 @@ scripts/wine-font-setup.sh --prefix ~/.wine --check   # report only
 ```
 
 It locates the fonts through fontconfig (so distribution paths do not matter),
-copies them into the prefix, registers the MS Core Fonts for GDI, writes the
+copies them into the prefix, registers the copies under the Fonts key, writes the
 `FontLink` fallback chain and switches on this branch's text rendering. It is
 idempotent, and `--check` shows whether everything is still in place — worth running
 after a prefix update. Wine rewrites the FontLink chain with its own defaults whenever
