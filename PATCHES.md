@@ -1294,7 +1294,14 @@ This is the recommended branch. What it changes, by subsystem:
   mouse-input failures in `win` and eight hotkey failures in `msg` came and went between runs
   of the previous build as well). An earlier attempt that restacked the override-redirect
   windows below the frames in X changed nothing on screen under KWin and is reverted
-  (`a8d19f0bb18`)
+  (`a8d19f0bb18`). Wine's own popup menus (class `#32768`) are excluded from the rule: they
+  are created as owned `WS_POPUP` with ex style `0` and get `WS_EX_TOPMOST` only when shown,
+  while `create_whole_window()` decides at creation — the census above saw them after they were
+  shown. Managed, a click on a menu item let KWin activate the menu window, the owner lost the
+  activation and the menu closed before the item was chosen: in REAPER on Plasma Wayland the
+  menu bar and right-click menus opened, but no item could be clicked, while shortcuts worked
+  (issue 629). With the class excluded, menu items work again in REAPER (user check, Plasma
+  Wayland)
 - **win32u**: the palette messages of an activation are sent only on a palettized display.
   `set_active_window()` sent `WM_QUERYNEWPALETTE` to every newly active window and, when the
   window answered, broadcast `WM_PALETTEISCHANGING`. Wine's own user32 message tests, which
