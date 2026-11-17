@@ -3263,10 +3263,18 @@ pixels than Windows' rasteriser, not from the blend. For a run in a solid colour
 takes precedence over `text_linear_blend`; gradient and bitmap brushes keep the
 previous path. Unset, ClearType text is bit-identical.
 
-Unrelated to the above, FL Studio's Piano Roll needs one more font fix to show
-flat/sharp symbols (♭ ♯) instead of tofu boxes — FL bypasses Wine's font
-fallback through `GetGlyphIndices`. That one has its own project:
-[giang17/flstudio-wine-font-fix](https://github.com/giang17/flstudio-wine-font-fix).
+Unrelated to the above, FL Studio 2026's piano roll needs one more font file to show the
+flat sign (♭) in its chord names instead of a box. FL draws that text with its own font
+code, not through DirectWrite or GDI, and opens the font files by name in
+`C:\windows\Fonts`: `segoeui.ttf`, and for a glyph that file lacks a list of further
+files, of which `malgun.ttf` is the first with a flat sign on Windows 10. Wine's font
+substitution and fallback are not on that path, and a Wine prefix has none of those files
+(measured with FL Studio 26.1.7, issue 618). `scripts/wine-font-setup.sh --segoe-from DIR`
+copies `malgun.ttf` along with Segoe UI from a Windows font directory. Without Microsoft
+fonts, [giang17/flstudio-wine-font-fix](https://github.com/giang17/flstudio-wine-font-fix)
+puts DejaVu Sans, which has ♭ and ♯, in place of `segoeui.ttf`. (FL Studio 2025 still
+looked glyphs up through DirectWrite's `GetGlyphIndices` on a Segoe UI face, which returns
+no glyph for a character the font lacks.)
 
 ## Steinberg installers: PowerShell hosting in Wine-Mono
 
