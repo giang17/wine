@@ -1938,6 +1938,28 @@ This is the recommended branch. What it changes, by subsystem:
   rectangles whose corners are smaller than the sides, the same pill as a path, `FillEllipse()`
   and ellipses as paths render pixel for pixel as before. The d2d1 tests fail at the same 26
   lines on x86_64 and i386.
+- **d2d1**: the wedge between the skirts of two curve triangles is filled at the point their
+  curves share. Each skirt ends on the normal of its own control edge through the end point of
+  the curve; where the tangent turns in that point the two normals differ, and on the outside
+  of the turn a wedge that wide belonged to neither skirt, so a pixel centre in it got no
+  coverage (issue 633). The quadratic pieces arc segments and cubics are cut into do not meet
+  at the same tangent: those of an ellipse of four arc segments with radii 3 and 3.66 turn by
+  1.3 degrees where two segments meet, and with its centre on a pixel centre the pixel beside
+  its right point came out at 0 of 255 for a coverage of 126, now 126. The wedge is filled
+  with one triangle between the common point and the outer vertices of the two skirts, which
+  carries the distance from the tangent there, moved inward by 1/24 of the curvature; a
+  triangle that holds no pixel centre is left out, and a turn of more than a sixteenth counts
+  as a corner and is left alone. `WINE_D2D_CURVE_JOINTS=0` leaves the wedges open. The 384
+  paths of twelve captured frames of Minimal Audio Current's tap display change in 357 pixels
+  in original size, every one of them closer to the coverage: the sum of the errors is 1,378
+  for 13,998, none is more than 64 off for 47 (a dot with radii 1 and 1.84 had the pixel
+  beside its right point at 0 for 112, now 111). At 150 %: 730 pixels, 2,147 for 39,173, none
+  more than 64 off for 260. Single figures of those frames, glyphs, large shapes,
+  `FillEllipse()` and `FillRoundedRectangle()` render pixel for pixel as with the switch off,
+  the d2d1 tests fail at the same 26 lines on x86_64 and i386, and filling the 32 paths of a
+  frame takes 20.4 ms at best for 20.5 with the switch off. Not covered: the same wedge
+  between the skirts of two straight outline edges, at the corners of the polygon a path of
+  very small arcs is drawn as.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
