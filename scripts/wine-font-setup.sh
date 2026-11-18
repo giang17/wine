@@ -788,10 +788,29 @@ for _ in $(seq 1 15); do
     printf '%s\n' "$(fontlink_block)" | grep -q '^"DejaVu Sans"=.*NotoSansSymbols2' && break
     sleep 1
 done
+# The Fonts key values of step 4 arrive the same way.  In a prefix that had the
+# FontLink value before this run the poll above ends at once, and a --check
+# started right after the run read a system.reg without the new values and
+# reported the copies as unregistered (measured 2026-11-18: exit 3 while the
+# wineserver was still running, exit 0 once it had ended).  Wait for every
+# value this run wrote.
+for _ in $(seq 1 15); do
+    missing=0
+    for l in "${reg_lines[@]}"; do
+        f=${l##*=\"}; fonts_key_has_file "${f%\"}" || missing=1
+    done
+    [ "$missing" -eq 0 ] && break
+    sleep 1
+done
 
 ok=1
 for f in "${REQUIRED[@]}"; do
     [ -f "$FONTDIR/$f" ] || { echo "ERROR: $f was not copied into $FONTDIR" >&2; ok=0; }
+done
+for l in "${reg_lines[@]}"; do
+    f=${l##*=\"}; f=${f%\"}
+    fonts_key_has_file "$f" || {
+        echo "ERROR: the Fonts key value for $f did not appear in $SYSREG." >&2; ok=0; }
 done
 printf '%s\n' "$(fontlink_block)" | grep -q '^"DejaVu Sans"=.*NotoSansSymbols2' || {
     echo "ERROR: the FontLink entry did not appear in $SYSREG." >&2
