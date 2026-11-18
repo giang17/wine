@@ -1960,6 +1960,31 @@ This is the recommended branch. What it changes, by subsystem:
   frame takes 20.4 ms at best for 20.5 with the switch off. Not covered: the same wedge
   between the skirts of two straight outline edges, at the corners of the polygon a path of
   very small arcs is drawn as.
+- **d2d1**: the wedge between the skirts of two straight outline edges is filled at a corner of
+  the fill. Every straight outline edge gets a skirt for its antialiasing ramp, at a right angle
+  to the edge; where two edges meet in a corner that points outward the skirts end on different
+  normals, and a pixel centre in the wedge between them got no coverage (issue 635). Next to a
+  right angle that is a quarter of a pixel at most, next to the corners of a polygon that stands
+  for a curve close to a half: a 24-gon of radius 6 had the pixel beside a corner at 0 of 255
+  for a coverage of 119, and a path of very small arcs, whose pieces are filled as their chords,
+  had the pixel below a pill with radii 1 and 1.22 at 0 for 113. The wedge is filled with one
+  triangle between the corner and the outer vertices of the two skirts; it carries the distance
+  from the line through the corner, moved inward by what the outline falls back from it over the
+  width of a pixel. A straight edge that meets a curve gets the same triangle towards the skirt
+  of the curve triangle (0 for 102 above a pill with radii 3 and 3.66). A turn of more than 143
+  degrees is left alone, and `WINE_D2D_FILL_AA_CORNERS=0` leaves all the wedges open. Regular
+  polygons of 3 to 24 sides and a star at radii 1.5 to 6 change in 269 pixels: the sum of the
+  errors against the area coverage is 1,168 for 7,203, and no pixel is drawn 0 for a coverage
+  above 32, for 82. Pills as paths: largest errors towards dark -4 for -113. Glyphs of DejaVu
+  Sans at 6 to 13 pixels: 1,149 for 2,281 over 136 pixels. Single figures of twelve captured
+  frames of Minimal Audio Current's tap display: 16 pixels, all closer. Those frames as a whole
+  change in 758 pixels, 7,499 for 23,421, 4 more than 64 off for 69; 175 of the pixels are
+  farther from the coverage, 169 of them within reach of more than one figure of their path:
+  figures that share a pixel are blended, not added, so what one gains in its wedge comes on top
+  of the others (28 pixels more than 32 too bright for 8). Large shapes, `FillEllipse()` and
+  `FillRoundedRectangle()` render as before, the d2d1 tests fail at the same 26 lines on x86_64
+  and i386, and filling the 32 paths of a frame takes 21.1 ms at best for 20.6 with the switch
+  off.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
