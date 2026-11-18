@@ -1987,6 +1987,29 @@ This is the recommended branch. What it changes, by subsystem:
   `FillRoundedRectangle()` render as before, the d2d1 tests fail at the same 26 lines on x86_64
   and i386, and filling the 32 paths of a frame takes 21.1 ms at best for 20.6 with the switch
   off.
+- **d2d1**: the fill antialiasing bridges the dents of the outline. The skirts of two straight
+  outline edges that meet in a corner pointing inward overlap beyond it; next to a deep corner
+  that is close to what the two edges cover together, but where the outline is merely jagged
+  below the size of a pixel the skirts of edges a hundredth of a pixel long fan out in every
+  direction and lie on top of each other. The union of figures that overlap with almost the
+  same border has such an outline: four dots of Minimal Audio Current's tap display on one
+  baseline that cover 60 of 255 of a pixel came out at 107, now 76 (issue 637). A vertex at
+  which the outline turns inward is left out of the outline the skirts are made for while it
+  lies within 1/16 of a pixel behind the line between its neighbours, and the triangle in
+  between carries the ramp of the new skirt up to the fill; at a shallow inward corner that
+  remains, the two skirts end on the line halfway between their normals. Slots between two
+  figures stay. `WINE_D2D_FILL_AA_BRIDGES=0` keeps every vertex. Bottom edges in steps of
+  1/64 to 1/8 pixel change in 90 pixels, the sum of the errors against the coverage is 1,360
+  for 2,866; polygons with a polygon for a hole 134 for 228. The 384 paths of twelve captured
+  frames of the tap display change in 759 pixels: 13,486 for 16,922, 9 pixels more than 64
+  off for 59. Glyphs change in 56 pixels (458 for 536); polygons, pills, large shapes and
+  single figures of the frames in none. The d2d1 tests fail at the same 26 lines on x86_64 and
+  i386, and filling the 32 paths of a frame takes 21.3 ms at best for 21.2 with the switch
+  off. Over every pixel of the paths with overlapping figures the sum of the errors hardly
+  moves (788,249 for 789,235): most pixels that are too bright there are drawn by a face of
+  the mesh that does not know the outline edge of the face next to it, and three of the four
+  pixels of the issue stay where they were (190 for a coverage of 55, the skirt of a curve
+  triangle that lies inside the union).
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
