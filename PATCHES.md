@@ -1857,6 +1857,46 @@ This is the recommended branch. What it changes, by subsystem:
   255 at most, and filling the 32 paths of a frame takes 20.1 to 20.2 ms at best for 20.0
   to 20.9. The d2d1 tests fail at the same lines before and after on x86_64 (30 failures),
   and at those lines on i386.
+- **d2d1**: the wedge between the two skirts of a Bézier curve triangle is filled at its
+  control point. A curve triangle whose control point lies outside the fill gets a skirt
+  across each of its two control edges, so that the antialiasing ramp carries on past the
+  curve where the triangle is thinner than the ramp. Each skirt reaches outward at a right
+  angle to its own edge, and the edges turn at the control point by as much as the curve
+  piece does: the wedge between the skirts belonged to neither. Next to a curve piece
+  smaller than a pixel the control point lies within the ramp (0.08 pixels outside the
+  curve for a corner of radius 1), and a pixel whose centre fell into the wedge was not
+  drawn: beside the cap of a bar 2 wide and 2.44 high in Minimal Audio Current's tap
+  display a pixel came out at 0 of 255 for a coverage of 61 (issue 619). The wedge is now
+  closed with a fan of up to four triangles around the control point, as far out as the
+  skirts reach. The fan starts and ends on the outer vertices of the two skirts, so that
+  the rasteriser gives a pixel centre on a common edge to one triangle (with edges that
+  merely ran along those of the skirts a pixel was drawn twice, 157 for a coverage of 93).
+  Its texture coordinates do not continue the mapping of the triangle: the shader takes
+  the implicit function over the length of its gradient for the distance, which several
+  lengths of a small triangle away from it is half the distance and less (55 drawn in a
+  pixel the figure does not reach). With u = 0 the function is a plane, and each triangle
+  of the fan carries the distance from the tangent of the circle of curvature the curve has
+  halfway along, at the point of the circle the triangle faces. A triangle that holds no
+  pixel centre is left out, and so is the fan where the curve is more than 0.75 pixels from
+  the control point. The triangles of an arc get none, their corner lies 0.41 radii outside
+  the curve: `FillEllipse()` and `FillRoundedRectangle()` render as before.
+  `WINE_D2D_CURVE_CORNERS=0` leaves the wedge open, and the 384 paths of twelve captured
+  frames then render pixel for pixel as before. The pixel comes out at 71. Over the 384
+  paths in original size 18,998 pixels change: against the coverage at 16 by 128 points per
+  pixel the sum of the errors is 60,685 for 289,525, 14,630 pixels are closer and 3,768
+  farther (125 of them by more than 4, 7 by more than 16), 2 pixels are more than 64 off
+  for 385 and 14 more than 32 too dark for 2,832. At 150 %: 36,891 for 255,535 at 14,990
+  pixels, none more than 64 off for 389. 1,072 figures of those frames, each on its own:
+  4,330 for 13,694 at 2,210 pixels, none farther by more than 4. 270 glyphs of DejaVu Sans
+  at 6, 9 and 13 pixels: 430 for 1,393 at 52 pixels, at twice the size 53 for 638 at 33.
+  Ellipses of four `ArcSegment`s with radii from 1 to 3: 52 for 521 at 36 pixels. The rings,
+  discs and mixed shapes of the curve edge test program are pixel-identical. In the two
+  pixels that are farther by more than 32 the old value was drawn by a second primitive (55
+  became 111 for a coverage of 57); the figure beside the first has a line of one float
+  between two corner curves, the case of issue 620. On the NVIDIA card the twelve frames
+  give 59,521 for 289,344, and filling the 32 paths of a frame takes 20.5 to 21.1 ms at
+  best for 20.0 to 20.3 with the switch off in the same binary. The d2d1 tests fail at the
+  same 26 lines with the switch on and off, on x86_64 and i386.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
