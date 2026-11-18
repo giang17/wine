@@ -2447,12 +2447,37 @@ struct d2d_fill_aa_outline
      * number, which is more than two where figures touch. */
     UINT32 *nb;
     BYTE *nb_cnt;
+    /* For each of the two, the third vertex of the face the outline edge
+     * to it belongs to: the side of the edge the fill lies on. */
+    UINT32 *opp;
+    /* For d2d_fill_aa_faces(): every vertex in pixels, and for each of the
+     * two neighbours the point that gives the direction of the outline edge
+     * to it, in pixels, and whether its line is a bound of the fill. */
+    double *px, *tangent;
+    BYTE *tangent_ok;
 };
 
-static void d2d_fill_aa_outline_add(struct d2d_fill_aa_outline *o, UINT32 a, UINT32 b)
+/* tangent is the point that gives the direction of the edge at a, b or the
+ * control point of the curve the edge is the chord of, or NULL for an edge
+ * whose line is no bound of the fill. */
+static void d2d_fill_aa_outline_add(struct d2d_fill_aa_outline *o, UINT32 a, UINT32 b, UINT32 opp,
+        const D2D1_POINT_2F *tangent, const double *m)
 {
     if (o->nb_cnt[a] < 2)
-        o->nb[2 * a + o->nb_cnt[a]] = b + 1;
+    {
+        unsigned int k = 2 * a + o->nb_cnt[a];
+
+        o->nb[k] = b + 1;
+        if (o->opp)
+        {
+            o->opp[k] = opp;
+            if ((o->tangent_ok[k] = !!tangent))
+            {
+                o->tangent[2 * k] = m[0] * tangent->x + m[1] * tangent->y + m[2];
+                o->tangent[2 * k + 1] = m[3] * tangent->x + m[4] * tangent->y + m[5];
+            }
+        }
+    }
     if (o->nb_cnt[a] < 3)
         ++o->nb_cnt[a];
 }
@@ -2546,6 +2571,244 @@ static BOOL d2d_fill_aa_neighbour_plane(const struct d2d_fill_aa_outline *o, UIN
         return FALSE;
 
     return TRUE;
+}
+
+/* The outline edges at the corners of a face of the triangulation.
+ *
+ * d2d_fill_aa_neighbours() gives the triangles of a fan the outline edges
+ * next to their own. A face of the triangulation needs them just as much: one
+ * that touches the outline in a corner only has no outline edge of its own at
+ * all, and the pixels along the side of a bar that is triangulated with other
+ * figures were drawn at 255 for a coverage of 151 (wine-dev issue 638). The
+ * weight is the distance from a whole line, though, and the line goes on
+ * where the edge ends: where the outline leaves the half plane a few edges
+ * on, fill lies beyond the line, and the weight would darken it.
+ *
+ * So a face takes the half plane of an outline edge that ends in one of its
+ * corners only where the fill of that edge lies on the side of the face, and
+ * where the outline is followed and found inside the half plane for as far
+ * as it matters: along the line, over the part of the face that lies within
+ * a pixel of the line. The outline is followed from the corner in both
+ * directions; it has to turn towards the fill in the corner, and it may
+ * leave the line into the fill for good. A margin past the end of the face
+ * was measured and dropped: with one of a pixel a face 12 pixels long lost
+ * the half plane of the side of its bar over another figure that meets the
+ * bar 0.3 pixels further on. The edges are taken in the order of the angle
+ * at which the face leaves them, as many as the face has weights left.
+ * WINE_D2D_FILL_AA_FACES=0 leaves the faces of the triangulation with their
+ * own edges. */
+#define D2D_FILL_AA_FACE_TOLERANCE 0.02
+#define D2D_FILL_AA_FACE_STEPS 24
+
+static BOOL d2d_fill_aa_faces(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_FACES", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+/* The vertices in pixels, once for all faces; m is the pixel transform. */
+static void d2d_fill_aa_outline_prepare(struct d2d_fill_aa_outline *o, const double *m)
+{
+    size_t count = o->fill->vertex_count, i;
+
+    for (i = 0; i < count; ++i)
+    {
+        const D2D1_POINT_2F *p = &o->fill->vertices[i];
+
+        o->px[2 * i] = m[0] * p->x + m[1] * p->y + m[2];
+        o->px[2 * i + 1] = m[3] * p->x + m[4] * p->y + m[5];
+    }
+}
+
+/* Follows the outline from prev through cur and tells whether it stays in
+ * the half plane with the unit normal n through q0, all in pixels, until it
+ * has reached limit along dir or gone more than a pixel and a half into the
+ * half plane. */
+static BOOL d2d_fill_aa_outline_inside(const struct d2d_fill_aa_outline *o, UINT32 prev, UINT32 cur,
+        const double *q0, const double *dir, const double *n, double limit)
+{
+    double reach = 0.0;
+    unsigned int step;
+    UINT32 next;
+
+    for (step = 0; step < D2D_FILL_AA_FACE_STEPS; ++step)
+    {
+        unsigned int k = o->nb[2 * prev] - 1 == cur ? 0 : 1;
+        const double *t = &o->tangent[4 * prev + 2 * k];
+        double q[2], s, d;
+
+        q[0] = o->px[2 * cur] - q0[0];
+        q[1] = o->px[2 * cur + 1] - q0[1];
+        s = q[0] * dir[0] + q[1] * dir[1];
+        d = q[0] * n[0] + q[1] * n[1];
+        if (d < -D2D_FILL_AA_FACE_TOLERANCE)
+            return FALSE;
+        /* On the line and back along it: the outline folds over, as it does around a slot between two
+         * figures, and what lies beyond the fold is not seen from here. */
+        if (d <= D2D_FILL_AA_FACE_TOLERANCE && s < reach - D2D_FILL_AA_FACE_TOLERANCE)
+            return FALSE;
+        reach = max(reach, s);
+        /* The curve between the two lies within the triangle of its control point. */
+        if (!o->tangent_ok[2 * prev + k])
+            return FALSE;
+        if ((t[0] - q0[0]) * n[0] + (t[1] - q0[1]) * n[1] < -D2D_FILL_AA_FACE_TOLERANCE)
+            return FALSE;
+        /* The limit is as a rule a corner of the face that lies on the outline itself, and the outline
+         * arrives right there. */
+        if (s >= limit - 1.0e-6 || d > 1.5)
+            return TRUE;
+        if (!d2d_fill_aa_outline_other(o, cur, prev, &next))
+            return FALSE;
+        prev = cur;
+        cur = next;
+    }
+    return FALSE;
+}
+
+/* Gives the weights of the face f that are not taken, free, the half planes
+ * of the outline edges at its corners; see d2d_fill_aa_faces().
+ *
+ * For every corner on the outline and each of the two outline edges there:
+ * the edge is not one of the face, its line is a bound of the fill, and the
+ * face lies on the side of the line the fill of the edge lies on. That takes
+ * no square root, nor does the order: the square of the sine of the angle at
+ * which the face leaves the line, with its sign. The outline is followed for as many of
+ * them, in that order, as the face has weights left. */
+static void d2d_fill_aa_face_planes(const struct d2d_fill_aa_outline *o, const struct d2d_face *f,
+        const BOOL *free, float (*w)[3])
+{
+    struct
+    {
+        double sine2, dir[2], len2, c[2], s[2], side;
+        UINT32 a;
+        unsigned int i, k;
+    } cand[6];
+    unsigned int count = 0, left = free[0] + free[1] + free[2], i, j, k, slot = 0, order[6];
+    const double tol = D2D_FILL_AA_FACE_TOLERANCE;
+    double q[3][2];
+
+    if (!left || (o->nb_cnt[f->v[0]] != 2 && o->nb_cnt[f->v[1]] != 2 && o->nb_cnt[f->v[2]] != 2))
+        return;
+    for (i = 0; i < 3; ++i)
+    {
+        q[i][0] = o->px[2 * f->v[i]];
+        q[i][1] = o->px[2 * f->v[i] + 1];
+    }
+    for (i = 0; i < 3; ++i)
+    {
+        UINT32 a = f->v[i];
+        unsigned int j1 = (i + 1) % 3, j2 = (i + 2) % 3;
+
+        if (o->nb_cnt[a] != 2)
+            continue;
+        for (k = 0; k < 2; ++k)
+        {
+            UINT32 x = o->nb[2 * a + k] - 1;
+            const double *t = &o->tangent[4 * a + 2 * k], *po = &o->px[2 * o->opp[2 * a + k]];
+            double dx, dy, side, c1, c2, s1, s2, tol2, e1, e2;
+
+            /* An edge of the face itself has its own weight. */
+            if (x == f->v[j1] || x == f->v[j2] || x == o->nb[2 * a + 1 - k] - 1 || !o->tangent_ok[2 * a + k])
+                continue;
+            dx = t[0] - q[i][0];
+            dy = t[1] - q[i][1];
+            /* Twice the areas the corners span with the edge, signed towards its fill. */
+            side = dx * (po[1] - q[i][1]) - dy * (po[0] - q[i][0]);
+            if (side == 0.0)
+                continue;
+            side = side < 0.0 ? -1.0 : 1.0;
+            c1 = side * (dx * (q[j1][1] - q[i][1]) - dy * (q[j1][0] - q[i][0]));
+            c2 = side * (dx * (q[j2][1] - q[i][1]) - dy * (q[j2][0] - q[i][0]));
+            tol2 = tol * tol * (dx * dx + dy * dy);
+            if ((c1 < 0.0 && c1 * c1 > tol2) || (c2 < 0.0 && c2 * c2 > tol2))
+                continue;
+            if (!(max(c1, c2) > 0.0 && max(c1, c2) * max(c1, c2) > tol2))
+                continue;
+            s1 = dx * (q[j1][0] - q[i][0]) + dy * (q[j1][1] - q[i][1]);
+            s2 = dx * (q[j2][0] - q[i][0]) + dy * (q[j2][1] - q[i][1]);
+            e1 = c1 * fabs(c1) / (s1 * s1 + c1 * c1 + 1.0e-30);
+            e2 = c2 * fabs(c2) / (s2 * s2 + c2 * c2 + 1.0e-30);
+
+            cand[count].sine2 = min(e1, e2);
+            cand[count].dir[0] = dx;
+            cand[count].dir[1] = dy;
+            cand[count].len2 = dx * dx + dy * dy;
+            cand[count].c[0] = c1;
+            cand[count].c[1] = c2;
+            cand[count].s[0] = s1;
+            cand[count].s[1] = s2;
+            cand[count].side = side;
+            cand[count].a = a;
+            cand[count].i = i;
+            cand[count].k = k;
+            ++count;
+        }
+    }
+    for (i = 0; i < count; ++i)
+    {
+        for (j = i; j && cand[order[j - 1]].sine2 > cand[i].sine2; --j)
+            order[j] = order[j - 1];
+        order[j] = i;
+    }
+
+    for (j = 0; j < count && left; ++j)
+    {
+        const double len = sqrt(cand[order[j]].len2), inv = 1.0 / len, *c = cand[order[j]].c, *cs = cand[order[j]].s;
+        double dir[2], back[2], n[2], s[3], d[3], lo = 0.0, hi = 0.0;
+        UINT32 a = cand[order[j]].a;
+        unsigned int l;
+
+        if (!(len > 1.0e-6))
+            continue;
+        i = cand[order[j]].i;
+        k = cand[order[j]].k;
+        dir[0] = cand[order[j]].dir[0] * inv;
+        dir[1] = cand[order[j]].dir[1] * inv;
+        n[0] = -cand[order[j]].side * dir[1];
+        n[1] = cand[order[j]].side * dir[0];
+        s[i] = d[i] = 0.0;
+        s[(i + 1) % 3] = cs[0] * inv;
+        s[(i + 2) % 3] = cs[1] * inv;
+        d[(i + 1) % 3] = c[0] * inv;
+        d[(i + 2) % 3] = c[1] * inv;
+
+        /* How far the part of the face within a pixel of the line reaches along it. */
+        for (l = 0; l < 3; ++l)
+        {
+            unsigned int e = (l + 1) % 3;
+
+            if (d[l] <= 1.0)
+            {
+                lo = min(lo, s[l]);
+                hi = max(hi, s[l]);
+            }
+            if ((d[l] < 1.0) != (d[e] < 1.0))
+            {
+                double x = s[l] + (s[e] - s[l]) * (1.0 - d[l]) / (d[e] - d[l]);
+
+                lo = min(lo, x);
+                hi = max(hi, x);
+            }
+        }
+
+        /* The outline turns towards the fill in the corner and stays inside from there on, in both directions. */
+        back[0] = -dir[0];
+        back[1] = -dir[1];
+        if (!d2d_fill_aa_outline_inside(o, a, o->nb[2 * a + k] - 1, q[i], dir, n, hi)
+                || !d2d_fill_aa_outline_inside(o, a, o->nb[2 * a + 1 - k] - 1, q[i], back, n, -lo))
+            continue;
+
+        while (!free[slot])
+            ++slot;
+        for (l = 0; l < 3; ++l)
+            w[slot][l] = d[l];
+        ++slot;
+        --left;
+    }
 }
 
 /* Marks the faces of the fans: runs of consecutive faces around the same
@@ -3633,12 +3896,37 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     {
         outline.nb = calloc(fill->vertex_count, 2 * sizeof(*outline.nb));
         outline.nb_cnt = calloc(fill->vertex_count, sizeof(*outline.nb_cnt));
+        /* Without it the faces of the triangulation keep their own edges. */
+        if (d2d_fill_aa_faces() && fabs(pdet) > 1.0e-12)
+        {
+            outline.opp = calloc(fill->vertex_count, 2 * sizeof(*outline.opp));
+            outline.px = malloc(fill->vertex_count * 2 * sizeof(*outline.px));
+            outline.tangent = malloc(fill->vertex_count * 4 * sizeof(*outline.tangent));
+            outline.tangent_ok = calloc(fill->vertex_count, 2 * sizeof(*outline.tangent_ok));
+            if (!outline.opp || !outline.px || !outline.tangent || !outline.tangent_ok)
+            {
+                free(outline.opp);
+                free(outline.px);
+                free(outline.tangent);
+                free(outline.tangent_ok);
+                outline.opp = NULL;
+                outline.px = outline.tangent = NULL;
+                outline.tangent_ok = NULL;
+            }
+        }
         if (!outline.nb || !outline.nb_cnt || !fan)
         {
             free(outline.nb);
             free(outline.nb_cnt);
+            free(outline.opp);
+            free(outline.px);
+            free(outline.tangent);
+            free(outline.tangent_ok);
             outline.nb = NULL;
             outline.nb_cnt = NULL;
+            outline.opp = NULL;
+            outline.px = outline.tangent = NULL;
+            outline.tangent_ok = NULL;
             neighbours = FALSE;
         }
         outline.fill = fill;
@@ -3668,8 +3956,18 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
                 continue;
             if (neighbours)
             {
-                d2d_fill_aa_outline_add(&outline, a, b_v);
-                d2d_fill_aa_outline_add(&outline, b_v, a);
+                const D2D1_POINT_2F *ta = &fill->vertices[b_v], *tb = &fill->vertices[a];
+
+                if (edge_curve[slot])
+                {
+                    /* A seam whose curve is not known, or a control edge, with fill on either side. */
+                    if (seams[slot].start == ~0u || !seams[slot].chord)
+                        ta = tb = NULL;
+                    else
+                        ta = tb = &seams[slot].control;
+                }
+                d2d_fill_aa_outline_add(&outline, a, b_v, f->v[e], ta, pm);
+                d2d_fill_aa_outline_add(&outline, b_v, a, f->v[e], tb, pm);
             }
             if (!edge_curve[slot] || (seams[slot].start != ~0u && seams[slot].chord))
                 on_outline[a] = on_outline[b_v] = 1;
@@ -3678,12 +3976,16 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
         }
     }
 
+    if (outline.opp)
+        d2d_fill_aa_outline_prepare(&outline, pm);
+
     /* Pass 2: build inner triangle vertices with edge weights. */
     vi = 0;
     for (i = 0; i < fc; i++)
     {
         const struct d2d_face *f = &fill->faces[i];
         float w[3][3], t[3][3], c1[3], c2[3];
+        BOOL free_weight[3];
         UINT32 slots[3];
         int j, e;
 
@@ -3719,6 +4021,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
                         && d2d_fill_aa_seam_params(fill, f, e, &seams[slot], t[e], &c1[e], &c2[e]);
             for (j = 0; j < 3; j++)
                 w[e][j] = ramp ? (j == e ? 1.0f : 0.0f) : 10.0f;
+            free_weight[e] = !ramp;
         }
 
         /* The interior edges take the outline edges next to the triangle's
@@ -3756,6 +4059,10 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
                     taken[ib] = TRUE;
                 }
             }
+        }
+        else if (outline.opp)
+        {
+            d2d_fill_aa_face_planes(&outline, f, free_weight, w);
         }
 
         for (j = 0; j < 3; j++, vi++)
@@ -4094,6 +4401,10 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     free(on_outline);
     free(outline.nb);
     free(outline.nb_cnt);
+    free(outline.opp);
+    free(outline.px);
+    free(outline.tangent);
+    free(outline.tangent_ok);
     free(fan);
     free(corners);
     free(corner_curves);
