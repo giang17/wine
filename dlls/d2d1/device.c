@@ -3548,10 +3548,11 @@ static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *rend
  * from its corner io: a quad reaching CURVE_SKIRT_PIXELS outward in screen space.
  * The texture coordinates of the outer corners continue the affine mapping of the
  * triangle, so the pixel shader evaluates the same implicit curve there and the
- * antialiasing ramp simply carries on past the triangle edge. */
+ * antialiasing ramp simply carries on past the triangle edge. normal, if not
+ * NULL, receives the unit vector in pixels along which the skirt reaches out. */
 #define D2D_CURVE_SKIRT_PIXELS 0.75f
 static unsigned int d2d_curve_add_skirt(struct d2d_curve_vertex *out, const struct d2d_curve_vertex *v,
-        unsigned int i0, unsigned int i1, unsigned int io, const float *m, const float *inv)
+        unsigned int i0, unsigned int i1, unsigned int io, const float *m, const float *inv, float *normal)
 {
     const D2D1_POINT_2F *p0 = &v[0].position, *p1 = &v[1].position, *p2 = &v[2].position;
     float ex, ey, len, nx, ny, dx, dy, det;
@@ -3576,6 +3577,11 @@ static unsigned int d2d_curve_add_skirt(struct d2d_curve_vertex *out, const stru
     {
         nx = -nx;
         ny = -ny;
+    }
+    if (normal)
+    {
+        normal[0] = nx;
+        normal[1] = ny;
     }
     nx *= D2D_CURVE_SKIRT_PIXELS;
     ny *= D2D_CURVE_SKIRT_PIXELS;
@@ -3611,6 +3617,197 @@ static unsigned int d2d_curve_add_skirt(struct d2d_curve_vertex *out, const stru
     return 6;
 }
 
+/* The unit vector halfway between the unit vectors a and b. */
+static BOOL d2d_curve_bisect(const double *a, const double *b, double *out)
+{
+    double x = a[0] + b[0], y = a[1] + b[1], len;
+
+    if (!((len = sqrt(x * x + y * y)) > 1e-4))
+        return FALSE;
+    out[0] = x / len;
+    out[1] = y / len;
+    return TRUE;
+}
+
+/* Whether the triangle a, b, c holds the centre of a pixel, in pixels with pixel
+ * i covering [i, i + 1]. A centre within D2D_CURVE_CORNER_SLACK of an edge
+ * counts: the rasteriser places the vertices on a grid of its own. */
+#define D2D_CURVE_CORNER_SLACK 0.03
+static BOOL d2d_curve_triangle_holds_centre(const double *a, const double *b, const double *c)
+{
+    double x0 = min(a[0], min(b[0], c[0])), x1 = max(a[0], max(b[0], c[0]));
+    double y0 = min(a[1], min(b[1], c[1])), y1 = max(a[1], max(b[1], c[1]));
+    double area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]), s = area < 0.0 ? -1.0 : 1.0;
+    double px, py, slack = D2D_CURVE_CORNER_SLACK;
+
+    for (py = ceil(y0 - slack - 0.5) + 0.5; py <= y1 + slack; py += 1.0)
+    {
+        for (px = ceil(x0 - slack - 0.5) + 0.5; px <= x1 + slack; px += 1.0)
+        {
+            /* Twice the areas the centre spans with each edge; an edge is at most 1.5 pixels long. */
+            if (s * ((b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])) >= -1.5 * slack
+                    && s * ((c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0])) >= -1.5 * slack
+                    && s * ((a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0])) >= -1.5 * slack)
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Close the wedge the skirts across the two control edges of the Bézier
+ * triangle v leave open at its control point. Each skirt reaches outward at a
+ * right angle to its own edge, and the edges turn at the control point by as
+ * much as the curve piece does: beyond the control point a wedge that wide
+ * belongs to neither. As long as the control point lies more than half a pixel
+ * outside the curve nothing is drawn there anyway. Next to a curve piece
+ * smaller than a pixel it is closer, a corner of radius 1 has it 0.08 pixels
+ * outside, and a pixel centre in the wedge got no coverage where the figure
+ * covers a quarter of the pixel. The wedge is filled with a fan of up to four
+ * triangles around the control point, as far out as the skirts reach; a
+ * triangle that holds no pixel centre draws nothing and is left out.
+ *
+ * a and b are the outer vertices the skirts across the edges 0-1 and 1-2 have
+ * at the control point. The fan starts and ends on them: only an edge between
+ * the same two vertices is one the rasteriser gives to exactly one of its two
+ * triangles, and a pixel centre on an edge that merely runs along that of a
+ * skirt was drawn twice or not at all. pm maps the geometry to pixels, see
+ * d2d_device_context_get_pixel_transform().
+ *
+ * The texture coordinates do not continue the affine mapping of the triangle
+ * as those of the skirts do. The pixel shader takes the distance from the
+ * curve to be the implicit function over the length of its gradient, and
+ * several lengths of a small triangle away from it, which is where the fan
+ * lies, that comes out at half the distance and less. With u = 0 the function
+ * is -v, a plane, and the shader's distance is exact for the line where v is
+ * 0. Each triangle of the fan takes for that line the tangent of the circle of
+ * curvature the curve has halfway along, at the point of the circle the
+ * triangle faces: next to a small piece the distance then grows in every
+ * direction away from it, next to a large one the line is the tangent of the
+ * curve nearest the control point.
+ *
+ * The triangles of an arc get no fan: their corner lies 0.41 radii outside the
+ * curve, which is half a pixel at a radius of 1.2, and below that the wedge
+ * holds no pixel with a coverage worth drawing. WINE_D2D_CURVE_CORNERS=0
+ * leaves the wedge open for Béziers as well. */
+#define D2D_CURVE_CORNER_TRIANGLES 4
+
+static BOOL d2d_curve_corners(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_CURVE_CORNERS", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+static unsigned int d2d_curve_add_skirt_corner(struct d2d_curve_vertex *out, const struct d2d_curve_vertex *v,
+        const struct d2d_curve_vertex *a, const struct d2d_curve_vertex *b, const float *na, const float *nb,
+        const double *pm, const float *inv)
+{
+    double dir[D2D_CURVE_CORNER_TRIANGLES + 1][2], px[D2D_CURVE_CORNER_TRIANGLES + 1][2];
+    double q[3][2], t[2], rel[2], ex, ey, e2, h, c, r;
+    unsigned int i, j, k, count, hit = 0, written = 0;
+
+    for (k = 0; k < 3; ++k)
+    {
+        q[k][0] = pm[0] * v[k].position.x + pm[1] * v[k].position.y + pm[2];
+        q[k][1] = pm[3] * v[k].position.x + pm[4] * v[k].position.y + pm[5];
+    }
+    /* Halfway along, the curve runs parallel to the chord at half the height
+     * the control point has above the chord, and nowhere is it closer to the
+     * control point: beyond the reach of the antialiasing ramp the wedge holds
+     * nothing to draw. h is that height times the length of the chord. */
+    ex = q[2][0] - q[0][0];
+    ey = q[2][1] - q[0][1];
+    e2 = ex * ex + ey * ey;
+    h = ex * (q[1][1] - q[0][1]) - ey * (q[1][0] - q[0][0]);
+    if (!(e2 > 1e-8) || h * h > 4.0 * D2D_CURVE_SKIRT_PIXELS * D2D_CURVE_SKIRT_PIXELS * e2)
+        return 0;
+
+    /* One triangle up to a sixteenth of a turn between the normals, two up to an eighth, four beyond. */
+    c = na[0] * nb[0] + na[1] * nb[1];
+    count = c > 0.92387953 ? 1 : c > 0.70710678 ? 2 : 4;
+    dir[0][0] = na[0];
+    dir[0][1] = na[1];
+    dir[count][0] = nb[0];
+    dir[count][1] = nb[1];
+    if (count > 1 && !d2d_curve_bisect(dir[0], dir[count], dir[count / 2]))
+        return 0;
+    if (count > 2 && (!d2d_curve_bisect(dir[0], dir[2], dir[1]) || !d2d_curve_bisect(dir[2], dir[4], dir[3])))
+        return 0;
+    for (i = 0; i <= count; ++i)
+    {
+        px[i][0] = q[1][0] + D2D_CURVE_SKIRT_PIXELS * dir[i][0];
+        px[i][1] = q[1][1] + D2D_CURVE_SKIRT_PIXELS * dir[i][1];
+    }
+    for (i = 0; i < count; ++i)
+    {
+        if (d2d_curve_triangle_holds_centre(q[1], px[i], px[i + 1]))
+            hit |= 1u << i;
+    }
+    if (!hit)
+        return 0;
+
+    /* The unit normal of the chord, towards the control point, the height of
+     * the control point, the radius of curvature halfway along the curve, and
+     * the control point as the centre of that circle sees it. */
+    e2 = sqrt(e2);
+    t[0] = -ey / e2;
+    t[1] = ex / e2;
+    if ((h /= e2) < 0.0)
+    {
+        t[0] = -t[0];
+        t[1] = -t[1];
+        h = -h;
+    }
+    if (!(h > 1e-6))
+        return 0;
+    r = e2 * e2 / (4.0 * h);
+    rel[0] = 0.25 * (2.0 * q[1][0] - q[0][0] - q[2][0]) + r * t[0];
+    rel[1] = 0.25 * (2.0 * q[1][1] - q[0][1] - q[2][1]) + r * t[1];
+
+    for (i = 0; i < count; ++i)
+    {
+        struct d2d_curve_vertex *o = &out[written];
+        double g[2], w[2], gl;
+
+        if (!(hit & (1u << i)) || !d2d_curve_bisect(dir[i], dir[i + 1], w))
+            continue;
+        /* The direction in which the centre of the circle sees the middle of the triangle. */
+        g[0] = rel[0] + 0.5 * D2D_CURVE_SKIRT_PIXELS * w[0];
+        g[1] = rel[1] + 0.5 * D2D_CURVE_SKIRT_PIXELS * w[1];
+        if (!((gl = sqrt(g[0] * g[0] + g[1] * g[1])) > 1e-12))
+            continue;
+        g[0] /= gl;
+        g[1] /= gl;
+
+        for (j = 0; j < 3; ++j)
+        {
+            double nx = j ? D2D_CURVE_SKIRT_PIXELS * dir[i + j - 1][0] : 0.0;
+            double ny = j ? D2D_CURVE_SKIRT_PIXELS * dir[i + j - 1][1] : 0.0;
+
+            if (!j)
+                o[j].position = v[1].position;
+            else if (i + j - 1 == 0)
+                o[j].position = a->position;
+            else if (i + j - 1 == count)
+                o[j].position = b->position;
+            else
+            {
+                o[j].position.x = v[1].position.x + inv[0] * (float)nx + inv[1] * (float)ny;
+                o[j].position.y = v[1].position.y + inv[2] * (float)nx + inv[3] * (float)ny;
+            }
+            o[j].texcoord.u = 0.0f;
+            o[j].texcoord.v = -(g[0] * (rel[0] + nx) + g[1] * (rel[1] + ny) - r);
+            o[j].texcoord.sign = v[1].texcoord.sign;
+        }
+        written += 3;
+    }
+
+    return written;
+}
+
 /* Curve triangles cover the space between the curve and its control polygon
  * only. The antialiasing ramp reaches half a pixel past the curve, and next to a
  * short curve piece the triangle is thinner than that, which would cut off the
@@ -3629,11 +3826,15 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
         const struct d2d_geometry *geometry, const struct d2d_curve_vertex *v, size_t count, size_t *out_count,
         BOOL beziers, const BYTE *skip)
 {
+    BOOL corners = beziers && d2d_curve_corners();
     struct d2d_curve_vertex *out;
     float m[4], inv[4], det;
     size_t i, n = 0;
+    double pm[6];
 
     d2d_device_context_get_pixel_matrix(context, &geometry->transform, m);
+    if (corners)
+        d2d_device_context_get_pixel_transform(context, &geometry->transform, pm);
     det = m[0] * m[3] - m[1] * m[2];
     if (!(fabsf(det) > 1e-12f))
         return NULL;
@@ -3642,7 +3843,7 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
     inv[2] = -m[2] / det;
     inv[3] = m[0] / det;
 
-    if (!(out = malloc((count / 3) * 15 * sizeof(*out))))
+    if (!(out = malloc((count / 3) * (15 + 3 * D2D_CURVE_CORNER_TRIANGLES) * sizeof(*out))))
         return NULL;
 
     for (i = 0; i + 2 < count; i += 3)
@@ -3654,12 +3855,20 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
         /* Corner 1 is the control point. */
         if (v[i].texcoord.sign < 0.0f)
         {
-            n += d2d_curve_add_skirt(&out[n], &v[i], 0, 1, 2, m, inv);
-            n += d2d_curve_add_skirt(&out[n], &v[i], 1, 2, 0, m, inv);
+            unsigned int s0, s1;
+            float n0[2], n1[2];
+
+            s0 = d2d_curve_add_skirt(&out[n], &v[i], 0, 1, 2, m, inv, n0);
+            s1 = d2d_curve_add_skirt(&out[n + s0], &v[i], 1, 2, 0, m, inv, n1);
+            /* The outer vertices at corner 1: the fifth of the first skirt, the third of the second. */
+            if (corners && s0 && s1)
+                s1 += d2d_curve_add_skirt_corner(&out[n + s0 + s1], &v[i], &out[n + 4], &out[n + s0 + 2],
+                        n0, n1, pm, inv);
+            n += s0 + s1;
         }
         else
         {
-            n += d2d_curve_add_skirt(&out[n], &v[i], 0, 2, 1, m, inv);
+            n += d2d_curve_add_skirt(&out[n], &v[i], 0, 2, 1, m, inv, NULL);
         }
     }
 
