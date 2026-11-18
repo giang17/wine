@@ -2625,6 +2625,8 @@ struct d2d_fill_aa_corner
      * which is more than two where figures touch. */
     UINT32 other[2];
     D2D1_POINT_2F n[2];
+    /* Their places among the bridged edges, see d2d_fill_aa_bridges(). */
+    UINT32 edge[2];
     BYTE count;
 };
 
@@ -2638,12 +2640,13 @@ static BOOL d2d_fill_aa_corners(void)
     return enabled;
 }
 
-static void d2d_fill_aa_corner_add(struct d2d_fill_aa_corner *c, UINT32 other, const D2D1_POINT_2F *n)
+static void d2d_fill_aa_corner_add(struct d2d_fill_aa_corner *c, UINT32 other, const D2D1_POINT_2F *n, UINT32 edge)
 {
     if (c->count < 2)
     {
         c->other[c->count] = other;
         c->n[c->count] = *n;
+        c->edge[c->count] = edge;
     }
     if (c->count < 3)
         ++c->count;
@@ -3215,6 +3218,241 @@ struct d2d_fill_aa_vertex
     float corner[3][2], corner_on[3];
 };
 
+/* The skirt of the straight outline edge from a to b: two triangles, the
+ * outer vertices are moved 0.75 pixels along outward by the vertex shader. */
+static void d2d_fill_aa_write_skirt(struct d2d_fill_aa_vertex *v, const D2D1_POINT_2F *a, const D2D1_POINT_2F *b,
+        const D2D1_POINT_2F *outward)
+{
+    static const BYTE end[6] = {0, 1, 0, 1, 1, 0}, outer[6] = {0, 0, 1, 0, 1, 1};
+    unsigned int k;
+
+    for (k = 0; k < 6; ++k)
+    {
+        v[k].pos = end[k] ? *b : *a;
+        v[k].u = outer[k] ? -1.0f : 0.0f;
+        v[k].v = 10.0f;
+        v[k].s = 10.0f;
+        v[k].ex = outer[k] ? outward->x : 0.0f;
+        v[k].ey = outer[k] ? outward->y : 0.0f;
+    }
+}
+
+/* Bridges over the places where the outline turns inward by less than
+ * D2D_FILL_AA_BRIDGE_DEPTH pixels.
+ *
+ * The skirts of two straight outline edges that meet in a corner pointing
+ * inward overlap beyond it, and a pixel centre in the overlap is drawn by
+ * both. Next to a deep corner that is close to what the two edges cover of
+ * the pixel together. Where the outline is merely jagged below the size of a
+ * pixel it is not: the union of figures that overlap with almost the same
+ * border, as the dots of Minimal Audio Current's tap display that stand on
+ * one baseline, has edges of a hundredth of a pixel there whose skirts, 0.75
+ * pixels long, fan out in every direction and lie on top of each other, and
+ * so do the triangles that fill the wedges at the corners in between
+ * (d2d_fill_aa_corners()). Four such dots that cover 60 of 255 of a pixel
+ * came out at 107 (wine-dev issue 637).
+ *
+ * So a vertex at which the outline turns inward is left out of the outline
+ * the skirts are made for, as long as it and what was left out before lie
+ * within that depth of the line between its two neighbours: the two edges
+ * become one, with one skirt. What is left is the outline without its dents,
+ * straight where it was jagged. The triangle between the vertex and its two
+ * neighbours lies outside the fill and inside the new edge; it is drawn with
+ * the distance from the edge it ends up behind, so the ramp of the skirt goes
+ * on up to the fill.
+ *
+ * At a corner that still points inward afterwards, by less than an eighth of
+ * a turn, the two skirts end on the line halfway between their normals
+ * instead of each on its own: they have that edge in common and no longer
+ * overlap. The pixel below such a corner of a polygon with a polygon for a
+ * hole came out 43 of 255 too bright. Each skirt gives up 0.75 tan(turn / 2)
+ * pixels of its length for that, so both edges have to be twice as long;
+ * across a shorter edge the skirt would fold over. A deeper corner is left
+ * with the overlap, which is close to what its two edges cover of a pixel
+ * together. WINE_D2D_FILL_AA_BRIDGES=0 keeps every vertex and every overlap.
+ *
+ * The skirt of an edge that goes takes the place of the first of the two it
+ * replaces in the vertex array, the triangle that of the second. */
+#define D2D_FILL_AA_BRIDGE_DEPTH 0.0625
+
+struct d2d_fill_aa_edge
+{
+    UINT32 a, b;
+    /* Where its skirt stands in the vertex array. */
+    UINT32 slot;
+    /* The edge it became a part of, ~0u for none. */
+    UINT32 parent;
+    /* How far the vertices left out between its ends lie from it at most, in pixels. */
+    float depth;
+    D2D1_POINT_2F n;
+};
+
+struct d2d_fill_aa_sliver
+{
+    UINT32 a, v, b, edge, slot;
+};
+
+static BOOL d2d_fill_aa_bridges(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_BRIDGES", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+/* edges holds edge_count edges with room for as many again, slivers has room
+ * for edge_count, stack for the vertices of the fill; m is the pixel
+ * transform. */
+static void d2d_fill_aa_bridge(const struct d2d_fill *fill, struct d2d_fill_aa_corner *corners,
+        struct d2d_fill_aa_edge *edges, size_t edge_count, struct d2d_fill_aa_sliver *slivers, UINT32 *stack,
+        const double *m, struct d2d_fill_aa_vertex *expanded)
+{
+    size_t sliver_count = 0, top = 0, i;
+    unsigned int k;
+
+    for (i = 0; i < fill->vertex_count; ++i)
+    {
+        if (corners[i].count == 2)
+            stack[top++] = i;
+    }
+
+    while (top)
+    {
+        UINT32 v = stack[--top], a, b;
+        struct d2d_fill_aa_corner *c = &corners[v];
+        const D2D1_POINT_2F *p = &fill->vertices[v], *pa, *pb;
+        struct d2d_fill_aa_edge *e0, *e1, *e;
+        double qa[2], qb[2], qv[2], dx, dy, len, depth, along;
+        D2D1_POINT_2F outward;
+        float flen;
+
+        if (c->count != 2 || (a = c->other[0]) == (b = c->other[1]))
+            continue;
+        pa = &fill->vertices[a];
+        pb = &fill->vertices[b];
+        /* The corner points inward where neither skirt reaches on along the other edge. */
+        if (!(c->n[1].x * (p->x - pa->x) + c->n[1].y * (p->y - pa->y) < 0.0f)
+                || !(c->n[0].x * (p->x - pb->x) + c->n[0].y * (p->y - pb->y) < 0.0f))
+            continue;
+
+        e0 = &edges[c->edge[0]];
+        e1 = &edges[c->edge[1]];
+        qa[0] = m[0] * pa->x + m[1] * pa->y + m[2];
+        qa[1] = m[3] * pa->x + m[4] * pa->y + m[5];
+        qb[0] = m[0] * pb->x + m[1] * pb->y + m[2];
+        qb[1] = m[3] * pb->x + m[4] * pb->y + m[5];
+        qv[0] = m[0] * p->x + m[1] * p->y + m[2];
+        qv[1] = m[3] * p->x + m[4] * p->y + m[5];
+        dx = qb[0] - qa[0];
+        dy = qb[1] - qa[1];
+        if (!((len = sqrt(dx * dx + dy * dy)) > 1.0e-4))
+            continue;
+        /* The vertex lies behind the new edge, not behind the line it is on
+         * past one of its ends: the bottom of a slot between two figures a
+         * hundredth of a pixel apart is no dent. */
+        along = (dx * (qv[0] - qa[0]) + dy * (qv[1] - qa[1])) / len;
+        if (!(along > 0.0 && along < len))
+            continue;
+        depth = fabs(dx * (qv[1] - qa[1]) - dy * (qv[0] - qa[0])) / len + max(e0->depth, e1->depth);
+        if (!(depth <= D2D_FILL_AA_BRIDGE_DEPTH))
+            continue;
+
+        /* At a right angle to the new edge, away from the vertex. */
+        outward.x = -(pb->y - pa->y);
+        outward.y = pb->x - pa->x;
+        if (!((flen = sqrtf(outward.x * outward.x + outward.y * outward.y)) > 0.0f))
+            continue;
+        outward.x /= flen;
+        outward.y /= flen;
+        if (outward.x * (pa->x - p->x) + outward.y * (pa->y - p->y) < 0.0f)
+        {
+            outward.x = -outward.x;
+            outward.y = -outward.y;
+        }
+
+        e = &edges[edge_count];
+        e->a = a;
+        e->b = b;
+        e->slot = e0->slot;
+        e->parent = ~0u;
+        e->depth = depth;
+        e->n = outward;
+        e0->parent = e1->parent = edge_count;
+        d2d_fill_aa_write_skirt(&expanded[e->slot], pa, pb, &outward);
+
+        slivers[sliver_count].a = a;
+        slivers[sliver_count].v = v;
+        slivers[sliver_count].b = b;
+        slivers[sliver_count].edge = edge_count;
+        slivers[sliver_count].slot = e1->slot;
+        ++sliver_count;
+
+        c->count = 0;
+        for (k = 0; k < 2; ++k)
+        {
+            UINT32 end = k ? b : a, far = k ? a : b;
+            struct d2d_fill_aa_corner *o = &corners[end];
+            unsigned int j;
+
+            for (j = 0; j < min(o->count, 2); ++j)
+            {
+                if (o->other[j] == v)
+                {
+                    o->other[j] = far;
+                    o->n[j] = outward;
+                    o->edge[j] = edge_count;
+                    break;
+                }
+            }
+            if (o->count == 2)
+                stack[top++] = end;
+        }
+        ++edge_count;
+    }
+
+    for (i = 0; i < sliver_count; ++i)
+    {
+        const struct d2d_fill_aa_sliver *sl = &slivers[i];
+        struct d2d_fill_aa_vertex *o = &expanded[sl->slot];
+        const UINT32 idx[3] = {sl->a, sl->v, sl->b};
+        const struct d2d_fill_aa_edge *e = &edges[sl->edge];
+        const D2D1_POINT_2F *pa, *pb;
+        double qa[2], nx, ny, len, ox, oy;
+
+        while (e->parent != ~0u)
+            e = &edges[e->parent];
+        pa = &fill->vertices[e->a];
+        pb = &fill->vertices[e->b];
+        qa[0] = m[0] * pa->x + m[1] * pa->y + m[2];
+        qa[1] = m[3] * pa->x + m[4] * pa->y + m[5];
+        /* The normal of the edge in pixels, on the side its skirt reaches out to. */
+        nx = -(m[3] * (pb->x - pa->x) + m[4] * (pb->y - pa->y));
+        ny = m[0] * (pb->x - pa->x) + m[1] * (pb->y - pa->y);
+        ox = m[0] * e->n.x + m[1] * e->n.y;
+        oy = m[3] * e->n.x + m[4] * e->n.y;
+        len = sqrt(nx * nx + ny * ny);
+        if (nx * ox + ny * oy < 0.0)
+            len = -len;
+
+        memset(o, 0, 6 * sizeof(*o));
+        for (k = 0; k < 6; ++k)
+        {
+            const D2D1_POINT_2F *q = &fill->vertices[idx[k < 3 ? k : 0]];
+
+            o[k].pos = *q;
+            if (k < 3 && len != 0.0)
+            {
+                o[k].u = max(-((m[0] * q->x + m[1] * q->y + m[2] - qa[0]) * nx
+                        + (m[3] * q->x + m[4] * q->y + m[5] - qa[1]) * ny) / len, 0.0);
+                o[k].v = 10.0f;
+                o[k].s = 10.0f;
+            }
+        }
+    }
+}
+
 /* Builds the antialiased fill mesh of a geometry under the current transform:
  * the vertex array the D2D_SHAPE_TYPE_FILL_AA shaders take. Returns FALSE when
  * the fill has nothing to antialias or the mesh cannot be built; the plain
@@ -3230,7 +3468,10 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     UINT32 *curve_ends = NULL;
     struct d2d_fill_aa_outline outline = {0};
     struct d2d_fill_aa_corner *corners = NULL;
-    UINT32 *corner_curves = NULL;
+    struct d2d_fill_aa_sliver *slivers = NULL;
+    struct d2d_fill_aa_edge *edges = NULL;
+    UINT32 *corner_curves = NULL, *bridge_stack = NULL;
+    size_t edge_count = 0;
     BOOL neighbours = d2d_fill_aa_neighbours();
     size_t pixel_count = 0, pixels_size = 0, thin_count = 0;
     struct d2d_fill_aa_pixel *pixels = NULL;
@@ -3349,7 +3590,24 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     expanded_count = (fc - thin_count) * 3 + boundary_count * 6 + pixel_count * 6;
     if (boundary_count > 1 && d2d_fill_aa_corners() && fabs(pdet) > 1.0e-12
             && (corners = calloc(fill->vertex_count, sizeof(*corners))))
+    {
         expanded_count += boundary_count * 3;
+        if (d2d_fill_aa_bridges())
+        {
+            edges = malloc(2 * boundary_count * sizeof(*edges));
+            slivers = malloc(boundary_count * sizeof(*slivers));
+            bridge_stack = malloc((fill->vertex_count + 2 * boundary_count) * sizeof(*bridge_stack));
+            if (!edges || !slivers || !bridge_stack)
+            {
+                free(edges);
+                free(slivers);
+                free(bridge_stack);
+                edges = NULL;
+                slivers = NULL;
+                bridge_stack = NULL;
+            }
+        }
+    }
     expanded = calloc(expanded_count, sizeof(*expanded));
     on_outline = calloc(fill->vertex_count, sizeof(*on_outline));
     if (!expanded || !on_outline)
@@ -3357,6 +3615,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
         free(expanded);
         free(on_outline);
         free(corners);
+        free(edges);
+        free(slivers);
+        free(bridge_stack);
         free(fan);
         free(thin);
         free(pixels);
@@ -3565,42 +3826,32 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             /* Skirt quad: 2 triangles (A, B, A_out) + (B, B_out, A_out).
              * Inner verts (A, B): bary=0 for boundary component, ex/ey=0.
              * Outer verts (A_out, B_out): bary=-1 for boundary component, ex/ey=outward. */
-            /* Triangle 1: A, B, A_out */
-            expanded[vi].pos = pa;
-            expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-            expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
-            vi++;
-            expanded[vi].pos = pb;
-            expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-            expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
-            vi++;
-            expanded[vi].pos = pa;
-            expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-            expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
-            vi++;
-            /* Triangle 2: B, B_out, A_out */
-            expanded[vi].pos = pb;
-            expanded[vi].u = 0.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-            expanded[vi].ex = 0.0f; expanded[vi].ey = 0.0f;
-            vi++;
-            expanded[vi].pos = pb;
-            expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-            expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
-            vi++;
-            expanded[vi].pos = pa;
-            expanded[vi].u = -1.0f; expanded[vi].v = 10.0f; expanded[vi].s = 10.0f;
-            expanded[vi].ex = outward.x; expanded[vi].ey = outward.y;
-            vi++;
+            d2d_fill_aa_write_skirt(&expanded[vi], &pa, &pb, &outward);
 
             /* Mark this edge as processed to avoid a duplicate skirt from the adjacent face. */
             edge_processed[slot] = 1;
             if (corners)
             {
-                d2d_fill_aa_corner_add(&corners[ai], bi, &outward);
-                d2d_fill_aa_corner_add(&corners[bi], ai, &outward);
+                d2d_fill_aa_corner_add(&corners[ai], bi, &outward, edge_count);
+                d2d_fill_aa_corner_add(&corners[bi], ai, &outward, edge_count);
             }
+            if (edges && edge_count < boundary_count)
+            {
+                edges[edge_count].a = ai;
+                edges[edge_count].b = bi;
+                edges[edge_count].slot = vi;
+                edges[edge_count].parent = ~0u;
+                edges[edge_count].depth = 0.0f;
+                edges[edge_count].n = outward;
+            }
+            ++edge_count;
+            vi += 6;
         }
     }
+
+    /* The outline without its dents; see d2d_fill_aa_bridges(). */
+    if (edges && edge_count <= boundary_count)
+        d2d_fill_aa_bridge(fill, corners, edges, edge_count, slivers, bridge_stack, pm, expanded);
 
     /* The Bézier triangles drawn with skirts across their control edges, by
      * the vertex an end of their curve lies on: twice the triangle plus the
@@ -3640,7 +3891,72 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             pb = &fill->vertices[c->other[1]];
             if (!(c->n[1].x * (p->x - pa->x) + c->n[1].y * (p->y - pa->y) > 0.0f)
                     || !(c->n[0].x * (p->x - pb->x) + c->n[0].y * (p->y - pb->y) > 0.0f))
+            {
+                /* A corner that points inward by less than an eighth of a turn: both skirts end on the
+                 * line halfway between their normals; see d2d_fill_aa_bridges(). */
+                if (edges
+                        && c->n[1].x * (p->x - pa->x) + c->n[1].y * (p->y - pa->y) < 0.0f
+                        && c->n[0].x * (p->x - pb->x) + c->n[0].y * (p->y - pb->y) < 0.0f)
+                {
+                    double dn[2][2], bis[2], gx, gy;
+
+                    for (k = 0; k < 2; ++k)
+                    {
+                        dn[k][0] = pm[0] * c->n[k].x + pm[1] * c->n[k].y;
+                        dn[k][1] = pm[3] * c->n[k].x + pm[4] * c->n[k].y;
+                        if (!((len = sqrt(dn[k][0] * dn[k][0] + dn[k][1] * dn[k][1])) > 1.0e-12))
+                            break;
+                        dn[k][0] /= len;
+                        dn[k][1] /= len;
+                    }
+                    cosine = k == 2 ? dn[0][0] * dn[1][0] + dn[0][1] * dn[1][1] : 0.0;
+                    /* Each skirt gives up 0.75 tan(turn / 2) of its length along the edge, and may have to at
+                     * its other end as well. */
+                    if (cosine > 0.70710678)
+                    {
+                        double need = 2.0 * 0.75 * sqrt((1.0 - cosine) / (1.0 + cosine)), ex, ey;
+
+                        ex = pm[0] * (p->x - pa->x) + pm[1] * (p->y - pa->y);
+                        ey = pm[3] * (p->x - pa->x) + pm[4] * (p->y - pa->y);
+                        if (!(ex * ex + ey * ey > need * need))
+                            cosine = 0.0;
+                        ex = pm[0] * (p->x - pb->x) + pm[1] * (p->y - pb->y);
+                        ey = pm[3] * (p->x - pb->x) + pm[4] * (p->y - pb->y);
+                        if (!(ex * ex + ey * ey > need * need))
+                            cosine = 0.0;
+                    }
+                    if (cosine > 0.70710678)
+                    {
+                        bis[0] = dn[0][0] + dn[1][0];
+                        bis[1] = dn[0][1] + dn[1][1];
+                        len = sqrt(bis[0] * bis[0] + bis[1] * bis[1]);
+                        bis[0] /= len;
+                        bis[1] /= len;
+                        /* Back to the space of the geometry; the vertex shader sets the length. */
+                        gx = (pm[4] * bis[0] - pm[1] * bis[1]) / pdet;
+                        gy = (pm[0] * bis[1] - pm[3] * bis[0]) / pdet;
+                        len = sqrt(gx * gx + gy * gy);
+                        for (k = 0; k < 2 && len > 0.0; ++k)
+                        {
+                            const struct d2d_fill_aa_edge *e = &edges[c->edge[k]];
+                            struct d2d_fill_aa_vertex *o = &expanded[e->slot];
+                            float u = -(float)(bis[0] * dn[k][0] + bis[1] * dn[k][1]);
+                            static const BYTE at_a[2] = {2, 5};
+                            unsigned int j;
+
+                            for (j = 0; j < (e->a == i ? 2u : 1u); ++j)
+                            {
+                                struct d2d_fill_aa_vertex *w = &o[e->a == i ? at_a[j] : 4];
+
+                                w->ex = gx / len;
+                                w->ey = gy / len;
+                                w->u = u;
+                            }
+                        }
+                    }
+                }
                 continue;
+            }
         }
         else if (c->count != 1 || !corner_curves || !corner_curves[i] || corner_curves[i] == ~0u)
         {
@@ -3781,6 +4097,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     free(fan);
     free(corners);
     free(corner_curves);
+    free(edges);
+    free(slivers);
+    free(bridge_stack);
 
     *out = expanded;
     *out_count = expanded_count;
