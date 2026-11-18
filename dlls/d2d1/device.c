@@ -3807,6 +3807,184 @@ static unsigned int d2d_curve_add_skirt_corner(struct d2d_curve_vertex *out, con
     return written;
 }
 
+/* Close the wedge the skirts of two curve triangles that follow each other
+ * leave open at the point their curves share. Each skirt reaches outward at a
+ * right angle to its own control edge and ends on the normal of that edge
+ * through the common point. Where the tangent turns in that point the two
+ * normals differ, and on the outside of the turn a wedge that wide belongs to
+ * neither skirt. The quadratic pieces the four arc segments of an ellipse
+ * with radii 3 and 3.66 are cut into turn by 1.3 degrees where two segments
+ * meet: with the centre of the ellipse on a pixel centre, the pixel centres on
+ * its two axes lie in such wedges, and the pixel beside its right point came
+ * out at 0 of 255 for a coverage of 126 (wine-dev issue 633). Two curves that
+ * go on in the same direction have the same normal in exact arithmetic only:
+ * each skirt computes its outer vertex from its own edge.
+ *
+ * The wedge is filled with one triangle between the common point and the outer
+ * vertices the two skirts have there, taken from the skirts: only an edge
+ * between the same two vertices is one the rasteriser gives to exactly one of
+ * its two triangles. A triangle that holds no pixel centre draws nothing and
+ * is left out, and so is one where the tangent turns by more than a sixteenth
+ * of a turn, which is a corner of the figure. Where the skirts overlap, on the
+ * inside of a turn, nothing is added.
+ *
+ * As for the wedge at the control point (d2d_curve_add_skirt_corner()), the
+ * texture coordinates make the implicit function a plane, u = 0 and -v the
+ * distance in pixels from a line across the wedge. That line is the tangent in
+ * the common point, moved inward by what the curve falls back from its tangent
+ * on average over the width of a pixel, 1/24 of the curvature the two pieces
+ * have there: the pixel shader takes the line for an edge across the whole
+ * pixel, and with the tangent itself 172 of the 483 pixels that changed in
+ * twelve frames of Minimal Audio Current's tap display came out more than 16
+ * of 255 too bright.
+ *
+ * out holds, from joints[t].base, the triangle t of v, the skirt across its
+ * edge 0-1 and the skirt across its edge 1-2, six vertices each as
+ * d2d_curve_add_skirt() writes them: the outer vertex at corner 0 is the third
+ * of the first skirt, the one at corner 2 the fifth of the second. m and pm
+ * map the geometry to pixels, without and with the translation. Returns the
+ * number of vertices appended at out[n]. WINE_D2D_CURVE_JOINTS=0 leaves the
+ * wedges open. */
+#define D2D_CURVE_JOINT_COS 0.92387953f
+#define D2D_CURVE_JOINT_MAX_SAG 0.25
+
+struct d2d_curve_joint
+{
+    /* The place of the triangle in the output, ~0u if it has no skirts across its control edges. */
+    UINT32 base;
+    /* The unit normals of those skirts, in pixels. */
+    float n0[2], n1[2];
+};
+
+static BOOL d2d_curve_joints(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_CURVE_JOINTS", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+static size_t d2d_curve_join_skirts(struct d2d_curve_vertex *out, size_t n, const struct d2d_curve_vertex *v,
+        size_t count, const struct d2d_curve_joint *joints, const float *m, const double *pm)
+{
+    size_t tri_count = count / 3, map_size = tri_count * 2 + 16, t, u, probe, written = 0;
+    UINT32 *map = NULL, slot;
+    BOOL mapped = FALSE;
+    unsigned int j, k;
+
+    for (t = 0; t < tri_count; ++t)
+    {
+        const D2D1_POINT_2F *p = &v[3 * t + 2].position, *ctrl = &v[3 * t + 1].position;
+        struct d2d_curve_vertex *o = &out[n + written];
+        const struct d2d_curve_vertex *src[3], *tri[2];
+        double q[3][2], nb[2], len, sag = 0.0;
+        float c, ex, ey;
+
+        if (joints[t].base == ~0u)
+            continue;
+
+        /* The triangle that starts where this one ends is the next one, or
+         * the first one of the figure. */
+        u = t + 1;
+        if (u == tri_count || joints[u].base == ~0u || memcmp(&v[3 * u].position, p, sizeof(*p)))
+        {
+            if (!mapped)
+            {
+                mapped = TRUE;
+                if ((map = calloc(map_size, sizeof(*map))))
+                {
+                    for (u = 0; u < tri_count; ++u)
+                    {
+                        if (joints[u].base == ~0u)
+                            continue;
+                        slot = d2d_fill_aa_position_hash(&v[3 * u].position) % map_size;
+                        while (map[slot])
+                            slot = slot + 1 == map_size ? 0 : slot + 1;
+                        map[slot] = u + 1;
+                    }
+                }
+            }
+            if (!map)
+                continue;
+            slot = d2d_fill_aa_position_hash(p) % map_size;
+            for (probe = 0, u = tri_count; probe < map_size && map[slot]; ++probe)
+            {
+                if (!memcmp(&v[3 * (map[slot] - 1)].position, p, sizeof(*p)))
+                {
+                    u = map[slot] - 1;
+                    break;
+                }
+                slot = slot + 1 == map_size ? 0 : slot + 1;
+            }
+            if (u == tri_count)
+                continue;
+        }
+        if (u == t)
+            continue;
+
+        c = joints[t].n1[0] * joints[u].n0[0] + joints[t].n1[1] * joints[u].n0[1];
+        if (!(c > D2D_CURVE_JOINT_COS))
+            continue;
+        /* The wedge is open where the normal of the second skirt points on
+         * along the control edge of the first. */
+        ex = m[0] * (p->x - ctrl->x) + m[1] * (p->y - ctrl->y);
+        ey = m[2] * (p->x - ctrl->x) + m[3] * (p->y - ctrl->y);
+        if (!(joints[u].n0[0] * ex + joints[u].n0[1] * ey > 0.0f))
+            continue;
+
+        /* The common point and the outer vertices the two skirts have there. */
+        src[0] = &v[3 * t + 2];
+        src[1] = &out[joints[t].base + 13];
+        src[2] = &out[joints[u].base + 5];
+        for (k = 0; k < 3; ++k)
+        {
+            q[k][0] = pm[0] * src[k]->position.x + pm[1] * src[k]->position.y + pm[2];
+            q[k][1] = pm[3] * src[k]->position.x + pm[4] * src[k]->position.y + pm[5];
+        }
+        if (!d2d_curve_triangle_holds_centre(q[0], q[1], q[2]))
+            continue;
+        nb[0] = joints[t].n1[0] + joints[u].n0[0];
+        nb[1] = joints[t].n1[1] + joints[u].n0[1];
+        if (!((len = sqrt(nb[0] * nb[0] + nb[1] * nb[1])) > 1e-4))
+            continue;
+
+        /* The curvature of a quadratic Bézier at one of its ends is the area
+         * of its triangle over the cube of the control edge that ends there;
+         * the mean of the two pieces, over 24. */
+        tri[0] = &v[3 * t];
+        tri[1] = &v[3 * u];
+        for (j = 0; j < 2; ++j)
+        {
+            double a[3][2], area, l;
+
+            for (k = 0; k < 3; ++k)
+            {
+                a[k][0] = pm[0] * tri[j][k].position.x + pm[1] * tri[j][k].position.y;
+                a[k][1] = pm[3] * tri[j][k].position.x + pm[4] * tri[j][k].position.y;
+            }
+            area = 0.5 * fabs((a[1][0] - a[0][0]) * (a[2][1] - a[0][1]) - (a[1][1] - a[0][1]) * (a[2][0] - a[0][0]));
+            l = sqrt((a[2 - j][0] - a[1 - j][0]) * (a[2 - j][0] - a[1 - j][0])
+                    + (a[2 - j][1] - a[1 - j][1]) * (a[2 - j][1] - a[1 - j][1]));
+            if (l > 1e-6)
+                sag += area / (l * l * l) / 48.0;
+        }
+        sag = min(sag, D2D_CURVE_JOINT_MAX_SAG);
+
+        for (k = 0; k < 3; ++k)
+        {
+            o[k].position = src[k]->position;
+            o[k].texcoord.u = 0.0f;
+            o[k].texcoord.v = -((q[k][0] - q[0][0]) * nb[0] + (q[k][1] - q[0][1]) * nb[1]) / len - sag;
+            o[k].texcoord.sign = v[3 * t].texcoord.sign;
+        }
+        written += 3;
+    }
+    free(map);
+    return written;
+}
+
 /* Curve triangles cover the space between the curve and its control polygon
  * only. The antialiasing ramp reaches half a pixel past the curve, and next to a
  * short curve piece the triangle is thinner than that, which would cut off the
@@ -3826,13 +4004,15 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
         BOOL beziers, const BYTE *skip)
 {
     BOOL corners = beziers && d2d_curve_corners();
+    BOOL joined = beziers && count >= 6 && d2d_curve_joints();
+    struct d2d_curve_joint *joints = NULL;
     struct d2d_curve_vertex *out;
     float m[4], inv[4], det;
     size_t i, n = 0;
     double pm[6];
 
     d2d_device_context_get_pixel_matrix(context, &geometry->transform, m);
-    if (corners)
+    if (corners || joined)
         d2d_device_context_get_pixel_transform(context, &geometry->transform, pm);
     det = m[0] * m[3] - m[1] * m[2];
     if (!(fabsf(det) > 1e-12f))
@@ -3842,8 +4022,14 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
     inv[2] = -m[2] / det;
     inv[3] = m[0] / det;
 
-    if (!(out = malloc((count / 3) * (15 + 3 * D2D_CURVE_CORNER_TRIANGLES) * sizeof(*out))))
+    if (!(out = malloc((count / 3) * (18 + 3 * D2D_CURVE_CORNER_TRIANGLES) * sizeof(*out))))
         return NULL;
+    /* Without the joints the wedges stay open. */
+    if (joined && (joints = malloc((count / 3) * sizeof(*joints))))
+    {
+        for (i = 0; i < count / 3; ++i)
+            joints[i].base = ~0u;
+    }
 
     for (i = 0; i + 2 < count; i += 3)
     {
@@ -3859,6 +4045,12 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
 
             s0 = d2d_curve_add_skirt(&out[n], &v[i], 0, 1, 2, m, inv, n0);
             s1 = d2d_curve_add_skirt(&out[n + s0], &v[i], 1, 2, 0, m, inv, n1);
+            if (joints && s0 && s1)
+            {
+                joints[i / 3].base = n - 3;
+                memcpy(joints[i / 3].n0, n0, sizeof(n0));
+                memcpy(joints[i / 3].n1, n1, sizeof(n1));
+            }
             /* The outer vertices at corner 1: the fifth of the first skirt, the third of the second. */
             if (corners && s0 && s1)
                 s1 += d2d_curve_add_skirt_corner(&out[n + s0 + s1], &v[i], &out[n + 4], &out[n + s0 + 2],
@@ -3869,6 +4061,12 @@ static struct d2d_curve_vertex *d2d_device_context_curve_skirts(const struct d2d
         {
             n += d2d_curve_add_skirt(&out[n], &v[i], 0, 2, 1, m, inv, NULL);
         }
+    }
+
+    if (joints)
+    {
+        n += d2d_curve_join_skirts(out, n, v, count, joints, m, pm);
+        free(joints);
     }
 
     *out_count = n;
