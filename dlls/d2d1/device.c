@@ -2174,7 +2174,10 @@ static UINT32 d2d_fill_aa_next_slot(UINT32 slot, size_t map_size)
  * skirt would cover the same pixels a second time.
  *
  * Only edges that are actually in the mesh are marked; a chord that ended up as
- * an interior diagonal is simply not found. Flat Bézier triangles are not drawn
+ * an interior diagonal is simply not found. A corner of a curve triangle that
+ * lies on a vertex the triangulation left out of the mesh stands for the vertex
+ * a float or two away that is in it, see d2d_fill_aa_find_mesh_vertex(): the
+ * mesh has the edge between those. Flat Bézier triangles are not drawn
  * (see d2d_curve_is_flat()), so their edges are left to be straight boundary
  * edges with a skirt of their own.
  *
@@ -2248,30 +2251,26 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
             size_t idx[3], missing = 0;
             int a, b;
 
-            if (curve_ends)
-            {
-                size_t e0 = d2d_fill_aa_find_mesh_vertex(fill, vertex_map, vertex_map_size, used,
-                        &curves[c][i].position);
-                size_t e2 = d2d_fill_aa_find_mesh_vertex(fill, vertex_map, vertex_map_size, used,
-                        &curves[c][i + 2].position);
-
-                if (e0 != ~(size_t)0 && e2 != ~(size_t)0 && used[e0] && used[e2])
-                {
-                    curve_ends[2 * ((c ? counts[0] / 3 : 0) + i / 3)] = e0;
-                    curve_ends[2 * ((c ? counts[0] / 3 : 0) + i / 3) + 1] = e2;
-                }
-            }
-
-            if (!c && d2d_curve_is_flat(&curves[c][i], m))
-                continue;
-
+            /* A corner on a vertex that was left out of the mesh is looked up as
+             * the vertex next to it that the outline runs through: the edge
+             * between the two ends of the curve is a seam all the same, and
+             * unmarked it got a skirt on top of the curve triangle. */
             for (a = 0; a < 3; ++a)
             {
-                idx[a] = d2d_fill_aa_find_vertex(fill, vertex_map, vertex_map_size,
+                idx[a] = d2d_fill_aa_find_mesh_vertex(fill, vertex_map, vertex_map_size, used,
                         &curves[c][i + a].position);
                 if (idx[a] == ~(size_t)0)
                     ++missing;
             }
+
+            if (curve_ends && idx[0] != ~(size_t)0 && idx[2] != ~(size_t)0 && used[idx[0]] && used[idx[2]])
+            {
+                curve_ends[2 * ((c ? counts[0] / 3 : 0) + i / 3)] = idx[0];
+                curve_ends[2 * ((c ? counts[0] / 3 : 0) + i / 3) + 1] = idx[2];
+            }
+
+            if (!c && d2d_curve_is_flat(&curves[c][i], m))
+                continue;
 
             /* Only the control point may be missing, and only when it lies
              * outside the filled area: the two curve end points are figure
