@@ -1980,10 +1980,11 @@ This is the recommended branch. What it changes, by subsystem:
   frames of Minimal Audio Current's tap display: 16 pixels, all closer. Those frames as a whole
   change in 758 pixels, 7,499 for 23,421, 4 more than 64 off for 69; 175 of the pixels are
   farther from the coverage, 169 of them within reach of more than one figure of their path:
-  figures that overlap are each drawn with their own coverage and blended, where the path
-  covers their union, so what one gains in its wedge comes on top of the others (four dots that
-  cover 37, 5, 37 and 45 of a pixel and 60 together come out at 107; 28 pixels are more than 32
-  too bright for 8). Large shapes, `FillEllipse()` and
+  where figures overlap, the outline of their union is jagged below the size of a pixel, and
+  the skirts and the new triangles of its tiny edges lie on top of each other (four dots that
+  cover 60 of a pixel together came out at 107; 28 pixels are more than 32 too bright for 8;
+  the entry on the dents of the outline below takes most of that back). Large shapes,
+  `FillEllipse()` and
   `FillRoundedRectangle()` render as before, the d2d1 tests fail at the same 26 lines on x86_64
   and i386, and filling the 32 paths of a frame takes 21.1 ms at best for 20.6 with the switch
   off.
