@@ -2576,6 +2576,121 @@ static void d2d_fill_aa_mark_fans(const struct d2d_fill *fill, BYTE *fan)
     }
 }
 
+/* The wedge between the skirts of two straight outline edges.
+ *
+ * Every straight outline edge gets a skirt, a quad that reaches 0.75 pixels
+ * outward at a right angle to the edge. Where two such edges meet in a corner
+ * of the fill that points outward, the skirts end on two different normals,
+ * and beyond the corner a wedge as wide as the turn belongs to neither: a
+ * pixel centre in it got no coverage. Next to a right angle that is a quarter
+ * of a pixel at most. Next to the corners of a polygon that stands for a
+ * curve it is close to a half: a 24-gon of radius 6 had the pixel beside a
+ * corner at 0 of 255 for a coverage of 119, and so had the polygons a path
+ * of very small arcs is drawn as, whose pieces are filled as their chords
+ * (d2d_curve_is_flat(); wine-dev issue 635).
+ *
+ * The wedge is filled with one triangle between the corner and the two outer
+ * vertices the skirts have there. Its vertices are those of the skirts, the
+ * corner and the same two directions for the vertex shader to move it along,
+ * so that each of its two long edges is an edge of a skirt as well and the
+ * rasteriser gives a pixel centre on it to exactly one of the two. A triangle
+ * that holds no pixel centre is left out, and so is a turn of more than 143
+ * degrees, where the fill ends in a spike.
+ *
+ * The one weight of the triangle is the distance in pixels from a line across
+ * the wedge, at a right angle to the direction halfway between the two
+ * normals: the line through the corner, moved inward by what the outline
+ * falls back from it on average over the width of a pixel, half a pixel
+ * along the outline to either side. The pixel shader takes that line for an
+ * edge across the whole pixel.
+ *
+ * A straight outline edge that meets a curve has the same wedge between its
+ * skirt and the skirt of the curve triangle (d2d_device_context_curve_skirts()),
+ * as wide as the curve piece is off the direction of the edge where it starts:
+ * the first quadratic piece of an arc segment that goes on from a line does
+ * not start in its direction, and a pixel centre on the normal through the
+ * point where the two meet came out at 0 of 255 for a coverage of 102. The
+ * triangle then has the outer vertex of the curve skirt for its third corner,
+ * at the position d2d_curve_add_skirt() gives it, and the curve falls back
+ * from the line by its slope and by 1/48 of its curvature over half a pixel.
+ * Only the Bézier triangles that are drawn with skirts across their control
+ * edges count. WINE_D2D_FILL_AA_CORNERS=0 leaves all the wedges open. */
+#define D2D_FILL_AA_CORNER_COS -0.8
+#define D2D_FILL_AA_CORNER_STEPS 8
+
+struct d2d_fill_aa_corner
+{
+    /* The straight outline edges with a skirt that end in the vertex: their
+     * other ends, the directions their skirts reach out in, and their number,
+     * which is more than two where figures touch. */
+    UINT32 other[2];
+    D2D1_POINT_2F n[2];
+    BYTE count;
+};
+
+static BOOL d2d_fill_aa_corners(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_CORNERS", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+static void d2d_fill_aa_corner_add(struct d2d_fill_aa_corner *c, UINT32 other, const D2D1_POINT_2F *n)
+{
+    if (c->count < 2)
+    {
+        c->other[c->count] = other;
+        c->n[c->count] = *n;
+    }
+    if (c->count < 3)
+        ++c->count;
+}
+
+/* How far the outline falls back from the line through the vertex v with the
+ * normal nb, in pixels, summed over half a pixel along that line: along the
+ * outline from v through its neighbour next. q0 is v in pixels, m the pixel
+ * transform. Where the outline ends or turns back before half a pixel, the
+ * last edge is taken to go on. */
+static double d2d_fill_aa_corner_depth(const struct d2d_fill *fill, const struct d2d_fill_aa_outline *o,
+        const double *m, UINT32 v, UINT32 next, const double *q0, const double *nb)
+{
+    double xa = 0.0, da = 0.0, slope = 0.0, sum = 0.0, sign = 0.0, w;
+    UINT32 prev = v, cur = next, other;
+    unsigned int step;
+
+    for (step = 0; step < D2D_FILL_AA_CORNER_STEPS; ++step)
+    {
+        const D2D1_POINT_2F *p = &fill->vertices[cur];
+        double px = m[0] * p->x + m[1] * p->y + m[2] - q0[0], py = m[3] * p->x + m[4] * p->y + m[5] - q0[1];
+        double xb = px * -nb[1] + py * nb[0], db = -(px * nb[0] + py * nb[1]);
+
+        if (!step)
+            sign = xb < 0.0 ? -1.0 : 1.0;
+        xb *= sign;
+        if (!(xb > xa + 1.0e-9))
+            break;
+        slope = (db - da) / (xb - xa);
+        if (xb >= 0.5)
+            return sum + (da + 0.5 * slope * (0.5 - xa)) * (0.5 - xa);
+        sum += 0.5 * (da + db) * (xb - xa);
+        xa = xb;
+        da = db;
+        if (!o->nb || !d2d_fill_aa_outline_other(o, cur, prev, &other))
+            break;
+        prev = cur;
+        cur = other;
+    }
+    w = 0.5 - xa;
+    return sum + (da + 0.5 * slope * w) * w;
+}
+
+static BOOL d2d_curve_triangle_holds_centre(const double *a, const double *b, const double *c);
+static unsigned int d2d_curve_add_skirt(struct d2d_curve_vertex *out, const struct d2d_curve_vertex *v,
+        unsigned int i0, unsigned int i1, unsigned int io, const float *m, const float *inv, float *normal);
+
 /* A part of a fill thinner than a pixel.
  *
  * The coverage of a fragment is the smallest of the areas its triangle's
@@ -3114,6 +3229,8 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     size_t curve_count = (fill->bezier_vertex_count + fill->arc_vertex_count) / 3;
     UINT32 *curve_ends = NULL;
     struct d2d_fill_aa_outline outline = {0};
+    struct d2d_fill_aa_corner *corners = NULL;
+    UINT32 *corner_curves = NULL;
     BOOL neighbours = d2d_fill_aa_neighbours();
     size_t pixel_count = 0, pixels_size = 0, thin_count = 0;
     struct d2d_fill_aa_pixel *pixels = NULL;
@@ -3227,14 +3344,19 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     }
 
     /* Allocate: inner triangles (3 per face) + skirt quads (6 per boundary edge)
-     * + pixel quads (6 per pixel). */
+     * + pixel quads (6 per pixel) + a triangle for the wedge at one end of
+     * every boundary edge. */
     expanded_count = (fc - thin_count) * 3 + boundary_count * 6 + pixel_count * 6;
+    if (boundary_count > 1 && d2d_fill_aa_corners() && fabs(pdet) > 1.0e-12
+            && (corners = calloc(fill->vertex_count, sizeof(*corners))))
+        expanded_count += boundary_count * 3;
     expanded = calloc(expanded_count, sizeof(*expanded));
     on_outline = calloc(fill->vertex_count, sizeof(*on_outline));
     if (!expanded || !on_outline)
     {
         free(expanded);
         free(on_outline);
+        free(corners);
         free(fan);
         free(thin);
         free(pixels);
@@ -3472,6 +3594,156 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
 
             /* Mark this edge as processed to avoid a duplicate skirt from the adjacent face. */
             edge_processed[slot] = 1;
+            if (corners)
+            {
+                d2d_fill_aa_corner_add(&corners[ai], bi, &outward);
+                d2d_fill_aa_corner_add(&corners[bi], ai, &outward);
+            }
+        }
+    }
+
+    /* The Bézier triangles drawn with skirts across their control edges, by
+     * the vertex an end of their curve lies on: twice the triangle plus the
+     * end, plus one, or ~0u for more than one. */
+    if (corners && curve_ends && fill->bezier_vertex_count
+            && (corner_curves = calloc(fill->vertex_count, sizeof(*corner_curves))))
+    {
+        for (i = 0; i < fill->bezier_vertex_count / 3; ++i)
+        {
+            const struct d2d_curve_vertex *bz = &fill->bezier_vertices[3 * i];
+            unsigned int end;
+
+            if (!(bz->texcoord.sign < 0.0f) || (*curve_skip && (*curve_skip)[i]) || d2d_curve_is_flat(bz, m))
+                continue;
+            for (end = 0; end < 2; ++end)
+            {
+                UINT32 v = curve_ends[2 * i + end];
+
+                if (v != ~0u)
+                    corner_curves[v] = corner_curves[v] ? ~0u : 2 * i + end + 1;
+            }
+        }
+    }
+
+    /* The wedges between two skirts; see d2d_fill_aa_corners(). */
+    for (i = 0; corners && i < fill->vertex_count && vi + 3 <= expanded_count; ++i)
+    {
+        const struct d2d_fill_aa_corner *c = &corners[i];
+        const D2D1_POINT_2F *p = &fill->vertices[i], *pa, *pb, *third = NULL;
+        double q[3][2], d[2][2], nb[2], len, cosine, shift;
+        unsigned int k;
+
+        if (c->count == 2)
+        {
+            /* The corner points outward where each skirt reaches on along the other edge. */
+            pa = &fill->vertices[c->other[0]];
+            pb = &fill->vertices[c->other[1]];
+            if (!(c->n[1].x * (p->x - pa->x) + c->n[1].y * (p->y - pa->y) > 0.0f)
+                    || !(c->n[0].x * (p->x - pb->x) + c->n[0].y * (p->y - pb->y) > 0.0f))
+                continue;
+        }
+        else if (c->count != 1 || !corner_curves || !corner_curves[i] || corner_curves[i] == ~0u)
+        {
+            continue;
+        }
+
+        /* The corner and the outer vertices of the two skirts, in pixels, as the vertex shader places them. */
+        q[0][0] = pm[0] * p->x + pm[1] * p->y + pm[2];
+        q[0][1] = pm[3] * p->x + pm[4] * p->y + pm[5];
+        for (k = 0; k < c->count; ++k)
+        {
+            d[k][0] = pm[0] * c->n[k].x + pm[1] * c->n[k].y;
+            d[k][1] = pm[3] * c->n[k].x + pm[4] * c->n[k].y;
+            if (!((len = sqrt(d[k][0] * d[k][0] + d[k][1] * d[k][1])) > 1.0e-12))
+                break;
+            d[k][0] /= len;
+            d[k][1] /= len;
+            q[k + 1][0] = q[0][0] + 0.75 * d[k][0];
+            q[k + 1][1] = q[0][1] + 0.75 * d[k][1];
+        }
+        if (k < c->count)
+            continue;
+
+        if (c->count == 2)
+        {
+            cosine = d[0][0] * d[1][0] + d[0][1] * d[1][1];
+            if (!(cosine > D2D_FILL_AA_CORNER_COS) || !d2d_curve_triangle_holds_centre(q[0], q[1], q[2]))
+                continue;
+            nb[0] = d[0][0] + d[1][0];
+            nb[1] = d[0][1] + d[1][1];
+            len = sqrt(nb[0] * nb[0] + nb[1] * nb[1]);
+            nb[0] /= len;
+            nb[1] /= len;
+            shift = d2d_fill_aa_corner_depth(fill, &outline, pm, i, c->other[0], q[0], nb)
+                    + d2d_fill_aa_corner_depth(fill, &outline, pm, i, c->other[1], q[0], nb);
+        }
+        else
+        {
+            const struct d2d_curve_vertex *bz = &fill->bezier_vertices[3 * ((corner_curves[i] - 1) / 2)];
+            unsigned int end = (corner_curves[i] - 1) & 1;
+            double e[2], qc[2], x, area, det = (double)m[0] * m[3] - (double)m[1] * m[2];
+            struct d2d_curve_vertex skirt[6];
+            float inv[4], normal[2], fdet;
+
+            /* The vertex has to be the end of the curve itself, not one a float away from it. */
+            if (memcmp(&bz[2 * end].position, p, sizeof(*p)) || !(fabs(det) > 1.0e-12))
+                continue;
+            /* As d2d_device_context_curve_skirts() computes them. */
+            fdet = m[0] * m[3] - m[1] * m[2];
+            if (!(fabsf(fdet) > 1e-12f))
+                continue;
+            inv[0] = m[3] / fdet;
+            inv[1] = -m[1] / fdet;
+            inv[2] = -m[2] / fdet;
+            inv[3] = m[0] / fdet;
+            if (!d2d_curve_add_skirt(skirt, bz, end, end + 1, end ? 0 : 2, m, inv, normal))
+                continue;
+            third = &skirt[end ? 4 : 2].position;
+            d[1][0] = normal[0];
+            d[1][1] = normal[1];
+            q[2][0] = pm[0] * third->x + pm[1] * third->y + pm[2];
+            q[2][1] = pm[3] * third->x + pm[4] * third->y + pm[5];
+            qc[0] = pm[0] * bz[1].position.x + pm[1] * bz[1].position.y + pm[2] - q[0][0];
+            qc[1] = pm[3] * bz[1].position.x + pm[4] * bz[1].position.y + pm[5] - q[0][1];
+
+            /* The wedge is open where each skirt reaches on along the edge of the other. */
+            pa = &fill->vertices[c->other[0]];
+            e[0] = pm[0] * (p->x - pa->x) + pm[1] * (p->y - pa->y);
+            e[1] = pm[3] * (p->x - pa->x) + pm[4] * (p->y - pa->y);
+            if (!(d[1][0] * e[0] + d[1][1] * e[1] > 0.0) || !(d[0][0] * -qc[0] + d[0][1] * -qc[1] > 0.0))
+                continue;
+            cosine = d[0][0] * d[1][0] + d[0][1] * d[1][1];
+            if (!(cosine > D2D_FILL_AA_CORNER_COS) || !d2d_curve_triangle_holds_centre(q[0], q[1], q[2]))
+                continue;
+            nb[0] = d[0][0] + d[1][0];
+            nb[1] = d[0][1] + d[1][1];
+            len = sqrt(nb[0] * nb[0] + nb[1] * nb[1]);
+            nb[0] /= len;
+            nb[1] /= len;
+            shift = d2d_fill_aa_corner_depth(fill, &outline, pm, i, c->other[0], q[0], nb);
+            /* The curve: its control edge and, see d2d_curve_join_skirts(), its curvature at this end. */
+            x = fabs(qc[0] * -nb[1] + qc[1] * nb[0]);
+            len = sqrt(qc[0] * qc[0] + qc[1] * qc[1]);
+            if (x > 1.0e-9)
+                shift += -(qc[0] * nb[0] + qc[1] * nb[1]) / x / 8.0;
+            area = 0.5 * fabs(det * ((bz[1].position.x - bz[0].position.x) * (bz[2].position.y - bz[0].position.y)
+                    - (bz[1].position.y - bz[0].position.y) * (bz[2].position.x - bz[0].position.x)));
+            if (len > 1.0e-6)
+                shift += min(area / (len * len * len) / 48.0, 0.125);
+        }
+        shift = max(shift, 0.0);
+
+        for (k = 0; k < 3; ++k, ++vi)
+        {
+            expanded[vi].pos = k == 2 && third ? *third : *p;
+            expanded[vi].u = -((q[k][0] - q[0][0]) * nb[0] + (q[k][1] - q[0][1]) * nb[1]) - shift;
+            expanded[vi].v = 10.0f;
+            expanded[vi].s = 10.0f;
+            if (k && !(k == 2 && third))
+            {
+                expanded[vi].ex = c->n[k - 1].x;
+                expanded[vi].ey = c->n[k - 1].y;
+            }
         }
     }
 
@@ -3507,6 +3779,8 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     free(outline.nb);
     free(outline.nb_cnt);
     free(fan);
+    free(corners);
+    free(corner_curves);
 
     *out = expanded;
     *out_count = expanded_count;
