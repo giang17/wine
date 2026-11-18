@@ -1919,6 +1919,25 @@ This is the recommended branch. What it changes, by subsystem:
   fiftieth of a pixel apart share a pixel and are blended, not added (211 became 180 for a
   coverage of 222), or the pixel lies beside a cap, where the ramp of a curve this small is
   brighter than its area. The d2d1 tests fail at the same 26 lines on x86_64 and i386.
+- **d2d1**: a pill from `FillRoundedRectangle()`, a rounded rectangle whose corners take up a
+  whole side, no longer has dark pixels inside the figure. The fill of a rounded rectangle has
+  eight vertices on its straight edges, and where two corners take up a whole side the two
+  vertices on that side are the same point. The fill antialiasing finds the mesh edge an arc
+  runs along by the positions of its two ends and found the first of the two vertices; the
+  chord of the arc that starts on the second one stayed unmarked and was taken for a piece of
+  the outline, so the fill ramped down towards it inside the figure, and the face without an
+  area on the opposite side put a skirt on top of the arc (issue 632). The faces now take one
+  vertex for both and a face without an area is dropped; two such vertices a float or two
+  apart are put on the same point. A pill of 7.5 by 7.32 with radii 3 and 3.66 had two pixels
+  inside the figure at 133 and 177 of 255, now 255. Of 80 small pills 26 had a pixel inside
+  the figure more than 32 too dark, none has now; over the 345 pixels that change the sum of
+  the errors against the area coverage falls from 9,131 to 2,262, and the largest errors at a
+  radius of 3 are +19 and -4 for +59 and -122. Pills whose corners take up the whole width,
+  rounded rectangles that are an ellipse and those with radii above half of both sides gain
+  as much (8,807 to 1,593, 14,310 to 3,565 and 15,008 to 2,733 over 48 shapes each). Rounded
+  rectangles whose corners are smaller than the sides, the same pill as a path, `FillEllipse()`
+  and ellipses as paths render pixel for pixel as before. The d2d1 tests fail at the same 26
+  lines on x86_64 and i386.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
