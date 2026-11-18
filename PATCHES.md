@@ -1897,6 +1897,28 @@ This is the recommended branch. What it changes, by subsystem:
   give 59,521 for 289,344, and filling the 32 paths of a frame takes 20.5 to 21.1 ms at
   best for 20.0 to 20.3 with the switch off in the same binary. The d2d1 tests fail at the
   same 26 lines with the switch on and off, on x86_64 and i386.
+- **d2d1**: the seam of a curve that ends on a fill vertex left out of the mesh is
+  recognised. The fill antialiasing looks up the corners of every curve triangle among the
+  fill vertices and marks the mesh edge between two of them as a seam: the curve triangle
+  is drawn on top of it and antialiases itself, so the edge gets no skirt. A vertex a float
+  or two from another one can be left out of the mesh, the outline then runs through the
+  other; rounded rectangles have such lines where two corners take up a whole side, and so
+  has a figure closed by its last segment a float away from its start. A curve that ended
+  on the vertex left out was looked up with an edge no face has, the seam stayed unmarked,
+  and the edge got a skirt in addition to the curve triangle (issue 620). The corners are
+  now looked up as the neighbouring vertex that is in the mesh, as the assignment of curve
+  triangles to the thin parts of a fill does. Since the entry above a pixel there was drawn
+  by the fan and by that skirt: beside the cap of a bar 2 wide and 1.26 high of Minimal
+  Audio Current's tap display 111 of 255 for a coverage of 56, now 72. The 384 paths of
+  twelve captured frames in original size change in 51 pixels: against the coverage at 16
+  by 128 points per pixel the sum of the errors is 711 for 1,743, 40 pixels are closer and
+  11 farther (2 by more than 16, none by more than 32), none is more than 64 off for 10. At
+  150 %: 1,775 for 4,419 at 138 pixels, none more than 64 off for 18. Single figures of
+  those frames, glyphs, large shapes and small arcs render pixel for pixel as before. Where
+  the new value is farther, the skirt had made up for something else: two figures a
+  fiftieth of a pixel apart share a pixel and are blended, not added (211 became 180 for a
+  coverage of 222), or the pixel lies beside a cap, where the ramp of a curve this small is
+  brighter than its area. The d2d1 tests fail at the same 26 lines on x86_64 and i386.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
