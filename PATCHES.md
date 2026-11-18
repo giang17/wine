@@ -2010,6 +2010,30 @@ This is the recommended branch. What it changes, by subsystem:
   the mesh that does not know the outline edge of the face next to it, and three of the four
   pixels of the issue stay where they were (190 for a coverage of 55, the skirt of a curve
   triangle that lies inside the union).
+- **d2d1**: the faces of the fill mesh take the outline edges at their corners. A triangle of
+  the fill mesh was antialiased against its own outline edges, and one of a fan against those
+  next to its own as well; a face of the triangulation that touches the outline in a corner
+  only had none, and every pixel centre in it was drawn at full coverage however close to the
+  outline. Five pixels along the side of a bar in a frame of Minimal Audio Current's tap
+  display came out at 255 for a coverage of 151 (issue 638), and a pixel next to the short
+  straight side of a small rounded rectangle at 234 for 175 (issue 636). A face now takes,
+  for the weights its own edges leave unused, the half planes of the outline edges that end
+  in its corners -- only where the fill of the edge lies on the side of the face and the
+  outline, followed from the corner in both directions, stays inside the half plane for as
+  far as the face reaches along the line within a pixel of it; where the outline folds back
+  along the line, as around a slot between two figures, the edge is not taken.
+  `WINE_D2D_FILL_AA_FACES=0` leaves the faces with their own edges. The 384 paths of twelve
+  captured frames of the tap display change in 5,969 pixels: the sum of the errors against
+  the coverage is 49,168 for 113,999, 2 pixels are more than 64 of 255 off for 229 and 187
+  more than 32 for 1,011; 448 pixels are farther from the coverage, by 3,137 in all, 363 of
+  them within reach of more than one figure, and 53 are more than 32 too dark for 24. Over
+  every pixel of the 96 paths with overlapping figures: 769,674 for 788,249. Single figures
+  of the frames 5,892 for 9,454 over 581 pixels; glyphs of DejaVu Sans at 6 to 13 pixels
+  2,029 for 5,554 over 199 pixels, at 11 to 24 pixels 1,385 for 7,991 over 420; standing
+  pills 101 for 604, largest error +25 for +59, and the four pixels of issue 636 at their
+  coverage; small arcs 119 for 208. Regular polygons and large shapes do not change. The d2d1
+  tests fail at the same 26 lines on x86_64 and i386, and filling the 32 paths of a frame
+  takes 23.3 ms at best for 22.0 with the switch off.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
