@@ -10791,13 +10791,29 @@ static const struct d2d_geometry_ops d2d_rounded_rectangle_geometry_ops =
 /* The fill of a rounded rectangle: eight vertices on the straight edges, six
  * faces between them and an arc triangle per corner. The fill arrays are
  * reused when they are already there, which is what the reinit below relies
- * on. v1..v4 receive the corners, the outline tessellation needs them too. */
+ * on. v1..v4 receive the corners, the outline tessellation needs them too.
+ *
+ * Where two corners take up a whole side, as those of a pill do, the two
+ * vertices on that side are one point, and the faces take the first of the two
+ * for both; a face left without an area is dropped. The fill antialiasing
+ * finds the mesh edge a corner's arc runs along by the positions of its two
+ * ends, and for a position it finds the first vertex there. With the second
+ * one in the mesh the chord of the arc that starts on it was an edge between
+ * two other vertices and was taken for a piece of the outline: the fill ramped
+ * down towards it inside the figure, 133 of 255 for a pixel centre 0.016
+ * pixels from the chord of a pill with radii 3 and 3.66, and the face without
+ * an area on the opposite side put a skirt on top of the arc there. Two such
+ * vertices a float or two apart, which is what left + radius and right -
+ * radius come to for some coordinates, are put on the same point. */
 static BOOL d2d_rounded_rectangle_geometry_fill(struct d2d_geometry *geometry,
         const D2D1_ROUNDED_RECT *rounded_rect, D2D1_POINT_2F *corners)
 {
+    static const UINT8 faces[6][3] = {{0, 7, 6}, {0, 6, 5}, {0, 5, 4}, {0, 4, 1}, {1, 4, 3}, {1, 3, 2}};
     D2D1_POINT_2F *v, *v1 = &corners[0], *v2 = &corners[1], *v3 = &corners[2], *v4 = &corners[3];
+    UINT8 map[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    float l, r, t, b, x0, x1, y0, y1;
     struct d2d_face *f;
-    float l, r, t, b;
+    unsigned int i, n;
     float rx, ry;
 
     if (!geometry->fill.vertices && !(geometry->fill.vertices = malloc(8 * sizeof(*geometry->fill.vertices))))
@@ -10819,25 +10835,44 @@ static BOOL d2d_rounded_rectangle_geometry_fill(struct d2d_geometry *geometry,
     d2d_point_set(v3, l, b);
     d2d_point_set(v4, l, t);
 
+    x0 = l + rx;
+    x1 = r - rx;
+    y0 = t + ry;
+    y1 = b - ry;
+    if (x1 - x0 <= 2.0f * FLT_EPSILON * max(fabsf(l), fabsf(r)))
+    {
+        x1 = x0;
+        map[1] = 0;
+        map[5] = 4;
+    }
+    if (y1 - y0 <= 2.0f * FLT_EPSILON * max(fabsf(t), fabsf(b)))
+    {
+        y1 = y0;
+        map[3] = 2;
+        map[7] = 6;
+    }
+
     v = geometry->fill.vertices;
-    d2d_point_set(&v[0], l + rx, t);
-    d2d_point_set(&v[1], r - rx, t);
-    d2d_point_set(&v[2], r, t + ry);
-    d2d_point_set(&v[3], r, b - ry);
-    d2d_point_set(&v[4], r - rx, b);
-    d2d_point_set(&v[5], l + rx, b);
-    d2d_point_set(&v[6], l, b - ry);
-    d2d_point_set(&v[7], l, t + ry);
+    d2d_point_set(&v[0], x0, t);
+    d2d_point_set(&v[1], x1, t);
+    d2d_point_set(&v[2], r, y0);
+    d2d_point_set(&v[3], r, y1);
+    d2d_point_set(&v[4], x1, b);
+    d2d_point_set(&v[5], x0, b);
+    d2d_point_set(&v[6], l, y1);
+    d2d_point_set(&v[7], l, y0);
     geometry->fill.vertex_count = 8;
 
     f = geometry->fill.faces;
-    d2d_face_set(&f[0], 0, 7, 6);
-    d2d_face_set(&f[1], 0, 6, 5);
-    d2d_face_set(&f[2], 0, 5, 4);
-    d2d_face_set(&f[3], 0, 4, 1);
-    d2d_face_set(&f[4], 1, 4, 3);
-    d2d_face_set(&f[5], 1, 3, 2);
-    geometry->fill.face_count = 6;
+    for (i = 0, n = 0; i < ARRAY_SIZE(faces); ++i)
+    {
+        UINT8 i0 = map[faces[i][0]], i1 = map[faces[i][1]], i2 = map[faces[i][2]];
+
+        if (i0 == i1 || i1 == i2 || i0 == i2)
+            continue;
+        d2d_face_set(&f[n++], i0, i1, i2);
+    }
+    geometry->fill.face_count = n;
 
     if (!d2d_geometry_fill_add_arc_triangle(geometry, &v[1], v1, &v[2]))
         return FALSE;
