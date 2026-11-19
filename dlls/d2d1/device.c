@@ -2717,12 +2717,22 @@ static void d2d_fill_aa_outline_prepare(struct d2d_fill_aa_outline *o, const dou
     }
 }
 
+/* Where d2d_fill_aa_outline_inside() ended: the last two vertices, the place
+ * of the last one along the line and off it, how far the outline has reached
+ * along the line, and the number of edges followed. */
+struct d2d_fill_aa_walk
+{
+    UINT32 prev, cur;
+    double s, d, reach;
+    unsigned int steps;
+};
+
 /* Follows the outline from prev through cur and tells whether it stays in
  * the half plane with the unit normal n through q0, all in pixels, until it
  * has reached limit along dir or gone more than a pixel and a half into the
- * half plane. */
+ * half plane. end receives where that was, or is NULL. */
 static BOOL d2d_fill_aa_outline_inside(const struct d2d_fill_aa_outline *o, UINT32 prev, UINT32 cur,
-        const double *q0, const double *dir, const double *n, double limit)
+        const double *q0, const double *dir, const double *n, double limit, struct d2d_fill_aa_walk *end)
 {
     double reach = 0.0;
     unsigned int step;
@@ -2753,11 +2763,173 @@ static BOOL d2d_fill_aa_outline_inside(const struct d2d_fill_aa_outline *o, UINT
         /* The limit is as a rule a corner of the face that lies on the outline itself, and the outline
          * arrives right there. */
         if (s >= limit - 1.0e-6 || d > 1.5)
+        {
+            if (end)
+            {
+                end->prev = prev;
+                end->cur = cur;
+                end->s = s;
+                end->d = d;
+                end->reach = reach;
+                end->steps = step + 1;
+            }
             return TRUE;
+        }
         if (!d2d_fill_aa_outline_other(o, cur, prev, &next))
             return FALSE;
         prev = cur;
         cur = next;
+    }
+    return FALSE;
+}
+
+/* A half plane of a face that gives way at a notch.
+ *
+ * d2d_fill_aa_face_planes() follows the outline along the line of a half
+ * plane for as far as the face reaches and no further; the margin past the
+ * end of the face that was dropped there took the half plane from faces that
+ * need it. A pixel reaches half a pixel beyond the face that holds its
+ * centre, though. Where the outline leaves the half plane right there, at a
+ * corner that points inward, fill lies beyond the line and the half plane
+ * darkened it: beside the notch between two overlapping figures of Minimal
+ * Audio Current's tap display, 0.14 pixels from the pixel centre, a face drew
+ * 173 of 255 for a coverage of 201, and of the 414 pixels of twelve captured
+ * frames that the half planes left farther from their coverage, by 3,991 in
+ * all, 220 lay within three quarters of a pixel of such a corner, by 3,385
+ * (wine-dev issue 640).
+ *
+ * So the outline is followed on, for D2D_FILL_AA_PLANE_NOTCH_MARGIN pixels
+ * past the end of the face, to the vertex after which it leaves the half
+ * plane or runs back along the line. If that vertex carries a notch
+ * (d2d_fill_aa_notches()), the weight of the half plane takes it along: the
+ * places of the corners of the face along the line, from the vertex on, in
+ * seam_t, what the vertex lies off the line in seam_c1, as -4 minus that, and
+ * the code of the notch in seam_c2. The pixel shader (plane_notch() in
+ * shape_ps_code) puts the pixel centre relative to the vertex together from
+ * the two and takes the union of the half plane, cut by the edge of the notch
+ * that runs along it, and the half plane of the edge the outline leaves
+ * along; beyond the vertex the half plane bounds nothing. That holds up to a
+ * quarter of a pixel from the vertex and fades back to the half plane over
+ * the next eighth: with the fade of notch_edge(), over a quarter, the pixels
+ * between a quarter and half a pixel from the vertex came out closer by 541
+ * in all and farther by 618.
+ *
+ * The edge the outline leaves along is taken as the secant to the point of
+ * the outline D2D_FILL_AA_PLANE_NOTCH_SECANT pixels from the vertex, not as
+ * the tangent the notch has there: the curves of two round figures that
+ * cross fall back from their tangents, and the union came out too bright
+ * with them, 150 pixels of the frames farther from their coverage by 996 in
+ * all for 118 by 741. A half plane has room for one notch; where the outline
+ * leaves it past either end of the face, the one nearer to the face is
+ * taken. WINE_D2D_FILL_AA_PLANE_NOTCHES=0 leaves the half planes as they
+ * were. */
+#define D2D_FILL_AA_PLANE_NOTCH_MARGIN 0.5
+#define D2D_FILL_AA_PLANE_NOTCH_SECANT 0.5
+
+struct d2d_fill_aa_plane_notch
+{
+    /* The vertex of the outline, ~0u for none. */
+    UINT32 v;
+    /* The places of the corners of the face along the line from the vertex
+     * on, and what the vertex lies off the line, in pixels. */
+    float t[3], d;
+    /* The vertex after it, and the normal of the half plane. */
+    UINT32 next;
+    double n[2];
+};
+
+static BOOL d2d_fill_aa_plane_notches(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_PLANE_NOTCHES", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+/* The point of the outline r pixels from the vertex v as the crow flies, the
+ * outline followed through next; relative to v, in pixels. */
+static void d2d_fill_aa_outline_secant(const struct d2d_fill_aa_outline *o, UINT32 v, UINT32 next, double r,
+        double *secant)
+{
+    double x0 = 0.0, y0 = 0.0, x1, y1;
+    UINT32 prev = v, cur = next, other;
+    unsigned int step;
+
+    for (step = 0; step < D2D_FILL_AA_FACE_STEPS; ++step)
+    {
+        x1 = o->px[2 * cur] - o->px[2 * v];
+        y1 = o->px[2 * cur + 1] - o->px[2 * v + 1];
+        if (x1 * x1 + y1 * y1 >= r * r)
+        {
+            /* Where the edge from (x0, y0) to (x1, y1) crosses the circle. */
+            double dx = x1 - x0, dy = y1 - y0, a = dx * dx + dy * dy, b = x0 * dx + y0 * dy, c = x0 * x0 + y0 * y0 - r * r;
+            double disc = b * b - a * c, t = a > 0.0 && disc > 0.0 ? (-b + sqrt(disc)) / a : 1.0;
+
+            secant[0] = x0 + t * dx;
+            secant[1] = y0 + t * dy;
+            return;
+        }
+        x0 = x1;
+        y0 = y1;
+        if (!d2d_fill_aa_outline_other(o, cur, prev, &other) || other == v)
+            break;
+        prev = cur;
+        cur = other;
+    }
+    secant[0] = o->px[2 * next] - o->px[2 * v];
+    secant[1] = o->px[2 * next + 1] - o->px[2 * v + 1];
+}
+
+/* Follows the outline on from where d2d_fill_aa_outline_inside() ended, to
+ * D2D_FILL_AA_PLANE_NOTCH_MARGIN past limit, and finds the vertex after which
+ * it leaves the half plane or runs back along the line: *v, the vertex after
+ * it *next, and the place of *v along dir and off the line. A curve that
+ * leaves between two vertices on the inner side of the line is no such
+ * vertex. */
+static BOOL d2d_fill_aa_outline_leaves(const struct d2d_fill_aa_outline *o, const struct d2d_fill_aa_walk *walk,
+        const double *q0, const double *dir, const double *n, double limit, UINT32 *v, UINT32 *next,
+        double *s_v, double *d_v)
+{
+    double reach = walk->reach, s_prev = walk->s, d_prev = walk->d;
+    UINT32 prev = walk->prev, cur = walk->cur, other;
+    unsigned int step;
+
+    for (step = walk->steps; step < 2 * D2D_FILL_AA_FACE_STEPS; ++step)
+    {
+        double q[2], s, d;
+        BOOL out, curve_out;
+        const double *t;
+        unsigned int k;
+
+        if (s_prev >= limit + D2D_FILL_AA_PLANE_NOTCH_MARGIN || d_prev > 1.5)
+            return FALSE;
+        if (!d2d_fill_aa_outline_other(o, cur, prev, &other))
+            return FALSE;
+        prev = cur;
+        cur = other;
+        k = o->nb[2 * prev] - 1 == cur ? 0 : 1;
+        t = &o->tangent[4 * prev + 2 * k];
+        q[0] = o->px[2 * cur] - q0[0];
+        q[1] = o->px[2 * cur + 1] - q0[1];
+        s = q[0] * dir[0] + q[1] * dir[1];
+        d = q[0] * n[0] + q[1] * n[1];
+        out = d < -D2D_FILL_AA_FACE_TOLERANCE;
+        curve_out = !o->tangent_ok[2 * prev + k]
+                || (t[0] - q0[0]) * n[0] + (t[1] - q0[1]) * n[1] < -D2D_FILL_AA_FACE_TOLERANCE;
+        *v = prev;
+        *next = cur;
+        *s_v = s_prev;
+        *d_v = d_prev;
+        if (out || curve_out)
+            return out || d_prev > D2D_FILL_AA_FACE_TOLERANCE;
+        /* On the line and back along it. */
+        if (d <= D2D_FILL_AA_FACE_TOLERANCE && s < reach - D2D_FILL_AA_FACE_TOLERANCE)
+            return TRUE;
+        reach = max(reach, s);
+        s_prev = s;
+        d_prev = d;
     }
     return FALSE;
 }
@@ -2832,9 +3004,11 @@ static BOOL d2d_fill_aa_face_has_pixel(const double (*q)[2])
  * face lies on the side of the line the fill of the edge lies on. That takes
  * no square root, nor does the order: the square of the sine of the angle at
  * which the face leaves the line, with its sign. The outline is followed for as many of
- * them, in that order, as the face has weights left. */
+ * them, in that order, as the face has weights left. notches receives, for
+ * each weight, the notch the half plane gives way at, or is NULL; see
+ * d2d_fill_aa_plane_notches(). */
 static void d2d_fill_aa_face_planes(const struct d2d_fill_aa_outline *o, const struct d2d_face *f,
-        const BOOL *free, float (*w)[3])
+        const BOOL *free, float (*w)[3], struct d2d_fill_aa_plane_notch *notches)
 {
     struct
     {
@@ -2916,6 +3090,7 @@ static void d2d_fill_aa_face_planes(const struct d2d_fill_aa_outline *o, const s
     {
         const double len = sqrt(cand[order[j]].len2), inv = 1.0 / len, *c = cand[order[j]].c, *cs = cand[order[j]].s;
         double dir[2], back[2], n[2], s[3], d[3], lo = 0.0, hi = 0.0;
+        struct d2d_fill_aa_walk walk[2];
         UINT32 a = cand[order[j]].a;
         unsigned int l;
 
@@ -2955,14 +3130,39 @@ static void d2d_fill_aa_face_planes(const struct d2d_fill_aa_outline *o, const s
         /* The outline turns towards the fill in the corner and stays inside from there on, in both directions. */
         back[0] = -dir[0];
         back[1] = -dir[1];
-        if (!d2d_fill_aa_outline_inside(o, a, o->nb[2 * a + k] - 1, q[i], dir, n, hi)
-                || !d2d_fill_aa_outline_inside(o, a, o->nb[2 * a + 1 - k] - 1, q[i], back, n, -lo))
+        if (!d2d_fill_aa_outline_inside(o, a, o->nb[2 * a + k] - 1, q[i], dir, n, hi, notches ? &walk[0] : NULL)
+                || !d2d_fill_aa_outline_inside(o, a, o->nb[2 * a + 1 - k] - 1, q[i], back, n, -lo,
+                notches ? &walk[1] : NULL))
             continue;
 
         while (!free[slot])
             ++slot;
         for (l = 0; l < 3; ++l)
             w[slot][l] = d[l];
+        if (notches)
+        {
+            UINT32 v[2], next[2];
+            double s_v[2], d_v[2];
+            BOOL found[2];
+            unsigned int e;
+
+            found[0] = d2d_fill_aa_outline_leaves(o, &walk[0], q[i], dir, n, hi,
+                    &v[0], &next[0], &s_v[0], &d_v[0]) && v[0] != a;
+            found[1] = d2d_fill_aa_outline_leaves(o, &walk[1], q[i], back, n, -lo,
+                    &v[1], &next[1], &s_v[1], &d_v[1]) && v[1] != a;
+            /* The end nearer to the face. */
+            e = found[1] && (!found[0] || s_v[1] + lo < s_v[0] - hi);
+            if (found[e])
+            {
+                notches[slot].v = v[e];
+                notches[slot].next = next[e];
+                notches[slot].d = d_v[e];
+                notches[slot].n[0] = n[0];
+                notches[slot].n[1] = n[1];
+                for (l = 0; l < 3; ++l)
+                    notches[slot].t[l] = (e ? -s[l] : s[l]) - s_v[e];
+            }
+        }
         ++slot;
         --left;
     }
@@ -3937,6 +4137,8 @@ struct d2d_fill_aa_turn
     /* At a corner that points inward: the inward normals in pixels, as
      * angles, and the reach of the notch in pixels; 0 elsewhere. */
     float angle[2], reach;
+    /* The same normals as vectors, for d2d_fill_aa_plane_notches(). */
+    double normal[2][2];
 };
 
 static BOOL d2d_fill_aa_notches(void)
@@ -4273,6 +4475,11 @@ static void d2d_fill_aa_notch(const struct d2d_fill *fill, struct d2d_fill_aa_tu
         return;
     t->angle[0] = angle[0];
     t->angle[1] = angle[1];
+    for (k = 0; k < 2; ++k)
+    {
+        t->normal[k][0] = cos(t->angle[k]);
+        t->normal[k][1] = sin(t->angle[k]);
+    }
     t->reach = min(t->len[0], t->len[1]);
 }
 
@@ -5938,12 +6145,14 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
     {
         const struct d2d_face *f = &fill->faces[i];
         float w[3][3], t[3][3], c1[3], c2[3];
+        struct d2d_fill_aa_plane_notch plane_notches[3];
         BOOL free_weight[3];
         UINT32 slots[3];
         int j, e;
 
         if (thin && thin[i])
             continue;
+        plane_notches[0].v = plane_notches[1].v = plane_notches[2].v = ~0u;
 
         for (e = 0; e < 3; e++)
         {
@@ -6020,7 +6229,40 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
         }
         else if (outline.opp)
         {
-            d2d_fill_aa_face_planes(&outline, f, free_weight, w);
+            d2d_fill_aa_face_planes(&outline, f, free_weight, w,
+                    turns && d2d_fill_aa_plane_notches() ? plane_notches : NULL);
+            /* A half plane that gives way at a notch; see d2d_fill_aa_plane_notches(). */
+            for (e = 0; e < 3; e++)
+            {
+                const struct d2d_fill_aa_plane_notch *pn = &plane_notches[e];
+                struct d2d_fill_aa_turn turn;
+                double leave[2];
+
+                if (pn->v == ~0u || !(turns[pn->v].reach > 0.0f))
+                    continue;
+                turn = turns[pn->v];
+                d2d_fill_aa_outline_secant(&outline, pn->v, pn->next, D2D_FILL_AA_PLANE_NOTCH_SECANT, leave);
+                if (leave[0] != 0.0 || leave[1] != 0.0)
+                {
+                    /* The edge the outline leaves along is the one of the two
+                     * whose normal is further from that of the half plane; it
+                     * is taken as the secant. */
+                    unsigned int b = turn.normal[0][0] * pn->n[0] + turn.normal[0][1] * pn->n[1]
+                            < turn.normal[1][0] * pn->n[0] + turn.normal[1][1] * pn->n[1] ? 0 : 1;
+                    double nx = -leave[1], ny = leave[0];
+
+                    if (nx * turn.normal[b][0] + ny * turn.normal[b][1] < 0.0)
+                    {
+                        nx = -nx;
+                        ny = -ny;
+                    }
+                    turn.angle[b] = atan2(ny, nx);
+                }
+                c1[e] = -4.0f - pn->d;
+                c2[e] = d2d_fill_aa_notch_code(&turn);
+                for (j = 0; j < 3; j++)
+                    t[e][j] = pn->t[j];
+            }
         }
 
         for (j = 0; j < 3; j++, vi++)
@@ -14437,6 +14679,55 @@ static const char shape_ps_code[] =
     "    return lerp(e, max(e, u), saturate((min(r, 0.25f) + 0.25f - length(c_end)) * 4.0f));\n"
     "}\n"
     "\n"
+    "/* The coverage e of a half plane that a face takes from an outline edge at\n"
+    " * one of its corners, where the outline leaves the line at a notch past the\n"
+    " * end of the face (d2d_fill_aa_plane_notches()): dist the distance of the\n"
+    " * pixel centre from the line and g its gradient, st the place along the\n"
+    " * line from the notch on and gt its gradient, dv what the notch lies off\n"
+    " * the line, code the code of the notch. Beyond the notch the half plane\n"
+    " * bounds nothing. Up to a quarter of a pixel from it the fill is the union\n"
+    " * of the half plane, cut by the edge of the notch that runs along it, and\n"
+    " * the half plane of the edge the outline leaves along, fading back to the\n"
+    " * half plane over the next eighth. */\n"
+    "float plane_notch(float e, float dist, float2 g, float st, float2 gt, float dv, float code)\n"
+    "{\n"
+    "    uint k = asuint(code) - 0x40000000u, q = k >> 24;\n"
+    "    float a1 = (float)((k >> 12) & 4095u) * (6.28318531f / 4096.0f) - 3.14159265f;\n"
+    "    float a2 = (float)(k & 4095u) * (6.28318531f / 4096.0f) - 3.14159265f;\n"
+    "    float r = q < 32u ? (float)q * 0.125f : 4.0f + (float)(q - 32u) * 0.5f;\n"
+    "    float2 na = float2(cos(a1), sin(a1)), nb = float2(cos(a2), sin(a2));\n"
+    "    float2 gn = g / max(length(g), 0.0001f);\n"
+    "    float2 c = st * gt / max(length(gt), 0.0001f) + (dist - dv) * gn, db;\n"
+    "    float ua, ub, sa, sb, t, un;\n"
+    "\n"
+    "    if (st > 0.0f)\n"
+    "        return 1.0f;\n"
+    "    /* na is the edge of the notch that runs along the line, nb the one\n"
+    "     * the outline leaves the half plane along. */\n"
+    "    if (dot(na, gn) < dot(nb, gn))\n"
+    "    {\n"
+    "        float2 x = na;\n"
+    "        na = nb;\n"
+    "        nb = x;\n"
+    "    }\n"
+    "    sa = dot(c, na);\n"
+    "    sb = dot(c, nb);\n"
+    "    ua = max(1.0f - e, 1.0f - edge_coverage(sa, na));\n"
+    "    ub = 1.0f - edge_coverage(sb, nb);\n"
+    "    t = acos(clamp(dot(na, nb), -1.0f, 1.0f)) * (2.0f / 3.14159265f);\n"
+    "    if (t <= 1.0f)\n"
+    "        un = 1.0f - lerp(min(ua, ub), ua * ub, t);\n"
+    "    else\n"
+    "        un = 1.0f - lerp(ua * ub, max(ua + ub - 1.0f, 0.0f), t - 1.0f);\n"
+    "    /* Under the skirt of the edge the outline leaves along; see notch_union(). */\n"
+    "    db = float2(-nb.y, nb.x);\n"
+    "    if (dot(db, na) > 0.0f)\n"
+    "        db = -db;\n"
+    "    if (sb < 0.0f && sb > -0.75f && sa >= 0.0f && dot(c, db) > 0.0f)\n"
+    "        un = 1.0f - (1.0f - un) / max(ub, 0.001f);\n"
+    "    return lerp(e, max(e, un), saturate((min(r, 0.25f) + 0.125f - length(c)) * 8.0f));\n"
+    "}\n"
+    "\n"
     "/* The mean height over the pixel between a curve and its tangent, in\n"
     " * pixels. The curve runs along a parameter from lo to hi, p0 at the pixel\n"
     " * centre and dp its derivative along the tangent, and lies q (p - p0)^2 off\n"
@@ -14636,12 +14927,18 @@ static const char shape_ps_code[] =
     "        if (i.b.w > 1.5f && aa_mode)\n"
     "        {\n"
     "            float3 edges = i.b.xyz;\n"
-    "            float3 t = saturate(i.seam_t);\n"
+    "            /* A half plane that gives way at a notch has a seam_c1 of -4 and\n"
+    "             * below, the code of the notch in seam_c2 and the place along its\n"
+    "             * line in seam_t; see plane_notch(). It is no seam. */\n"
+    "            float3 plane = step(i.seam_c1, -2.5f);\n"
+    "            float3 seam_t = i.seam_t * (1.0f - plane), seam_c1 = i.seam_c1 * (1.0f - plane);\n"
+    "            float3 seam_c2 = i.seam_c2 * (1.0f - plane);\n"
+    "            float3 t = saturate(seam_t);\n"
     "            float2 g_x = float2(ddx(edges.x), ddy(edges.x));\n"
     "            float2 g_y = float2(ddx(edges.y), ddy(edges.y));\n"
     "            float2 g_z = float2(ddx(edges.z), ddy(edges.z));\n"
     "            float3 grad_e = float3(length(g_x), length(g_y), length(g_z));\n"
-    "            float3 edge_px = (edges + t * (i.seam_c1 + i.seam_c2 * t))\n"
+    "            float3 edge_px = (edges + t * (seam_c1 + seam_c2 * t))\n"
     "                    / max(grad_e, float3(0.0001f, 0.0001f, 0.0001f));\n"
     "            /* The area inside each edge, from its pixel distance and its\n"
     "             * normal (the gradient of the weight); the nearest edge bounds\n"
@@ -14649,15 +14946,24 @@ static const char shape_ps_code[] =
     "            float ea = edge_coverage(edge_px.x, g_x), eb = edge_coverage(edge_px.y, g_y);\n"
     "            float ec = edge_coverage(edge_px.z, g_z), fa;\n"
     "            /* The seams towards curve triangles. */\n"
-    "            if (curve_area && any(i.seam_c2 != 0.0f))\n"
+    "            if (curve_area && any(seam_c2 != 0.0f))\n"
     "            {\n"
-    "                ea = seam_coverage(edges.x, g_x, i.seam_t.x, float2(ddx(i.seam_t.x), ddy(i.seam_t.x)),\n"
-    "                        i.seam_c1.x, i.seam_c2.x);\n"
-    "                eb = seam_coverage(edges.y, g_y, i.seam_t.y, float2(ddx(i.seam_t.y), ddy(i.seam_t.y)),\n"
-    "                        i.seam_c1.y, i.seam_c2.y);\n"
-    "                ec = seam_coverage(edges.z, g_z, i.seam_t.z, float2(ddx(i.seam_t.z), ddy(i.seam_t.z)),\n"
-    "                        i.seam_c1.z, i.seam_c2.z);\n"
+    "                ea = seam_coverage(edges.x, g_x, seam_t.x, float2(ddx(i.seam_t.x), ddy(i.seam_t.x)),\n"
+    "                        seam_c1.x, seam_c2.x);\n"
+    "                eb = seam_coverage(edges.y, g_y, seam_t.y, float2(ddx(i.seam_t.y), ddy(i.seam_t.y)),\n"
+    "                        seam_c1.y, seam_c2.y);\n"
+    "                ec = seam_coverage(edges.z, g_z, seam_t.z, float2(ddx(i.seam_t.z), ddy(i.seam_t.z)),\n"
+    "                        seam_c1.z, seam_c2.z);\n"
     "            }\n"
+    "            if (plane.x > 0.5f)\n"
+    "                ea = plane_notch(ea, edge_px.x, g_x, i.seam_t.x, float2(ddx(i.seam_t.x), ddy(i.seam_t.x)),\n"
+    "                        -i.seam_c1.x - 4.0f, i.seam_c2.x);\n"
+    "            if (plane.y > 0.5f)\n"
+    "                eb = plane_notch(eb, edge_px.y, g_y, i.seam_t.y, float2(ddx(i.seam_t.y), ddy(i.seam_t.y)),\n"
+    "                        -i.seam_c1.y - 4.0f, i.seam_c2.y);\n"
+    "            if (plane.z > 0.5f)\n"
+    "                ec = plane_notch(ec, edge_px.z, g_z, i.seam_t.z, float2(ddx(i.seam_t.z), ddy(i.seam_t.z)),\n"
+    "                        -i.seam_c1.z - 4.0f, i.seam_c2.z);\n"
     "            fa = min(ea, min(eb, ec));\n"
     "            /* A triangle that touches the outline only at a corner knows none of\n"
     "             * the outline's edges. corner01/corner2 run from the corners to the\n"
@@ -14691,7 +14997,7 @@ static const char shape_ps_code[] =
     "                 * (seam_c2 other than 0) gives way likewise, and so does the\n"
     "                 * plain bound of the other end of either: both stand for the\n"
     "                 * same outline, which the notch ends. */\n"
-    "                if (i.seam_c1.x < -0.5f || (notch_reach && i.seam_c2.x != 0.0f))\n"
+    "                if (seam_c1.x < -0.5f || (notch_reach && seam_c2.x != 0.0f))\n"
     "                {\n"
     "                    if (i.corner_on.z > 1.5f)\n"
     "                        ea = notch_edge(ea, c2, c1, i.corner_on.z);\n"
@@ -14702,7 +15008,7 @@ static const char shape_ps_code[] =
     "                    if (notch_reach && i.corner_on.y > 1.5f && i.corner_on.z < 1.5f)\n"
     "                        bound2 = notch_edge(bound2, c1, c2, i.corner_on.y);\n"
     "                }\n"
-    "                if (i.seam_c1.y < -0.5f || (notch_reach && i.seam_c2.y != 0.0f))\n"
+    "                if (seam_c1.y < -0.5f || (notch_reach && seam_c2.y != 0.0f))\n"
     "                {\n"
     "                    if (i.corner_on.x > 1.5f)\n"
     "                        eb = notch_edge(eb, c0, c2, i.corner_on.x);\n"
@@ -14713,7 +15019,7 @@ static const char shape_ps_code[] =
     "                    if (notch_reach && i.corner_on.z > 1.5f && i.corner_on.x < 1.5f)\n"
     "                        bound0 = notch_edge(bound0, c2, c0, i.corner_on.z);\n"
     "                }\n"
-    "                if (i.seam_c1.z < -0.5f || (notch_reach && i.seam_c2.z != 0.0f))\n"
+    "                if (seam_c1.z < -0.5f || (notch_reach && seam_c2.z != 0.0f))\n"
     "                {\n"
     "                    if (i.corner_on.y > 1.5f)\n"
     "                        ec = notch_edge(ec, c1, c0, i.corner_on.y);\n"
@@ -14726,11 +15032,12 @@ static const char shape_ps_code[] =
     "                }\n"
     "                fa = min(min(ea, min(eb, ec)), min(bound0, min(bound1, bound2)));\n"
     "            }\n"
-    "            /* A pixel that two walls of the outline share (seam_c1 of -2): they\n"
+    "            /* A pixel that two walls of the outline share (seam_c1 of -2, and\n"
+    "             * not of -4 and below, which is a half plane): they\n"
     "             * cover edges.x and edges.y of it and are drawn by two primitives,\n"
     "             * blended; the fill covers edges.z. This third primitive brings the\n"
     "             * three to that, for the opacity of the brush. */\n"
-    "            if (i.seam_c1.x < -1.5f)\n"
+    "            if (i.seam_c1.x < -1.5f && i.seam_c1.x > -2.5f)\n"
     "            {\n"
     "                float al = colour.a, den = (1.0f - al * edges.x) * (1.0f - al * edges.y);\n"
     "\n"
