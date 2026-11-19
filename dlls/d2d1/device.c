@@ -2208,6 +2208,37 @@ static UINT32 d2d_fill_aa_next_slot(UINT32 slot, size_t map_size)
     return slot + 1 == map_size ? 0 : slot + 1;
 }
 
+/* The curve triangles that lie inside the fill.
+ *
+ * Where the figures of a path overlap, the curves of one figure run through
+ * the area of another. The mesh is that of their union: the edges of such a
+ * curve triangle that are in it, its chord or its two control edges, have a
+ * face on either side, and the area of the triangle is filled by faces. Drawn
+ * on top of them the triangle covers that area a second time, and its skirt
+ * carries the antialiasing ramp of an outline that is none into the fill. A
+ * brush that is not opaque shows it: at an opacity of one half 6,523 pixels
+ * of twelve captured frames of Minimal Audio Current's tap display were more
+ * than 16 of 255 above the opacity times the coverage, 1,414 without these
+ * triangles. Where the fill is narrower than the 0.75 pixels of the skirt it
+ * comes out on the far side, 192 for a coverage of 55 below a dot 0.85 pixels
+ * high, 88 without (wine-dev issue 637).
+ *
+ * A curve triangle with at least one edge in the mesh and none of them on the
+ * outline is not drawn. Its skirt had also lit pixels that the faces draw too
+ * dark, at the notches between overlapping figures: without them and without
+ * d2d_fill_aa_notch_reach() the opaque frames come out farther from their
+ * coverage by 6,467 in all over 584 pixels for 4,411 closer over 475.
+ * WINE_D2D_CURVE_INSIDE=0 draws them all. */
+static BOOL d2d_curve_inside(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_CURVE_INSIDE", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
 /* Mark the mesh edges that run along a curve segment.
  *
  * The tessellation puts the corners of every curve triangle on figure vertices,
@@ -2237,12 +2268,16 @@ static UINT32 d2d_fill_aa_next_slot(UINT32 slot, size_t map_size)
  * before the arcs, the vertices of the mesh the two ends of its curve lie on,
  * if both do; see d2d_fill_aa_find_mesh_vertex(). The caller sets it to ~0u.
  *
+ * curve_inside, if not NULL, receives 1 for every curve triangle that has an
+ * edge in the mesh and none with a face on one side only; see
+ * d2d_curve_inside(). The caller sets it to 0.
+ *
  * Returns FALSE if the marking could not be completed. Half-marked data is
  * worse than none — an unmarked seam would get a skirt and be drawn twice — so
  * the caller falls back to the plain fill in that case. */
 static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
-        const UINT64 *edge_keys, BYTE *edge_curve, struct d2d_fill_aa_seam *seams, size_t map_size,
-        const float *m, UINT32 *curve_ends)
+        const UINT64 *edge_keys, const BYTE *edge_cnt, BYTE *edge_curve, struct d2d_fill_aa_seam *seams,
+        size_t map_size, const float *m, UINT32 *curve_ends, BYTE *curve_inside)
 {
     const struct d2d_curve_vertex *curves[2];
     size_t counts[2], vertex_map_size, i, c;
@@ -2293,6 +2328,7 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
         for (i = 0; i + 2 < counts[c]; i += 3)
         {
             const D2D1_POINT_2F *p0, *p1, *p2;
+            BOOL on_outline = FALSE, inside = FALSE;
             size_t idx[3], missing = 0;
             int a, b;
 
@@ -2361,6 +2397,10 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                     if (edge_keys[slot] != key)
                         continue;
                     edge_curve[slot] = 1;
+                    if (edge_cnt[slot] == 1)
+                        on_outline = TRUE;
+                    else
+                        inside = TRUE;
 
                     p0 = &curves[c][i].position;
                     p1 = &curves[c][i + 1].position;
@@ -2398,6 +2438,8 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                     }
                 }
             }
+            if (curve_inside && inside && !on_outline)
+                curve_inside[(c ? counts[0] / 3 : 0) + i / 3] = 1;
         }
     }
 
@@ -3314,6 +3356,9 @@ static void d2d_fill_aa_mark_thin(const struct d2d_device_context *context, cons
      * drawn by its pixels then. */
     for (i = curve_count; i--;)
     {
+        /* Inside the fill and not drawn; see d2d_curve_inside(). */
+        if (curve_skip[i])
+            continue;
         if (curve_ends[2 * i] == ~0u || (r = d2d_fill_aa_find_part(parent, curve_ends[2 * i]))
                 != d2d_fill_aa_find_part(parent, curve_ends[2 * i + 1]))
         {
@@ -5444,8 +5489,8 @@ static void d2d_fill_aa_shared_pixels(struct d2d_device_context *context, const 
  * the fill has nothing to antialias or the mesh cannot be built; the plain
  * triangle path draws the geometry then. *curve_skip receives NULL or, for
  * every curve triangle of the fill, the Béziers before the arcs, whether the
- * mesh draws its area and it is not to be drawn; see d2d_fill_aa_thin(). The
- * caller frees *out and *curve_skip. */
+ * mesh draws its area and it is not to be drawn; see d2d_fill_aa_thin() and
+ * d2d_curve_inside(). The caller frees *out and *curve_skip. */
 static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, const struct d2d_fill *fill, struct d2d_fill *closed,
         struct d2d_fill_aa_vertex **out, size_t *out_count, BYTE **curve_skip)
@@ -5537,8 +5582,13 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
      * curve triangle is thinner than half a pixel. */
     if (curve_count && d2d_fill_aa_thin() && (curve_ends = malloc(curve_count * 2 * sizeof(*curve_ends))))
         memset(curve_ends, 0xff, curve_count * 2 * sizeof(*curve_ends));
-    if (curve_count && !d2d_fill_aa_mark_curve_edges(fill, edge_keys, edge_curve, seams, map_size, m, curve_ends))
+    if (curve_count && d2d_curve_inside())
+        *curve_skip = calloc(curve_count, sizeof(**curve_skip));
+    if (curve_count && !d2d_fill_aa_mark_curve_edges(fill, edge_keys, edge_cnt, edge_curve, seams, map_size, m,
+            curve_ends, *curve_skip))
     {
+        free(*curve_skip);
+        *curve_skip = NULL;
         free(curve_ends);
         free(face_slots);
         free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
@@ -5591,6 +5641,8 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
             free(added);
             if (!ok)
             {
+                free(*curve_skip);
+                *curve_skip = NULL;
                 free(curve_ends);
                 free(face_slots);
                 free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
@@ -5614,6 +5666,8 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
     /* Nothing to antialias; the plain path draws exactly the same pixels more cheaply. */
     if (!boundary_count && !seam_count)
     {
+        free(*curve_skip);
+        *curve_skip = NULL;
         free(curve_ends);
         free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
         return FALSE;
@@ -5625,7 +5679,7 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
     /* The parts that are drawn by their pixels; see d2d_fill_aa_thin(). */
     d2d_device_context_get_pixel_transform(render_target, &geometry->transform, pm);
     pdet = pm[0] * pm[4] - pm[1] * pm[3];
-    if (curve_ends)
+    if (curve_ends && !*curve_skip)
         *curve_skip = calloc(curve_count, sizeof(**curve_skip));
     /* Without the means to leave out the curve triangles of a part they
      * would be drawn on top of its pixels. */
