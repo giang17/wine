@@ -2125,6 +2125,48 @@ This is the recommended branch. What it changes, by subsystem:
   26 lines on x86_64 and i386. Filling the 32 paths of a frame of the tap display, with about
   17,600 walls, takes 26.3 to 26.8 ms at best for 24.9 to 25.0 with the switch off, and 30.5 to
   30.8 ms for 27.2 to 27.6 on average.
+- **d2d1**: a notch of the fill outline is taken at the size of a pixel. At a corner that points
+  inward the faces take the union of the half planes of its two outline edges, but the two
+  edges say where the outline goes only as far as they are long, and where two figures of a
+  path cross, their curves are cut into pieces as short as it happens: an edge of 0.04 pixels
+  at the tip of the notch between two overlapping dots of Minimal Audio Current's tap display,
+  after which the outline goes on along the same curve. Such a corner fell under the minimum
+  edge length and kept the plain corner bound, 167 of 255 for a coverage of 231, which only
+  the skirts of the curve triangles inside the fill covered up (issue 637). An edge shorter
+  than an eighth of a pixel now gives no direction: the line of that side goes through the
+  first outline vertex at least that far from the corner. The reach of either side is
+  followed along the outline for as long as it stays within an eighth of a pixel of the line,
+  and two lines that run back on each other with the fill on either side count as a slit. In
+  the pixel shader a seam and the plain bound of the other end give way at a notch as a
+  straight outline edge does, and under the skirt of the other edge of a notch narrower than
+  a right angle the face takes the share that the blend with that skirt makes the union (226
+  for a coverage of 191 before). `WINE_D2D_FILL_AA_NOTCH_REACH=0` switches it off. Twelve
+  captured frames: 1,791 pixels change, the sum of their errors is 16,353 for 28,188, 345 are
+  more than 16 closer and 54 farther; over every pixel 1,073 are more than 16 too dark for
+  1,361 and 17 more than 64 for 46. At 150 % 13,927 for 31,086, glyphs of DejaVu Sans 870 for
+  1,116 (6 to 13 pixels) and 430 for 614 (11 to 24 pixels), 80 paths of overlapping round
+  figures 205 for 405. Shapes, single figures, polygons, pills, small arcs and the curve test
+  images do not change. What is left is a face with the half plane of a neighbouring outline
+  edge next to a notch (issue 640).
+- **d2d1**: the curve triangles that lie inside the fill are not drawn. Where the figures of a
+  path overlap, the curves of one run through the area of another; the mesh is that of their
+  union, faces fill the area of such a curve triangle, and drawn on top of them it covered
+  that area a second time and carried its antialiasing skirt 0.75 pixels into the fill. A
+  brush that is not opaque showed it: with an opacity of 0.5, 6,612 pixels of twelve captured
+  frames of Minimal Audio Current's tap display were more than 16 of 255 brighter than the
+  opacity times the coverage and 1,918 more than 32; 1,414 and 224 now, the sum of the errors
+  over every pixel 568,300 for 732,803. 80 paths of overlapping ellipses, circles and rounded
+  rectangles: 42 for 538 and 7 for 181, sum 9,268 for 26,317. With an opaque brush the skirt
+  came out where the fill is narrower than its reach, 192 for a coverage of 55 below a dot
+  0.85 pixels high, 88 now (issue 637); the opaque frames change in 1,104 pixels, sum of their
+  errors 7,908 for 10,918, with 85 more than 16 closer and 29 farther, at 150 % 8,574 for
+  12,204. A curve triangle with an edge in the mesh and none of them on the outline is left
+  out; `WINE_D2D_CURVE_INSIDE=0` draws them all. It goes together with the entry before:
+  without the notches at the size of a pixel the opaque frames got worse (13,650 for 11,595).
+  Glyphs, shapes, single figures and the curve test images have no such triangle and do not
+  change. With both entries the d2d1 tests fail at the same 26 lines on x86_64 and i386, and
+  filling the 32 paths of a frame takes 27.8 ms at best of twenty runs for 27.5 with both
+  switches off (medians 29.2 and 28.7; an earlier series 27.4 for 26.8).
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
