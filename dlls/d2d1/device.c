@@ -3478,6 +3478,9 @@ struct d2d_fill_aa_vertex
     float u, v, s;
     float ex, ey;
     float seam_t[3], seam_c1[3], seam_c2[3];
+    /* corner_on is 0 for a corner off the outline, 1 for one on it, and the
+     * code of the notch, at least 2, at a corner that points inward; see
+     * d2d_fill_aa_notch_code(). */
     float corner[3][2], corner_on[3];
 };
 
@@ -3716,6 +3719,210 @@ static void d2d_fill_aa_bridge(const struct d2d_fill *fill, struct d2d_fill_aa_c
     }
 }
 
+/* The corner bound at the corners of the outline that point inward.
+ *
+ * A face that touches the outline in a corner only, with no half plane of an
+ * outline edge for the pixels near that corner, is limited by the pixel shader
+ * by the distance to the corner, taken as the distance to an edge through it
+ * at a right angle to the direction of the pixel. At a corner that points
+ * inward that is wrong both ways. The fill reaches around the corner, and the
+ * bound is too dark in the notch: the two pixels that hold the inner corners
+ * of an "M" of DejaVu Sans at 6 pixels, where the diagonals meet the stems,
+ * came out at 150 of 255 for a coverage of 238. Beside one of the two edges
+ * the distance to the corner is larger than the distance to the edge, and the
+ * bound is too bright there: the pixel beside the stem of a "T" at 24 pixels
+ * right under its bar, its centre 0.09 pixels inside the stem, came out at
+ * 252 for 143. Moving the bound outward fixes the first and makes the second
+ * worse, and which of the two a pixel is in does not depend on the face
+ * (wine-dev issue 637). d2d_fill_aa_face_planes() gives such a face neither
+ * edge: beyond the corner the outline leaves both half planes.
+ *
+ * Near the corner the fill is the union of the half planes of its two outline
+ * edges, the notch what lies outside both. The faces at the corner carry the
+ * inward normals of the two edges in pixels (d2d_fill_aa_notch_code()), and
+ * the pixel shader takes the area of the notch in the pixel from the parts u1
+ * and u2 of the pixel that lie outside each half plane: min(u1, u2) where the
+ * outline goes on straight, u1 u2 at a square notch, max(u1 + u2 - 1, 0) in a
+ * slot, blended by the angle between the normals; for a pixel centred on the
+ * corner that is the share of a disc the notch takes (notch_coverage()).
+ *
+ * A curve leaves the corner along its tangent, to the control point of a
+ * chord or along a control edge, and the edges are lines only so far: the
+ * model holds as long as both stay within an eighth of a pixel of their lines,
+ * the reach of the notch, and beyond that the bound runs out as the plain one
+ * does. Corners with an edge shorter than D2D_FILL_AA_NOTCH_MIN_EDGE pixels,
+ * as the risers of an outline in steps of 1/64 to 1/8 pixel, or a turn of
+ * less than D2D_FILL_AA_NOTCH_MIN_TURN degrees, as where two pieces of a
+ * curve meet and the outline follows the curve rather than the tangent, keep
+ * the plain bound. WINE_D2D_FILL_AA_NOTCHES=0 keeps it at every corner. */
+#define D2D_FILL_AA_NOTCH_MIN_EDGE 0.15f
+#define D2D_FILL_AA_NOTCH_MIN_TURN 15.0
+
+struct d2d_fill_aa_turn
+{
+    /* The points the outline heads for from the vertex along its first two
+     * boundary edges, the outward normals of those lines, and how far, in
+     * pixels, the edges follow them. */
+    D2D1_POINT_2F to[2], n[2];
+    float len[2];
+    /* The number of boundary edges at the vertex, up to 3. */
+    BYTE count;
+    /* At a corner that points inward: the inward normals in pixels, as
+     * angles, and the reach of the notch in pixels; 0 elsewhere. */
+    float angle[2], reach;
+};
+
+static BOOL d2d_fill_aa_notches(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_NOTCHES", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+/* Adds the boundary edge from a to b, whose face has its third vertex c, to the
+ * turns of its two ends. seam is the seam of a curve edge, NULL for a straight
+ * one; m is the pixel transform, pdet its determinant. */
+static void d2d_fill_aa_turn_add(const struct d2d_fill *fill, struct d2d_fill_aa_turn *turns, UINT32 a, UINT32 b,
+        UINT32 c, const struct d2d_fill_aa_seam *seam, const double *m, double pdet)
+{
+    const D2D1_POINT_2F *pa = &fill->vertices[a], *pb = &fill->vertices[b], *pc = &fill->vertices[c];
+    D2D1_POINT_2F n;
+    unsigned int j;
+    float len;
+
+    /* A curve that is not known gives no line. */
+    if (seam && seam->start == ~0u)
+        return;
+    n.x = -(pb->y - pa->y);
+    n.y = pb->x - pa->x;
+    if (!((len = sqrtf(n.x * n.x + n.y * n.y)) > 0.0f))
+        return;
+    if (n.x * (pa->x - pc->x) + n.y * (pa->y - pc->y) < 0.0f)
+        len = -len;
+    n.x /= len;
+    n.y /= len;
+
+    for (j = 0; j < 2; ++j)
+    {
+        UINT32 v = j ? b : a, o = j ? a : b;
+        const D2D1_POINT_2F *pv = &fill->vertices[v], *pe = &fill->vertices[o], *to = pe;
+        struct d2d_fill_aa_turn *t = &turns[v];
+        double ex, ey, r;
+        D2D1_POINT_2F nt;
+        float tl;
+
+        if (seam && seam->chord)
+            to = &seam->control;
+        nt.x = -(to->y - pv->y);
+        nt.y = to->x - pv->x;
+        if (!((tl = sqrtf(nt.x * nt.x + nt.y * nt.y)) > 0.0f))
+            continue;
+        if (nt.x * n.x + nt.y * n.y < 0.0f)
+            tl = -tl;
+        nt.x /= tl;
+        nt.y /= tl;
+        if (t->count < 2)
+        {
+            /* A curve departs from its tangent as h (s / 2 |to - v|)^2, h
+             * being the distance of its other end from the tangent; it stays
+             * within an eighth of a pixel of it for s up to
+             * 2 |to - v| sqrt(1 / 8h). */
+            ex = m[0] * (pe->x - pv->x) + m[1] * (pe->y - pv->y);
+            ey = m[3] * (pe->x - pv->x) + m[4] * (pe->y - pv->y);
+            r = sqrt(ex * ex + ey * ey);
+            if (seam)
+            {
+                double cx = m[0] * (to->x - pv->x) + m[1] * (to->y - pv->y);
+                double cy = m[3] * (to->x - pv->x) + m[4] * (to->y - pv->y);
+                double lc = sqrt(cx * cx + cy * cy), h;
+
+                if (seam->chord)
+                    h = lc > 0.0 ? fabs(cx * ey - cy * ex) / lc : 0.0;
+                else
+                    h = 4.0 * fabs(seam->c2) * sqrt(fabs(pdet));
+                if (h > 0.0)
+                    r = min(r, 2.0 * lc * sqrt(1.0 / (8.0 * h)));
+            }
+            t->to[t->count] = *to;
+            t->n[t->count] = nt;
+            t->len[t->count] = min(r, 1000.0);
+        }
+        if (t->count < 3)
+            ++t->count;
+    }
+}
+
+/* Sets the angles and the reach of the notch at vertex v, if the outline
+ * points inward there; see d2d_fill_aa_notches(). m is the pixel transform. */
+static void d2d_fill_aa_notch(const struct d2d_fill *fill, struct d2d_fill_aa_turn *t, UINT32 v, const double *m)
+{
+    const D2D1_POINT_2F *p = &fill->vertices[v];
+    float angle[2];
+    unsigned int k;
+
+    if (t->count != 2)
+        return;
+    /* The corner points inward where neither line reaches on along the other edge. */
+    if (!(t->n[1].x * (p->x - t->to[0].x) + t->n[1].y * (p->y - t->to[0].y) < 0.0f)
+            || !(t->n[0].x * (p->x - t->to[1].x) + t->n[0].y * (p->y - t->to[1].y) < 0.0f))
+        return;
+    if (min(t->len[0], t->len[1]) < D2D_FILL_AA_NOTCH_MIN_EDGE)
+        return;
+    for (k = 0; k < 2; ++k)
+    {
+        /* The outward normal mapped to pixels keeps its side of the line; the
+         * inward normal in pixels is at a right angle to the line in pixels. */
+        double ox = m[0] * t->n[k].x + m[1] * t->n[k].y, oy = m[3] * t->n[k].x + m[4] * t->n[k].y;
+        double ex = m[0] * (t->to[k].x - p->x) + m[1] * (t->to[k].y - p->y);
+        double ey = m[3] * (t->to[k].x - p->x) + m[4] * (t->to[k].y - p->y);
+        double nx = -ey, ny = ex;
+
+        if (!(sqrt(ox * ox + oy * oy) > 1.0e-12))
+            return;
+        if (nx * ox + ny * oy > 0.0)
+        {
+            nx = -nx;
+            ny = -ny;
+        }
+        angle[k] = atan2(ny, nx);
+    }
+    if (cos(angle[0] - angle[1]) > cos(D2D_FILL_AA_NOTCH_MIN_TURN * M_PI / 180.0))
+        return;
+    t->angle[0] = angle[0];
+    t->angle[1] = angle[1];
+    t->reach = min(t->len[0], t->len[1]);
+}
+
+/* The notch at a corner as the pixel shader takes it, in the bits of
+ * corner_on: the angles of the two inward normals in 4096ths of a turn from
+ * -pi, twelve bits each, and above them six bits of the reach, in eighths of
+ * a pixel up to 4 pixels and in halves up to 19, all added to the bits of
+ * 2.0f. That is a finite float of at least 2, which the shader tells from
+ * 0 and 1 by its value. A normal off by at most 0.044 degrees moves its line
+ * by 0.015 pixels at the largest reach. Giving the vertex the normals as two
+ * floats each made it 24 bytes larger, and filling the 32 paths of a frame of
+ * Minimal Audio Current's tap display took 24.9 ms at best for 22.5 even
+ * with the notches off. */
+static float d2d_fill_aa_notch_code(const struct d2d_fill_aa_turn *t)
+{
+    unsigned int a[2], r, k;
+    UINT32 bits;
+    float code;
+
+    for (k = 0; k < 2; ++k)
+        a[k] = (unsigned int)floor((t->angle[k] + M_PI) * (4096.0 / (2.0 * M_PI)) + 0.5) & 4095;
+    if (t->reach < 3.9375f)
+        r = (unsigned int)(t->reach * 8.0f + 0.5f);
+    else
+        r = min(32 + (unsigned int)((t->reach - 4.0f) * 2.0f + 0.5f), 62);
+    bits = 0x40000000u + ((r << 24) | (a[0] << 12) | a[1]);
+    memcpy(&code, &bits, sizeof(code));
+    return code;
+}
+
 /* Builds the antialiased fill mesh of a geometry under the current transform:
  * the vertex array the D2D_SHAPE_TYPE_FILL_AA shaders take. Returns FALSE when
  * the fill has nothing to antialias or the mesh cannot be built; the plain
@@ -3731,6 +3938,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     UINT32 *curve_ends = NULL;
     struct d2d_fill_aa_outline outline = {0};
     struct d2d_fill_aa_corner *corners = NULL;
+    struct d2d_fill_aa_turn *turns = NULL;
     struct d2d_fill_aa_sliver *slivers = NULL;
     struct d2d_fill_aa_edge *edges = NULL;
     UINT32 *corner_curves = NULL, *bridge_stack = NULL;
@@ -3891,6 +4099,10 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
         return FALSE;
     }
 
+    /* Without it every corner keeps the plain bound. */
+    if (d2d_fill_aa_notches() && fabs(pdet) > 1.0e-12)
+        turns = calloc(fill->vertex_count, sizeof(*turns));
+
     /* Without the neighbours the triangles keep their own edges only. */
     if (neighbours)
     {
@@ -3973,11 +4185,20 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
                 on_outline[a] = on_outline[b_v] = 1;
             else if (seams[slot].start == a || seams[slot].start == b_v)
                 on_outline[seams[slot].start] = 1;
+            if (turns)
+                d2d_fill_aa_turn_add(fill, turns, a, b_v, f->v[e], edge_curve[slot] ? &seams[slot] : NULL, pm, pdet);
         }
     }
 
     if (outline.opp)
         d2d_fill_aa_outline_prepare(&outline, pm);
+
+    /* The corners that point inward; see d2d_fill_aa_notches(). */
+    for (i = 0; turns && i < fill->vertex_count; ++i)
+    {
+        if (on_outline[i])
+            d2d_fill_aa_notch(fill, &turns[i], i, pm);
+    }
 
     /* Pass 2: build inner triangle vertices with edge weights. */
     vi = 0;
@@ -4081,6 +4302,8 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
                 expanded[vi].corner[e][0] = expanded[vi].pos.x - corner->x;
                 expanded[vi].corner[e][1] = expanded[vi].pos.y - corner->y;
                 expanded[vi].corner_on[e] = on_outline[f->v[e]];
+                if (turns && turns[f->v[e]].reach > 0.0f)
+                    expanded[vi].corner_on[e] = d2d_fill_aa_notch_code(&turns[f->v[e]]);
             }
         }
     }
@@ -4411,6 +4634,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     free(edges);
     free(slivers);
     free(bridge_stack);
+    free(turns);
 
     *out = expanded;
     *out_count = expanded_count;
@@ -12347,6 +12571,33 @@ static const char shape_ps_code[] =
     "    return d > 0.0f ? 1.0f - t : t;\n"
     "}\n"
     "\n"
+    "/* The coverage near a corner of the outline that points inward, from c, the\n"
+    " * pixel centre relative to the corner, and the code of the notch: the bits\n"
+    " * of 2.0f plus the angles of the inward normals of its two edges in 4096ths\n"
+    " * of a turn from -pi and above them the reach r, in eighths of a pixel up\n"
+    " * to 4 and in halves beyond (d2d_fill_aa_notch_code()). It is 1 minus the\n"
+    " * area of the notch, the part of the pixel outside both half planes. From the parts\n"
+    " * u1 and u2 outside each, that is min(u1, u2) where the edges are on one\n"
+    " * line, u1 * u2 at a right angle and max(u1 + u2 - 1, 0) where they run\n"
+    " * back on each other, blended by the angle between the normals. The edges\n"
+    " * follow their lines for r pixels from the corner; beyond that the bound\n"
+    " * runs out as the plain corner bound does. */\n"
+    "float notch_coverage(float2 c, float code)\n"
+    "{\n"
+    "    uint k = asuint(code) - 0x40000000u, q = k >> 24;\n"
+    "    float a1 = (float)((k >> 12) & 4095u) * (6.28318531f / 4096.0f) - 3.14159265f;\n"
+    "    float a2 = (float)(k & 4095u) * (6.28318531f / 4096.0f) - 3.14159265f;\n"
+    "    float r = q < 32u ? (float)q * 0.125f : 4.0f + (float)(q - 32u) * 0.5f;\n"
+    "    float2 n1 = float2(cos(a1), sin(a1)), n2 = float2(cos(a2), sin(a2));\n"
+    "    float u1 = 1.0f - edge_coverage(dot(c, n1), n1), u2 = 1.0f - edge_coverage(dot(c, n2), n2);\n"
+    "    float prod = u1 * u2, t, far = edge_coverage(length(c) - r, c);\n"
+    "\n"
+    "    t = acos(clamp(dot(n1, n2), -1.0f, 1.0f)) * (2.0f / 3.14159265f);\n"
+    "    if (t <= 1.0f)\n"
+    "        return max(1.0f - lerp(min(u1, u2), prod, t), far);\n"
+    "    return max(1.0f - lerp(prod, max(u1 + u2 - 1.0f, 0.0f), t - 1.0f), far);\n"
+    "}\n"
+    "\n"
     "float4 main(struct input i) : SV_Target\n"
     "{\n"
     "    float4 colour;\n"
@@ -12522,9 +12773,20 @@ static const char shape_ps_code[] =
     "            {\n"
     "                float2x2 to_px = float2x2(jy.y, -jy.x, -jx.y, jx.x) / det;\n"
     "                float2 c0 = mul(to_px, i.corner01.xy), c1 = mul(to_px, i.corner01.zw), c2 = mul(to_px, i.corner2);\n"
-    "                float3 corner_px = float3(length(c0), length(c1), length(c2)) + (1.0f - i.corner_on) * 1.0e4f;\n"
-    "                fa = min(fa, min(edge_coverage(corner_px.x, c0),\n"
-    "                        min(edge_coverage(corner_px.y, c1), edge_coverage(corner_px.z, c2))));\n"
+    "                float3 corner_px = float3(length(c0), length(c1), length(c2))\n"
+    "                        + (1.0f - min(i.corner_on, 1.0f)) * 1.0e4f;\n"
+    "                float bound0 = edge_coverage(corner_px.x, c0), bound1 = edge_coverage(corner_px.y, c1);\n"
+    "                float bound2 = edge_coverage(corner_px.z, c2);\n"
+    "\n"
+    "                /* A corner that points inward carries the code of its notch\n"
+    "                 * in corner_on, at least 2. */\n"
+    "                if (i.corner_on.x > 1.5f)\n"
+    "                    bound0 = notch_coverage(c0, i.corner_on.x);\n"
+    "                if (i.corner_on.y > 1.5f)\n"
+    "                    bound1 = notch_coverage(c1, i.corner_on.y);\n"
+    "                if (i.corner_on.z > 1.5f)\n"
+    "                    bound2 = notch_coverage(c2, i.corner_on.z);\n"
+    "                fa = min(fa, min(bound0, min(bound1, bound2)));\n"
     "            }\n"
     "            colour.a *= fa;\n"
     "            colour.rgb *= fa;\n"
