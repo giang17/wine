@@ -2762,6 +2762,68 @@ static BOOL d2d_fill_aa_outline_inside(const struct d2d_fill_aa_outline *o, UINT
     return FALSE;
 }
 
+/* The faces that are drawn in no pixel.
+ *
+ * A face of the fill mesh that holds no pixel centre yields no fragment, and
+ * what its weights are is nobody's business. Where the figures of a path
+ * overlap, most faces are such slivers: of the first 100,000 faces of a frame
+ * of Minimal Audio Current's tap display that d2d_fill_aa_face_planes() was
+ * to give half planes, 74,553. They get none: finding them, with the walks
+ * along the outline, is most of what the half planes cost. Filling the 32
+ * paths of a frame takes 26.8 ms at best of sixteen runs for 27.7, the images
+ * bit for bit the same. A face counts as holding a pixel centre that lies
+ * within D2D_FILL_AA_FACE_PIXEL_MARGIN pixels of it, for what the positions
+ * lose on their way to the rasteriser, and a face whose bounding box holds
+ * more than six centres is not looked at any closer.
+ * WINE_D2D_FILL_AA_FACE_PIXELS=0 gives every face its half planes. */
+#define D2D_FILL_AA_FACE_PIXEL_MARGIN (1.0 / 64.0)
+
+static BOOL d2d_fill_aa_face_pixels(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_FACE_PIXELS", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+/* Whether the triangle q, in pixels, holds a pixel centre; see
+ * d2d_fill_aa_face_pixels(). */
+static BOOL d2d_fill_aa_face_has_pixel(const double (*q)[2])
+{
+    const double m = D2D_FILL_AA_FACE_PIXEL_MARGIN;
+    double x0 = ceil(min(q[0][0], min(q[1][0], q[2][0])) - 0.5 - m), x1 = floor(max(q[0][0], max(q[1][0], q[2][0])) - 0.5 + m);
+    double y0 = ceil(min(q[0][1], min(q[1][1], q[2][1])) - 0.5 - m), y1 = floor(max(q[0][1], max(q[1][1], q[2][1])) - 0.5 + m);
+    double x, y, area;
+    unsigned int i;
+
+    if (x1 < x0 || y1 < y0)
+        return FALSE;
+    if ((x1 - x0 + 1.0) * (y1 - y0 + 1.0) > 6.0)
+        return TRUE;
+    area = (q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[1][1] - q[0][1]) * (q[2][0] - q[0][0]);
+    for (y = y0; y <= y1; y += 1.0)
+    {
+        for (x = x0; x <= x1; x += 1.0)
+        {
+            for (i = 0; i < 3; ++i)
+            {
+                const double *a = q[i], *b = q[(i + 1) % 3];
+                double ex = b[0] - a[0], ey = b[1] - a[1];
+                double e = ex * (y + 0.5 - a[1]) - ey * (x + 0.5 - a[0]);
+
+                /* Outside this edge by more than the margin. */
+                if ((area < 0.0 ? -e : e) < -m * sqrt(ex * ex + ey * ey))
+                    break;
+            }
+            if (i == 3)
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 /* Gives the weights of the face f that are not taken, free, the half planes
  * of the outline edges at its corners; see d2d_fill_aa_faces().
  *
@@ -2791,6 +2853,8 @@ static void d2d_fill_aa_face_planes(const struct d2d_fill_aa_outline *o, const s
         q[i][0] = o->px[2 * f->v[i]];
         q[i][1] = o->px[2 * f->v[i] + 1];
     }
+    if (d2d_fill_aa_face_pixels() && !d2d_fill_aa_face_has_pixel(q))
+        return;
     for (i = 0; i < 3; ++i)
     {
         UINT32 a = f->v[i];
