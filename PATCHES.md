@@ -2034,6 +2034,30 @@ This is the recommended branch. What it changes, by subsystem:
   coverage; small arcs 119 for 208. Regular polygons and large shapes do not change. The d2d1
   tests fail at the same 26 lines on x86_64 and i386, and filling the 32 paths of a frame
   takes 23.3 ms at best for 22.0 with the switch off.
+- **d2d1**: the corner bound at a corner of the outline that points inward is taken from the
+  half planes of its two outline edges. A face of the fill mesh that touches the outline in a
+  corner only, without a half plane of an outline edge near it, was limited by the distance to
+  that corner, as if an edge ran through it at a right angle to the pixel. At a corner that
+  points inward that is wrong both ways: the fill reaches around the corner, and the two pixels
+  at the inner corners of an "M" of DejaVu Sans at 6 pixels came out at 150 of 255 for a
+  coverage of 238; beside one of the two edges the distance to the corner is larger than to the
+  edge, and the pixel beside the stem of a "T" at 24 pixels right under its bar came out at 252
+  for 143 (issue 637). The pixel shader now takes 1 minus the area of the notch in the pixel,
+  the part outside both half planes, from the parts outside each, blended by the angle between
+  the two normals; a curve counts with its tangent, the model holds as far as both edges stay
+  within an eighth of a pixel of their lines, and corners with an edge shorter than 0.15 pixels
+  or a turn below 15 degrees keep the plain bound. The two normals and that reach travel in the
+  bits of `corner_on`, so the vertex keeps its size. `WINE_D2D_FILL_AA_NOTCHES=0` keeps the
+  plain bound. The 384 paths of twelve captured frames of Minimal Audio Current's tap display
+  change in 1,196 pixels: the sum of the errors against the coverage is 10,702 for 24,720, 6
+  pixels are more than 64 off for 45 and 62 more than 32 for 290; at 150 % 18,819 for 36,813.
+  Over every pixel of the 96 paths with overlapping figures 765,483 for 769,674. Glyphs of
+  DejaVu Sans at 6 to 13 pixels 2,453 for 7,380 over 299 pixels, at 11 to 24 pixels 1,615 for
+  9,067 over 593, none more than 64 off for 19 and 27; regular polygons and stars 788 for
+  1,298, all in the stars; two star shapes 84 for 41 over 57 pixels, none more than 16 off.
+  Single figures, pills, small arcs and the curve test images do not change. The d2d1 tests
+  fail at the same 26 lines on x86_64 and i386, and filling the 32 paths of a frame takes
+  23.2 ms at best for 22.5 with the switch off.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
