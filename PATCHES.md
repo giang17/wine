@@ -2492,6 +2492,25 @@ This is the recommended branch. What it changes, by subsystem:
   this branch is built in, `opengl32` keeps the Vulkan mapping of a buffer until the buffer
   is destroyed, so the higher limit costs no address space there; a 32-bit Wine or an
   old-WoW64 build pays up to 1 GiB of the 32-bit address space for it
+- **wined3d**: the command stream flushes the GL context when it runs out of commands, on a
+  device that presents through GDI. A GL driver holds what it is given until its buffer is
+  full or a flush, a swap or a read asks for it; an application that issues a few hundred
+  draws per frame between long stretches of its own work never fills that buffer, and the
+  GPU started on the frame when the present read it back. The present then waited for the
+  whole frame on the command stream thread, and for as long the X server got nothing
+  through to the GPU: a put of a window surface, and every request of any client behind
+  it, waited too. Minimal Audio Current's Direct2D editor in REAPER (a composition swap
+  chain on a child window, about 141 draws per frame, NVIDIA): the download of a frame
+  took 17.9 ms at the median, 1.1 ms of that for the transfer; all window surface puts of
+  more than 3 ms (113 of 399 in 12 s) fell into a download and carried 88 % of the time
+  spent in puts, up to 20 ms each where a put takes 0.5 ms otherwise. Now the download
+  takes 1.0 ms, and over two runs of 30 s each way the editor runs at 16.6 and 17.0 frames
+  per second for 15.0 and 15.1, the main thread is blocked 9.5 and 10.2 % of the time for
+  18.6 and 19.0 % (waiting for the X server 3.0 and 3.2 % for 12.7 and 13.0 %), the
+  command stream thread takes 8.7 and 8.9 % of a core for 19.1 and 19.4 % and the X server
+  3.7 and 4.0 % for 14.3 and 14.4 %. KORG's Trinity, which takes the same present path and
+  issues the draws of a frame without a pause, is unchanged at 66 frames per second. A
+  swap chain that swaps is not flushed. `WINE_D3D_IDLE_FLUSH=0` turns it off (issue 634)
 - **opengl32 (WoW64)**: the Vulkan mapping behind a persistently mappable GL buffer is kept
   for the lifetime of the buffer instead of being created and destroyed around every
   `glMapBufferRange()`/`glUnmapBuffer()` pair. 32-bit wined3d does not keep its buffer
