@@ -3923,6 +3923,34 @@ static float d2d_fill_aa_notch_code(const struct d2d_fill_aa_turn *t)
     return code;
 }
 
+/* An outline edge of a face that ends at a corner that points inward.
+ *
+ * A face of the fill mesh ramps down towards its own outline edges as if each
+ * went on beyond its ends. Where an edge ends at a notch, the outline turns
+ * into the fill there: beyond the corner the edge bounds nothing, and close to
+ * the corner the fill is the union of the half planes of the notch's two edges
+ * (d2d_fill_aa_notches()), not the half plane of the face's edge alone. A
+ * pixel at an inner corner of a "+" of DejaVu Sans at 13 pixels came out at 154
+ * of 255 for a coverage of 204, one in a captured frame of Minimal Audio
+ * Current's tap display at 144 for 238 (wine-dev issue 639). The pixel shader
+ * takes the union up to a quarter of a pixel from the corner and fades back to
+ * the edge over the next quarter: further out the tangent of a curve at the
+ * corner no longer stands for the curve, and the inner corner of an "m" of
+ * DejaVu Sans at 6 pixels came out at 231 for 185 with the whole reach of the
+ * notch. A straight outline edge of
+ * the face is marked by a seam_c1 of -1 for that; a seam has 0 or more there,
+ * and a straight edge has no seam_t to multiply it with.
+ * WINE_D2D_FILL_AA_NOTCH_EDGES=0 leaves the edges as they are. */
+static BOOL d2d_fill_aa_notch_edges(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_NOTCH_EDGES", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
 /* Builds the antialiased fill mesh of a geometry under the current transform:
  * the vertex array the D2D_SHAPE_TYPE_FILL_AA shaders take. Returns FALSE when
  * the fill has nothing to antialias or the mesh cannot be built; the plain
@@ -4236,7 +4264,12 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             if (edge_cnt[slot] != 1)
                 ramp = FALSE;
             else if (!edge_curve[slot])
+            {
                 ramp = TRUE;
+                /* A straight outline edge of the face; see d2d_fill_aa_notch_edges(). */
+                if (d2d_fill_aa_notch_edges())
+                    c1[e] = -1.0f;
+            }
             else
                 ramp = seams[slot].start != ~0u
                         && d2d_fill_aa_seam_params(fill, f, e, &seams[slot], t[e], &c1[e], &c2[e]);
@@ -4640,6 +4673,7 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     *out_count = expanded_count;
     return TRUE;
 }
+
 
 static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, const struct d2d_fill *fill,
@@ -12438,20 +12472,42 @@ static const char shape_ps_code[] =
     " * back on each other, blended by the angle between the normals. The edges\n"
     " * follow their lines for r pixels from the corner; beyond that the bound\n"
     " * runs out as the plain corner bound does. */\n"
-    "float notch_coverage(float2 c, float code)\n"
+    "float notch_union(float2 c, float code, out float r)\n"
     "{\n"
     "    uint k = asuint(code) - 0x40000000u, q = k >> 24;\n"
     "    float a1 = (float)((k >> 12) & 4095u) * (6.28318531f / 4096.0f) - 3.14159265f;\n"
     "    float a2 = (float)(k & 4095u) * (6.28318531f / 4096.0f) - 3.14159265f;\n"
-    "    float r = q < 32u ? (float)q * 0.125f : 4.0f + (float)(q - 32u) * 0.5f;\n"
+    "    r = q < 32u ? (float)q * 0.125f : 4.0f + (float)(q - 32u) * 0.5f;\n"
     "    float2 n1 = float2(cos(a1), sin(a1)), n2 = float2(cos(a2), sin(a2));\n"
     "    float u1 = 1.0f - edge_coverage(dot(c, n1), n1), u2 = 1.0f - edge_coverage(dot(c, n2), n2);\n"
-    "    float prod = u1 * u2, t, far = edge_coverage(length(c) - r, c);\n"
+    "    float prod = u1 * u2, t;\n"
     "\n"
     "    t = acos(clamp(dot(n1, n2), -1.0f, 1.0f)) * (2.0f / 3.14159265f);\n"
     "    if (t <= 1.0f)\n"
-    "        return max(1.0f - lerp(min(u1, u2), prod, t), far);\n"
-    "    return max(1.0f - lerp(prod, max(u1 + u2 - 1.0f, 0.0f), t - 1.0f), far);\n"
+    "        return 1.0f - lerp(min(u1, u2), prod, t);\n"
+    "    return 1.0f - lerp(prod, max(u1 + u2 - 1.0f, 0.0f), t - 1.0f);\n"
+    "}\n"
+    "\n"
+    "float notch_coverage(float2 c, float code)\n"
+    "{\n"
+    "    float r, u = notch_union(c, code, r);\n"
+    "\n"
+    "    return max(u, edge_coverage(length(c) - r, c));\n"
+    "}\n"
+    "\n"
+    "/* The coverage e of an outline edge of the face that ends at a notch, c_end\n"
+    " * the pixel centre relative to that corner and c_other relative to the other\n"
+    " * end of the edge: beyond the corner the edge bounds nothing, and up to a\n"
+    " * quarter of a pixel from it the fill is the union of the half planes of the\n"
+    " * notch, fading back to the edge over the next quarter. */\n"
+    "float notch_edge(float e, float2 c_end, float2 c_other, float code)\n"
+    "{\n"
+    "    float r, u;\n"
+    "\n"
+    "    if (dot(c_end, c_other - c_end) > 0.0f)\n"
+    "        return 1.0f;\n"
+    "    u = notch_union(c_end, code, r);\n"
+    "    return lerp(e, max(e, u), saturate((min(r, 0.25f) + 0.25f - length(c_end)) * 4.0f));\n"
     "}\n"
     "\n"
     "float4 main(struct input i) : SV_Target\n"
@@ -12613,8 +12669,8 @@ static const char shape_ps_code[] =
     "            /* The area inside each edge, from its pixel distance and its\n"
     "             * normal (the gradient of the weight); the nearest edge bounds\n"
     "             * the area left from above. */\n"
-    "            float fa = min(edge_coverage(edge_px.x, g_x),\n"
-    "                    min(edge_coverage(edge_px.y, g_y), edge_coverage(edge_px.z, g_z)));\n"
+    "            float ea = edge_coverage(edge_px.x, g_x), eb = edge_coverage(edge_px.y, g_y);\n"
+    "            float ec = edge_coverage(edge_px.z, g_z), fa = min(ea, min(eb, ec));\n"
     "            /* A triangle that touches the outline only at a corner knows none of\n"
     "             * the outline's edges. corner01/corner2 run from the corners to the\n"
     "             * pixel in geometry space; mapped to pixels through their derivatives,\n"
@@ -12642,7 +12698,30 @@ static const char shape_ps_code[] =
     "                    bound1 = notch_coverage(c1, i.corner_on.y);\n"
     "                if (i.corner_on.z > 1.5f)\n"
     "                    bound2 = notch_coverage(c2, i.corner_on.z);\n"
-    "                fa = min(fa, min(bound0, min(bound1, bound2)));\n"
+    "                /* A straight outline edge of the face (seam_c1 of -1) that ends\n"
+    "                 * at a notch. */\n"
+    "                if (i.seam_c1.x < -0.5f)\n"
+    "                {\n"
+    "                    if (i.corner_on.z > 1.5f)\n"
+    "                        ea = notch_edge(ea, c2, c1, i.corner_on.z);\n"
+    "                    if (i.corner_on.y > 1.5f)\n"
+    "                        ea = notch_edge(ea, c1, c2, i.corner_on.y);\n"
+    "                }\n"
+    "                if (i.seam_c1.y < -0.5f)\n"
+    "                {\n"
+    "                    if (i.corner_on.x > 1.5f)\n"
+    "                        eb = notch_edge(eb, c0, c2, i.corner_on.x);\n"
+    "                    if (i.corner_on.z > 1.5f)\n"
+    "                        eb = notch_edge(eb, c2, c0, i.corner_on.z);\n"
+    "                }\n"
+    "                if (i.seam_c1.z < -0.5f)\n"
+    "                {\n"
+    "                    if (i.corner_on.y > 1.5f)\n"
+    "                        ec = notch_edge(ec, c1, c0, i.corner_on.y);\n"
+    "                    if (i.corner_on.x > 1.5f)\n"
+    "                        ec = notch_edge(ec, c0, c1, i.corner_on.x);\n"
+    "                }\n"
+    "                fa = min(min(ea, min(eb, ec)), min(bound0, min(bound1, bound2)));\n"
     "            }\n"
     "            colour.a *= fa;\n"
     "            colour.rgb *= fa;\n"
