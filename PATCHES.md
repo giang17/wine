@@ -2084,6 +2084,27 @@ This is the recommended branch. What it changes, by subsystem:
   64 off for 95. Glyphs, shapes, polygons, pills, small arcs and the curve test images do not
   change. The d2d1 tests fail at the same 26 lines on x86_64 and i386, and filling the 32 paths
   of a frame takes 24.7 ms at best for 23.4 with the switch off.
+- **d2d1**: the fill antialiasing takes the area a curve leaves of the half plane at its
+  tangent. The pixel shader turned the distance of a pixel centre from the outline into the area
+  of the pixel inside a straight edge at that distance; a curve falls back from that line within
+  the pixel, and what lies between the two was counted as covered. At the round ends of the
+  figures 2 pixels wide in Minimal Audio Current's tap display 130,425 pixels of twelve captured
+  frames came out 8.1 of 255 too bright on average and 16,619 by more than 16, which is 78 % of
+  the pixels of those frames that were more than 16 too bright (issue 642). A curve triangle now
+  takes the distance to its curve to second order and a face the gradient of the distance to the
+  curve at a seam, and both take off the mean height of the curve over its tangent across the
+  pixel, curvature / 24 for a pixel the tangent crosses along the grid; a piece of the outline
+  answers only for the part of the pixel it runs along itself. `WINE_D2D_CURVE_AREA=0` switches
+  it off. Over every pixel of the 384 paths of the frames the sum of the errors against the
+  coverage is 1,116,626 for 1,714,234 and 4,884 pixels are more than 16 too bright for 21,288; of
+  the 149,733 pixels that change none is more than 16 farther. More than 16 too dark are 2,811
+  for 2,366: where two figures share a pixel their coverages are blended, and the excess had
+  hidden part of what that leaves out (issue 641). Glyphs of DejaVu Sans 16,666 for 21,828 (6 to
+  13 pixels) and 14,585 for 23,379 (11 to 24 pixels) at the pixels that change, 15 of them more
+  than 16 farther; rounded rectangles 11,011 for 39,021, small arcs 6,043 for 20,083; the larger
+  fills of the curve test images are as close or closer to the area coverage and to the
+  rendering of Windows 10. The d2d1 tests fail at the same 26 lines on x86_64 and i386, and
+  filling the 32 paths of a frame takes 25.0 ms at best for 25.1 with the switch off.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
