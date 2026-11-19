@@ -2070,6 +2070,20 @@ This is the recommended branch. What it changes, by subsystem:
   DejaVu Sans 947 for 1,580 (6 to 13 pixels) and 462 for 1,327 (11 to 24 pixels); polygons and
   stars 530 for 877; the curve test images do not change. The d2d1 tests fail at the same 26
   lines on x86_64 and i386; filling a frame takes as long as before.
+- **d2d1**: hairline gaps between two outline edges are zipped in the fill antialiasing mesh. Two
+  figures of a path that stand a hundredth of a pixel apart leave a slot in the outline of their
+  union; each side was antialiased on its own and the two partial coverages were blended where
+  the path covers their sum: 190 of 255 for a coverage of 253 between a bar and the figure
+  beside it in Minimal Audio Current's tap display (issue 639), where such slots held 492 of the
+  607 pixels more than 32 too dark. Straight outline edges that face each other across less than
+  1/64 pixel for at least a quarter of a pixel now meet in one vertex at each end of the gap, and
+  the walls become interior edges; a closed gap adds at most 4 of 255 to the pixels along it.
+  `WINE_D2D_FILL_AA_GAPS=0` leaves the gaps open. The 384 paths of twelve captured frames change
+  in 4,897 pixels: the sum of the errors against the coverage is 22,514 for 46,360, 13 pixels are
+  more than 64 off for 43 and 176 more than 32 for 565; at 150 % 19,966 for 51,554, 1 more than
+  64 off for 95. Glyphs, shapes, polygons, pills, small arcs and the curve test images do not
+  change. The d2d1 tests fail at the same 26 lines on x86_64 and i386, and filling the 32 paths
+  of a frame takes 24.7 ms at best for 23.4 with the switch off.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
