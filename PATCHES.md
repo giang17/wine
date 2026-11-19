@@ -2058,6 +2058,18 @@ This is the recommended branch. What it changes, by subsystem:
   Single figures, pills, small arcs and the curve test images do not change. The d2d1 tests
   fail at the same 26 lines on x86_64 and i386, and filling the 32 paths of a frame takes
   23.2 ms at best for 22.5 with the switch off.
+- **d2d1**: an outline edge of a face that ends at a corner that points inward gives way to the
+  notch near that corner. A face ramps down towards its own outline edges as if each went on
+  beyond its ends; where an edge ends at a notch the outline turns into the fill, and the pixel
+  at an inner corner of a "+" of DejaVu Sans at 13 pixels came out at 154 of 255 for a coverage
+  of 204, one in a captured frame of Minimal Audio Current's tap display at 144 for 238 (issue
+  639). Beyond the corner the edge now bounds nothing, and up to a quarter of a pixel from it
+  the face takes the union of the two half planes of the notch, fading back to the edge over
+  the next quarter. `WINE_D2D_FILL_AA_NOTCH_EDGES=0` leaves the edges as they are. The 384 paths
+  of twelve captured frames of the tap display change in 259 pixels, 4,026 for 6,621; glyphs of
+  DejaVu Sans 947 for 1,580 (6 to 13 pixels) and 462 for 1,327 (11 to 24 pixels); polygons and
+  stars 530 for 877; the curve test images do not change. The d2d1 tests fail at the same 26
+  lines on x86_64 and i386; filling a frame takes as long as before.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
