@@ -1339,6 +1339,8 @@ static BOOL d2d_curve_area(void)
     return enabled;
 }
 
+static BOOL d2d_fill_aa_notch_reach(void);
+
 static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
         struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc)
 {
@@ -1360,6 +1362,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
     new_cb.dst_scale_y = context->text_dst_scale_y;
     new_cb.dst_offset_y = context->text_dst_offset_y;
     new_cb.curve_area = d2d_curve_area();
+    new_cb.notch_reach = d2d_fill_aa_notch_reach();
     if (!d2d_brush_fill_cb(brush, &new_cb.colour_brush))
         WARN("Failed to initialize colour brush buffer.\n");
     if (!d2d_brush_fill_cb(opacity_brush, &new_cb.opacity_brush))
@@ -3798,11 +3801,12 @@ static void d2d_fill_aa_bridge(const struct d2d_fill *fill, struct d2d_fill_aa_c
  * chord or along a control edge, and the edges are lines only so far: the
  * model holds as long as both stay within an eighth of a pixel of their lines,
  * the reach of the notch, and beyond that the bound runs out as the plain one
- * does. Corners with an edge shorter than D2D_FILL_AA_NOTCH_MIN_EDGE pixels,
- * as the risers of an outline in steps of 1/64 to 1/8 pixel, or a turn of
- * less than D2D_FILL_AA_NOTCH_MIN_TURN degrees, as where two pieces of a
- * curve meet and the outline follows the curve rather than the tangent, keep
- * the plain bound. WINE_D2D_FILL_AA_NOTCHES=0 keeps it at every corner. */
+ * does. Corners with an edge that the outline follows for less than
+ * D2D_FILL_AA_NOTCH_MIN_EDGE pixels (d2d_fill_aa_notch_reach()), as the risers
+ * of an outline in steps of 1/64 to 1/8 pixel, or a turn of less than
+ * D2D_FILL_AA_NOTCH_MIN_TURN degrees, as where two pieces of a curve meet and
+ * the outline follows the curve rather than the tangent, keep the plain
+ * bound. WINE_D2D_FILL_AA_NOTCHES=0 keeps it at every corner. */
 #define D2D_FILL_AA_NOTCH_MIN_EDGE 0.15f
 #define D2D_FILL_AA_NOTCH_MIN_TURN 15.0
 
@@ -3813,6 +3817,12 @@ struct d2d_fill_aa_turn
      * pixels, the edges follow them. */
     D2D1_POINT_2F to[2], n[2];
     float len[2];
+    /* For d2d_fill_aa_notch_reach(): the length of each edge in pixels, the
+     * vertex its line heads for and the one before it on the outline, and
+     * whether the edge follows the line up to there. */
+    float edge[2];
+    UINT32 other[2], before[2];
+    BYTE whole[2];
     /* The number of boundary edges at the vertex, up to 3. */
     BYTE count;
     /* At a corner that points inward: the inward normals in pixels, as
@@ -3881,6 +3891,10 @@ static void d2d_fill_aa_turn_add(const struct d2d_fill *fill, struct d2d_fill_aa
             ex = m[0] * (pe->x - pv->x) + m[1] * (pe->y - pv->y);
             ey = m[3] * (pe->x - pv->x) + m[4] * (pe->y - pv->y);
             r = sqrt(ex * ex + ey * ey);
+            t->edge[t->count] = r;
+            t->other[t->count] = o;
+            t->before[t->count] = v;
+            t->whole[t->count] = 1;
             if (seam)
             {
                 double cx = m[0] * (to->x - pv->x) + m[1] * (to->y - pv->y);
@@ -3891,8 +3905,11 @@ static void d2d_fill_aa_turn_add(const struct d2d_fill *fill, struct d2d_fill_aa
                     h = lc > 0.0 ? fabs(cx * ey - cy * ex) / lc : 0.0;
                 else
                     h = 4.0 * fabs(seam->c2) * sqrt(fabs(pdet));
-                if (h > 0.0)
-                    r = min(r, 2.0 * lc * sqrt(1.0 / (8.0 * h)));
+                if (h > 0.0 && 2.0 * lc * sqrt(1.0 / (8.0 * h)) < r)
+                {
+                    r = 2.0 * lc * sqrt(1.0 / (8.0 * h));
+                    t->whole[t->count] = 0;
+                }
             }
             t->to[t->count] = *to;
             t->n[t->count] = nt;
@@ -3903,20 +3920,226 @@ static void d2d_fill_aa_turn_add(const struct d2d_fill *fill, struct d2d_fill_aa
     }
 }
 
+/* The notch at the size of a pixel.
+ *
+ * The two edges that meet in a corner say where the outline goes only as far
+ * as they are long. Where two figures of a path cross, the pieces their
+ * curves are cut into at the crossing are as short as it happens: an edge of
+ * 0.04 pixels at the tip of the notch between two overlapping dots of Minimal
+ * Audio Current's tap display, after which the outline goes on along the same
+ * curve. Such a corner fell under D2D_FILL_AA_NOTCH_MIN_EDGE and kept the
+ * plain bound: the faces drew the pixel above the tip at 167 of 255 for a
+ * coverage of 231, and only the skirts of the curve triangles that lie inside
+ * the fill there, which have no business in it, brought it to 229 (wine-dev
+ * issue 637).
+ *
+ * An edge shorter than D2D_FILL_AA_NOTCH_COARSE pixels gives no direction:
+ * the line of that side goes through the first vertex of the outline that
+ * lies at least that far from the corner. The reach of either side is then
+ * followed along the outline past the end of the edge, for as long as the
+ * outline stays within an eighth of a pixel of the line and goes on along it,
+ * a curve taken at its ends and halfway. A corner with a riser of an outline
+ * in steps still falls short of D2D_FILL_AA_NOTCH_MIN_EDGE: the outline leaves
+ * the line of the riser at its end. Taking the point of the outline at exactly
+ * D2D_FILL_AA_NOTCH_COARSE from the corner for the line, not the next vertex,
+ * was measured and made the frames worse by 356 in all over 634 pixels.
+ *
+ * Where the two lines then run back on each other with the fill on either
+ * side, the walls of a gap that is closed further on, the corner is a slit
+ * and counts as one that points inward: the test for that is the sign of next
+ * to nothing there. WINE_D2D_FILL_AA_NOTCH_REACH=0 leaves every corner with
+ * its own two edges, and the pixel shader with the notches as they were (see
+ * notch_union() and notch_edge() in shape_ps_code). */
+#define D2D_FILL_AA_NOTCH_COARSE 0.125
+#define D2D_FILL_AA_NOTCH_STEPS 12
+
+static BOOL d2d_fill_aa_notch_reach(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_NOTCH_REACH", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+/* Takes the line of side k of the corner v through the first vertex of the
+ * outline at least D2D_FILL_AA_NOTCH_COARSE pixels away, if the edge is
+ * shorter than that; see d2d_fill_aa_notch_reach(). */
+static void d2d_fill_aa_notch_coarse(const struct d2d_fill *fill, const struct d2d_fill_aa_outline *o,
+        struct d2d_fill_aa_turn *t, UINT32 v, unsigned int k, const double *m)
+{
+    const D2D1_POINT_2F *p = &fill->vertices[v], *q = NULL;
+    UINT32 prev = v, cur = t->other[k], next;
+    float hx, hy, hl, hand;
+    double qx, qy, r = 0.0;
+    unsigned int step;
+
+    if (!o->nb || !(t->edge[k] < D2D_FILL_AA_NOTCH_COARSE))
+        return;
+    for (step = 0; step < D2D_FILL_AA_NOTCH_STEPS; ++step)
+    {
+        if (!d2d_fill_aa_outline_other(o, cur, prev, &next) || next == v)
+            return;
+        prev = cur;
+        cur = next;
+        q = &fill->vertices[cur];
+        qx = m[0] * (q->x - p->x) + m[1] * (q->y - p->y);
+        qy = m[3] * (q->x - p->x) + m[4] * (q->y - p->y);
+        if ((r = sqrt(qx * qx + qy * qy)) >= D2D_FILL_AA_NOTCH_COARSE)
+            break;
+    }
+    if (step == D2D_FILL_AA_NOTCH_STEPS)
+        return;
+    /* The side of the line the fill lies on stays the same along the outline. */
+    hand = (t->to[k].x - p->x) * t->n[k].y - (t->to[k].y - p->y) * t->n[k].x;
+    hx = -(q->y - p->y);
+    hy = q->x - p->x;
+    if (!((hl = sqrtf(hx * hx + hy * hy)) > 0.0f))
+        return;
+    if (hand < 0.0f)
+        hl = -hl;
+    t->n[k].x = hx / hl;
+    t->n[k].y = hy / hl;
+    t->to[k] = *q;
+    t->before[k] = prev;
+    t->other[k] = cur;
+    t->whole[k] = 1;
+    t->len[k] = min(r, 1000.0);
+}
+
+/* How far the outline follows the line of side k of the corner v, in pixels:
+ * past the vertex the line heads for, for as long as the outline stays within
+ * an eighth of a pixel of the line and goes on along it; see
+ * d2d_fill_aa_notch_reach(). */
+static float d2d_fill_aa_notch_follow(const struct d2d_fill *fill, const struct d2d_fill_aa_outline *o,
+        const struct d2d_fill_aa_turn *t, UINT32 v, unsigned int k, const double *m)
+{
+    const D2D1_POINT_2F *p = &fill->vertices[v], *to = &t->to[k], *q;
+    double dx = m[0] * (to->x - p->x) + m[1] * (to->y - p->y), dy = m[3] * (to->x - p->x) + m[4] * (to->y - p->y);
+    double l = sqrt(dx * dx + dy * dy), qx, qy, s, d, s_prev, d_prev, reach = t->len[k];
+    UINT32 prev = t->before[k], cur = t->other[k], next;
+    unsigned int step;
+
+    if (!o->nb || !(l > 0.0))
+        return reach;
+    dx /= l;
+    dy /= l;
+    q = &fill->vertices[cur];
+    qx = m[0] * (q->x - p->x) + m[1] * (q->y - p->y);
+    qy = m[3] * (q->x - p->x) + m[4] * (q->y - p->y);
+    s_prev = qx * dx + qy * dy;
+    d_prev = fabs(qy * dx - qx * dy);
+    if (d_prev > 0.125 || !(s_prev > 0.0))
+        return reach;
+    reach = max(reach, s_prev);
+    for (step = 0; step < D2D_FILL_AA_NOTCH_STEPS; ++step)
+    {
+        UINT32 lo, hi, slot;
+        UINT64 key;
+
+        if (!d2d_fill_aa_outline_other(o, cur, prev, &next))
+            break;
+        lo = min(cur, next);
+        hi = max(cur, next);
+        key = ((UINT64)lo << 32) + hi + 1u;
+        slot = d2d_fill_aa_edge_slot(key, o->map_size);
+        while (o->edge_keys[slot] && o->edge_keys[slot] != key)
+            slot = d2d_fill_aa_next_slot(slot, o->map_size);
+        if (!o->edge_keys[slot])
+            break;
+        if (o->edge_curve[slot])
+        {
+            /* The curve between the two, halfway. */
+            const D2D1_POINT_2F *c0 = &fill->vertices[cur], *c2 = &fill->vertices[next], *c1;
+            D2D1_POINT_2F mid;
+
+            if (o->seams[slot].start == ~0u || !o->seams[slot].chord)
+                break;
+            c1 = &o->seams[slot].control;
+            mid.x = 0.25f * c0->x + 0.5f * c1->x + 0.25f * c2->x;
+            mid.y = 0.25f * c0->y + 0.5f * c1->y + 0.25f * c2->y;
+            qx = m[0] * (mid.x - p->x) + m[1] * (mid.y - p->y);
+            qy = m[3] * (mid.x - p->x) + m[4] * (mid.y - p->y);
+            s = qx * dx + qy * dy;
+            d = fabs(qy * dx - qx * dy);
+            if (!(s > s_prev))
+                break;
+            if (d > 0.125)
+            {
+                reach = max(reach, s_prev + (s - s_prev) * (0.125 - d_prev) / (d - d_prev));
+                break;
+            }
+            reach = max(reach, s);
+            s_prev = s;
+            d_prev = d;
+        }
+        q = &fill->vertices[next];
+        qx = m[0] * (q->x - p->x) + m[1] * (q->y - p->y);
+        qy = m[3] * (q->x - p->x) + m[4] * (q->y - p->y);
+        s = qx * dx + qy * dy;
+        d = fabs(qy * dx - qx * dy);
+        if (!(s > s_prev))
+            break;
+        if (d > 0.125)
+        {
+            reach = max(reach, s_prev + (s - s_prev) * (0.125 - d_prev) / (d - d_prev));
+            break;
+        }
+        reach = max(reach, s);
+        s_prev = s;
+        d_prev = d;
+        prev = cur;
+        cur = next;
+    }
+    return min(reach, 1000.0);
+}
+
 /* Sets the angles and the reach of the notch at vertex v, if the outline
- * points inward there; see d2d_fill_aa_notches(). m is the pixel transform. */
-static void d2d_fill_aa_notch(const struct d2d_fill *fill, struct d2d_fill_aa_turn *t, UINT32 v, const double *m)
+ * points inward there; see d2d_fill_aa_notches(). m is the pixel transform,
+ * o the outline for d2d_fill_aa_notch_reach(). */
+static void d2d_fill_aa_notch(const struct d2d_fill *fill, struct d2d_fill_aa_turn *t, UINT32 v, const double *m,
+        const struct d2d_fill_aa_outline *o)
 {
     const D2D1_POINT_2F *p = &fill->vertices[v];
+    BOOL reach = d2d_fill_aa_notch_reach(), slit = FALSE;
     float angle[2];
     unsigned int k;
 
     if (t->count != 2)
         return;
+    if (reach && (t->edge[0] < D2D_FILL_AA_NOTCH_COARSE || t->edge[1] < D2D_FILL_AA_NOTCH_COARSE))
+    {
+        /* The corner as its own two edges have it. */
+        BOOL fine = t->n[1].x * (p->x - t->to[0].x) + t->n[1].y * (p->y - t->to[0].y) < 0.0f
+                && t->n[0].x * (p->x - t->to[1].x) + t->n[0].y * (p->y - t->to[1].y) < 0.0f;
+        float d0x, d0y, d1x, d1y, l0, l1;
+
+        for (k = 0; k < 2; ++k)
+            d2d_fill_aa_notch_coarse(fill, o, t, v, k, m);
+        d0x = t->to[0].x - p->x;
+        d0y = t->to[0].y - p->y;
+        d1x = t->to[1].x - p->x;
+        d1y = t->to[1].y - p->y;
+        l0 = sqrtf(d0x * d0x + d0y * d0y);
+        l1 = sqrtf(d1x * d1x + d1y * d1y);
+        /* A slit: within three degrees of each other, the fill on either side. */
+        slit = fine && l0 > 0.0f && l1 > 0.0f && d0x * d1x + d0y * d1y > 0.0f
+                && fabsf(d0x * d1y - d0y * d1x) < 0.05f * l0 * l1
+                && t->n[0].x * t->n[1].x + t->n[0].y * t->n[1].y < 0.0f;
+    }
     /* The corner points inward where neither line reaches on along the other edge. */
-    if (!(t->n[1].x * (p->x - t->to[0].x) + t->n[1].y * (p->y - t->to[0].y) < 0.0f)
-            || !(t->n[0].x * (p->x - t->to[1].x) + t->n[0].y * (p->y - t->to[1].y) < 0.0f))
+    if (!slit && (!(t->n[1].x * (p->x - t->to[0].x) + t->n[1].y * (p->y - t->to[0].y) < 0.0f)
+            || !(t->n[0].x * (p->x - t->to[1].x) + t->n[0].y * (p->y - t->to[1].y) < 0.0f)))
         return;
+    if (reach)
+    {
+        for (k = 0; k < 2; ++k)
+        {
+            if (t->whole[k])
+                t->len[k] = d2d_fill_aa_notch_follow(fill, o, t, v, k, m);
+        }
+    }
     if (min(t->len[0], t->len[1]) < D2D_FILL_AA_NOTCH_MIN_EDGE)
         return;
     for (k = 0; k < 2; ++k)
@@ -5588,7 +5811,7 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
     for (i = 0; turns && i < fill->vertex_count; ++i)
     {
         if (on_outline[i])
-            d2d_fill_aa_notch(fill, &turns[i], i, pm);
+            d2d_fill_aa_notch(fill, &turns[i], i, pm, &outline);
     }
 
     /* Pass 2: build inner triangle vertices with edge weights. */
@@ -13605,6 +13828,7 @@ static const char shape_ps_code[] =
     "float dst_scale_y;\n"
     "float dst_offset_y;\n"
     "bool curve_area;\n"
+    "bool notch_reach;\n"
     "struct brush\n"
     "{\n"
     "    uint type;\n"
@@ -13886,7 +14110,16 @@ static const char shape_ps_code[] =
     " * line, u1 * u2 at a right angle and max(u1 + u2 - 1, 0) where they run\n"
     " * back on each other, blended by the angle between the normals. The edges\n"
     " * follow their lines for r pixels from the corner; beyond that the bound\n"
-    " * runs out as the plain corner bound does. */\n"
+    " * runs out as the plain corner bound does.\n"
+    " *\n"
+    " * At a notch narrower than a right angle the skirt of either edge reaches\n"
+    " * over the fill behind the other. The skirt carries the half plane of its\n"
+    " * own edge and is blended over the face there, so a face that drew the\n"
+    " * union under it came out too bright: 226 of 255 for a coverage of 191\n"
+    " * beside the tip of the notch between two figures of Minimal Audio\n"
+    " * Current's tap display. Under the skirt of an edge, outside its half plane\n"
+    " * u and on its side of the corner, the face takes 1 - (1 - union) / u,\n"
+    " * which the blend with the skirt makes the union (wine-dev issue 637). */\n"
     "float notch_union(float2 c, float code, out float r)\n"
     "{\n"
     "    uint k = asuint(code) - 0x40000000u, q = k >> 24;\n"
@@ -13895,12 +14128,29 @@ static const char shape_ps_code[] =
     "    r = q < 32u ? (float)q * 0.125f : 4.0f + (float)(q - 32u) * 0.5f;\n"
     "    float2 n1 = float2(cos(a1), sin(a1)), n2 = float2(cos(a2), sin(a2));\n"
     "    float u1 = 1.0f - edge_coverage(dot(c, n1), n1), u2 = 1.0f - edge_coverage(dot(c, n2), n2);\n"
-    "    float prod = u1 * u2, t;\n"
+    "    float prod = u1 * u2, t, un;\n"
     "\n"
     "    t = acos(clamp(dot(n1, n2), -1.0f, 1.0f)) * (2.0f / 3.14159265f);\n"
     "    if (t <= 1.0f)\n"
-    "        return 1.0f - lerp(min(u1, u2), prod, t);\n"
-    "    return 1.0f - lerp(prod, max(u1 + u2 - 1.0f, 0.0f), t - 1.0f);\n"
+    "        un = 1.0f - lerp(min(u1, u2), prod, t);\n"
+    "    else\n"
+    "        un = 1.0f - lerp(prod, max(u1 + u2 - 1.0f, 0.0f), t - 1.0f);\n"
+    "    if (notch_reach)\n"
+    "    {\n"
+    "        /* Along each edge, away from the corner: on the outer side of the other line. */\n"
+    "        float2 d1 = float2(-n1.y, n1.x), d2 = float2(-n2.y, n2.x);\n"
+    "        float s1 = dot(c, n1), s2 = dot(c, n2);\n"
+    "\n"
+    "        if (dot(d1, n2) > 0.0f)\n"
+    "            d1 = -d1;\n"
+    "        if (dot(d2, n1) > 0.0f)\n"
+    "            d2 = -d2;\n"
+    "        if (s1 < 0.0f && s1 > -0.75f && s2 >= 0.0f && dot(c, d1) > 0.0f)\n"
+    "            return 1.0f - (1.0f - un) / max(u1, 0.001f);\n"
+    "        if (s2 < 0.0f && s2 > -0.75f && s1 >= 0.0f && dot(c, d2) > 0.0f)\n"
+    "            return 1.0f - (1.0f - un) / max(u2, 0.001f);\n"
+    "    }\n"
+    "    return un;\n"
     "}\n"
     "\n"
     "float notch_coverage(float2 c, float code)\n"
@@ -14175,27 +14425,42 @@ static const char shape_ps_code[] =
     "                if (i.corner_on.z > 1.5f)\n"
     "                    bound2 = notch_coverage(c2, i.corner_on.z);\n"
     "                /* A straight outline edge of the face (seam_c1 of -1) that ends\n"
-    "                 * at a notch. */\n"
-    "                if (i.seam_c1.x < -0.5f)\n"
+    "                 * at a notch. With notch_reach a seam the face ramps towards\n"
+    "                 * (seam_c2 other than 0) gives way likewise, and so does the\n"
+    "                 * plain bound of the other end of either: both stand for the\n"
+    "                 * same outline, which the notch ends. */\n"
+    "                if (i.seam_c1.x < -0.5f || (notch_reach && i.seam_c2.x != 0.0f))\n"
     "                {\n"
     "                    if (i.corner_on.z > 1.5f)\n"
     "                        ea = notch_edge(ea, c2, c1, i.corner_on.z);\n"
     "                    if (i.corner_on.y > 1.5f)\n"
     "                        ea = notch_edge(ea, c1, c2, i.corner_on.y);\n"
+    "                    if (notch_reach && i.corner_on.z > 1.5f && i.corner_on.y < 1.5f)\n"
+    "                        bound1 = notch_edge(bound1, c2, c1, i.corner_on.z);\n"
+    "                    if (notch_reach && i.corner_on.y > 1.5f && i.corner_on.z < 1.5f)\n"
+    "                        bound2 = notch_edge(bound2, c1, c2, i.corner_on.y);\n"
     "                }\n"
-    "                if (i.seam_c1.y < -0.5f)\n"
+    "                if (i.seam_c1.y < -0.5f || (notch_reach && i.seam_c2.y != 0.0f))\n"
     "                {\n"
     "                    if (i.corner_on.x > 1.5f)\n"
     "                        eb = notch_edge(eb, c0, c2, i.corner_on.x);\n"
     "                    if (i.corner_on.z > 1.5f)\n"
     "                        eb = notch_edge(eb, c2, c0, i.corner_on.z);\n"
+    "                    if (notch_reach && i.corner_on.x > 1.5f && i.corner_on.z < 1.5f)\n"
+    "                        bound2 = notch_edge(bound2, c0, c2, i.corner_on.x);\n"
+    "                    if (notch_reach && i.corner_on.z > 1.5f && i.corner_on.x < 1.5f)\n"
+    "                        bound0 = notch_edge(bound0, c2, c0, i.corner_on.z);\n"
     "                }\n"
-    "                if (i.seam_c1.z < -0.5f)\n"
+    "                if (i.seam_c1.z < -0.5f || (notch_reach && i.seam_c2.z != 0.0f))\n"
     "                {\n"
     "                    if (i.corner_on.y > 1.5f)\n"
     "                        ec = notch_edge(ec, c1, c0, i.corner_on.y);\n"
     "                    if (i.corner_on.x > 1.5f)\n"
     "                        ec = notch_edge(ec, c0, c1, i.corner_on.x);\n"
+    "                    if (notch_reach && i.corner_on.y > 1.5f && i.corner_on.x < 1.5f)\n"
+    "                        bound0 = notch_edge(bound0, c1, c0, i.corner_on.y);\n"
+    "                    if (notch_reach && i.corner_on.x > 1.5f && i.corner_on.y < 1.5f)\n"
+    "                        bound1 = notch_edge(bound1, c0, c1, i.corner_on.x);\n"
     "                }\n"
     "                fa = min(min(ea, min(eb, ec)), min(bound0, min(bound1, bound2)));\n"
     "            }\n"

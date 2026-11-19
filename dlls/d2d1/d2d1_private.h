@@ -235,7 +235,11 @@ struct d2d_ps_cb
     /* Whether the fill antialiasing takes the area a curve leaves of the half
      * plane at its tangent; see curve_shift() in shape_ps_code. */
     BOOL curve_area;
-    unsigned int pad[2];
+    /* Whether a notch of the fill outline is taken at the size of a pixel and
+     * the seams and bounds of a face give way to it; see
+     * d2d_fill_aa_notch_reach() and notch_union() in shape_ps_code. */
+    BOOL notch_reach;
+    unsigned int pad;
     struct d2d_brush_cb colour_brush;
     struct d2d_brush_cb opacity_brush;
 };
