@@ -3951,6 +3951,555 @@ static BOOL d2d_fill_aa_notch_edges(void)
     return enabled;
 }
 
+/* Hairline gaps between two outline edges.
+ *
+ * Two figures of a path that stand a hundredth of a pixel apart leave a slot
+ * in the outline of their union. Each side was antialiased as an edge of its
+ * own, the face on one side ramping down towards its wall and the skirt of the
+ * other wall reaching over it, and the two partial coverages a and b were
+ * blended to a + b - ab where the path covers a + b: 190 of 255 for a coverage
+ * of 253 between a bar and the figure beside it in Minimal Audio Current's tap
+ * display (wine-dev issue 639).
+ *
+ * Straight outline edges that face each other across a gap narrower than
+ * D2D_FILL_AA_GAP_WIDTH pixels for at least D2D_FILL_AA_GAP_MIN_LENGTH pixels
+ * are found on a grid of one pixel, and the mesh is built again with the gap
+ * zipped: at each end of it the two walls meet in one vertex. A wall that
+ * goes on is split at the vertex the other one ends at, both are split at a
+ * new vertex halfway where neither ends, and where both end at a vertex of
+ * their own a triangle closes the gap. The walls become interior edges, and
+ * the rest of the antialiasing runs on the new mesh as on any other.
+ *
+ * A closed gap adds its width to every pixel along it, while the blend is far
+ * off only near its middle: closing gaps of up to 1/16 pixel made the pixels
+ * of twelve captured frames of the tap display farther from their coverage
+ * by 23,456 in all for 26,482 closer, of up to 1/64 pixel by 4,287 for
+ * 25,286; the gaps of the tap display are 0.007 and 0.014 pixels wide. Vertices
+ * of the mesh are never merged: one of them may be a corner of a curve
+ * triangle, and d2d_fill_aa_mark_thin() then gives up on the whole path. A
+ * shorter gap is left open: splitting a wall a fraction of a pixel before its
+ * end takes its half plane (d2d_fill_aa_face_planes()) from the faces at that
+ * end. WINE_D2D_FILL_AA_GAPS=0 leaves all gaps open. */
+#define D2D_FILL_AA_GAP_WIDTH (1.0 / 64.0)
+#define D2D_FILL_AA_GAP_MIN_LENGTH 0.25
+#define D2D_FILL_AA_GAP_SNAP (1.0 / 64.0)
+
+static BOOL d2d_fill_aa_gaps(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_GAPS", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+struct d2d_fill_aa_gap_edge
+{
+    /* The face, the index of its vertex opposite the edge, the edge from a to
+     * b, a in pixels, the direction and the normal towards the side without
+     * fill, and the length in pixels. */
+    UINT32 face, e, a, b;
+    double p[2], d[2], n[2], len;
+    /* The cells of the grid it comes near, none if cx1 is below cx0. */
+    INT64 cx0, cx1, cy0, cy1;
+};
+
+struct d2d_fill_aa_gap_cell
+{
+    UINT32 edge, next;
+};
+
+struct d2d_fill_aa_gap_bucket
+{
+    UINT64 key;
+    UINT32 first;
+};
+
+struct d2d_fill_aa_gap_split
+{
+    UINT32 edge, v;
+    double t;
+};
+
+struct d2d_fill_aa_gap_merge
+{
+    UINT32 from, to;
+};
+
+struct d2d_fill_aa_gap
+{
+    /* The two walls, and the ends of the gap along each, in pixels from a;
+     * where both walls end at a vertex, those vertices. */
+    UINT32 e1, e2;
+    double t1[2], t2[2];
+    UINT32 v1[2], v2[2];
+};
+
+static int __cdecl d2d_fill_aa_gap_split_cmp(const void *a, const void *b)
+{
+    const struct d2d_fill_aa_gap_split *x = a, *y = b;
+
+    if (x->edge != y->edge)
+        return x->edge < y->edge ? -1 : 1;
+    return x->t < y->t ? -1 : x->t > y->t;
+}
+
+/* Narrows [*lo, *hi] to where v0 + (v1 - v0) * lambda lies in [lower, upper]. */
+static BOOL d2d_fill_aa_gap_clip(double v0, double v1, double lower, double upper, double *lo, double *hi)
+{
+    double dv = v1 - v0, x, y;
+
+    if (fabs(dv) < 1.0e-12)
+        return v0 >= lower && v0 <= upper && *lo <= *hi;
+    x = (lower - v0) / dv;
+    y = (upper - v0) / dv;
+    if (x > y)
+    {
+        double t = x;
+        x = y;
+        y = t;
+    }
+    *lo = max(*lo, x);
+    *hi = min(*hi, y);
+    return *lo <= *hi;
+}
+
+/* Whether e2 faces e1 across a gap no wider than D2D_FILL_AA_GAP_WIDTH, and where. */
+static BOOL d2d_fill_aa_gap_pair(const struct d2d_fill_aa_gap_edge *e1, const struct d2d_fill_aa_gap_edge *e2,
+        struct d2d_fill_aa_gap *gap)
+{
+    double lo = 0.0, hi = 1.0, qx, qy, t0, t1, s0, s1;
+
+    if (!(e1->n[0] * e2->n[0] + e1->n[1] * e2->n[1] < -0.99))
+        return FALSE;
+    if (e1->a == e2->a || e1->a == e2->b || e1->b == e2->a || e1->b == e2->b)
+        return FALSE;
+    qx = e2->p[0] + e2->d[0] * e2->len;
+    qy = e2->p[1] + e2->d[1] * e2->len;
+    t0 = (e2->p[0] - e1->p[0]) * e1->d[0] + (e2->p[1] - e1->p[1]) * e1->d[1];
+    t1 = (qx - e1->p[0]) * e1->d[0] + (qy - e1->p[1]) * e1->d[1];
+    s0 = (e2->p[0] - e1->p[0]) * e1->n[0] + (e2->p[1] - e1->p[1]) * e1->n[1];
+    s1 = (qx - e1->p[0]) * e1->n[0] + (qy - e1->p[1]) * e1->n[1];
+    if (!d2d_fill_aa_gap_clip(t0, t1, 0.0, e1->len, &lo, &hi) || !d2d_fill_aa_gap_clip(s0, s1, -1.0e-6, D2D_FILL_AA_GAP_WIDTH, &lo, &hi))
+        return FALSE;
+    if ((hi - lo) * e2->len < D2D_FILL_AA_GAP_MIN_LENGTH)
+        return FALSE;
+    gap->t1[0] = t0 + (t1 - t0) * lo;
+    gap->t1[1] = t0 + (t1 - t0) * hi;
+    gap->t2[0] = lo * e2->len;
+    gap->t2[1] = hi * e2->len;
+    return TRUE;
+}
+
+/* Builds in out a copy of the mesh of fill with its hairline gaps zipped; see
+ * above. Returns FALSE if there is none or it cannot be built. The edge map
+ * is that of fill, and face_slots holds the slots of the three edges of each
+ * face in it. m is the pixel transform. On
+ * success *replaced marks the faces of fill that out no longer has and *added
+ * the faces of out that fill does not have; the caller frees them and
+ * out->vertices and out->faces. */
+static BOOL d2d_fill_aa_close_gaps(const struct d2d_fill *fill, const BYTE *edge_cnt,
+        const BYTE *edge_curve, const UINT32 *face_slots, const double *m, struct d2d_fill *out,
+        BYTE **replaced, BYTE **added)
+{
+    size_t edge_count = 0, cell_count, table_size, gap_count = 0, gaps_size = 0, split_count, i, k, l;
+    struct d2d_fill_aa_gap_bucket *table = NULL;
+    struct d2d_fill_aa_gap_merge *merges = NULL;
+    double width = D2D_FILL_AA_GAP_WIDTH;
+    size_t merge_count, edges_size = 0;
+    UINT32 *parent = NULL;
+    struct d2d_fill_aa_gap_split *splits = NULL;
+    struct d2d_fill_aa_gap_edge *edges = NULL;
+    struct d2d_fill_aa_gap_cell *cells = NULL;
+    struct d2d_fill_aa_gap *gaps = NULL;
+    D2D1_POINT_2F *vertices = NULL;
+    struct d2d_face *faces = NULL;
+    BYTE *was = NULL, *is_new = NULL;
+    size_t vertex_count, face_count, faces_size;
+    BOOL ret = FALSE;
+
+    /* The straight outline edges long enough to face another one along a gap,
+     * in the order of their faces. */
+    for (i = 0; i < fill->face_count; ++i)
+    {
+        const struct d2d_face *f = &fill->faces[i];
+        unsigned int e;
+
+        for (e = 0; e < 3; ++e)
+        {
+            UINT32 slot = face_slots[3 * i + e];
+            const D2D1_POINT_2F *pa, *pb, *po;
+            struct d2d_fill_aa_gap_edge *g;
+            double qx, qy, ox, oy;
+
+            if (edge_cnt[slot] != 1 || edge_curve[slot])
+                continue;
+            pa = &fill->vertices[f->v[(e + 1) % 3]];
+            pb = &fill->vertices[f->v[(e + 2) % 3]];
+            if (!d2d_array_reserve((void **)&edges, &edges_size, edge_count + 1, sizeof(*edges)))
+                goto done;
+            g = &edges[edge_count];
+            g->p[0] = m[0] * pa->x + m[1] * pa->y + m[2];
+            g->p[1] = m[3] * pa->x + m[4] * pa->y + m[5];
+            qx = m[0] * pb->x + m[1] * pb->y + m[2];
+            qy = m[3] * pb->x + m[4] * pb->y + m[5];
+            if (!((g->len = sqrt((qx - g->p[0]) * (qx - g->p[0]) + (qy - g->p[1]) * (qy - g->p[1])))
+                    >= D2D_FILL_AA_GAP_MIN_LENGTH))
+                continue;
+            po = &fill->vertices[f->v[e]];
+            g->face = i;
+            g->e = e;
+            g->a = f->v[(e + 1) % 3];
+            g->b = f->v[(e + 2) % 3];
+            ox = m[0] * po->x + m[1] * po->y + m[2];
+            oy = m[3] * po->x + m[4] * po->y + m[5];
+            g->d[0] = (qx - g->p[0]) / g->len;
+            g->d[1] = (qy - g->p[1]) / g->len;
+            g->n[0] = -g->d[1];
+            g->n[1] = g->d[0];
+            if ((ox - g->p[0]) * g->n[0] + (oy - g->p[1]) * g->n[1] > 0.0)
+            {
+                g->n[0] = -g->n[0];
+                g->n[1] = -g->n[1];
+            }
+            ++edge_count;
+        }
+    }
+    if (edge_count < 2)
+        goto done;
+
+    /* The edges by the cells of a grid of one pixel they come near, in a hash
+     * table of the cells. */
+    for (i = 0, cell_count = 0; i < edge_count; ++i)
+    {
+        struct d2d_fill_aa_gap_edge *g = &edges[i];
+        double qx = g->p[0] + g->d[0] * g->len, qy = g->p[1] + g->d[1] * g->len;
+
+        g->cx0 = (INT64)floor(min(g->p[0], qx) - width);
+        g->cx1 = (INT64)floor(max(g->p[0], qx) + width);
+        g->cy0 = (INT64)floor(min(g->p[1], qy) - width);
+        g->cy1 = (INT64)floor(max(g->p[1], qy) + width);
+        if ((g->cx1 - g->cx0 + 1) * (g->cy1 - g->cy0 + 1) > 4096)
+            g->cx1 = g->cx0 - 1;
+        else
+            cell_count += (g->cx1 - g->cx0 + 1) * (g->cy1 - g->cy0 + 1);
+    }
+    for (table_size = 16; table_size < 2 * cell_count; table_size <<= 1);
+    if (!(cells = malloc(cell_count * sizeof(*cells))) || !(table = malloc(table_size * sizeof(*table))))
+        goto done;
+    for (i = 0; i < table_size; ++i)
+        table[i].first = ~0u;
+    for (i = 0, k = 0; i < edge_count; ++i)
+    {
+        const struct d2d_fill_aa_gap_edge *g = &edges[i];
+        INT64 cx, cy;
+
+        for (cx = g->cx0; cx <= g->cx1; ++cx)
+        {
+            for (cy = g->cy0; cy <= g->cy1; ++cy)
+            {
+                UINT64 key = ((UINT64)(UINT32)cx << 32) | (UINT32)cy;
+                size_t slot = (size_t)((key * 0x9e3779b97f4a7c15ull) >> 32) & (table_size - 1);
+
+                while (table[slot].first != ~0u && table[slot].key != key)
+                    slot = (slot + 1) & (table_size - 1);
+                table[slot].key = key;
+                cells[k].edge = i;
+                cells[k].next = table[slot].first;
+                table[slot].first = k++;
+            }
+        }
+    }
+
+    for (i = 0; i < table_size; ++i)
+    {
+        UINT32 x, y;
+
+        for (x = table[i].first; x != ~0u; x = cells[x].next)
+        {
+            for (y = cells[x].next; y != ~0u; y = cells[y].next)
+            {
+                UINT32 n1 = min(cells[x].edge, cells[y].edge), n2 = max(cells[x].edge, cells[y].edge);
+                const struct d2d_fill_aa_gap_edge *g1 = &edges[n1], *g2 = &edges[n2];
+                INT64 cx = max(g1->cx0, g2->cx0), cy = max(g1->cy0, g2->cy0);
+
+                /* Each pair once, in the first cell both come near. */
+                if ((((UINT64)(UINT32)cx << 32) | (UINT32)cy) != table[i].key)
+                    continue;
+                if (!d2d_array_reserve((void **)&gaps, &gaps_size, gap_count + 1, sizeof(*gaps)))
+                    goto done;
+                if (d2d_fill_aa_gap_pair(g1, g2, &gaps[gap_count]))
+                {
+                    gaps[gap_count].e1 = n1;
+                    gaps[gap_count].e2 = n2;
+                    ++gap_count;
+                }
+            }
+        }
+    }
+    if (!gap_count)
+        goto done;
+
+    /* The ends of each gap: the two walls meet in one vertex there. Where a
+     * wall ends at a vertex the other one is split at it; where both end, a
+     * triangle closes the gap below; where neither does, a new vertex halfway
+     * between them splits both. */
+    if (!(splits = malloc(gap_count * 4 * sizeof(*splits))) || !(merges = malloc(gap_count * 2 * sizeof(*merges)))
+            || !(vertices = malloc((fill->vertex_count + 2 * gap_count + 4 * gap_count) * sizeof(*vertices))))
+        goto done;
+    memcpy(vertices, fill->vertices, fill->vertex_count * sizeof(*vertices));
+    vertex_count = fill->vertex_count;
+    for (i = 0, split_count = 0, merge_count = 0; i < gap_count; ++i)
+    {
+        const struct d2d_fill_aa_gap_edge *g1 = &edges[gaps[i].e1], *g2 = &edges[gaps[i].e2];
+
+        for (k = 0; k < 2; ++k)
+        {
+            double t1 = gaps[i].t1[k], t2 = gaps[i].t2[k];
+            UINT32 v1 = t1 <= D2D_FILL_AA_GAP_SNAP ? g1->a : t1 >= g1->len - D2D_FILL_AA_GAP_SNAP ? g1->b : ~0u;
+            UINT32 v2 = t2 <= D2D_FILL_AA_GAP_SNAP ? g2->a : t2 >= g2->len - D2D_FILL_AA_GAP_SNAP ? g2->b : ~0u;
+
+            gaps[i].v1[k] = gaps[i].v2[k] = ~0u;
+            if (v1 != ~0u && v2 != ~0u)
+            {
+                /* Both walls end here: a triangle closes the gap at this end. Merging the two vertices instead
+                 * took a corner of a curve triangle out of the mesh, and d2d_fill_aa_mark_thin() gave up. */
+                gaps[i].v1[k] = v1;
+                gaps[i].v2[k] = v2;
+            }
+            else if (v2 != ~0u)
+            {
+                splits[split_count].edge = gaps[i].e1;
+                splits[split_count].t = t1;
+                splits[split_count++].v = v2;
+            }
+            else if (v1 != ~0u)
+            {
+                splits[split_count].edge = gaps[i].e2;
+                splits[split_count].t = t2;
+                splits[split_count++].v = v1;
+            }
+            else
+            {
+                const D2D1_POINT_2F *a1 = &fill->vertices[g1->a], *b1 = &fill->vertices[g1->b];
+                const D2D1_POINT_2F *a2 = &fill->vertices[g2->a], *b2 = &fill->vertices[g2->b];
+                float r1 = t1 / g1->len, r2 = t2 / g2->len;
+
+                vertices[vertex_count].x = 0.5f * (a1->x + (b1->x - a1->x) * r1 + a2->x + (b2->x - a2->x) * r2);
+                vertices[vertex_count].y = 0.5f * (a1->y + (b1->y - a1->y) * r1 + a2->y + (b2->y - a2->y) * r2);
+                splits[split_count].edge = gaps[i].e1;
+                splits[split_count].t = t1;
+                splits[split_count++].v = vertex_count;
+                splits[split_count].edge = gaps[i].e2;
+                splits[split_count].t = t2;
+                splits[split_count++].v = vertex_count;
+                ++vertex_count;
+            }
+        }
+    }
+    qsort(splits, split_count, sizeof(*splits), d2d_fill_aa_gap_split_cmp);
+    /* Two splits of one wall at the same place are one vertex, if one of them
+     * is new; two vertices of the mesh stay apart. */
+    for (i = 1; i < split_count; ++i)
+    {
+        UINT32 a = splits[i - 1].v, b = splits[i].v;
+
+        if (splits[i].edge != splits[i - 1].edge || splits[i].t - splits[i - 1].t > D2D_FILL_AA_GAP_SNAP
+                || a == b || (a < fill->vertex_count && b < fill->vertex_count))
+            continue;
+        if (merge_count == gap_count * 2)
+            goto done;
+        merges[merge_count].from = b >= fill->vertex_count ? b : a;
+        merges[merge_count++].to = b >= fill->vertex_count ? a : b;
+        splits[i].v = splits[i - 1].v = merges[merge_count - 1].to;
+    }
+
+    /* The faces with a split wall as a fan. */
+    faces_size = fill->face_count + 2 * split_count + 2 * gap_count + 16;
+    if (!(faces = malloc(faces_size * sizeof(*faces))) || !(is_new = calloc(faces_size, sizeof(*is_new)))
+            || !(was = calloc(fill->face_count, sizeof(*was))))
+        goto done;
+    face_count = 0;
+    for (i = 0, k = 0; i < fill->face_count; ++i)
+    {
+        const struct d2d_face *f = &fill->faces[i];
+        UINT32 poly[3 + 64], on_edge[3] = {0};
+        size_t n = 0, first;
+        unsigned int e, c;
+
+        while (k < split_count && edges[splits[k].edge].face < i)
+            ++k;
+        first = k;
+        for (l = first; l < split_count && edges[splits[l].edge].face == i; ++l)
+            ++on_edge[edges[splits[l].edge].e];
+        if (!on_edge[0] && !on_edge[1] && !on_edge[2])
+        {
+            faces[face_count++] = *f;
+            continue;
+        }
+        /* The polygon v[0], the points on edge 2 (v[0] to v[1]), v[1], those on edge 0, v[2], those on edge 1;
+         * the splits of an edge run from its a, which is the vertex before them. */
+        for (c = 0; c < 3; ++c)
+        {
+            e = (c + 2) % 3;
+            poly[n++] = f->v[c];
+            for (l = first; l < split_count && edges[splits[l].edge].face == i; ++l)
+            {
+                if (edges[splits[l].edge].e != e || poly[n - 1] == splits[l].v || n >= ARRAY_SIZE(poly) - 1)
+                    continue;
+                poly[n++] = splits[l].v;
+            }
+        }
+        if (face_count + n + 1 > faces_size)
+            goto done;
+        was[i] = 1;
+        if ((on_edge[0] != 0) + (on_edge[1] != 0) + (on_edge[2] != 0) == 1)
+        {
+            /* A fan from the vertex opposite the split edge. */
+            for (e = 0; e < 3 && !on_edge[e]; ++e);
+            for (c = 0; c < n && poly[c] != f->v[e]; ++c);
+            for (l = 1; l + 1 < n; ++l)
+            {
+                faces[face_count].v[0] = f->v[e];
+                faces[face_count].v[1] = poly[(c + l) % n];
+                faces[face_count].v[2] = poly[(c + l + 1) % n];
+                is_new[face_count++] = 1;
+            }
+        }
+        else
+        {
+            /* A fan from the centroid. */
+            vertices[vertex_count].x = (fill->vertices[f->v[0]].x + fill->vertices[f->v[1]].x
+                    + fill->vertices[f->v[2]].x) / 3.0f;
+            vertices[vertex_count].y = (fill->vertices[f->v[0]].y + fill->vertices[f->v[1]].y
+                    + fill->vertices[f->v[2]].y) / 3.0f;
+            for (l = 0; l < n; ++l)
+            {
+                faces[face_count].v[0] = vertex_count;
+                faces[face_count].v[1] = poly[l];
+                faces[face_count].v[2] = poly[(l + 1) % n];
+                is_new[face_count++] = 1;
+            }
+            ++vertex_count;
+        }
+    }
+
+    /* The gaps that end at a vertex of both walls: a triangle there, two where
+     * both ends do; the walls meet in a vertex at an end otherwise. */
+    for (i = 0; i < gap_count; ++i)
+    {
+        UINT32 c[4];
+        size_t m = 0;
+
+        if (gaps[i].v1[0] == ~0u && gaps[i].v1[1] == ~0u)
+            continue;
+        for (k = 0; k < 2; ++k)
+        {
+            UINT32 shared;
+
+            if (gaps[i].v1[k] != ~0u)
+            {
+                c[m++] = k ? gaps[i].v1[k] : gaps[i].v2[k];
+                c[m++] = k ? gaps[i].v2[k] : gaps[i].v1[k];
+                continue;
+            }
+            /* The vertex both walls are split at. */
+            shared = ~0u;
+            for (l = 0; l < split_count; ++l)
+            {
+                if (splits[l].edge == gaps[i].e1 && fabs(splits[l].t - gaps[i].t1[k]) <= D2D_FILL_AA_GAP_SNAP)
+                    shared = splits[l].v;
+            }
+            if (shared == ~0u)
+                break;
+            c[m++] = shared;
+        }
+        if (k < 2 || face_count + 2 > faces_size)
+            continue;
+        is_new[face_count] = is_new[face_count + 1] = 1;
+        /* c holds the end at lambda 0 (wall 2 then wall 1) and the end at lambda 1 (wall 1 then wall 2). */
+        if (m == 3)
+        {
+            faces[face_count].v[0] = c[0];
+            faces[face_count].v[1] = c[1];
+            faces[face_count].v[2] = c[2];
+            ++face_count;
+        }
+        else if (m == 4)
+        {
+            faces[face_count].v[0] = c[0];
+            faces[face_count].v[1] = c[1];
+            faces[face_count].v[2] = c[2];
+            ++face_count;
+            faces[face_count].v[0] = c[0];
+            faces[face_count].v[1] = c[2];
+            faces[face_count].v[2] = c[3];
+            ++face_count;
+        }
+    }
+
+    /* The new vertices two splits of a wall share, and the faces that collapse with them. */
+    if (!(parent = malloc(vertex_count * sizeof(*parent))))
+        goto done;
+    for (i = 0; i < vertex_count; ++i)
+        parent[i] = i;
+    for (i = 0; i < merge_count; ++i)
+    {
+        UINT32 x = merges[i].from, y = merges[i].to;
+
+        while (parent[x] != x)
+            x = parent[x];
+        while (parent[y] != y)
+            y = parent[y];
+        if (x != y)
+            parent[x] = y;
+    }
+    for (i = 0, k = 0; i < face_count; ++i)
+    {
+        struct d2d_face f = faces[i];
+        unsigned int c;
+
+        for (c = 0; c < 3; ++c)
+        {
+            while (parent[f.v[c]] != f.v[c])
+                f.v[c] = parent[f.v[c]];
+        }
+        if (f.v[0] == f.v[1] || f.v[1] == f.v[2] || f.v[0] == f.v[2])
+            continue;
+        is_new[k] = is_new[i];
+        faces[k++] = f;
+    }
+    face_count = k;
+
+    *out = *fill;
+    out->vertices = vertices;
+    out->vertex_count = vertex_count;
+    out->faces = faces;
+    out->face_count = face_count;
+    out->faces_size = faces_size;
+    *replaced = was;
+    *added = is_new;
+    vertices = NULL;
+    faces = NULL;
+    was = is_new = NULL;
+    ret = TRUE;
+
+done:
+    free(edges);
+    free(cells);
+    free(table);
+    free(gaps);
+    free(splits);
+    free(merges);
+    free(parent);
+    free(vertices);
+    free(faces);
+    free(was);
+    free(is_new);
+    return ret;
+}
+
 /* Builds the antialiased fill mesh of a geometry under the current transform:
  * the vertex array the D2D_SHAPE_TYPE_FILL_AA shaders take. Returns FALSE when
  * the fill has nothing to antialias or the mesh cannot be built; the plain
@@ -3958,10 +4507,11 @@ static BOOL d2d_fill_aa_notch_edges(void)
  * every curve triangle of the fill, the Béziers before the arcs, whether the
  * mesh draws its area and it is not to be drawn; see d2d_fill_aa_thin(). The
  * caller frees *out and *curve_skip. */
-static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_target,
-        const struct d2d_geometry *geometry, const struct d2d_fill *fill,
+static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, const struct d2d_fill *fill, struct d2d_fill *closed,
         struct d2d_fill_aa_vertex **out, size_t *out_count, BYTE **curve_skip)
 {
+    UINT32 *face_slots = NULL;
     size_t curve_count = (fill->bezier_vertex_count + fill->arc_vertex_count) / 3;
     UINT32 *curve_ends = NULL;
     struct d2d_fill_aa_outline outline = {0};
@@ -4004,6 +4554,9 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     }
     for (i = 0; i < map_size; ++i)
         seams[i].start = ~0u;
+    /* The slots of the edges of each face; see d2d_fill_aa_close_gaps(). */
+    if (d2d_fill_aa_gaps())
+        face_slots = malloc(fc * 3 * sizeof(*face_slots));
 
     /* Pass 1: count edge occurrences via open-addressing hash. */
     for (i = 0; i < fc; i++)
@@ -4024,11 +4577,14 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
             }
             if (probe == map_size)
             {
+                free(face_slots);
                 free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
                 return FALSE;
             }
             edge_keys[slot] = key;
             edge_cnt[slot]++;
+            if (face_slots)
+                face_slots[3 * i + e] = slot;
         }
     }
 
@@ -4042,8 +4598,66 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     if (curve_count && !d2d_fill_aa_mark_curve_edges(fill, edge_keys, edge_curve, seams, map_size, m, curve_ends))
     {
         free(curve_ends);
+        free(face_slots);
         free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
         return FALSE;
+    }
+
+    /* The hairline gaps. The mesh goes on with them zipped: the edges of the
+     * faces that were split leave the edge map and those of the new faces
+     * join it. The curve seams stay as they were, only straight outline edges
+     * are split and no vertex of the mesh goes. */
+    if (face_slots)
+    {
+        BYTE *replaced, *added;
+        BOOL ok = TRUE;
+        size_t j;
+
+        d2d_device_context_get_pixel_transform(render_target, &geometry->transform, pm);
+        if (fabs(pm[0] * pm[4] - pm[1] * pm[3]) > 1.0e-12 && d2d_fill_aa_close_gaps(fill, edge_cnt,
+                edge_curve, face_slots, pm, closed, &replaced, &added))
+        {
+            for (i = 0; i < fc + closed->face_count && ok; ++i)
+            {
+                const struct d2d_face *f = i < fc ? &fill->faces[i] : &closed->faces[i - fc];
+                int e;
+
+                if (i < fc ? !replaced[i] : !added[i - fc])
+                    continue;
+                for (e = 0; e < 3; ++e)
+                {
+                    UINT32 a = f->v[(e + 1) % 3], b_v = f->v[(e + 2) % 3];
+                    UINT32 lo = a < b_v ? a : b_v, hi = a < b_v ? b_v : a;
+                    UINT64 key = ((UINT64)lo << 32) + hi + 1u;
+                    UINT32 slot = d2d_fill_aa_edge_slot(key, map_size);
+
+                    for (j = 0; j < map_size && edge_keys[slot] && edge_keys[slot] != key; ++j)
+                        slot = d2d_fill_aa_next_slot(slot, map_size);
+                    if (j == map_size)
+                    {
+                        ok = FALSE;
+                        break;
+                    }
+                    edge_keys[slot] = key;
+                    if (i < fc)
+                        --edge_cnt[slot];
+                    else
+                        ++edge_cnt[slot];
+                }
+            }
+            free(replaced);
+            free(added);
+            if (!ok)
+            {
+                free(curve_ends);
+                free(face_slots);
+                free(edge_keys); free(edge_cnt); free(edge_processed); free(edge_curve); free(seams);
+                return FALSE;
+            }
+            fill = closed;
+            fc = fill->face_count;
+        }
+        free(face_slots);
     }
 
     /* Count the boundary edges that get a skirt, i.e. everything but the seams,
@@ -4674,6 +5288,18 @@ static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_
     return TRUE;
 }
 
+static BOOL d2d_device_context_fill_aa_expand(struct d2d_device_context *render_target,
+        const struct d2d_geometry *geometry, const struct d2d_fill *fill,
+        struct d2d_fill_aa_vertex **out, size_t *out_count, BYTE **curve_skip)
+{
+    struct d2d_fill closed = {0};
+    BOOL ret;
+
+    ret = d2d_device_context_fill_aa_expand_mesh(render_target, geometry, fill, &closed, out, out_count, curve_skip);
+    free(closed.vertices);
+    free(closed.faces);
+    return ret;
+}
 
 static BOOL d2d_device_context_fill_triangles_aa(struct d2d_device_context *render_target,
         const struct d2d_geometry *geometry, const struct d2d_fill *fill,
