@@ -2105,6 +2105,26 @@ This is the recommended branch. What it changes, by subsystem:
   fills of the curve test images are as close or closer to the area coverage and to the
   rendering of Windows 10. The d2d1 tests fail at the same 26 lines on x86_64 and i386, and
   filling the 32 paths of a frame takes 25.0 ms at best for 25.1 with the switch off.
+- **d2d1**: a pixel that two walls of the outline share gets what they cover together. The
+  primitives of a fill are blended one over the other; where two figures of a path stand less
+  than a pixel apart, or along the two sides of a slot, the fill covers the sum of what lies
+  behind each wall, and the blend of the two coverages lacks their product: 175 of 255 for a
+  coverage of 228 in the gap between a bar and the rounded top of the figure beside it in
+  Minimal Audio Current's tap display (issue 641), where 1,882 of the 2,811 pixels more than 16
+  too dark in twelve captured frames were of this kind. Such a pixel now gets a third primitive,
+  a quad that carries the two coverages and what the fill covers; the pixel shader gives it the
+  coverage that brings the three to the fill, for the opacity of the brush. The walls are the
+  straight outline edges and the Bézier curve triangles on the outline; a pixel centre inside
+  both walls, a third wall across the two, arcs and corners that point outward are left as they
+  are. `WINE_D2D_FILL_AA_SHARED=0` switches the quads off. Over every pixel of the 384 paths of
+  the frames 1,361 are more than 16 too dark for 2,811 and 453 more than 32 for 1,164; of the
+  4,363 pixels that change the sum of the errors is 22,996 for 70,106, and 14 are more than 16
+  farther. Glyphs of DejaVu Sans 496 for 1,054 (6 to 13 pixels) and 896 for 1,805 (11 to 24
+  pixels); with a brush of opacity 0.5 the frames 10,079 for 16,644. Shapes, rounded rectangles,
+  small arcs, polygons and the curve test images do not change. The d2d1 tests fail at the same
+  26 lines on x86_64 and i386. Filling the 32 paths of a frame of the tap display, with about
+  17,600 walls, takes 26.3 to 26.8 ms at best for 24.9 to 25.0 with the switch off, and 30.5 to
+  30.8 ms for 27.2 to 27.6 on average.
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
