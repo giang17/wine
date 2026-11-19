@@ -2167,6 +2167,44 @@ This is the recommended branch. What it changes, by subsystem:
   change. With both entries the d2d1 tests fail at the same 26 lines on x86_64 and i386, and
   filling the 32 paths of a frame takes 27.8 ms at best of twenty runs for 27.5 with both
   switches off (medians 29.2 and 28.7; an earlier series 27.4 for 26.8).
+- **d2d1**: a half plane that a face of the fill mesh takes from an outline edge at one of its
+  corners gives way at the notch the outline leaves it at. The outline is followed along the
+  line of such a half plane for as far as the face reaches, and a pixel reaches half a pixel
+  beyond the face that holds its centre: where the outline left the line right there, at a
+  corner that points inward, fill lies beyond the line and the half plane darkened it, 173 of
+  255 for a coverage of 201 beside the notch between two overlapping figures of Minimal Audio
+  Current's tap display. Of the 414 pixels of twelve captured frames that the half planes left
+  farther from their coverage than the faces without them, 220 lay within three quarters of a
+  pixel of such a corner, by 3,385 of 3,991 in all (issue 640). The outline is now followed on
+  for half a pixel past the end of the face, to the vertex after which it leaves the half plane
+  or runs back along the line; if that vertex is a notch, the weight of the half plane carries
+  its place and its code, and the pixel shader takes the union of the half plane, cut by the
+  edge of the notch that runs along it, and the half plane of the edge the outline leaves along,
+  up to a quarter of a pixel from the vertex and fading out over the next eighth. That edge is
+  taken as the secant over half a pixel of the outline, since the curves of two round figures
+  that cross fall back from their tangents (with the tangent 150 pixels end up farther by 996 in
+  all, with the secant 118 by 741). `WINE_D2D_FILL_AA_PLANE_NOTCHES=0` switches it off. Twelve
+  captured frames: 329 pixels change, the sum of their errors is 3,069 for 5,533, 90 are more
+  than 16 closer and 8 farther; over every pixel 1,004 are more than 16 too dark for 1,112 and
+  235 more than 32 for 285, 4,838 more than 16 too bright for 4,810. Against the faces without
+  half planes 306 pixels are farther now, by 1,325 in all, and 5 of them by more than 16 for 90.
+  At 150 % 337 pixels, 2,484 for 6,766, 109 more than 16 closer and none farther. With a brush
+  of opacity 0.5 324 pixels, 2,829 for 2,958. Glyphs of DejaVu Sans change in 9 pixels of 810
+  renderings (115 for 150), the corpus of dented outlines in 2 (25 for 27), 80 paths of
+  overlapping round figures in 12 (118 for 105). Shapes, single figures, polygons, pills, small
+  arcs and the curve test images do not change. A half plane has room for one notch: where the
+  outline leaves it past either end of the face, the nearer one is taken. The d2d1 tests fail at
+  the same 26 lines on x86_64 and i386.
+- **d2d1**: a face of the fill mesh that holds no pixel centre gets no half planes. Such a face
+  yields no fragment, so its weights are never read, and where the figures of a path overlap
+  most faces are such slivers: 74,553 of the first 100,000 faces of a frame of Minimal Audio
+  Current's tap display that were to be given half planes. Finding the half planes, with the
+  walks along the outline, is most of what they cost. A pixel centre within 1/64 pixel of a face
+  counts as inside; `WINE_D2D_FILL_AA_FACE_PIXELS=0` gives every face its half planes. Every
+  rendering of the sets of the entry before is bit for bit the same with and without. Filling
+  the 32 paths of a frame takes 26.8 ms at best of sixteen runs for 27.7, and with the entry
+  before, whose walks past the end of the face cost 0.8 to 1.2 ms without this one, 27.0 ms at
+  best of twenty for 27.5 with both switches off (medians 28.6 and 28.7).
 - **d2d1**: the degenerate paths that failed `ID2D1GeometrySink::Close()` with `E_FAIL` close as
   on Windows. Of a million random closed paths on a 6x6 integer grid 152 failed and lost their
   figures, of 120,000 paths with float coordinates a few ULPs apart or below `FLT_MIN` 6,278;
