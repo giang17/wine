@@ -668,6 +668,11 @@ static ULONG STDMETHODCALLTYPE d2d_device_context_inner_Release(IUnknown *iface)
             if (context->scratch_ib[i].buffer)
                 ID3D11Buffer_Release(context->scratch_ib[i].buffer);
         }
+        free(context->fill_aa_walls);
+        free(context->fill_aa_mask);
+        free(context->fill_aa_cells);
+        free(context->fill_aa_owners);
+        free(context->fill_aa_seen);
         free(context->line_batch.vertices);
         free(context->line_batch.faces);
         free(context->line_batch.runs);
@@ -2096,6 +2101,9 @@ struct d2d_fill_aa_seam
     BOOL chord;
     /* Of a chord: where the tangents at its two ends meet. */
     D2D1_POINT_2F control;
+    /* The curve triangle, among the Béziers or the arcs. */
+    UINT32 curve;
+    BOOL arc;
 };
 
 static float d2d_fill_aa_line_distance(const D2D1_POINT_2F *p, const D2D1_POINT_2F *a, const D2D1_POINT_2F *b)
@@ -2359,6 +2367,8 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                         float ratio = c ? 0.41421356f : 0.5f;
                         float sag = ratio * d2d_fill_aa_line_distance(p1, p0, p2);
 
+                        seams[slot].curve = i / 3;
+                        seams[slot].arc = c;
                         seams[slot].start = idx[0];
                         seams[slot].c1 = 4.0f * sag;
                         seams[slot].c2 = -4.0f * sag;
@@ -2367,6 +2377,8 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                     }
                     else if (curves[c][i].texcoord.sign > 0.0f && !c && b == 1)
                     {
+                        seams[slot].curve = i / 3;
+                        seams[slot].arc = c;
                         seams[slot].start = idx[0];
                         seams[slot].c1 = 0.0f;
                         seams[slot].c2 = 0.25f * d2d_fill_aa_line_distance(p2, p0, p1);
@@ -2374,6 +2386,8 @@ static BOOL d2d_fill_aa_mark_curve_edges(const struct d2d_fill *fill,
                     }
                     else if (curves[c][i].texcoord.sign > 0.0f && !c && a == 1)
                     {
+                        seams[slot].curve = i / 3;
+                        seams[slot].arc = c;
                         seams[slot].start = idx[2];
                         seams[slot].c1 = 0.0f;
                         seams[slot].c2 = 0.25f * d2d_fill_aa_line_distance(p0, p1, p2);
@@ -4534,6 +4548,674 @@ done:
     return ret;
 }
 
+/* Pixels that two walls of the outline share.
+ *
+ * The primitives of a fill are blended one over the other. Where two walls
+ * of the outline reach the same pixel from two sides - two figures of a path
+ * that stand less than a pixel apart, or the two sides of a slot - the fill
+ * covers the sum of what lies behind each, a + b, and the blend of the two
+ * coverages is a + b - a b: 175 of 255 for a coverage of 228 in the gap
+ * between a bar and the rounded top of the figure beside it in Minimal Audio
+ * Current's tap display (wine-dev issue 641). Of the 2,811 pixels more than
+ * 16 too dark in twelve captured frames, 1,882 held figures that lie apart in
+ * the pixel, and in 1,731 of those the rendering was within 8 of the blend.
+ *
+ * Such a pixel gets a third primitive, a quad over the pixel that carries a,
+ * b and what the fill covers of it: with the coverage c for which
+ * (1 - a)(1 - b)(1 - c) is what the fill leaves uncovered the three blend to
+ * the fill, in whatever order they are drawn and without a change to the
+ * other two. The pixel shader works c out, for the opacity of the brush: a
+ * translucent fill lacks less.
+ *
+ * The walls are the straight outline edges and the Bézier curve triangles on
+ * the outline (d2d_fill_aa_wall_add()). What each covers of a pixel is
+ * worked out as the pixel shader does for the primitives of that wall
+ * (d2d_fill_aa_wall_coverage()), for the pixel centres between its ends
+ * only: beyond them the skirts and the wedges of its corners draw, not the
+ * wall. Two walls count where their inward normals are more than a quarter
+ * turn apart; what they cover together is as in notch_union() of
+ * shape_ps_code, the sum for walls that face each other and the blend at a
+ * right angle. A pixel centre inside both, a third wall across the two, and
+ * arcs are left as they are, and so are two walls that meet in a corner
+ * pointing outward, where the fill is what the two have in common: the pixel
+ * beyond the tip of a triangle came out at 96 of 255 where it is 17 without
+ * the quad. Where the two walls meet in a
+ * corner and the pixel centre lies inside a straight one, the face there
+ * takes the notch itself up to half a pixel from the corner (notch_edge()).
+ * WINE_D2D_FILL_AA_SHARED=0 switches the quads off. */
+static BOOL d2d_fill_aa_shared(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_FILL_AA_SHARED", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
+struct d2d_fill_aa_wall
+{
+    BOOL curve;
+    /* A straight edge: start, unit direction, length and inward unit normal, in pixels. */
+    double p[2], d[2], len, n[2];
+    /* A curve triangle: u and v as affine functions of the pixel position, and the filled side. */
+    double gu[2], u0, gv[2], v0, side;
+    UINT32 v[2];
+    int x0, x1, y0, y1;
+    /* Of a straight edge: the larger and the smaller component of its normal. */
+    double ec, es;
+    /* The sixteenths of a turn its inward normal points into, and those five
+     * to eleven sixteenths from them. */
+    UINT16 sectors, opposed;
+    /* The corners in pixels, and whether the rest above was worked out from
+     * them yet; see d2d_fill_aa_wall_prepare(). */
+    double q[3][2];
+    const struct d2d_curve_vertex *bz;
+    BOOL ready;
+    /* The vertices v in pixels. */
+    double vq[2][2];
+};
+
+/* floor() for values that fit an int, without the call. */
+static inline int d2d_fill_aa_floor(double x)
+{
+    int i = (int)x;
+
+    return i - (i > x);
+}
+
+/* The sixteenth of a turn the direction (x, y) lies in. */
+static unsigned int d2d_fill_aa_sector(double x, double y)
+{
+    double a = fabs(x), b = fabs(y);
+    unsigned int q = b > a ? (a > 0.41421356 * b ? 2 : 3) : (b > 0.41421356 * a ? 1 : 0);
+
+    if (x >= 0.0)
+        return y >= 0.0 ? q : 15 - q;
+    return y >= 0.0 ? 7 - q : 8 + q;
+}
+
+struct d2d_fill_aa_walls
+{
+    struct d2d_fill_aa_wall *walls;
+    size_t count, size;
+    BYTE *seen;
+    /* The pixels the walls reach. */
+    int x0, x1, y0, y1;
+};
+
+/* As edge_coverage() in shape_ps_code. */
+static double d2d_fill_aa_edge_coverage(double d, double nx, double ny)
+{
+    double a = fabs(nx), b = fabs(ny), c = max(a, b), s = min(a, b), l = sqrt(a * a + b * b), inner, outer, t;
+
+    if (l < 1.0e-6)
+    {
+        c = 1.0;
+        s = 0.0;
+    }
+    else
+    {
+        c /= l;
+        s /= l;
+    }
+    inner = 0.5 * (c - s);
+    outer = 0.5 * (c + s);
+    if (fabs(d) <= inner)
+        return 0.5 + d / c;
+    t = outer - fabs(d);
+    if (t <= 0.0)
+        return d > 0.0 ? 1.0 : 0.0;
+    t = t * t / max(2.0 * c * s, 1.0e-6);
+    return d > 0.0 ? 1.0 - t : t;
+}
+
+/* As curve_shift() in shape_ps_code, for a parameter range of 0 to 1. */
+static double d2d_fill_aa_curve_shift(double p0, double dp, double q, double g, double nx, double ny)
+{
+    double l = max(sqrt(nx * nx + ny * ny), 0.0001), len = l / max(max(fabs(nx), fabs(ny)), 0.0001);
+    double w = 0.5 * fabs(dp) * len, a = max(p0 - w, 0.0) - p0, b = min(p0 + w, 1.0) - p0, r;
+
+    if (b <= a)
+        return 0.0;
+    r = q * (b * b * b - a * a * a) / (3.0 * max(g * fabs(dp) * len, 0.000001));
+    return max(-0.25, min(0.25, r));
+}
+
+/* What wall covers of the pixel centred on (x, y), as the pixel shader draws
+ * it, with the inward unit normal there. FALSE if the centre lies beyond the
+ * ends of the wall. */
+static BOOL d2d_fill_aa_wall_coverage(const struct d2d_fill_aa_wall *wall, double x, double y, BOOL curve_area,
+        double *coverage, double *dist, double *n)
+{
+    if (!wall->curve)
+    {
+        double t = (x - wall->p[0]) * wall->d[0] + (y - wall->p[1]) * wall->d[1];
+        double d = (x - wall->p[0]) * wall->n[0] + (y - wall->p[1]) * wall->n[1], r;
+
+        if (t < 0.0 || t >= wall->len)
+            return FALSE;
+        /* As d2d_fill_aa_edge_coverage(), for a unit normal. */
+        r = 0.5 * (wall->ec + wall->es) - fabs(d);
+        if (r <= 0.0)
+            return FALSE;
+        if (fabs(d) <= 0.5 * (wall->ec - wall->es))
+            *coverage = 0.5 + d / wall->ec;
+        else
+        {
+            r = r * r / max(2.0 * wall->ec * wall->es, 1.0e-6);
+            *coverage = d > 0.0 ? 1.0 - r : r;
+        }
+        *dist = d;
+        n[0] = wall->n[0];
+        n[1] = wall->n[1];
+        return TRUE;
+    }
+    else
+    {
+        double u = wall->gu[0] * x + wall->gu[1] * y + wall->u0, v = wall->gv[0] * x + wall->gv[1] * y + wall->v0;
+        double f = u * u - v, df[2], g, d;
+
+        if (u < 0.0 || u >= 1.0)
+            return FALSE;
+        df[0] = 2.0 * u * wall->gu[0] - wall->gv[0];
+        df[1] = 2.0 * u * wall->gu[1] - wall->gv[1];
+        g = max(sqrt(df[0] * df[0] + df[1] * df[1]), 0.0001);
+        if (curve_area)
+        {
+            double hn = (wall->gu[0] * df[0] + wall->gu[1] * df[1]) / g;
+            double ht = (wall->gu[0] * -df[1] + wall->gu[1] * df[0]) / g;
+            double disc;
+
+            hn = 2.0 * hn * hn;
+            disc = g * g - 2.0 * hn * f;
+            d = wall->side * ((disc > 0.0 ? 2.0 * f / (g + sqrt(disc)) : f / g)
+                    + d2d_fill_aa_curve_shift(u, ht, 1.0, g, df[0], df[1]));
+        }
+        else
+        {
+            d = wall->side * f / g;
+        }
+        *dist = d;
+        n[0] = wall->side * df[0] / g;
+        n[1] = wall->side * df[1] / g;
+        *coverage = d2d_fill_aa_edge_coverage(d, df[0], df[1]);
+        return TRUE;
+    }
+}
+
+struct d2d_fill_aa_shared_pixel
+{
+    int x, y;
+    /* What each of the two walls covers of the pixel, and what the fill covers. */
+    float a, b, both;
+};
+
+struct d2d_fill_aa_owner
+{
+    UINT32 wall, next;
+};
+
+/* Whether wall can cover a part of the pixel centred on (x, y): the centre lies
+ * between its ends and within 0.75 pixels of it, by the first-order distance for a curve. */
+static BOOL d2d_fill_aa_wall_reaches(const struct d2d_fill_aa_wall *wall, double x, double y)
+{
+    if (!wall->curve)
+    {
+        double t = (x - wall->p[0]) * wall->d[0] + (y - wall->p[1]) * wall->d[1];
+
+        return t >= 0.0 && t < wall->len
+                && fabs((x - wall->p[0]) * wall->n[0] + (y - wall->p[1]) * wall->n[1]) < 0.5 * (wall->ec + wall->es);
+    }
+    else
+    {
+        double u = wall->gu[0] * x + wall->gu[1] * y + wall->u0, f, dx, dy;
+
+        if (u < 0.0 || u >= 1.0)
+            return FALSE;
+        f = u * u - (wall->gv[0] * x + wall->gv[1] * y + wall->v0);
+        dx = 2.0 * u * wall->gu[0] - wall->gv[0];
+        dy = 2.0 * u * wall->gu[1] - wall->gv[1];
+        return f * f < 0.5625 * (dx * dx + dy * dy);
+    }
+}
+
+struct d2d_fill_aa_shared_cell
+{
+    /* 0 for an empty slot. */
+    UINT64 key;
+    UINT32 first, count;
+};
+
+static UINT64 d2d_fill_aa_shared_key(int x, int y)
+{
+    return (((UINT64)(UINT32)x << 32) | (UINT32)y) + 1;
+}
+
+static size_t d2d_fill_aa_shared_slot(const struct d2d_fill_aa_shared_cell *table, size_t size, UINT64 key)
+{
+    size_t slot = (size_t)((key * 0x9e3779b97f4a7c15ull) >> 32) & (size - 1);
+
+    while (table[slot].key && table[slot].key != key)
+        slot = (slot + 1) & (size - 1);
+    return slot;
+}
+
+/* Adds the outline edge from a to b of a face with the third corner opp to
+ * the walls: the edge itself, or the curve of the seam it is. Only what the
+ * search for walls that face each other needs is worked out here. */
+static void d2d_fill_aa_wall_add(struct d2d_fill_aa_walls *list, const struct d2d_fill *fill, UINT32 a, UINT32 b,
+        UINT32 opp, const struct d2d_fill_aa_seam *seam, const BYTE *curve_skip, const double *pm)
+{
+    double lx0, lx1, ly0, ly1;
+    struct d2d_fill_aa_wall *w;
+    unsigned int k, bits;
+
+    if (list->count >= list->size)
+        return;
+    w = &list->walls[list->count];
+    w->ready = FALSE;
+    if (!seam)
+    {
+        const D2D1_POINT_2F *pa = &fill->vertices[a], *pb = &fill->vertices[b], *po = &fill->vertices[opp];
+        double ox, oy;
+
+        w->q[0][0] = pm[0] * pa->x + pm[1] * pa->y + pm[2];
+        w->q[0][1] = pm[3] * pa->x + pm[4] * pa->y + pm[5];
+        w->q[1][0] = pm[0] * pb->x + pm[1] * pb->y + pm[2];
+        w->q[1][1] = pm[3] * pb->x + pm[4] * pb->y + pm[5];
+        ox = pm[0] * po->x + pm[1] * po->y + pm[2];
+        oy = pm[3] * po->x + pm[4] * po->y + pm[5];
+        w->curve = FALSE;
+        /* The inward normal, of the length of the edge. */
+        w->n[0] = -(w->q[1][1] - w->q[0][1]);
+        w->n[1] = w->q[1][0] - w->q[0][0];
+        if ((ox - w->q[0][0]) * w->n[0] + (oy - w->q[0][1]) * w->n[1] < 0.0)
+        {
+            w->n[0] = -w->n[0];
+            w->n[1] = -w->n[1];
+        }
+        w->v[0] = a;
+        w->v[1] = b;
+        w->vq[0][0] = w->q[0][0];
+        w->vq[0][1] = w->q[0][1];
+        w->vq[1][0] = w->q[1][0];
+        w->vq[1][1] = w->q[1][1];
+        w->sectors = 1u << d2d_fill_aa_sector(w->n[0], w->n[1]);
+        lx0 = min(w->q[0][0], w->q[1][0]);
+        lx1 = max(w->q[0][0], w->q[1][0]);
+        ly0 = min(w->q[0][1], w->q[1][1]);
+        ly1 = max(w->q[0][1], w->q[1][1]);
+    }
+    else
+    {
+        double in[2], t[2];
+        unsigned int c;
+
+        if (seam->start == ~0u || seam->arc || seam->curve >= fill->bezier_vertex_count / 3
+                || list->seen[seam->curve] || (curve_skip && curve_skip[seam->curve]))
+            return;
+        list->seen[seam->curve] = 1;
+        w->bz = &fill->bezier_vertices[3 * seam->curve];
+        for (c = 0; c < 3; ++c)
+        {
+            w->q[c][0] = pm[0] * w->bz[c].position.x + pm[1] * w->bz[c].position.y + pm[2];
+            w->q[c][1] = pm[3] * w->bz[c].position.x + pm[4] * w->bz[c].position.y + pm[5];
+        }
+        w->curve = TRUE;
+        w->side = w->bz[0].texcoord.sign < 0.0f ? -1.0 : 1.0;
+        /* The ends of the curve as vertices of the mesh: those of the chord, or the start of a control edge. */
+        w->v[0] = seam->chord ? a : seam->start;
+        w->v[1] = seam->chord ? b : ~0u;
+        for (c = 0; c < 2; ++c)
+        {
+            const D2D1_POINT_2F *pv = &fill->vertices[w->v[c] == ~0u ? w->v[0] : w->v[c]];
+
+            w->vq[c][0] = pm[0] * pv->x + pm[1] * pv->y + pm[2];
+            w->vq[c][1] = pm[3] * pv->x + pm[4] * pv->y + pm[5];
+        }
+        /* The fill lies on the far side of the chord from the control point
+         * where side is negative, on its side otherwise; the normals at the
+         * two ends and in the middle are those of the control edges and the chord. */
+        in[0] = w->side * (w->q[1][0] - 0.5 * (w->q[0][0] + w->q[2][0]));
+        in[1] = w->side * (w->q[1][1] - 0.5 * (w->q[0][1] + w->q[2][1]));
+        w->sectors = 0;
+        for (c = 0; c < 3; ++c)
+        {
+            unsigned int from = c == 2 ? 1 : 0, to = c ? 2 : 1;
+
+            t[0] = -(w->q[to][1] - w->q[from][1]);
+            t[1] = w->q[to][0] - w->q[from][0];
+            if (t[0] * in[0] + t[1] * in[1] < 0.0)
+            {
+                t[0] = -t[0];
+                t[1] = -t[1];
+            }
+            w->sectors |= 1u << d2d_fill_aa_sector(t[0], t[1]);
+        }
+        lx0 = min(w->q[0][0], min(w->q[1][0], w->q[2][0]));
+        lx1 = max(w->q[0][0], max(w->q[1][0], w->q[2][0]));
+        ly0 = min(w->q[0][1], min(w->q[1][1], w->q[2][1]));
+        ly1 = max(w->q[0][1], max(w->q[1][1], w->q[2][1]));
+    }
+    if (!(lx0 > -1.0e6 && lx1 < 1.0e6 && ly0 > -1.0e6 && ly1 < 1.0e6))
+        return;
+    w->opposed = 0;
+    for (bits = w->sectors, k = 0; bits; bits >>= 1, ++k)
+    {
+        if (bits & 1)
+            w->opposed |= (0x0fe0u << k | 0x0fe0u >> (16 - k)) & 0xffffu;
+    }
+    /* The pixels whose centre lies within 0.75 pixels of the wall. */
+    w->x0 = d2d_fill_aa_floor(lx0 - 0.75 - 0.5) + 1;
+    w->x1 = d2d_fill_aa_floor(lx1 + 0.75 - 0.5);
+    w->y0 = d2d_fill_aa_floor(ly0 - 0.75 - 0.5) + 1;
+    w->y1 = d2d_fill_aa_floor(ly1 + 0.75 - 0.5);
+    list->x0 = min(list->x0, w->x0);
+    list->x1 = max(list->x1, w->x1);
+    list->y0 = min(list->y0, w->y0);
+    list->y1 = max(list->y1, w->y1);
+    ++list->count;
+}
+
+/* The rest of a wall that d2d_fill_aa_wall_add() left out. FALSE for one that has none. */
+static BOOL d2d_fill_aa_wall_prepare(struct d2d_fill_aa_wall *w)
+{
+    w->ready = TRUE;
+    if (!w->curve)
+    {
+        w->p[0] = w->q[0][0];
+        w->p[1] = w->q[0][1];
+        w->len = sqrt(w->n[0] * w->n[0] + w->n[1] * w->n[1]);
+        if (!(w->len > 1.0e-6))
+        {
+            w->len = 0.0;
+            return FALSE;
+        }
+        w->d[0] = (w->q[1][0] - w->q[0][0]) / w->len;
+        w->d[1] = (w->q[1][1] - w->q[0][1]) / w->len;
+        w->n[0] /= w->len;
+        w->n[1] /= w->len;
+        w->ec = max(fabs(w->n[0]), fabs(w->n[1]));
+        w->es = min(fabs(w->n[0]), fabs(w->n[1]));
+    }
+    else
+    {
+        const double (*q)[2] = w->q;
+        double det = (q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1]);
+        double u[3], v[3];
+        unsigned int c;
+
+        if (!(fabs(det) > 1.0e-12))
+        {
+            /* No pixel centre lies between its ends. */
+            w->gu[0] = w->gu[1] = 0.0;
+            w->u0 = -1.0;
+            return FALSE;
+        }
+        det = 1.0 / det;
+        for (c = 0; c < 3; ++c)
+        {
+            u[c] = w->bz[c].texcoord.u;
+            v[c] = w->bz[c].texcoord.v;
+        }
+        w->gu[0] = ((u[1] - u[0]) * (q[2][1] - q[0][1]) - (u[2] - u[0]) * (q[1][1] - q[0][1])) * det;
+        w->gu[1] = ((u[2] - u[0]) * (q[1][0] - q[0][0]) - (u[1] - u[0]) * (q[2][0] - q[0][0])) * det;
+        w->u0 = u[0] - w->gu[0] * q[0][0] - w->gu[1] * q[0][1];
+        w->gv[0] = ((v[1] - v[0]) * (q[2][1] - q[0][1]) - (v[2] - v[0]) * (q[1][1] - q[0][1])) * det;
+        w->gv[1] = ((v[2] - v[0]) * (q[1][0] - q[0][0]) - (v[1] - v[0]) * (q[2][0] - q[0][0])) * det;
+        w->v0 = v[0] - w->gv[0] * q[0][0] - w->gv[1] * q[0][1];
+    }
+    return TRUE;
+}
+
+/* Whether the two walls meet in a corner that points outward: they share a
+ * vertex, and the far end of one lies on the inner side of the other, n being
+ * its inward normal. The fill is what the two have in common there, not what
+ * they cover together. */
+static BOOL d2d_fill_aa_walls_convex(const struct d2d_fill_aa_wall *wa, const struct d2d_fill_aa_wall *wb,
+        const double *n)
+{
+    unsigned int o, k;
+
+    for (o = 0; o < 2; ++o)
+    {
+        for (k = 0; k < 2; ++k)
+        {
+            const double *far = wb->q[wb->curve ? 2 : 1], *corner = wa->vq[o];
+            double d0, d1;
+
+            if (wa->v[o] == ~0u || wa->v[o] != wb->v[k])
+                continue;
+            /* The end of wb that is not the corner. */
+            d0 = (wb->q[0][0] - corner[0]) * (wb->q[0][0] - corner[0]) + (wb->q[0][1] - corner[1]) * (wb->q[0][1] - corner[1]);
+            d1 = (far[0] - corner[0]) * (far[0] - corner[0]) + (far[1] - corner[1]) * (far[1] - corner[1]);
+            if (d0 > d1)
+                far = wb->q[0];
+            if ((far[0] - corner[0]) * n[0] + (far[1] - corner[1]) * n[1] > 0.02)
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* The pixels that two of the walls share, with what each covers of them and
+ * what the fill does; see d2d_fill_aa_shared(). */
+static void d2d_fill_aa_shared_pixels(struct d2d_device_context *context, const struct d2d_fill_aa_walls *list,
+        struct d2d_fill_aa_shared_pixel **pixels, size_t *pixel_count, size_t *pixels_size)
+{
+    size_t owner_count = 0, owners_size, table_size, cell_count = 0, wall_count = list->count, i, k;
+    struct d2d_fill_aa_wall *walls = list->walls, *w;
+    struct d2d_fill_aa_shared_cell *table;
+    struct d2d_fill_aa_owner *owners;
+    BOOL curve_area = d2d_curve_area();
+    UINT16 *mask = NULL;
+    INT64 gw, gh;
+    int x, y;
+
+    if (wall_count < 2)
+        return;
+    /* The table of the pixels and the walls in each are kept between fills, the
+     * table a power of two of slots and at most half full. */
+    for (table_size = 256; table_size < 4 * wall_count; table_size *= 2);
+    if (table_size > context->fill_aa_cells_size)
+    {
+        free(context->fill_aa_cells);
+        context->fill_aa_cells = malloc(table_size * sizeof(*table));
+        context->fill_aa_cells_size = context->fill_aa_cells ? table_size : 0;
+    }
+    if (!(table = context->fill_aa_cells))
+        return;
+    memset(table, 0, table_size * sizeof(*table));
+    owners = context->fill_aa_owners;
+    owners_size = context->fill_aa_owners_size;
+
+    /* Which way the walls face that come near each pixel: only a wall with one
+     * more than a quarter turn from it in the same pixel is looked at. */
+    gw = (INT64)list->x1 - list->x0 + 1;
+    gh = (INT64)list->y1 - list->y0 + 1;
+    if (gw > 0 && gh > 0 && gw * gh <= 1024 * 1024)
+    {
+        if ((size_t)(gw * gh) > context->fill_aa_mask_size)
+        {
+            free(context->fill_aa_mask);
+            context->fill_aa_mask = malloc(gw * gh * 2 * sizeof(*mask));
+            context->fill_aa_mask_size = context->fill_aa_mask ? gw * gh * 2 : 0;
+        }
+        if ((mask = context->fill_aa_mask))
+            memset(mask, 0, gw * gh * sizeof(*mask));
+    }
+    if (mask)
+    {
+        for (i = 0; i < wall_count; ++i)
+        {
+            w = &walls[i];
+            for (y = w->y0; y <= w->y1; ++y)
+            {
+                UINT16 *row = &mask[(y - list->y0) * gw - list->x0];
+
+                for (x = w->x0; x <= w->x1; ++x)
+                    row[x] |= w->sectors;
+            }
+        }
+    }
+
+    for (i = 0; i < wall_count; ++i)
+    {
+        w = &walls[i];
+        for (y = w->y0; y <= w->y1; ++y)
+        {
+            const UINT16 *row = mask ? &mask[(y - list->y0) * gw - list->x0] : NULL;
+
+            for (x = w->x0; x <= w->x1; ++x)
+            {
+                size_t cell;
+
+                if (row && !(row[x] & w->opposed))
+                    continue;
+                if (!w->ready)
+                    d2d_fill_aa_wall_prepare(w);
+                if (!d2d_fill_aa_wall_reaches(w, x + 0.5, y + 0.5))
+                    continue;
+                if (2 * (cell_count + 1) > table_size)
+                {
+                    struct d2d_fill_aa_shared_cell *grown;
+
+                    if (!(grown = calloc(table_size * 2, sizeof(*grown))))
+                        return;
+                    for (k = 0; k < table_size; ++k)
+                    {
+                        if (table[k].key)
+                            grown[d2d_fill_aa_shared_slot(grown, table_size * 2, table[k].key)] = table[k];
+                    }
+                    free(table);
+                    context->fill_aa_cells = table = grown;
+                    context->fill_aa_cells_size = table_size *= 2;
+                }
+                if (owner_count == owners_size)
+                {
+                    struct d2d_fill_aa_owner *grown;
+
+                    if (!(grown = realloc(owners, (2 * owners_size + 1024) * sizeof(*owners))))
+                        return;
+                    context->fill_aa_owners = owners = grown;
+                    context->fill_aa_owners_size = owners_size = 2 * owners_size + 1024;
+                }
+                cell = d2d_fill_aa_shared_slot(table, table_size, d2d_fill_aa_shared_key(x, y));
+                if (!table[cell].key)
+                {
+                    table[cell].key = d2d_fill_aa_shared_key(x, y);
+                    table[cell].first = ~0u;
+                    ++cell_count;
+                }
+                owners[owner_count].wall = i;
+                owners[owner_count].next = table[cell].first;
+                table[cell].first = owner_count++;
+                ++table[cell].count;
+            }
+        }
+    }
+
+    for (i = 0; i < table_size; ++i)
+    {
+        struct d2d_fill_aa_shared_owner
+        {
+            UINT32 wall;
+            double cov, dist, n[2];
+        } own_data[8];
+        const struct d2d_fill_aa_shared_owner *own[8], *oa = NULL, *ob = NULL;
+        double best = 0.0, u1, u2, t, target, c;
+        unsigned int count = 0, o, p;
+        BOOL third = FALSE;
+        UINT32 idx;
+
+        if (!table[i].key || table[i].count < 2)
+            continue;
+        x = (int)(UINT32)((table[i].key - 1) >> 32);
+        y = (int)(UINT32)(table[i].key - 1);
+        for (idx = table[i].first; idx != ~0u && count < ARRAY_SIZE(own); idx = owners[idx].next)
+        {
+            struct d2d_fill_aa_shared_owner *d = &own_data[count];
+
+            d->wall = owners[idx].wall;
+            if (d2d_fill_aa_wall_coverage(&walls[d->wall], x + 0.5, y + 0.5, curve_area, &d->cov, &d->dist, d->n)
+                    && d->cov > 1.0 / 512.0 && d->cov < 1.0 - 1.0 / 512.0)
+                own[count++] = d;
+        }
+        for (o = 0; o < count; ++o)
+        {
+            for (p = o + 1; p < count; ++p)
+            {
+                double dot = own[o]->n[0] * own[p]->n[0] + own[o]->n[1] * own[p]->n[1];
+
+                if (dot < best)
+                {
+                    best = dot;
+                    oa = own[o];
+                    ob = own[p];
+                }
+            }
+        }
+        if (!oa)
+            continue;
+        /* A third wall that runs along neither of the two. */
+        for (o = 0; o < count; ++o)
+        {
+            if (own[o] != oa && own[o] != ob && own[o]->n[0] * oa->n[0] + own[o]->n[1] * oa->n[1] < 0.5
+                    && own[o]->n[0] * ob->n[0] + own[o]->n[1] * ob->n[1] < 0.5)
+                third = TRUE;
+        }
+        if (third)
+            continue;
+        t = acos(max(-1.0, min(1.0, best))) * (2.0 / M_PI) - 1.0;
+        if (oa->dist > 0.0 && ob->dist > 0.0)
+            continue;
+        if (oa->dist > 0.0 || ob->dist > 0.0)
+        {
+            const struct d2d_fill_aa_wall *wa = &walls[oa->wall], *wb = &walls[ob->wall];
+
+            /* Two walls that meet in a corner: a face with a straight outline edge that
+             * ends there takes the notch itself up to half a pixel from the corner, see
+             * notch_edge(). */
+            for (o = 0; o < 2; ++o)
+            {
+                if (wa->v[o] != ~0u && (wa->v[o] == wb->v[0] || wa->v[o] == wb->v[1]))
+                {
+                    double dx = x + 0.5 - wa->vq[o][0], dy = y + 0.5 - wa->vq[o][1];
+
+                    if (!(oa->dist > 0.0 ? wa : wb)->curve && dx * dx + dy * dy < 0.25)
+                        third = TRUE;
+                }
+            }
+            if (third)
+                continue;
+        }
+        /* The foot of each wall lies outside the other, and they do not meet in a
+         * corner that points outward. */
+        if ((oa->dist * oa->n[0] - ob->dist * ob->n[0]) * oa->n[0]
+                + (oa->dist * oa->n[1] - ob->dist * ob->n[1]) * oa->n[1] > 1.0e-6
+                || (ob->dist * ob->n[0] - oa->dist * oa->n[0]) * ob->n[0]
+                + (ob->dist * ob->n[1] - oa->dist * oa->n[1]) * ob->n[1] > 1.0e-6
+                || d2d_fill_aa_walls_convex(&walls[oa->wall], &walls[ob->wall], oa->n)
+                || d2d_fill_aa_walls_convex(&walls[ob->wall], &walls[oa->wall], ob->n))
+            continue;
+        u1 = 1.0 - oa->cov;
+        u2 = 1.0 - ob->cov;
+        target = u1 * u2 + (max(u1 + u2 - 1.0, 0.0) - u1 * u2) * t;
+        c = 1.0 - target / (u1 * u2);
+        if (!(c >= 1.0 / 255.0))
+            continue;
+        if (!d2d_array_reserve((void **)pixels, pixels_size, *pixel_count + 1, sizeof(**pixels)))
+            return;
+        (*pixels)[*pixel_count].x = x;
+        (*pixels)[*pixel_count].y = y;
+        (*pixels)[*pixel_count].a = oa->cov;
+        (*pixels)[*pixel_count].b = ob->cov;
+        (*pixels)[*pixel_count].both = 1.0 - target;
+        ++*pixel_count;
+    }
+}
+
 /* Builds the antialiased fill mesh of a geometry under the current transform:
  * the vertex array the D2D_SHAPE_TYPE_FILL_AA shaders take. Returns FALSE when
  * the fill has nothing to antialias or the mesh cannot be built; the plain
@@ -4559,6 +5241,9 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
     size_t pixel_count = 0, pixels_size = 0, thin_count = 0;
     struct d2d_fill_aa_pixel *pixels = NULL;
     BYTE *fan = NULL, *thin = NULL;
+    struct d2d_fill_aa_walls shared = {0};
+    size_t shared_room = 0;
+    BOOL shared_on = FALSE;
     struct d2d_fill_aa_vertex *expanded;
     double pm[6], pdet;
     BYTE *on_outline;
@@ -4755,7 +5440,10 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
             }
         }
     }
-    expanded = calloc(expanded_count, sizeof(*expanded));
+    /* Room for the pixels that two walls share; see d2d_fill_aa_shared_pixels(). */
+    if (d2d_fill_aa_shared())
+        shared_room = 64 + boundary_count / 4;
+    expanded = calloc(expanded_count + 6 * shared_room, sizeof(*expanded));
     on_outline = calloc(fill->vertex_count, sizeof(*on_outline));
     if (!expanded || !on_outline)
     {
@@ -4824,6 +5512,30 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
         outline.map_size = map_size;
     }
 
+    if (d2d_fill_aa_shared() && fabs(pdet) > 1.0e-12)
+    {
+        shared.size = boundary_count + seam_count;
+        if (shared.size * sizeof(*shared.walls) > render_target->fill_aa_walls_size)
+        {
+            free(render_target->fill_aa_walls);
+            render_target->fill_aa_walls = malloc(shared.size * 2 * sizeof(*shared.walls));
+            render_target->fill_aa_walls_size = render_target->fill_aa_walls ? shared.size * 2 * sizeof(*shared.walls) : 0;
+        }
+        shared.walls = render_target->fill_aa_walls;
+        /* The curve triangles that are among the walls already. */
+        if (fill->bezier_vertex_count / 3 > render_target->fill_aa_seen_size)
+        {
+            free(render_target->fill_aa_seen);
+            render_target->fill_aa_seen = malloc(fill->bezier_vertex_count / 3 * 2);
+            render_target->fill_aa_seen_size = render_target->fill_aa_seen ? fill->bezier_vertex_count / 3 * 2 : 0;
+        }
+        if ((shared.seen = render_target->fill_aa_seen))
+            memset(shared.seen, 0, fill->bezier_vertex_count / 3);
+        shared_on = shared.walls && (!fill->bezier_vertex_count || shared.seen);
+    }
+    shared.x0 = shared.y0 = INT_MAX;
+    shared.x1 = shared.y1 = INT_MIN;
+
     /* The fill vertices that lie on the outline: both ends of a straight boundary
      * edge and of a chord, the curve end of a control edge. */
     for (i = 0; i < fc; i++)
@@ -4857,6 +5569,9 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
                 d2d_fill_aa_outline_add(&outline, a, b_v, f->v[e], ta, pm);
                 d2d_fill_aa_outline_add(&outline, b_v, a, f->v[e], tb, pm);
             }
+            if (shared_on && !(thin && thin[i]))
+                d2d_fill_aa_wall_add(&shared, fill, a, b_v, f->v[e], edge_curve[slot] ? &seams[slot] : NULL,
+                        *curve_skip, pm);
             if (!edge_curve[slot] || (seams[slot].start != ~0u && seams[slot].chord))
                 on_outline[a] = on_outline[b_v] = 1;
             else if (seams[slot].start == a || seams[slot].start == b_v)
@@ -5294,6 +6009,45 @@ static BOOL d2d_device_context_fill_aa_expand_mesh(struct d2d_device_context *re
         }
     }
     expanded_count = vi; /* actual count (may be less if degenerate edges skipped) */
+    /* The pixels that two walls share; see d2d_fill_aa_shared_pixels(). */
+    if (shared_on)
+    {
+        struct d2d_fill_aa_shared_pixel *sp = NULL;
+        size_t sp_count = 0, sp_size = 0;
+        struct d2d_fill_aa_vertex *grown;
+
+        d2d_fill_aa_shared_pixels(render_target, &shared, &sp, &sp_count, &sp_size);
+        if (sp_count > shared_room
+                && (grown = realloc(expanded, (expanded_count + 6 * sp_count) * sizeof(*expanded))))
+        {
+            expanded = grown;
+            memset(&expanded[expanded_count], 0, 6 * sp_count * sizeof(*expanded));
+            shared_room = sp_count;
+        }
+        if (sp_count && sp_count <= shared_room)
+        {
+            for (i = 0; i < sp_count; ++i)
+            {
+                static const unsigned int corners[6] = {0, 1, 2, 1, 3, 2};
+                unsigned int k;
+
+                /* A seam_c1 of -2 marks the quad; see shape_ps_code. */
+                for (k = 0; k < 6; ++k, ++vi)
+                {
+                    double px = sp[i].x + (corners[k] & 1) - pm[2], py = sp[i].y + (corners[k] >> 1) - pm[5];
+
+                    expanded[vi].pos.x = (pm[4] * px - pm[1] * py) / pdet;
+                    expanded[vi].pos.y = (pm[0] * py - pm[3] * px) / pdet;
+                    expanded[vi].u = sp[i].a;
+                    expanded[vi].v = sp[i].b;
+                    expanded[vi].s = sp[i].both;
+                    expanded[vi].seam_c1[0] = -2.0f;
+                }
+            }
+            expanded_count = vi;
+        }
+        free(sp);
+    }
     free(thin);
     free(pixels);
     free(curve_ends);
@@ -13444,6 +14198,17 @@ static const char shape_ps_code[] =
     "                        ec = notch_edge(ec, c0, c1, i.corner_on.x);\n"
     "                }\n"
     "                fa = min(min(ea, min(eb, ec)), min(bound0, min(bound1, bound2)));\n"
+    "            }\n"
+    "            /* A pixel that two walls of the outline share (seam_c1 of -2): they\n"
+    "             * cover edges.x and edges.y of it and are drawn by two primitives,\n"
+    "             * blended; the fill covers edges.z. This third primitive brings the\n"
+    "             * three to that, for the opacity of the brush. */\n"
+    "            if (i.seam_c1.x < -1.5f)\n"
+    "            {\n"
+    "                float al = colour.a, den = (1.0f - al * edges.x) * (1.0f - al * edges.y);\n"
+    "\n"
+    "                fa = al > 0.000001f && den > 0.000001f\n"
+    "                        ? saturate((1.0f - (1.0f - al * edges.z) / den) / al) : 0.0f;\n"
     "            }\n"
     "            colour.a *= fa;\n"
     "            colour.rgb *= fa;\n"

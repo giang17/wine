@@ -456,6 +456,17 @@ struct d2d_device_context
     float text_dst_scale_y, text_dst_offset_y;
     struct d2d_scratch_buffer scratch_vb[D2D_SHAPE_TYPE_COUNT];
     struct d2d_scratch_buffer scratch_ib[D2D_SHAPE_TYPE_COUNT];
+    /* The walls of a fill, the grid over them, the table of the pixels they
+     * come near with the walls in each and the marks of the curve triangles
+     * among them, kept between fills; see d2d_fill_aa_shared_pixels(). */
+    void *fill_aa_walls;
+    size_t fill_aa_walls_size;
+    UINT16 *fill_aa_mask;
+    size_t fill_aa_mask_size;
+    void *fill_aa_cells, *fill_aa_owners;
+    size_t fill_aa_cells_size, fill_aa_owners_size;
+    BYTE *fill_aa_seen;
+    size_t fill_aa_seen_size;
     struct d2d_line_batch line_batch;
     struct d2d_fill_batch fill_batch;
     /* Session 6 (C1): persistent scratch rectangle geometry for FillRectangle.
