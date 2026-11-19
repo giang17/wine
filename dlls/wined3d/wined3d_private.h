@@ -3760,6 +3760,12 @@ struct wined3d_cs
     LONG progress_waiters;
     LONG waiting_for_progress;
     LONG pending_presents;
+    /* Command stream thread only, see wined3d_cs_flush_idle(): draws went to
+     * the context since it was last flushed, and when a swapchain last
+     * presented by reading its frame back. */
+    bool unflushed_draws;
+    bool readback_present;
+    DWORD readback_present_time;
 };
 
 static inline void wined3d_device_context_lock(struct wined3d_device_context *context)

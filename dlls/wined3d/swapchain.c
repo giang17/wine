@@ -1260,6 +1260,12 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         swapchain->gdi_texture = NULL;
     }
 
+    /* The download below waits for whatever the driver still holds of the
+     * frame; the command stream flushes when it runs dry while this device
+     * presents this way, see wined3d_cs_flush_idle(). */
+    swapchain->device->cs->readback_present = true;
+    swapchain->device->cs->readback_present_time = GetTickCount();
+
     wined3d_texture_load_location(src_texture, 0, context, WINED3D_LOCATION_SYSMEM);
     wined3d_texture_get_pitch(src_texture, 0, &row_pitch, &slice_pitch);
 

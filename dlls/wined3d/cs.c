@@ -1423,6 +1423,7 @@ static void wined3d_cs_exec_flush(struct wined3d_cs *cs, const void *data)
     struct wined3d_context *context;
 
     TRACE_(d3d_perf)("Flushing adapter.\n");
+    cs->unflushed_draws = false;
     context = context_acquire(cs->c.device, NULL, 0);
     cs->c.device->adapter->adapter_ops->adapter_flush_context(context);
     context_release(context);
@@ -3891,6 +3892,58 @@ static void wined3d_cs_exec_execute_command_list(struct wined3d_cs *cs, const vo
     }
 }
 
+/* The command stream has run dry with draws in the context that were never
+ * flushed.  A GL driver keeps what it is given until its buffer is full or a
+ * flush, a swap or a read asks for it, and an application that draws a few
+ * hundred primitives per frame between long stretches of its own work never
+ * fills that buffer: the GPU starts on the frame when the present reads it
+ * back.  The present then waits for the whole frame on the command stream
+ * thread, and for as long the X server gets nothing through to the GPU, so
+ * that a put of a window surface and every request behind it wait as well.
+ *
+ * Minimal Audio Current issues about 141 draws per frame of its Direct2D
+ * editor, a composition swapchain on a child window in REAPER.  The download
+ * in swapchain_blit_gdi() took 17.9 ms at the median (NVIDIA), 1.1 ms of that
+ * for the transfer, and the surface puts that fell into it took up to 20 ms
+ * where a put takes 0.5 ms otherwise: the main thread spent 13 % of its time
+ * waiting for the X server.  With the context flushed here the download takes
+ * 1.0 ms and the editor runs at 16.6 to 17.0 frames per second for 15.0 to
+ * 15.1 (wine-dev issue 634).  KORG's Trinity, whose draws of a frame come without
+ * a pause, is unchanged at 66 frames per second.
+ *
+ * Only a device that presents through GDI is flushed: a swapchain that swaps
+ * waits for nothing.  WINE_D3D_IDLE_FLUSH=0 turns it off. */
+static void wined3d_cs_flush_idle(struct wined3d_cs *cs)
+{
+    static const DWORD readback_present_timeout = 1000; /* ms */
+    struct wined3d_device *device = cs->c.device;
+    struct wined3d_context *context;
+    static int enabled = -1;
+
+    cs->unflushed_draws = false;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv("WINE_D3D_IDLE_FLUSH");
+        enabled = !e || e[0] != '0';
+    }
+    if (!enabled || !cs->readback_present || !device->context_count)
+        return;
+    if (GetTickCount() - cs->readback_present_time > readback_present_timeout)
+    {
+        cs->readback_present = false;
+        return;
+    }
+
+    TRACE_(d3d_perf)("Flushing adapter, the command stream is idle.\n");
+
+    wined3d_cs_command_lock(cs);
+    context = context_acquire(device, NULL, 0);
+    device->adapter->adapter_ops->adapter_flush_context(context);
+    context_release(context);
+    wined3d_cs_command_unlock(cs);
+}
+
 static DWORD WINAPI wined3d_cs_run(void *ctx)
 {
     struct wined3d_cs_queue *queue;
@@ -3931,6 +3984,8 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
                 YieldProcessor();
                 if (++spin_count >= WINED3D_CS_SPIN_COUNT)
                 {
+                    if (cs->unflushed_draws)
+                        wined3d_cs_flush_idle(cs);
                     if (poll)
                         poll = WINED3D_CS_QUERY_POLL_INTERVAL - 1;
                     else
