@@ -5132,6 +5132,8 @@ void draw_primitive(struct wined3d_device *device, const struct wined3d_state *s
         checkGLcall("disable rasterizer discard");
     }
 
+    /* see wined3d_cs_flush_idle() */
+    device->cs->unflushed_draws = true;
     context_release(context);
 
     TRACE("Draw completed.\n");
