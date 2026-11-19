@@ -232,7 +232,10 @@ struct d2d_ps_cb
     float dst_offset_x;
     float dst_scale_y;
     float dst_offset_y;
-    unsigned int pad[3];
+    /* Whether the fill antialiasing takes the area a curve leaves of the half
+     * plane at its tangent; see curve_shift() in shape_ps_code. */
+    BOOL curve_area;
+    unsigned int pad[2];
     struct d2d_brush_cb colour_brush;
     struct d2d_brush_cb opacity_brush;
 };

@@ -1301,6 +1301,39 @@ static void STDMETHODCALLTYPE d2d_device_context_FillEllipse(ID2D1DeviceContext6
     ID2D1EllipseGeometry_Release(geometry);
 }
 
+/* The area of a pixel inside the outline of a fill, where the outline is a curve.
+ *
+ * The pixel shader turns the distance of the pixel centre from the outline
+ * into the area of the pixel inside a straight edge at that distance
+ * (edge_coverage()). A curve falls back from that line within the pixel, and
+ * what lies between the two was counted as covered: at the round ends of
+ * figures 2 pixels wide, as in Minimal Audio Current's tap display, 130,425
+ * pixels of twelve frames with one such figure in reach came out 8.1 of 255
+ * too bright on average and 16,619 of them by more than 16, and what was drawn
+ * was the half plane at the tangent (wine-dev issue 642).
+ *
+ * With the switch on, the shader takes the distance to a curve triangle's
+ * curve to second order, as the outline branch does, and at the seam of a
+ * face towards a curve the gradient of the distance to the curve instead of
+ * the normal of the mesh edge; from both it then takes the mean height of the
+ * curve over its tangent across the pixel (curve_shift()). A piece of the
+ * outline answers only for the part of the pixel it runs along itself: beyond
+ * its ends the parabola goes on where the outline does not, and with the
+ * whole pixel taken for every piece 276 pixels of the frames came out more
+ * than 16 farther from their coverage, all of them darker. What the
+ * neighbouring pieces add to the pixel is left out: over every pixel of the
+ * frames the sum of the errors is 1,116,626, where it was 983,146 with the
+ * whole pixel and 1,714,234 before. WINE_D2D_CURVE_AREA=0 switches it off. */
+static BOOL d2d_curve_area(void)
+{
+    static int enabled = -1;
+    char buf[8];
+
+    if (enabled < 0)
+        enabled = !(GetEnvironmentVariableA("WINE_D2D_CURVE_AREA", buf, sizeof(buf)) && !strcmp(buf, "0"));
+    return enabled;
+}
+
 static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *context,
         struct d2d_brush *brush, struct d2d_brush *opacity_brush, BOOL outline, BOOL is_arc)
 {
@@ -1321,6 +1354,7 @@ static HRESULT d2d_device_context_update_ps_cb(struct d2d_device_context *contex
     new_cb.dst_offset_x = context->text_dst_offset_x;
     new_cb.dst_scale_y = context->text_dst_scale_y;
     new_cb.dst_offset_y = context->text_dst_offset_y;
+    new_cb.curve_area = d2d_curve_area();
     if (!d2d_brush_fill_cb(brush, &new_cb.colour_brush))
         WARN("Failed to initialize colour brush buffer.\n");
     if (!d2d_brush_fill_cb(opacity_brush, &new_cb.opacity_brush))
@@ -12816,6 +12850,7 @@ static const char shape_ps_code[] =
     "float dst_offset_x;\n"
     "float dst_scale_y;\n"
     "float dst_offset_y;\n"
+    "bool curve_area;\n"
     "struct brush\n"
     "{\n"
     "    uint type;\n"
@@ -13136,6 +13171,56 @@ static const char shape_ps_code[] =
     "    return lerp(e, max(e, u), saturate((min(r, 0.25f) + 0.25f - length(c_end)) * 4.0f));\n"
     "}\n"
     "\n"
+    "/* The mean height over the pixel between a curve and its tangent, in\n"
+    " * pixels. The curve runs along a parameter from lo to hi, p0 at the pixel\n"
+    " * centre and dp its derivative along the tangent, and lies q (p - p0)^2 off\n"
+    " * the tangent in units of which g make a pixel; n is the normal. The\n"
+    " * tangent crosses the pixel over 1 / c, c the larger component of the unit\n"
+    " * normal, and only the part of that the curve itself runs along counts. For\n"
+    " * a curve that crosses the whole pixel this is its curvature / (24 c^2):\n"
+    " * 11 of 255 for a radius of 1 on the pixel grid. The clamp guards the\n"
+    " * division where the gradient vanishes. */\n"
+    "float curve_shift(float p0, float dp, float lo, float hi, float q, float g, float2 n)\n"
+    "{\n"
+    "    float l = max(length(n), 0.0001f), len = l / max(max(abs(n.x), abs(n.y)), 0.0001f);\n"
+    "    float w = 0.5f * abs(dp) * len, a = max(p0 - w, lo) - p0, b = min(p0 + w, hi) - p0;\n"
+    "\n"
+    "    if (b <= a)\n"
+    "        return 0.0f;\n"
+    "    return clamp(q * (b * b * b - a * a * a) / (3.0f * max(g * abs(dp) * len, 0.000001f)), -0.25f, 0.25f);\n"
+    "}\n"
+    "\n"
+    "/* The distance of the pixel centre from the curve f = 0 of a curve\n"
+    " * triangle for the area of the pixel inside it, positive on the filled\n"
+    " * side: f the implicit form and side 1 or -1 for the side of it that is\n"
+    " * filled, df the screen gradient of f, hn its second derivative along the\n"
+    " * gradient and shift the result of curve_shift(). f + |df| d + hn d^2 / 2 = 0\n"
+    " * solved for d is the distance to second order; the fill lies inside the\n"
+    " * curve where side is negative and loses the shift there. */\n"
+    "float curve_distance(float f, float side, float2 df, float hn, float shift)\n"
+    "{\n"
+    "    float g = max(length(df), 0.0001f), disc = g * g - 2.0f * hn * f;\n"
+    "\n"
+    "    return side * ((disc > 0.0f ? 2.0f * f / (g + sqrt(disc)) : f / g) + shift);\n"
+    "}\n"
+    "\n"
+    "/* The coverage of a face of the fill mesh towards one of its edges: e the\n"
+    " * weight of the edge and g its gradient, st the place along the edge and gt\n"
+    " * its gradient, c1 st + c2 st^2 what the curve of a seam lies off the edge.\n"
+    " * The normal of the curve is the gradient of the distance to it, and the\n"
+    " * curve leaves c2 (t - st)^2 between itself and its tangent. */\n"
+    "float seam_coverage(float e, float2 g, float st, float2 gt, float c1, float c2)\n"
+    "{\n"
+    "    float t = saturate(st), phi = e + t * (c1 + c2 * t), l;\n"
+    "    float2 n = g;\n"
+    "\n"
+    "    if (c2 == 0.0f)\n"
+    "        return edge_coverage(phi / max(length(g), 0.0001f), g);\n"
+    "    n += (c1 + 2.0f * c2 * t) * gt;\n"
+    "    l = max(length(n), 0.0001f);\n"
+    "    return edge_coverage(phi / l + curve_shift(st, dot(gt, float2(-n.y, n.x)) / l, 0.0f, 1.0f, c2, l, n), n);\n"
+    "}\n"
+    "\n"
     "float4 main(struct input i) : SV_Target\n"
     "{\n"
     "    float4 colour;\n"
@@ -13296,7 +13381,18 @@ static const char shape_ps_code[] =
     "             * normal (the gradient of the weight); the nearest edge bounds\n"
     "             * the area left from above. */\n"
     "            float ea = edge_coverage(edge_px.x, g_x), eb = edge_coverage(edge_px.y, g_y);\n"
-    "            float ec = edge_coverage(edge_px.z, g_z), fa = min(ea, min(eb, ec));\n"
+    "            float ec = edge_coverage(edge_px.z, g_z), fa;\n"
+    "            /* The seams towards curve triangles. */\n"
+    "            if (curve_area && any(i.seam_c2 != 0.0f))\n"
+    "            {\n"
+    "                ea = seam_coverage(edges.x, g_x, i.seam_t.x, float2(ddx(i.seam_t.x), ddy(i.seam_t.x)),\n"
+    "                        i.seam_c1.x, i.seam_c2.x);\n"
+    "                eb = seam_coverage(edges.y, g_y, i.seam_t.y, float2(ddx(i.seam_t.y), ddy(i.seam_t.y)),\n"
+    "                        i.seam_c1.y, i.seam_c2.y);\n"
+    "                ec = seam_coverage(edges.z, g_z, i.seam_t.z, float2(ddx(i.seam_t.z), ddy(i.seam_t.z)),\n"
+    "                        i.seam_c1.z, i.seam_c2.z);\n"
+    "            }\n"
+    "            fa = min(ea, min(eb, ec));\n"
     "            /* A triangle that touches the outline only at a corner knows none of\n"
     "             * the outline's edges. corner01/corner2 run from the corners to the\n"
     "             * pixel in geometry space; mapped to pixels through their derivatives,\n"
@@ -13363,7 +13459,17 @@ static const char shape_ps_code[] =
     "                float2 fdv = float2(ddx(i.b.y), ddy(i.b.y));\n"
     "                float2 fdf = 2.0f * i.b.x * fdu - fdv;\n"
     "                float fgrad = length(fdf);\n"
-    "                float fa = edge_coverage(fval / max(fgrad, 0.0001f), fdf);\n"
+    "                float fd = fval / max(fgrad, 0.0001f);\n"
+    "                /* The curve is v = u^2 for u from 0 to 1 and lies (u - u0)^2\n"
+    "                 * off its tangent at u0. */\n"
+    "                if (curve_area)\n"
+    "                {\n"
+    "                    float hn = dot(fdu, fdf) / max(fgrad, 0.0001f);\n"
+    "                    float ht = dot(fdu, float2(-fdf.y, fdf.x)) / max(fgrad, 0.0001f);\n"
+    "                    fd = curve_distance(i.b.x * i.b.x - i.b.y, i.b.z, fdf, 2.0f * hn * hn,\n"
+    "                            curve_shift(i.b.x, ht, 0.0f, 1.0f, 1.0f, fgrad, fdf));\n"
+    "                }\n"
+    "                float fa = edge_coverage(fd, fdf);\n"
     "                colour.a *= fa;\n"
     "                colour.rgb *= fa;\n"
     "            }\n"
@@ -13381,7 +13487,19 @@ static const char shape_ps_code[] =
     "                float2 fdv = float2(ddx(i.b.y), ddy(i.b.y));\n"
     "                float2 fdf = 2.0f * i.b.x * fdu + 2.0f * i.b.y * fdv;\n"
     "                float fgrad = length(fdf);\n"
-    "                float fa = edge_coverage(fval / max(fgrad, 0.0001f), fdf);\n"
+    "                float fd = fval / max(fgrad, 0.0001f);\n"
+    "                /* The curve is the quarter of the unit circle from the angle\n"
+    "                 * 0 to pi / 2 and lies (phi - phi0)^2 off its tangent at phi0. */\n"
+    "                if (curve_area)\n"
+    "                {\n"
+    "                    float2 gn = fdf / max(fgrad, 0.0001f), gt = float2(-gn.y, gn.x);\n"
+    "                    float hn = dot(fdu, gn) * dot(fdu, gn) + dot(fdv, gn) * dot(fdv, gn);\n"
+    "                    float r2 = max(i.b.x * i.b.x + i.b.y * i.b.y, 0.0001f);\n"
+    "                    float dphi = dot((i.b.x * fdv - i.b.y * fdu) / r2, gt);\n"
+    "                    fd = curve_distance(i.b.x * i.b.x + i.b.y * i.b.y - 1.0f, i.b.z, fdf, 2.0f * hn,\n"
+    "                            curve_shift(atan2(i.b.y, i.b.x), dphi, 0.0f, 1.57079633f, 1.0f, fgrad, fdf));\n"
+    "                }\n"
+    "                float fa = edge_coverage(fd, fdf);\n"
     "                colour.a *= fa;\n"
     "                colour.rgb *= fa;\n"
     "            }\n"
