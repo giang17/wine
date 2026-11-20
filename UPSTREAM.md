@@ -5,7 +5,7 @@ matching WineHQ bug report where one exists and the state of upstream Wine.
 The list covers fixes that were checked against upstream; it is not complete.
 PATCHES.md describes every change of the fork.
 
-As of 2026-11-20: branch `d2d1-dcomp-11.0` at `b4f927be3e6`, upstream master
+As of 2026-11-20: branch `d2d1-dcomp-11.0` at `7c5c7c23446`, upstream master
 at `wine-11.22-107-g76f8e947954`.
 
 None of the fork's own fixes is submitted to WineHQ: Wine's Clean-Room
@@ -17,8 +17,8 @@ information for users of the fork, not a request to take the code upstream.
 
 | Component | Defect | Fork commit | WineHQ bug | Upstream |
 |---|---|---|---|---|
-| crypt32 | Verifying a signature re-sorts the signed attributes, so a valid signature whose attributes are not in DER order fails; FL Studio 2026 does not start | `e83d57f244c` | [60273](https://bugs.winehq.org/show_bug.cgi?id=60273) | Wine 11.21, `a358d7ecf13` |
-| msi | The saved string pool counts unused slots at its end, crosses 65535 entries and switches to 3-byte string references; the Kontakt 8 installer aborts | `1b8b85be40d` | [59056](https://bugs.winehq.org/show_bug.cgi?id=59056) | master after Wine 11.22, `fd1a09b8702` |
+| crypt32 | Verifying a signature re-sorts the signed attributes, so a valid signature whose attributes are not in DER order fails; FL Studio 2026 does not start | `05965da7736` (backport of `a358d7ecf13`, replaces the fork's own fix) | [60273](https://bugs.winehq.org/show_bug.cgi?id=60273) | Wine 11.21, `a358d7ecf13` |
+| msi | The saved string pool counts unused slots at its end, crosses 65535 entries and switches to 3-byte string references; the Kontakt 8 installer aborts | `89612d2640e` (backport of `fd1a09b8702`, replaces the fork's own fix) | [59056](https://bugs.winehq.org/show_bug.cgi?id=59056) | master after Wine 11.22, `fd1a09b8702` |
 | ntdll | A debugger's break-in thread in a WoW64 process starts at a truncated 64-bit address | `aa300232981` (backport of `a9dd4878b14`, replaces the fork's own fix) | [59803](https://bugs.winehq.org/show_bug.cgi?id=59803) | Wine 11.22, `a9dd4878b14` |
 | mf | The audio renderer never reports a completed scrub | `1cd7e8c5883` (backport of `324a7da836e`) | - | Wine 11.5, `324a7da836e` |
 
