@@ -2614,13 +2614,18 @@ This is the recommended branch. What it changes, by subsystem:
   extension for them); upstream 11.20 still re-creates the mapping on every cycle
 - **ole32**: RevokeDragDrop no longer touches drop targets owned by other processes
   (fixes a crash when closing plugin windows)
-- **crypt32**: verifying a signature hashes the signed attributes as they are stored in
-  the message instead of re-encoding them. The encoder sorts a SET OF into DER order, but a
-  signer may emit the attributes unsorted and the signature covers the order it used, so
-  re-encoding produced a different hash and verification failed with
-  TRUST_E_CERT_SIGNATURE. Affects any application that checks its own Authenticode
-  signature at startup; FL Studio 2026 reported that the program could not be verified and
-  exited
+- **crypt32**: verifying a signature hashes the signed attributes in the order the signer
+  emitted them. The encoder sorts a SET OF into DER order, but a signer may emit the
+  attributes unsorted and the signature covers the order it used, so re-encoding produced a
+  different hash and verification failed with TRUST_E_CERT_SIGNATURE. Affects any
+  application that checks its own Authenticode signature at startup; FL Studio 2026 reported
+  that the program could not be verified and exited. Backport of a358d7ecf13 and its test
+  840a939ee52 from Wine 11.21 (Michael Nelson, Wine bug 60273): when verifying, the decoded
+  attributes are encoded without sorting them. It replaces the fork's earlier fix, which
+  hashed the bytes of the message as received. `WinVerifyTrust()` on `FL64.exe` and
+  `FLEngine_x64.dll` of FL Studio 26.1.7 returns 0 where Wine 11.0 returns
+  TRUST_E_CERT_SIGNATURE, FL Studio starts, and `crypt32_test msg` passes its 1032 tests on
+  both architectures (Wine 11.0 fails the new one)
 - **ws2_32**: `SIO_ADDRESS_LIST_SORT` was undefined and every call got WSAEOPNOTSUPP;
   Chromium issues it for every resolution that returns an IPv6 address and discards the
   result on failure (FL Studio 2026's WebView2 hit it 35 times in 18 minutes). Addresses
@@ -3365,7 +3370,7 @@ these were developed against, but they are not specific to it.
 | Ableton Live 12 (Intro / Lite) | Custom (D3D11 + WebView2) | Fully functional — window decorations, stable move/resize, F11 fullscreen both ways, menu bar hit testing, Splice view; the content indexer (`Ableton Index.exe`) runs on the built-in VC runtime |
 | VirtualDJ 2026 (build 9583) | Custom skin engine (D3D11, FLIP_SEQUENTIAL swapchains with an R8G8B8A8 back buffer) | Runs — decks, browser, and the skin re-lays out while the window is being resized (4–5 relayouts per second during a corner drag). Needs two patches from this branch: the wined3d GL present for flip-model swapchains without a BGR back buffer, without which both windows stay black, and the wined3d shared between all DXGI factories of the process — the application calls `CreateDXGIFactory1()` before every frame and several times per relayout, and at 60–480 ms per call on an NVIDIA card the skin followed a resize only seconds after the drag |
 | Native Access 3.25.2 | Electron/Chromium (D3D11 + DComp) | Installs, signs in and installs products (verified with a Kontakt 7 update, Supercharger and the bundled NTKDaemon). Needs the `powershell` patch from this branch: without it the installer loops forever on "Native Access is running" and the bundled NTKDaemon is never installed, leaving the app stuck at "grant permission to install dependencies". Kontakt 8's own installer aborts under Wine for unrelated reasons (InstallAware) |
-| Kontakt 8 Player 8.12.1 | Custom; installer: InstallAware/MSI | Installs and runs. The official installer needs the `msi` string-pool patch from this branch — without it it aborts after 77 s with "Setup has failed: FALSE", writes no installer log and leaves the product missing (WineHQ bug 59056). Both routes verified with the patch: running the setup executable directly, and a reinstall through Native Access 3; each produces the desktop shortcut and registry entries. Both the standalone and the VST3 in Reaper run: the Player browser lists its 1940 presets and instruments load and play, alongside Kontakt 6 and 7 |
+| Kontakt 8 Player 8.12.1 | Custom; installer: InstallAware/MSI | Installs and runs. The official installer needs the `msi` string-pool fix of this branch — without it it aborts after 77 s with "Setup has failed: FALSE", writes no installer log and leaves the product missing (WineHQ bug 59056). The fix is the backport of fd1a09b8702 and its test af2f3f557f2 from upstream master after Wine 11.22 (Selim Bucher); it replaces the fork's own patch, which bounded the saved string pool the same way, at the highest id with a persistent reference. Both routes were verified with the fork's patch: running the setup executable directly, and a reinstall through Native Access 3; each produces the desktop shortcut and registry entries. Both the standalone and the VST3 in Reaper run: the Player browser lists its 1940 presets and instruments load and play, alongside Kontakt 6 and 7 |
 | SynthEdit 1.5 | Custom engine (D2D1 + winex11 client surfaces) | Fully functional — the MDI canvas draws completely and stays stable: no permanently black regions after a menu closes, no caption flicker while resizing or moving the top-level window, and canvas children no longer vanish mid-resize. Needs the winex11 client-surface and d2d1 bitmap-brush fixes from this branch |
 | EPROM - Memory Rites (VST3 in Reaper) | JUCE 8.0.13; splash/login via WebView2 | Fully functional — the splash and login window render through WebView2, and once signed in the GUI is entirely JUCE. Requires the `HideWineVersion` entry (`wine.inf` sets it for the plug-in hosts); without it JUCE 8.0.13 detects Wine, falls back from Direct2D to GDI and the plug-in comes up with a black background and missing GUI elements |
 | Minimal Audio Current / Evoke / Lucid (VST3 in Reaper) | JUCE 8.0.13 | Fully functional, same `HideWineVersion` requirement as above — without it the GDI fallback leaves the background black and parts of the interface missing |
