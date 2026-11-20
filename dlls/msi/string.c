@@ -420,24 +420,7 @@ UINT msi_string2id( const string_table *st, const WCHAR *str, int len, UINT *id 
     return ERROR_INVALID_PARAMETER;
 }
 
-/* Highest id that needs a pool entry when saving.  Ids of strings without a
- * persistent refcount are not referenced by any saved table, but entries in
- * the middle of the pool still have to be written out as empty entries to
- * keep the following ids stable.  Entries past the last persistent string
- * (allocation headroom, nonpersistent strings) carry no information; writing
- * them can needlessly push the pool past the 0xffff id limit and switch the
- * file to 3-byte string references. */
-static UINT last_persistent_id( const string_table *st )
-{
-    UINT i, last = 0;
-
-    for( i=1; i<st->maxcount; i++ )
-        if( st->strings[i].persistent_refcount )
-            last = i;
-    return last;
-}
-
-static void string_totalsize( const string_table *st, UINT last, UINT *datasize, UINT *poolsize )
+static void string_totalsize( const string_table *st, UINT *datasize, UINT *poolsize )
 {
     UINT i, len, holesize;
 
@@ -447,7 +430,7 @@ static void string_totalsize( const string_table *st, UINT last, UINT *datasize,
     *poolsize = 4;
     *datasize = 0;
     holesize = 0;
-    for( i=1; i<=last; i++ )
+    for( i=1; i<st->maxcount; i++ )
     {
         if( !st->strings[i].persistent_refcount )
         {
@@ -579,7 +562,7 @@ end:
 
 UINT msi_save_string_table( const string_table *st, IStorage *storage, UINT *bytes_per_strref )
 {
-    UINT i, last, datasize = 0, poolsize = 0, sz, used, r, codepage, n;
+    UINT i, datasize = 0, poolsize = 0, sz, used, r, codepage, n;
     UINT ret = ERROR_FUNCTION_FAILED;
     CHAR *data = NULL;
     USHORT *pool = NULL;
@@ -587,10 +570,9 @@ UINT msi_save_string_table( const string_table *st, IStorage *storage, UINT *byt
     TRACE("\n");
 
     /* construct the new table in memory first */
-    last = last_persistent_id( st );
-    string_totalsize( st, last, &datasize, &poolsize );
+    string_totalsize( st, &datasize, &poolsize );
 
-    TRACE("%u %u %u %u\n", st->maxcount, last, datasize, poolsize );
+    TRACE("%u %u %u\n", st->maxcount, datasize, poolsize );
 
     pool = malloc( poolsize );
     if( ! pool )
@@ -609,7 +591,7 @@ UINT msi_save_string_table( const string_table *st, IStorage *storage, UINT *byt
     codepage = st->codepage;
     pool[0] = codepage & 0xffff;
     pool[1] = codepage >> 16;
-    if (last > 0xffff)
+    if (st->maxcount > 0xffff)
     {
         pool[1] |= 0x8000;
         *bytes_per_strref = LONG_STR_BYTES;
@@ -618,7 +600,7 @@ UINT msi_save_string_table( const string_table *st, IStorage *storage, UINT *byt
         *bytes_per_strref = sizeof(USHORT);
 
     n = 1;
-    for( i=1; i<=last; i++ )
+    for( i=1; i<st->maxcount; i++ )
     {
         if( !st->strings[i].persistent_refcount )
         {
