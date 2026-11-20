@@ -174,8 +174,9 @@
 |  CodeWeavers or any software vendor. Wine's Clean-Room Guidelines do not   |
 |  accept LLM-generated code; the fork is developed with LLM assistance, so  |
 |  no merge requests go to WineHQ while that rule stands. Several earlier    |
-|  fixes from the fork are part of upstream Wine. Upstream's own README is   |
-|  kept as README.wine.                                                      |
+|  fixes from the fork are part of upstream Wine. UPSTREAM.md lists defects  |
+|  in upstream Wine that the fork fixes and their state upstream.            |
+|  Upstream's own README is kept as README.wine.                             |
 +----------------------------------------------------------------------------+
 
 +--[ credits ]---------------------------------------------------------------+
@@ -189,6 +190,8 @@
 |      https://github.com/giang17/wine/releases                              |
 |  * patches                                                                 |
 |      https://github.com/giang17/wine/blob/d2d1-dcomp-11.0/PATCHES.md       |
+|  * upstream status                                                         |
+|      https://github.com/giang17/wine/blob/d2d1-dcomp-11.0/UPSTREAM.md      |
 |  * issues                                                                  |
 |      https://github.com/giang17/wine/issues                                |
 |  * fedora copr                                                             |
