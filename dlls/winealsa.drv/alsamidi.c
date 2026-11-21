@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <time.h>
 #include <alsa/asoundlib.h>
@@ -78,7 +79,18 @@ struct midi_src
     snd_seq_t          *seq;
     snd_seq_addr_t      addr;
     int                 port_in;
+    /* System exclusive input that arrived while no buffer was queued.  It is
+     * handed to the next buffer the application adds instead of being lost;
+     * see handle_sysex_event(). */
+    BYTE               *pending;
+    UINT                pending_len;
+    UINT                pending_size;
+    BOOL                buffers_used;   /* a buffer was added since the device was opened */
 };
+
+/* An application that stops adding buffers must not make us hold an unbounded
+ * amount of data. */
+#define MAX_PENDING_SYSEX (256 * 1024)
 
 static pthread_mutex_t seq_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t in_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -105,6 +117,7 @@ static uint64_t last_scan_time;
 
 static BOOL rec_thread_running;
 static int rec_cancel_pipe[2];
+static int rec_wake_pipe[2] = {-1, -1};   /* midi_in_add_buffer() -> record thread: deliver pending sysex */
 static pthread_t rec_thread_id;
 
 static pthread_mutex_t notify_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -693,6 +706,19 @@ static UINT alsa_midi_init(void)
     scan_devices();
     seq_unlock();
 
+    /* Without the wake-up pipe pending sysex input still goes out with the
+     * next event that arrives, only later. */
+    if (pipe(rec_wake_pipe) < 0)
+    {
+        WARN("Couldn't create the wake-up pipe for midi-in\n");
+        rec_wake_pipe[0] = rec_wake_pipe[1] = -1;
+    }
+    else
+    {
+        fcntl(rec_wake_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(rec_wake_pipe[1], F_SETFL, O_NONBLOCK);
+    }
+
     if (pipe(rec_cancel_pipe) < 0)
         WARN("Couldn't create the cancel pipe for midi-in\n");
     else if (pthread_create(&rec_thread_id, NULL, rec_thread_proc, seq))
@@ -719,6 +745,12 @@ NTSTATUS alsa_midi_release(void *args)
         close(rec_cancel_pipe[1]);
         rec_thread_running = FALSE;
         TRACE("Stopped thread for midi-in\n");
+    }
+    if (rec_wake_pipe[0] != -1)
+    {
+        close(rec_wake_pipe[0]);
+        close(rec_wake_pipe[1]);
+        rec_wake_pipe[0] = rec_wake_pipe[1] = -1;
     }
     if (midi_seq) seq_close();
 
@@ -1209,27 +1241,27 @@ static UINT midi_out_reset(WORD dev_id)
     return MMSYSERR_NOERROR;
 }
 
-static void handle_sysex_event(struct midi_src *src, BYTE *data, UINT len)
+/* Copy sysex bytes into the queued buffers and return how many were taken.  A
+ * buffer is returned when it is full or holds the end of a message, so a
+ * message never shares a buffer with the next one.  Called with the in_buffer
+ * lock held. */
+static UINT fill_sysex_buffers(struct midi_src *src, const BYTE *data, UINT len)
 {
     UINT pos = 0, copy_len, current_time = get_time_msec() - src->startTime;
     struct notify_context notify;
+    const BYTE *end;
     MIDIHDR *hdr;
 
-    in_buffer_lock();
-
-    while (len)
+    while (pos < len && (hdr = src->lpQueueHdr))
     {
-        hdr = src->lpQueueHdr;
-        if (!hdr) break;
-
-        copy_len = min(len, hdr->dwBufferLength - hdr->dwBytesRecorded);
+        copy_len = min(len - pos, hdr->dwBufferLength - hdr->dwBytesRecorded);
+        if ((end = memchr(data + pos, 0xF7, copy_len)))
+            copy_len = end - (data + pos) + 1;
         memcpy(hdr->lpData + hdr->dwBytesRecorded, data + pos, copy_len);
         hdr->dwBytesRecorded += copy_len;
-        len -= copy_len;
         pos += copy_len;
 
-        if ((hdr->dwBytesRecorded == hdr->dwBufferLength) ||
-            (*(BYTE*)(hdr->lpData + hdr->dwBytesRecorded - 1) == 0xF7))
+        if (hdr->dwBytesRecorded == hdr->dwBufferLength || end)
         { /* buffer full or end of sysex message */
             src->lpQueueHdr = hdr->lpNext;
             hdr->dwFlags &= ~MHDR_INQUEUE;
@@ -1239,6 +1271,88 @@ static void handle_sysex_event(struct midi_src *src, BYTE *data, UINT len)
         }
     }
 
+    return pos;
+}
+
+/* Keep sysex bytes that found no buffer.  Called with the in_buffer lock held. */
+static void keep_pending_sysex(struct midi_src *src, const BYTE *data, UINT len)
+{
+    UINT size;
+    BYTE *new;
+
+    if (src->pending_len + len > MAX_PENDING_SYSEX)
+    {
+        WARN("no buffer queued, %u bytes of system exclusive input lost, %u bytes wait\n",
+             len, src->pending_len);
+        return;
+    }
+    if (src->pending_len + len > src->pending_size)
+    {
+        size = max(max(src->pending_size * 2, 4096), src->pending_len + len);
+        if (!(new = realloc(src->pending, size)))
+        {
+            WARN("out of memory, %u bytes of system exclusive input lost\n", len);
+            return;
+        }
+        src->pending = new;
+        src->pending_size = size;
+    }
+    memcpy(src->pending + src->pending_len, data, len);
+    src->pending_len += len;
+    TRACE("no buffer queued, %u bytes of system exclusive input wait\n", src->pending_len);
+}
+
+/* Hand pending sysex bytes to the queued buffers.  Called with the in_buffer
+ * lock held. */
+static void flush_pending_sysex(struct midi_src *src)
+{
+    UINT taken = fill_sysex_buffers(src, src->pending, src->pending_len);
+
+    src->pending_len -= taken;
+    if (src->pending_len) memmove(src->pending, src->pending + taken, src->pending_len);
+}
+
+static void handle_sysex_event(struct midi_src *src, BYTE *data, UINT len)
+{
+    UINT taken;
+
+    in_buffer_lock();
+
+    /* An application that reads system exclusive input queues a few buffers
+     * and adds each one again from its MIM_LONGDATA callback.  If that callback
+     * is slow, a dump at full MIDI speed can find no buffer queued for a moment;
+     * the data is kept for the next buffer instead of being dropped.  For an
+     * application that never queued a buffer nothing is kept, as before. */
+    if (src->pending_len)
+    {
+        keep_pending_sysex(src, data, len);
+        flush_pending_sysex(src);
+    }
+    else if ((taken = fill_sysex_buffers(src, data, len)) < len)
+    {
+        if (src->buffers_used)
+            keep_pending_sysex(src, data + taken, len - taken);
+        else
+            TRACE("no buffer queued, %u bytes of system exclusive input dropped\n", len - taken);
+    }
+
+    in_buffer_unlock();
+}
+
+/* Called on the record thread when midi_in_add_buffer() has queued a buffer
+ * for a source with pending sysex input. */
+static void flush_all_pending_sysex(void)
+{
+    unsigned int i, num;
+
+    devices_lock();
+    num = __atomic_load_n(&num_srcs, __ATOMIC_ACQUIRE);
+    devices_unlock();
+
+    in_buffer_lock();
+    for (i = 0; i < num; i++)
+        if (srcs[i].state == 1 && srcs[i].pending_len && srcs[i].lpQueueHdr)
+            flush_pending_sysex(srcs + i);
     in_buffer_unlock();
 }
 
@@ -1384,17 +1498,22 @@ static void *rec_thread_proc(void *arg)
     struct pollfd *pollfd;
     int ret;
 
-    /* Add on one for the read end of the cancel pipe */
-    num_fds = snd_seq_poll_descriptors_count(midi_seq, POLLIN) + 1;
+    /* Add on two for the read ends of the cancel and wake-up pipes */
+    num_fds = snd_seq_poll_descriptors_count(midi_seq, POLLIN) + 2;
     pollfd = malloc(num_fds * sizeof(struct pollfd));
 
     while(1)
     {
+        BOOL seq_ready = FALSE;
+        int i;
+
         pollfd[0].fd = rec_cancel_pipe[0];
         pollfd[0].events = POLLIN;
+        pollfd[1].fd = rec_wake_pipe[0];   /* -1 without the pipe, poll() skips it */
+        pollfd[1].events = POLLIN;
 
         seq_lock();
-        snd_seq_poll_descriptors(midi_seq, pollfd + 1, num_fds - 1, POLLIN);
+        snd_seq_poll_descriptors(midi_seq, pollfd + 2, num_fds - 2, POLLIN);
         seq_unlock();
 
         /* Check if an event is present */
@@ -1403,6 +1522,19 @@ static void *rec_thread_proc(void *arg)
 
         if (pollfd[0].revents & POLLIN) /* cancelled */
             break;
+
+        if (pollfd[1].revents & POLLIN) /* a buffer was added for pending sysex input */
+        {
+            char drain[64];
+            while (read(rec_wake_pipe[0], drain, sizeof(drain)) > 0) ;
+            flush_all_pending_sysex();
+        }
+
+        /* The sequencer is in blocking mode: read only when it has input. */
+        for (i = 2; i < num_fds; i++)
+            if (pollfd[i].revents) seq_ready = TRUE;
+        if (!seq_ready)
+            continue;
 
         do
         {
@@ -1478,6 +1610,8 @@ static UINT midi_in_open(WORD dev_id, MIDIOPENDESC *desc, UINT flags, struct not
     src->wFlags = HIWORD(flags & CALLBACK_TYPEMASK);
 
     src->lpQueueHdr = NULL;
+    src->pending_len = 0;
+    src->buffers_used = FALSE;
     src->midiDesc = *desc;
     src->state = 0;
     src->startTime = 0;
@@ -1531,6 +1665,13 @@ static UINT midi_in_close(WORD dev_id, struct notify_context *notify)
     src->midiDesc.hMidi = 0;
     src->seq = NULL;
 
+    in_buffer_lock();
+    free(src->pending);
+    src->pending = NULL;
+    src->pending_len = src->pending_size = 0;
+    src->buffers_used = FALSE;
+    in_buffer_unlock();
+
     return MMSYSERR_NOERROR;
 }
 
@@ -1538,6 +1679,7 @@ static UINT midi_in_add_buffer(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
 {
     struct midi_src *src;
     MIDIHDR **next;
+    BOOL wake;
 
     TRACE("(%04X, %p, %d);\n", dev_id, hdr, hdr_size);
 
@@ -1561,7 +1703,17 @@ static UINT midi_in_add_buffer(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
     while (*next) next = &(*next)->lpNext;
     *next = hdr;
 
+    src->buffers_used = TRUE;
+    /* Pending sysex input is delivered on the record thread, as any other
+     * input: applications add buffers from their MIM_LONGDATA callback, which
+     * runs on the notify thread, and posting notifications from here could
+     * wait for that very thread. */
+    wake = src->pending_len != 0;
+
     in_buffer_unlock();
+
+    if (wake && rec_wake_pipe[1] != -1)
+        write(rec_wake_pipe[1], "w", 1);   /* nonblocking; a full pipe already wakes the thread */
 
     return MMSYSERR_NOERROR;
 }
@@ -1639,6 +1791,9 @@ static UINT midi_in_stop(WORD dev_id)
     if (src->state == -1) return MIDIERR_NODEVICE;
 
     src->state = 0;
+    in_buffer_lock();
+    src->pending_len = 0;   /* input after the stop is not recorded either */
+    in_buffer_unlock();
     return MMSYSERR_NOERROR;
 }
 
@@ -1657,6 +1812,7 @@ static DWORD midi_in_reset(WORD dev_id, struct notify_context *notify)
 
     in_buffer_lock();
 
+    src->pending_len = 0;
     if (src->lpQueueHdr)
     {
         hdr = src->lpQueueHdr;
