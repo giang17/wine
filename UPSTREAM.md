@@ -63,4 +63,5 @@ there, or, where it does not or upstream changed the functions involved since
 | winex11 | A click on the virtual desktop background ends the session (`BadWindow` on `_NET_WM_USER_TIME`) | `8c6b232482a` | - |
 | winex11 | An offscreen EGL swap is presented before it has completed; Studio Pro 8's Studio Assistant popup comes up black | `e8ed3cc4c61` | [60555](https://bugs.winehq.org/show_bug.cgi?id=60555) |
 | winex11 | GL rendering into a hidden top-level has no backing store; reading it back returns stale content (HALion Sonic, Anima 3D view) | `6989d99b9fa` | - |
+| winealsa | System exclusive input that arrives while the application has no buffer queued is dropped; FM-Alive DX Manager receives Yamaha DX11 voice banks short and its Patch Viewer never finishes | `c3b7c790f2b` | - |
 | winmm, winealsa | MIDI devices connected after start-up are not enumerated | `280603c82e0`, `e1e936d1843`, `d07446559cb` | - |
