@@ -2763,6 +2763,19 @@ This is the recommended branch. What it changes, by subsystem:
   shared-mode stream at random phases aborted within the first 100 of 1000 rounds in three of
   three runs before, and ran all rounds after. Upstream has the same code (wine-11.20 and
   master of 2026-10-19)
+- **winealsa (MIDI input)**: system exclusive input that arrives while the application has no
+  buffer queued is kept and handed to the next buffer it adds, instead of being dropped. An
+  application typically queues a few buffers and adds each one again from its `MIM_LONGDATA`
+  callback; when that callback is slow, a dump at full MIDI speed finds the queue empty for a
+  moment. FM-Alive DX Manager (255-byte buffers) got 3590 and 3846 bytes of 4104-byte Yamaha DX11
+  voice banks that arrived complete at the ALSA port, and its Patch Viewer never finished
+  syncing; now all five banks list their 32 voices. A test client with three 255-byte buffers
+  whose callback pauses 400 ms at the start of each message, fed 4104-byte dumps in 256-byte
+  events every 82 ms through `Midi Through`, received 3589 bytes of each before and all of them
+  after, 64- and 32-bit (`projects/midi-sysex-647` in the workspace). The pending bytes are
+  delivered from the record thread, at most 256 KiB per port, and dropped on `midiInStop()`,
+  `midiInReset()` and close; nothing is kept for an application that never queued a buffer.
+  Upstream has the same code (master of 2026-11-20, wine-11.22-138)
 - **Virtual-desktop compositor (winex11)**: windows inside a Wine virtual desktop get
   real per-pixel alpha, which the plain desktop drawable cannot provide. A small
   XDamage-driven compositor assembles frames off screen and composites them through an
@@ -3386,6 +3399,7 @@ these were developed against, but they are not specific to it.
 | Waves Central 17.1.5 | Electron | Installs, starts, signs in and installs products (the Waves Ultimate demo, 254 plug-in bundles). Needs the `powershell` and `taskkill` patches from this branch: without the version queries it stops at start with "Waves Central cannot access PowerShell", and `taskkill /t` could leave the product installation stuck at "Closing COSMOS". Its cache cleanup ("Clear cache") calls `robocopy.exe`, a stub in upstream Wine; with the `robocopy` of this branch it removes the download cache (6.3 GB down to 3.5 MB in the measured run), keeps the two server folders, and Waves Central restarts |
 | Waves V17 plug-ins (VST3 in Reaper) | Waves framework (WaveShell + WavesLib); the editor draws through OpenGL (measured for API-550A) | The editors draw, also side by side and after closing and reopening them — checked with API-550A, Abbey Road Reel ADT Live and CLA Guitars; audio passes and the meter moves (checked with the Clavinet instrument, stereo). Needs the `wglShareLists()` patches from this branch: without them the editor stayed black and REAPER froze. Checked with the demo licence, which mutes the audio periodically |
 | Waves COSMOS Sample Finder 17 | Electron 36, frameless window | The window resizes at edges and corners, maximizes, restores and moves, also by dragging the title bar of the maximized window (checked on KWin X11; the sample analysis itself is not checked). Needs the size hint and window state patches from this branch: it answers `WM_GETMINMAXINFO` with a maximum of `INT_MAX`, which fixed the window at its minimum size, and a drag on the maximized window left it fullscreen. |
+| FM-Alive DX Manager 5.5.10 | .NET Framework 4.8 (WinForms/WPF), ClickOnce | Installs through `rundll32 dfshim.dll,ShOpenVerbApplication` in a prefix with the native .NET Framework 4.8 (Wine Mono has no ClickOnce, and the application refuses to start outside it), talks SysEx to a Yamaha DX11 and lists all five voice banks in its Patch Viewer. Needs the `winealsa` MIDI input patch from this branch: without it the first bank of a sync arrived short and the Patch Viewer never finished |
 
 ## Font Setup
 
