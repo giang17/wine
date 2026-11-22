@@ -782,26 +782,39 @@ elif [ "$DO_UIFONT" -eq 1 ]; then
 fi
 
 # --- 5. verify ---------------------------------------------------------------
-# Wine keeps the registry in the wineserver and flushes system.reg to disk with
-# a delay — checking immediately reports a false failure. Poll with a cap.
-for _ in $(seq 1 15); do
-    printf '%s\n' "$(fontlink_block)" | grep -q '^"DejaVu Sans"=.*NotoSansSymbols2' && break
-    sleep 1
-done
-# The Fonts key values of step 4 arrive the same way.  In a prefix that had the
-# FontLink value before this run the poll above ends at once, and a --check
-# started right after the run read a system.reg without the new values and
-# reported the copies as unregistered (measured 2026-11-18: exit 3 while the
-# wineserver was still running, exit 0 once it had ended).  Wait for every
-# value this run wrote.
-for _ in $(seq 1 15); do
-    missing=0
-    for l in "${reg_lines[@]}"; do
-        f=${l##*=\"}; fonts_key_has_file "${f%\"}" || missing=1
+# Wine keeps the registry in the wineserver.  It writes system.reg and user.reg
+# when it exits and, while processes of the prefix keep it running, every 30 s
+# (server/registry.c, save_period) -- checking the files right away reports a
+# false failure.  Every check below therefore waits for every value this run
+# wrote, against one deadline that covers a full save period.  15 s per check
+# was enough when the wineserver ended after the run (2026-11-18: a --check
+# right after the run read a system.reg without the new Fonts values while the
+# wineserver was still running); with another process of the prefix keeping it
+# alive, the run reported all 16 values it had written as missing and exited 1
+# (2026-11-22, a crashed application's error dialog in the prefix).
+VERIFY_DEADLINE=$((SECONDS + 35))
+waiting_said=0
+wait_for() {   # wait_for COMMAND...: true once it succeeds, false at the deadline
+    until "$@"; do
+        [ "$SECONDS" -ge "$VERIFY_DEADLINE" ] && return 1
+        if [ "$waiting_said" -eq 0 ]; then
+            echo "  waiting for the wineserver to write the registry to disk (at most 35 s)..."
+            waiting_said=1
+        fi
+        sleep 1
     done
-    [ "$missing" -eq 0 ] && break
-    sleep 1
-done
+}
+fontlink_ok() { printf '%s\n' "$(fontlink_block)" | grep -q '^"DejaVu Sans"=.*NotoSansSymbols2'; }
+fonts_values_ok() {
+    local l f
+    for l in "${reg_lines[@]}"; do
+        f=${l##*=\"}; fonts_key_has_file "${f%\"}" || return 1
+    done
+}
+uifont_ok() { [ "$(uifont_face MenuFont)" = "Segoe UI" ]; }
+
+wait_for fontlink_ok
+wait_for fonts_values_ok
 
 ok=1
 for f in "${REQUIRED[@]}"; do
@@ -824,17 +837,15 @@ if [ "$DO_RENDERING" -eq 1 ]; then
               'Software\\Wine\\Direct2D:text_cleartype_blend'
               'Software\\Wine\\DirectWrite:outline_in_natural_modes'
               'Control Panel\\Desktop:FontSmoothingType')
-    # The wineserver writes user.reg a moment after the last reg add returns,
-    # so wait for every value, not for one of them: on a prefix that already
-    # had the others, a check right away misses the value added last.
-    for _ in $(seq 1 15); do
-        missing=0
+    # Wait for every value, not for one of them: on a prefix that already had
+    # the others, a check right away misses the value added last.
+    switches_ok() {
+        local kv
         for kv in "${switches[@]}"; do
-            [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || missing=1
+            [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || return 1
         done
-        [ "$missing" -eq 0 ] && break
-        sleep 1
-    done
+    }
+    wait_for switches_ok
     for kv in "${switches[@]}"; do
         [ -n "$(reg_value "$USERREG" "${kv%%:*}" "${kv##*:}")" ] || {
             echo "ERROR: ${kv##*:} did not appear in $USERREG." >&2; ok=0; }
@@ -842,11 +853,8 @@ if [ "$DO_RENDERING" -eq 1 ]; then
 fi
 
 if [ "$DO_UIFONT" -eq 1 ] && [ "$have_segoe" -eq 1 ]; then
-    for _ in $(seq 1 15); do
-        [ "$(uifont_face MenuFont)" = "Segoe UI" ] && break
-        sleep 1
-    done
-    [ "$(uifont_face MenuFont)" = "Segoe UI" ] || {
+    wait_for uifont_ok
+    uifont_ok || {
         echo "ERROR: the WindowMetrics fonts did not switch to Segoe UI in $USERREG." >&2; ok=0; }
 fi
 
