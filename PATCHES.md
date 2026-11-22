@@ -1134,6 +1134,9 @@ This is the recommended branch. What it changes, by subsystem:
   `projects/menubar-uah-caption-test/uahcaption.exe`: the bar is 18 px instead of 22 after
   the styles are dropped at the same width. Live 12.4.5, KWin 5.27 on X11, F11 from the
   maximised window: `_NET_WM_STATE_FULLSCREEN` at 1920x1080, before no fullscreen state.
+  Since the backport of upstream's `b94b54c62b7` (Wine 11.22) the bar is laid out at every
+  `get_menu_bar_height()` call, which covers this case without a condition of its own; the
+  test window and Live give the same result.
 - **win32u / user32**: a visible top-level window that loses both `WS_CAPTION` and
   `WS_THICKFRAME` through `SetWindowLong()`, or gets one of them again, is posted
   `WM_DWMNCRENDERINGCHANGED` (wParam: has a frame), and when the message is dispatched its
@@ -2380,14 +2383,23 @@ This is the recommended branch. What it changes, by subsystem:
   which now selects the item even when it already has the focus; `get_menu_bar_height()`
   takes the height from `NtUserDrawMenuBarTemp()`. An application that rebuilds its bar in
   `WM_INITMENU` gets a valid rectangle for the selected item and no extra
-  `WM_NCCALCSIZE`. Two additions of the fork on top: laying out the bar sends the measure
+  `WM_NCCALCSIZE`. One addition of the fork on top: laying out the bar sends the measure
   and init messages above to the owner, which must not happen while the menu is locked, so
   `GetMenuItemRect()` and `MenuItemFromPoint()` lay out an invalid bar before they lock the
-  menu (with the series alone the user32 menu test aborted with `BUG: holding USER lock`);
-  and the height is laid out again when the window width changes, where the series did so
-  only when the items changed (Ableton Live 12, started maximised, had its bar on five
-  lines, window top to client 141 px instead of 53). Checked with the user32 menu test in
-  both architectures and the menus of Live 12, FL Studio 2026 and Cubase 15
+  menu (with the series alone the user32 menu test aborted with `BUG: holding USER lock`).
+  The height is also laid out again at every `get_menu_bar_height()` call, where the series
+  did so only when the items changed (Ableton Live 12, started maximised, had its bar on
+  five lines, window top to client 141 px instead of 53; Notepad++ 8.9.8.1 has it on eight
+  rows at every window size, 179 px instead of 53, Wine bug 60669). That is upstream's own
+  follow-up from Wine 11.22, `b94b54c62b7` by Rémi Bernon, carried as a backport; until
+  then the fork laid the bar out again when the width differed or when the window had got
+  or lost `WS_CAPTION` since, and the backport took the place of both conditions (same
+  line as on the rolling branch). Checked with the user32 menu test in
+  both architectures and the menus of Live 12, FL Studio 2026 and Cubase 15; for the
+  backport of `b94b54c62b7` with Notepad++, REAPER 7.78 and Cubase Pro 15 through start,
+  1000x640, maximised, restored, 560x640 and 1300x800 (window and client sizes as before,
+  one row, two at a client width of 560) and with F11 from the maximised window in
+  Live 12 (`projects/menubar-592` in the workspace)
 - **wineserver**: a top-level's surface flush no longer overwrites child windows that
   belong to a *different process*. Such a child draws straight into the top-level's
   drawable while the owner flushes its own surface over it with a delay — a black
