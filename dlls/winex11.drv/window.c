@@ -686,9 +686,9 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
                 CWEventMask | CWBitGravity | CWBackingStore);
     }
 
-    attr->background_pixel  = 0;
-    data->black_expose_bg = 1;
-    return (CWSaveUnder | CWColormap | CWBorderPixel | CWBackPixel |
+    /* no background is set on this path (upstream 73f7ca409a9), so there is none to suppress */
+    data->black_expose_bg = 0;
+    return (CWSaveUnder | CWColormap | CWBorderPixel |
             CWEventMask | CWBitGravity | CWBackingStore);
 }
 
