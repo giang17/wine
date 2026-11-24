@@ -390,6 +390,20 @@ This is the recommended branch. What it changes, by subsystem:
   Windows 10. dcomp has tests now (`dlls/dcomp/tests`): device creation, the visual tree,
   targets, surfaces and the leaf properties written for wined3d -- 266 tests without a
   failure on Windows 10, 554 on the fork with the 97 known differences marked.
+- **DComp target windows that a third party subclasses**: dcomp and dxgi hook the window
+  procedure of a composition target, and both told by the installed procedure whether
+  their hook was in place. A plug-in that subclasses its own window after them, or
+  comctl32's `SetWindowSubclass()`, hid both: the next `CreateTargetForHwnd()` on the
+  window hooked a second time and the procedures called each other in a ring until the
+  stack was gone. oeksound soothe3 1.0.6 creates two targets on its editor window and
+  subclasses it in between; inserting it in REAPER through yabridge ended the Wine host
+  with a stack overflow (giang17/wine issue 32, reported by kn9ff with the analysis, a
+  reproducer and the patch the fix starts from). Both now keep on the window what their
+  hook calls next for as long as the hook is in the chain, and a message that no target
+  claims goes there, so a third party below the hook stays in the chain as well. A test
+  with six orders of hooking and releasing: three ended in the ring before, one of them
+  without return, and a fourth lost the third party's procedure once the target above it
+  was released; all six pass, 64- and 32-bit. soothe3 itself was not run here
 - **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
   only the version 1 classes, so an application that creates the version 2 pair while
   bringing up its Direct Composition engine fails there. Applications built on the CCL
