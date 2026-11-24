@@ -1073,8 +1073,20 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                          * what sits on the window and we have already subclassed it
                          * once, ours is still in the chain and chaining again would
                          * close a ring - ours would call dcomp's, which calls the
-                         * procedure it saved (ours) right back (issue 101). */
+                         * procedure it saved (ours) right back (issue 101).
+                         *
+                         * A third party (a plug-in's own SetWindowLongPtrA,
+                         * comctl32's SetWindowSubclass) may have subclassed on top
+                         * of us and of dcomp, and then the installed procedure is
+                         * nobody's of ours.  __wine_dcomp_orig_wndproc is removed
+                         * only when we unhook, so it says that ours is still in
+                         * the chain (oeksound soothe3 1.0.6, giang17/wine issue
+                         * 32) - unless the class procedure is installed: nothing
+                         * is subclassed then, somebody below us put back what it
+                         * had saved and cut us out. */
                         if (installed == dcomp_popup_wndproc || installed == dcomp_target_wndproc
+                                || (GetPropW(target_hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP)
+                                    && installed != (WNDPROC)GetClassLongPtrW(target_hwnd, GCLP_WNDPROC))
                                 || (installed
                                     && installed == (WNDPROC)GetPropW(target_hwnd, WINE_DCOMP_SUBCLASS_PROC_PROP)
                                     && GetPropW(target_hwnd, WINE_DCOMP_ORIG_WNDPROC_PROP)))

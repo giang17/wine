@@ -3646,6 +3646,19 @@ static const WCHAR dcomp_real_wndproc_prop[] = L"__wine_dcomp_real_wndproc";
  * before chaining, so neither builds a chain that runs through the other and
  * back into itself (issue 101). */
 static const WCHAR dcomp_subclass_proc_prop[] = WINE_DCOMP_SUBCLASS_PROC_PROP;
+/* The procedure right below dcomp_target_wndproc in the window's chain: set
+ * when we hook, removed only when we unhook.  A third party (a plug-in's own
+ * SetWindowLongPtrA, comctl32's SetWindowSubclass) may subclass on top of us
+ * and of dxgi; then neither the installed procedure nor
+ * dcomp_subclass_proc_prop says that we are still in the chain, and hooking
+ * a second time closes a ring: the new hook calls the third party, which
+ * calls down to the old hook, which reads the new target's orig_wndproc and
+ * calls the third party again until the stack is gone (oeksound soothe3
+ * 1.0.6, giang17/wine issue 32).  It is also where a message goes when no
+ * target holds the procedure any more -- dcomp_real_wndproc_prop is the
+ * procedure found at the first hook of the window's lifetime, and a third
+ * party may have subclassed between an unhook and the next hook. */
+static const WCHAR dcomp_next_wndproc_prop[] = L"__wine_dcomp_next_wndproc";
 
 static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
@@ -3939,6 +3952,7 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
             {
                 SetWindowLongPtrW(target->hwnd, GWLP_WNDPROC, (LONG_PTR)target->orig_wndproc);
                 RemovePropW(target->hwnd, dcomp_subclass_proc_prop);
+                RemovePropW(target->hwnd, dcomp_next_wndproc_prop);
                 FIXME("Removed WndProc subclass from hwnd %p.\n", target->hwnd);
             }
             /* Never leave the back-pointer on a window we are about to free. */
@@ -8181,8 +8195,10 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
          * painting (the composite path runs independently of the WndProc)
          * but all input is dead.  Forward to the application's procedure
          * preserved for the window's lifetime instead. */
-        WNDPROC real = (WNDPROC)GetPropW(hwnd, dcomp_real_wndproc_prop);
+        WNDPROC real = (WNDPROC)GetPropW(hwnd, dcomp_next_wndproc_prop);
 
+        if (!real)
+            real = (WNDPROC)GetPropW(hwnd, dcomp_real_wndproc_prop);
         if (real && real != dcomp_target_wndproc)
         {
             static unsigned int orphan_forward_count;
@@ -8409,6 +8425,7 @@ static LRESULT CALLBACK dcomp_target_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
         }
         RemovePropW(hwnd, dcomp_target_prop);
         RemovePropW(hwnd, dcomp_present_flush_prop);
+        RemovePropW(hwnd, dcomp_next_wndproc_prop);
         target->orig_wndproc = NULL;
         if (!orig_wndproc)
             return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -8577,7 +8594,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
 {
     struct dcomp_target *previous;
     struct dcomp_target *object;
-    WNDPROC installed;
+    WNDPROC installed, next;
 
     TRACE("iface %p, hwnd %p, topmost %d, target %p.\n", iface, hwnd, topmost, target);
 
@@ -8664,9 +8681,22 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
      * round - ours calls dxgi's, dxgi's reads the procedure it saved (ours) and
      * calls back into us.  Our procedure is already in the chain in that case
      * and the new target is picked up through dcomp_target_prop, so there is
-     * nothing left to install (issue 101). */
+     * nothing left to install (issue 101).
+     *
+     * And once a third party has subclassed on top of either: the installed
+     * procedure is then nobody's of ours, and only dcomp_next_wndproc_prop
+     * says that our procedure is still in the chain.  With the class
+     * procedure installed nothing is subclassed at all, so somebody below us
+     * put back what it had saved and cut us out; the mark is stale then and
+     * we hook again. */
     installed = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
-    if (installed == dcomp_target_wndproc
+    if ((next = (WNDPROC)GetPropW(hwnd, dcomp_next_wndproc_prop))
+            && installed == (WNDPROC)GetClassLongPtrW(hwnd, GCLP_WNDPROC))
+    {
+        RemovePropW(hwnd, dcomp_next_wndproc_prop);
+        next = NULL;
+    }
+    if (installed == dcomp_target_wndproc || next
             || (installed && installed == (WNDPROC)GetPropW(hwnd, dcomp_subclass_proc_prop)
                 && (previous || GetPropW(hwnd, dcomp_real_wndproc_prop))))
     {
@@ -8679,10 +8709,12 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
             previous->orig_wndproc = NULL;
         }
 
-        /* Fall back to the procedure stashed by whoever subclassed the window
-         * first.  Without it the application's wndproc drops out of the chain and
-         * the window only ever sees DefWindowProcW: clicks never reach the plugin
-         * and nothing repaints. */
+        /* Fall back to the procedure below our hook, and to the one stashed by
+         * whoever subclassed the window first.  Without it the application's
+         * wndproc drops out of the chain and the window only ever sees
+         * DefWindowProcW: clicks never reach the plugin and nothing repaints. */
+        if (!object->orig_wndproc)
+            object->orig_wndproc = next;
         if (!object->orig_wndproc)
             object->orig_wndproc = (WNDPROC)GetPropW(hwnd, dcomp_real_wndproc_prop);
         if (!object->orig_wndproc)
@@ -8707,6 +8739,8 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
 
         /* Publish what we installed so dxgi recognises the subclass as ours. */
         SetPropW(hwnd, dcomp_subclass_proc_prop, (HANDLE)dcomp_target_wndproc);
+        if (object->orig_wndproc)
+            SetPropW(hwnd, dcomp_next_wndproc_prop, (HANDLE)object->orig_wndproc);
 
         /* Remember the application's own procedure for the whole lifetime of the
          * window.  Targets are recreated on resize, and the one that installed the
