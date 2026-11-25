@@ -4206,6 +4206,13 @@ struct wined3d_swapchain
     unsigned int own_width;
     unsigned int own_height;
     BOOL own_valid;
+    /* dcomp_target: bound to a window as the root content of a composition
+     * target.  dcomp_layered: the window has a layer of the other kind as
+     * well, written by the presents of this swapchain; such a swapchain
+     * presents through GDI on a top-level window too, see
+     * swapchain_dcomp_window_update_layered(). */
+    BOOL dcomp_target;
+    BOOL dcomp_layered;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);
