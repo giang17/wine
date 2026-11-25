@@ -403,7 +403,9 @@ This is the recommended branch. What it changes, by subsystem:
   claims goes there, so a third party below the hook stays in the chain as well. A test
   with six orders of hooking and releasing: three ended in the ring before, one of them
   without return, and a fourth lost the third party's procedure once the target above it
-  was released; all six pass, 64- and 32-bit. soothe3 itself was not run here
+  was released; all six pass, 64- and 32-bit. soothe3 1.0.6 itself, inserted in REAPER 7.82
+  (the Windows build under Wine, not through yabridge), creates its two targets, draws and
+  lets REAPER exit cleanly
 - **Two DComp targets on one window**: Windows lets a window carry one target created with
   `topmost` set and one without and composes the topmost tree over the other. Here the two
   swapchains replaced each other on the window, and the transparent parts of the topmost
@@ -431,7 +433,10 @@ This is the recommended branch. What it changes, by subsystem:
   the window has both targets, and the error for a second target of the same kind
   (`0x88980800`; the fork lets the new target take the window over and says so in a
   FIXME -- the five applications create one target per window and none on a resize).
-  soothe3 itself was not run here
+  soothe3 1.0.6 itself in REAPER 7.82 shows its interface and, while audio runs, the
+  display that follows the signal over it (checked on KWin X11 with an NVIDIA card); its
+  log has neither the FIXME for a second target of the same kind nor the one for leaves
+  below the topmost root, so it reaches none of these differences while its editor is open
 - **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
   only the version 1 classes, so an application that creates the version 2 pair while
   bringing up its Direct Composition engine fails there. Applications built on the CCL
@@ -3467,6 +3472,7 @@ these were developed against, but they are not specific to it.
 | Waves Central 17.1.5 | Electron | Installs, starts, signs in and installs products (the Waves Ultimate demo, 254 plug-in bundles). Needs the `powershell` and `taskkill` patches from this branch: without the version queries it stops at start with "Waves Central cannot access PowerShell", and `taskkill /t` could leave the product installation stuck at "Closing COSMOS". Its cache cleanup ("Clear cache") calls `robocopy.exe`, a stub in upstream Wine; with the `robocopy` of this branch it removes the download cache (6.3 GB down to 3.5 MB in the measured run), keeps the two server folders, and Waves Central restarts |
 | Waves V17 plug-ins (VST3 in Reaper) | Waves framework (WaveShell + WavesLib); the editor draws through OpenGL (measured for API-550A) | The editors draw, also side by side and after closing and reopening them — checked with API-550A, Abbey Road Reel ADT Live and CLA Guitars; audio passes and the meter moves (checked with the Clavinet instrument, stereo). Needs the `wglShareLists()` patches from this branch: without them the editor stayed black and REAPER froze. Checked with the demo licence, which mutes the audio periodically |
 | Waves COSMOS Sample Finder 17 | Electron 36, frameless window | The window resizes at edges and corners, maximizes, restores and moves, also by dragging the title bar of the maximized window (checked on KWin X11; the sample analysis itself is not checked). Needs the size hint and window state patches from this branch: it answers `WM_GETMINMAXINFO` with a maximum of `INT_MAX`, which fixed the window at its minimum size, and a drag on the maximized window left it fullscreen. |
+| oeksound soothe3 1.0.6 (VST3 in Reaper) | JUCE 8.0.6 interface and a spectrum display of its own, each in a DComp target on the editor window; PACE/iLok wrapper | Loads after the iLok activation, the editor draws and the display follows the audio signal (checked in REAPER 7.82 on KWin X11 with an NVIDIA card). With the builtin `msvcp140` it loads only with the money facet ids from this branch; the editor is the case of the third-party subclass and two-targets entries |
 | FM-Alive DX Manager 5.5.10 | .NET Framework 4.8 (WinForms/WPF), ClickOnce | Installs through `rundll32 dfshim.dll,ShOpenVerbApplication` in a prefix with the native .NET Framework 4.8 (Wine Mono has no ClickOnce, and the application refuses to start outside it), talks SysEx to a Yamaha DX11 and lists all five voice banks in its Patch Viewer. Needs the `winealsa` MIDI input patch from this branch: without it the first bank of a sync arrived short and the Patch Viewer never finished |
 
 ## Font Setup
