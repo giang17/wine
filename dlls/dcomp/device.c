@@ -3957,7 +3957,10 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
             /* The window may carry a second target, one of the two created
              * with topmost set (issue 653).  It takes the window over with
              * the hook and the procedure below it, the way a successor does
-             * on creation. */
+             * on creation.  The procedure is ours whatever the other target
+             * holds: the window procedure calls the one of the target the
+             * window refers to, and what an earlier owner kept may have left
+             * the chain since. */
             if (ours)
             {
                 struct dcomp_target *other;
@@ -3965,8 +3968,7 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
                 EnterCriticalSection(&dcomp_all_targets_cs);
                 if ((other = dcomp_window_other_target(target->hwnd, target)))
                 {
-                    if (!other->orig_wndproc)
-                        other->orig_wndproc = target->orig_wndproc;
+                    other->orig_wndproc = target->orig_wndproc;
                     target->orig_wndproc = NULL;
                     SetPropW(target->hwnd, dcomp_target_prop, (HANDLE)other);
                     ours = FALSE;
