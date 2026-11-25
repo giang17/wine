@@ -2607,18 +2607,18 @@
 # extern ?id@?$messages@D@std@@2V0locale@2@A
 # extern ?id@?$messages@G@std@@2V0locale@2@A
 # extern ?id@?$messages@_W@std@@2V0locale@2@A
-# extern ?id@?$money_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A
-# extern ?id@?$money_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A
-# extern ?id@?$money_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A
-# extern ?id@?$money_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A
-# extern ?id@?$money_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A
-# extern ?id@?$money_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A
-# extern ?id@?$moneypunct@D$00@std@@2V0locale@2@A
-# extern ?id@?$moneypunct@D$0A@@std@@2V0locale@2@A
-# extern ?id@?$moneypunct@G$00@std@@2V0locale@2@A
-# extern ?id@?$moneypunct@G$0A@@std@@2V0locale@2@A
-# extern ?id@?$moneypunct@_W$00@std@@2V0locale@2@A
-# extern ?id@?$moneypunct@_W$0A@@std@@2V0locale@2@A
+@ extern ?id@?$money_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A money_get_char_id
+@ extern ?id@?$money_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A money_get_short_id
+@ extern ?id@?$money_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A money_get_wchar_id
+@ extern ?id@?$money_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A money_put_char_id
+@ extern ?id@?$money_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A money_put_short_id
+@ extern ?id@?$money_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A money_put_wchar_id
+@ extern ?id@?$moneypunct@D$00@std@@2V0locale@2@A moneypunct_char_true_id
+@ extern ?id@?$moneypunct@D$0A@@std@@2V0locale@2@A moneypunct_char_false_id
+@ extern ?id@?$moneypunct@G$00@std@@2V0locale@2@A moneypunct_short_true_id
+@ extern ?id@?$moneypunct@G$0A@@std@@2V0locale@2@A moneypunct_short_false_id
+@ extern ?id@?$moneypunct@_W$00@std@@2V0locale@2@A moneypunct_wchar_true_id
+@ extern ?id@?$moneypunct@_W$0A@@std@@2V0locale@2@A moneypunct_wchar_false_id
 @ extern ?id@?$num_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A num_get_char_id
 @ extern ?id@?$num_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A num_get_short_id
 @ extern ?id@?$num_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A num_get_wchar_id

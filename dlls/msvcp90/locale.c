@@ -12427,6 +12427,48 @@ void __cdecl locale__Locimp__Makewloc(const _Locinfo *locinfo, category cat, loc
     }
 }
 
+#if _MSVCP_VER >= 100
+/* Since msvcp100 the DLL exports nothing of the money facets but their
+ * ids and intl; the code of the classes is in the application. */
+
+/* ?id@?$money_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A */
+locale_id money_get_char_id = {0};
+
+/* ?id@?$money_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A */
+locale_id money_get_short_id = {0};
+
+/* ?id@?$money_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A */
+locale_id money_get_wchar_id = {0};
+
+/* ?id@?$money_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A */
+locale_id money_put_char_id = {0};
+
+/* ?id@?$money_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A */
+locale_id money_put_short_id = {0};
+
+/* ?id@?$money_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A */
+locale_id money_put_wchar_id = {0};
+
+/* ?id@?$moneypunct@D$00@std@@2V0locale@2@A */
+locale_id moneypunct_char_true_id = {0};
+
+/* ?id@?$moneypunct@D$0A@@std@@2V0locale@2@A */
+locale_id moneypunct_char_false_id = {0};
+
+/* ?id@?$moneypunct@G$00@std@@2V0locale@2@A */
+locale_id moneypunct_short_true_id = {0};
+
+/* ?id@?$moneypunct@G$0A@@std@@2V0locale@2@A */
+locale_id moneypunct_short_false_id = {0};
+
+/* ?id@?$moneypunct@_W$00@std@@2V0locale@2@A */
+locale_id moneypunct_wchar_true_id = {0};
+
+/* ?id@?$moneypunct@_W$0A@@std@@2V0locale@2@A */
+locale_id moneypunct_wchar_false_id = {0};
+
+#endif /* _MSVCP_VER >= 100 */
+
 /* ?_Makexloc@_Locimp@locale@std@@CAXABV_Locinfo@3@HPAV123@PBV23@@Z */
 /* ?_Makexloc@_Locimp@locale@std@@CAXAEBV_Locinfo@3@HPEAV123@PEBV23@@Z */
 /* List of missing facets:
