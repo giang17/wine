@@ -65,12 +65,147 @@ static BOOL set_window_present_rect(HWND hwnd, UINT x, UINT y, UINT width, UINT 
     return !D3DKMTEscape(&escape);
 }
 
+/* --- Two composition layers on one window (issue 653) -----------------------
+ *
+ * A window carries up to two DirectComposition targets, one created with
+ * topmost set and one without, and Windows composes the topmost tree over the
+ * other one whatever the order they were created or presented in.  With a
+ * swapchain as the root content of each, both swapchains are bound to the
+ * same window here, and a GDI present that copies only its own composition
+ * buffer to the window replaces the other layer with it: the transparent
+ * parts of the topmost layer arrive as black.  oeksound soothe3 1.0.6 draws
+ * its spectrum into a topmost target 60 times a second from a render thread
+ * and its JUCE interface into the other one; the editor stayed black
+ * (giang17/wine issue 33).
+ *
+ * So the swapchains that present to one window find each other through this
+ * table, and every present puts both layers into the frame it blits, see
+ * swapchain_compose_window_layers().
+ *
+ * The two present from the command stream threads of two devices.  The
+ * entry's lock is held from before a present touches its composition buffers
+ * until its frame is in the window: it keeps the buffers of the other layer
+ * in place while they are read, and it keeps two frames from reaching the
+ * window in the wrong order.  A swapchain allocates, writes and frees
+ * surface_bits and own_bits only under the lock of the entry it is registered
+ * in, and it leaves that entry before it presents to another window and
+ * before it is destroyed.
+ *
+ * An entry is never freed, only handed to another window once both of its
+ * layers are gone.  A second swapchain of the same kind (the successor an
+ * application creates on a resize) takes the slot of the first.
+ *
+ * Only the GDI present comes through here, the one a child window gets -- a
+ * plug-in editor in its host.  A top-level window presents through GL
+ * (WINED3D_SWAPCHAIN_PREFER_GL_PRESENT) and its two layers still replace
+ * each other. */
+#define WINED3D_DCOMP_WINDOW_SLOTS 64
+
+struct wined3d_dcomp_window
+{
+    HWND window;
+    SRWLOCK lock;
+    struct wined3d_swapchain *layer[2];     /* [0] the window's other tree, [1] the topmost one */
+};
+
+static struct wined3d_dcomp_window wined3d_dcomp_windows[WINED3D_DCOMP_WINDOW_SLOTS];
+static SRWLOCK wined3d_dcomp_windows_lock = SRWLOCK_INIT;
+
+static void swapchain_dcomp_window_leave(struct wined3d_swapchain *swapchain)
+{
+    struct wined3d_dcomp_window *entry = swapchain->dcomp_window;
+    unsigned int i;
+
+    if (!entry)
+        return;
+
+    AcquireSRWLockExclusive(&wined3d_dcomp_windows_lock);
+    /* Waits out a present of the other layer that reads our buffers. */
+    AcquireSRWLockExclusive(&entry->lock);
+    for (i = 0; i < ARRAY_SIZE(entry->layer); ++i)
+    {
+        if (entry->layer[i] == swapchain)
+            entry->layer[i] = NULL;
+    }
+    if (!entry->layer[0] && !entry->layer[1])
+        entry->window = NULL;
+    swapchain->own_valid = FALSE;
+    ReleaseSRWLockExclusive(&entry->lock);
+    ReleaseSRWLockExclusive(&wined3d_dcomp_windows_lock);
+    swapchain->dcomp_window = NULL;
+}
+
+/* Register the swapchain as a layer of the window it is about to present to
+ * and take the window's lock.  Returns NULL, with no lock held, when the
+ * table is full; the present then goes out the way it did before. */
+static struct wined3d_dcomp_window *swapchain_dcomp_window_enter(struct wined3d_swapchain *swapchain)
+{
+    unsigned int role = !!(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_DCOMP_TOPMOST);
+    struct wined3d_dcomp_window *entry = swapchain->dcomp_window, *unused = NULL;
+    unsigned int i;
+
+    if (!swapchain->win_handle)
+        return NULL;
+
+    if (entry && entry->window != swapchain->win_handle)
+    {
+        swapchain_dcomp_window_leave(swapchain);
+        entry = NULL;
+    }
+
+    /* The common case, without the table lock: still registered where the
+     * last present left us.  Our slot is only ever taken by a swapchain of
+     * the same kind, and the entry cannot move to another window while we
+     * are in it. */
+    if (entry && entry->layer[role] == swapchain)
+    {
+        AcquireSRWLockExclusive(&entry->lock);
+        return entry;
+    }
+
+    AcquireSRWLockExclusive(&wined3d_dcomp_windows_lock);
+    if (!entry)
+    {
+        for (i = 0; i < ARRAY_SIZE(wined3d_dcomp_windows); ++i)
+        {
+            if (wined3d_dcomp_windows[i].window == swapchain->win_handle)
+            {
+                entry = &wined3d_dcomp_windows[i];
+                break;
+            }
+            if (!wined3d_dcomp_windows[i].window && !unused)
+                unused = &wined3d_dcomp_windows[i];
+        }
+        if (!entry && (entry = unused))
+            entry->window = swapchain->win_handle;
+    }
+    if (entry)
+    {
+        entry->layer[role] = swapchain;
+        if (entry->layer[!role] == swapchain)
+            entry->layer[!role] = NULL;
+    }
+    ReleaseSRWLockExclusive(&wined3d_dcomp_windows_lock);
+
+    swapchain->dcomp_window = entry;
+    if (entry)
+        AcquireSRWLockExclusive(&entry->lock);
+    return entry;
+}
+
 void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
 {
+    HDC comp_dc = swapchain->comp_dc;
     HRESULT hr;
     UINT i;
 
     TRACE("Destroying swapchain %p.\n", swapchain);
+
+    /* Before any of the buffers go: the other layer of the window may be
+     * reading them. */
+    swapchain_dcomp_window_leave(swapchain);
+    free(swapchain->own_bits);
+    swapchain->own_bits = NULL;
 
     if (swapchain->comp_dc)
     {
@@ -86,8 +221,11 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
      * and bits they reference are freed above; leaving the props behind lets
      * the child-compositing path read a stale HDC/bits pointer after the
      * swapchain is gone. Only our own props are touched — __wine_dcomp_child_*
-     * and __wine_dcomp_is_child are owned by dcomp/dxgi and removed there. */
-    if (swapchain->win_handle)
+     * and __wine_dcomp_is_child are owned by dcomp/dxgi and removed there.
+     * And only while they are ours: the other layer of the window publishes
+     * its frame under the same names, and that one is still there. */
+    if (swapchain->win_handle
+            && (HDC)GetPropW(swapchain->win_handle, WINE_DCOMP_COMP_DC_PROP) == comp_dc)
     {
         RemovePropW(swapchain->win_handle, WINE_DCOMP_COMP_DC_PROP);
         RemovePropW(swapchain->win_handle, WINE_DCOMP_COMP_SIZE_PROP);
@@ -384,6 +522,20 @@ void CDECL wined3d_swapchain_set_premultiplied_alpha(struct wined3d_swapchain *s
         swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA;
     else
         swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA;
+}
+
+/* The swapchain is the root content of a composition target created with
+ * topmost set: its layer goes over the window's other one, see
+ * swapchain_dcomp_window_enter().  Configured at the bind like the flags
+ * above. */
+void CDECL wined3d_swapchain_set_dcomp_topmost(struct wined3d_swapchain *swapchain, BOOL topmost)
+{
+    TRACE("swapchain %p, topmost %d.\n", swapchain, topmost);
+
+    if (topmost)
+        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_DCOMP_TOPMOST;
+    else
+        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_DCOMP_TOPMOST;
 }
 
 void CDECL wined3d_swapchain_set_dirty_rects(struct wined3d_swapchain *swapchain,
@@ -1229,11 +1381,109 @@ static struct wined3d_texture *swapchain_update_gdi_texture(struct wined3d_swapc
     return texture;
 }
 
+/* comp_bits holds what this swapchain's layer alone looks like.  Keep a copy
+ * of that for the presents of the window's other layer, and turn comp_bits
+ * into the frame of both: the topmost layer over the other one, each at the
+ * window's origin and at its own size.  Called with the entry's lock held.
+ *
+ * A layer that has not presented since the other one appeared has no copy
+ * yet; its surface_bits stand in, which is the layer without the leaves of
+ * its tree.  A topmost swapchain that is not premultiplied has no alpha to
+ * blend by and covers what is below it. */
+static void swapchain_compose_window_layers(struct wined3d_swapchain *swapchain,
+        struct wined3d_dcomp_window *entry, unsigned int width, unsigned int height)
+{
+    unsigned int role = !!(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_DCOMP_TOPMOST);
+    struct wined3d_swapchain *peer = entry->layer[!role];
+    unsigned int peer_width = 0, peer_height = 0, y, w, h;
+    const DWORD *peer_bits = NULL;
+    BOOL top_blends;
+
+    if (!peer || !swapchain->comp_bits)
+    {
+        swapchain->own_valid = FALSE;
+        return;
+    }
+
+    if (peer->own_valid && peer->own_bits)
+    {
+        peer_bits = peer->own_bits;
+        peer_width = peer->own_width;
+        peer_height = peer->own_height;
+    }
+    else if (peer->surface_valid && peer->surface_bits)
+    {
+        peer_bits = peer->surface_bits;
+        peer_width = peer->surface_width;
+        peer_height = peer->surface_height;
+    }
+
+    if (!swapchain->own_bits || swapchain->own_width != width || swapchain->own_height != height)
+    {
+        free(swapchain->own_bits);
+        swapchain->own_valid = FALSE;
+        if (!(swapchain->own_bits = malloc((SIZE_T)width * height * sizeof(DWORD))))
+            return;
+        swapchain->own_width = width;
+        swapchain->own_height = height;
+    }
+    GdiFlush();
+    memcpy(swapchain->own_bits, swapchain->comp_bits, (SIZE_T)width * height * sizeof(DWORD));
+    swapchain->own_valid = TRUE;
+
+    if (!peer_bits)
+        return;
+
+    {
+        static unsigned int compose_count;
+
+        if (++compose_count <= 3 || !(compose_count % 2000))
+            TRACE("swapchain %p, window %p: %s layer %ux%u with the other one %ux%u of swapchain %p #%u.\n",
+                    swapchain, entry->window, role ? "topmost" : "base", width, height,
+                    peer_width, peer_height, peer, compose_count);
+    }
+
+    top_blends = !!((role ? swapchain : peer)->state.desc.flags & WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA);
+    w = min(width, peer_width);
+    h = min(height, peer_height);
+
+    if (!role)
+    {
+        if (top_blends)
+            composite_over_premul(swapchain->comp_bits, peer_bits, width, peer_width,
+                    0, 0, peer_width, peer_height, width, height, 0);
+        else
+            for (y = 0; y < h; ++y)
+                memcpy(swapchain->comp_bits + (SIZE_T)y * width, peer_bits + (SIZE_T)y * peer_width,
+                        w * sizeof(DWORD));
+        return;
+    }
+
+    if (!top_blends)
+        return;
+
+    for (y = 0; y < height; ++y)
+    {
+        DWORD *row = swapchain->comp_bits + (SIZE_T)y * width;
+
+        if (y < h)
+        {
+            memcpy(row, peer_bits + (SIZE_T)y * peer_width, w * sizeof(DWORD));
+            memset(row + w, 0, (width - w) * sizeof(DWORD));
+        }
+        else
+            memset(row, 0, width * sizeof(DWORD));
+    }
+    composite_over_premul(swapchain->comp_bits, swapchain->own_bits, width, width,
+            0, 0, width, height, width, height, 0);
+}
+
 static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         struct wined3d_context *context, const RECT *src_rect, const RECT *dst_rect)
 {
     struct wined3d_texture *back_buffer = swapchain->back_buffers[0];
     struct wined3d_texture *src_texture = back_buffer;
+    struct wined3d_dcomp_window *dcomp_window = NULL;
     D3DKMT_DESTROYDCFROMMEMORY destroy_desc;
     D3DKMT_CREATEDCFROMMEMORY create_desc;
     const struct wined3d_format *format;
@@ -1309,6 +1559,13 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         unsigned int dst_h = dst_rect->bottom - dst_rect->top;
         unsigned int src_w = src_rect->right - src_rect->left;
         unsigned int src_h = src_rect->bottom - src_rect->top;
+        /* The mark of a swapchain that composites as a child of another one:
+         * it only fills its buffer, the root reads it. */
+        BOOL is_child = !!GetPropW(swapchain->win_handle, WINE_DCOMP_IS_CHILD_PROP);
+
+        /* From here to the blit under the lock of the window's layers. */
+        if (!is_child)
+            dcomp_window = swapchain_dcomp_window_enter(swapchain);
 
         /* Ensure persistent composition buffer exists and is the right size. */
         if (!swapchain->comp_dc || swapchain->comp_width != dst_w
@@ -1588,23 +1845,34 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
         /* Phase 3 Compositor: rebuild comp_bits from clean root surface_bits,
          * then composite child visuals on top. */
-        if (!GetPropW(swapchain->win_handle, WINE_DCOMP_IS_CHILD_PROP))
+        if (!is_child)
         {
+            /* The leaves and the leaf layer published on the window belong to
+             * its other tree while there is one; a topmost layer above it
+             * must not draw them a second time. */
+            BOOL owns_leaves = !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_DCOMP_TOPMOST)
+                    || !dcomp_window || !dcomp_window->layer[0];
+
             if (swapchain->surface_valid && swapchain->surface_bits && swapchain->comp_bits)
             {
                 GdiFlush();
                 memcpy(swapchain->comp_bits, swapchain->surface_bits,
                         swapchain->surface_width * swapchain->surface_height * sizeof(DWORD));
             }
-            swapchain_composite_children(swapchain, dst_w, dst_h);
-            /* The dcomp leaf layer, see above. */
-            swapchain_composite_layer(swapchain, swapchain->comp_bits,
-                    swapchain->comp_width, dst_w, dst_h);
+            if (owns_leaves)
+            {
+                swapchain_composite_children(swapchain, dst_w, dst_h);
+                /* The dcomp leaf layer, see above. */
+                swapchain_composite_layer(swapchain, swapchain->comp_bits,
+                        swapchain->comp_width, dst_w, dst_h);
+            }
+            if (dcomp_window)
+                swapchain_compose_window_layers(swapchain, dcomp_window, dst_w, dst_h);
         }
 
         /* Child visuals: only update comp buffer, skip window blit.
          * The root visual reads our comp_bits directly. */
-        if (GetPropW(swapchain->win_handle, WINE_DCOMP_IS_CHILD_PROP))
+        if (is_child)
         {
             /* Child visuals: only update comp buffer, skip window blit. */
         }
@@ -1694,6 +1962,8 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
      * which is the repaint-cycle protection this call was added for. */
 
 done:
+    if (dcomp_window)
+        ReleaseSRWLockExclusive(&dcomp_window->lock);
     destroy_desc.hDc = src_dc;
     destroy_desc.hBitmap = bitmap;
     if ((status = D3DKMTDestroyDCFromMemory(&destroy_desc)))

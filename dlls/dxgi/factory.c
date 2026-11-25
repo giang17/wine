@@ -961,6 +961,12 @@ static LRESULT CALLBACK dcomp_swapchain_wndproc(HWND hwnd, UINT msg, WPARAM wpar
                         wined3d_swapchain_set_force_gdi_present(swapchain->wined3d_swapchain, TRUE);
                     }
 
+                    /* Whether the target was created with topmost set, from dcomp:
+                     * wined3d composes that swapchain over the one of the window's
+                     * other target instead of letting the two replace each other
+                     * (issue 653). */
+                    wined3d_swapchain_set_dcomp_topmost(swapchain->wined3d_swapchain, !!wparam);
+
                     wined3d_swapchain_set_device_window(swapchain->wined3d_swapchain, target_hwnd);
                     /* Remember the subclassed target for teardown in d3d11_swapchain_Release. */
                     swapchain->target_hwnd = target_hwnd;
