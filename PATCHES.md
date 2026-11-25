@@ -418,11 +418,20 @@ This is the recommended branch. What it changes, by subsystem:
   presenting from two threads, and when the second target is created after the first has
   presented; the fork showed one layer or the other -- on a top-level window, with single
   presents, that of the target created first whatever was presented last -- and now gives
-  the same values on a child and on a top-level window. Still different from Windows: the window's own content below a target
-  that stands alone (Windows shows the class background and what the window draws on
-  `WM_PAINT` where the tree is transparent, the fork black), leaves below the topmost
-  root while the window has both targets, and the error for a second target of the same
-  kind. soothe3 itself was not run here
+  the same values on a child and on a top-level window. Below a target that stands alone
+  Windows shows the GDI content of the window where the tree is transparent (white class
+  brush: 255,255,255 and 127,255,127 under the half transparent green; a yellow fill on
+  `WM_PAINT`: 255,255,0 and 127,255,0); the GDI present, the one a child window gets, now
+  puts the colour of a solid class background brush there, where it showed black. None of
+  the nine target windows of Minimal Audio Current, Serum 2, Trinity, Hotline and EPROM -
+  Memory Rites has such a brush (JUCE and VSTGUI: none; Chromium: black, and no
+  redirection bitmap), so nothing changes for them. Still different from Windows: what
+  the window draws on `WM_PAINT` below a single target, the window's content below a
+  single target on a top-level window (GL present), leaves below the topmost root while
+  the window has both targets, and the error for a second target of the same kind
+  (`0x88980800`; the fork lets the new target take the window over and says so in a
+  FIXME -- the five applications create one target per window and none on a resize).
+  soothe3 itself was not run here
 - **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
   only the version 1 classes, so an application that creates the version 2 pair while
   bringing up its Direct Composition engine fails there. Applications built on the CCL
