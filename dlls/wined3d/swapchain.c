@@ -1513,6 +1513,76 @@ static void swapchain_compose_window_layers(struct wined3d_swapchain *swapchain,
             0, 0, width, height, width, height, 0);
 }
 
+/* On Windows the tree of a composition target lies over the GDI content of
+ * its window, and where the frame is transparent that content shows: the
+ * class background, and what the window draws on WM_PAINT.  That holds for a
+ * target created with topmost and for one without, and below both when a
+ * window has two.  Here the frame reaches the window as a copy, and the hooks
+ * of dcomp and dxgi keep the window from erasing its background so that it
+ * cannot paint over the frame: the transparent pixels arrived as black.
+ *
+ * Put the colour of the class background brush below the finished frame,
+ * for a brush that is a system colour or solid.  bits holds the frame of the
+ * window's layers, premultiplied; it leaves here opaque.
+ *
+ * Nothing is done for a window without a background brush or with a black
+ * one, where black is what there is to show (a window that never draws has
+ * no defined content on Windows either), and for one with
+ * WS_EX_NOREDIRECTIONBITMAP, which has no GDI content.  Of nine target
+ * windows of five applications measured, none has another brush: JUCE and
+ * VSTGUI register their class without one, Chromium's "Intermediate D3D
+ * Window" has the black brush and no redirection bitmap.
+ *
+ * Not covered: what the window draws on WM_PAINT, which goes to the same
+ * window surface as the frame and is not kept apart from it; a pattern or
+ * hatched brush; a window that answers WM_ERASEBKGND itself; and the GL
+ * present of a top-level window, which copies the frame without its alpha
+ * (issue 653). */
+static void swapchain_composite_window_background(struct wined3d_swapchain *swapchain,
+        DWORD *bits, unsigned int width, unsigned int height)
+{
+    unsigned int r, g, b, x, y;
+    ULONG_PTR brush;
+    COLORREF colour;
+    LOGBRUSH lb;
+
+    if (!(brush = GetClassLongPtrW(swapchain->win_handle, GCLP_HBRBACKGROUND)))
+        return;
+    if (brush <= COLOR_MENUBAR + 1)
+        colour = GetSysColor(brush - 1);
+    else if (GetObjectW((HBRUSH)brush, sizeof(lb), &lb) == sizeof(lb) && lb.lbStyle == BS_SOLID)
+        colour = lb.lbColor;
+    else
+        return;
+    if (!(colour & 0x00ffffff))
+        return;
+    if (GetWindowLongW(swapchain->win_handle, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP)
+        return;
+
+    r = GetRValue(colour);
+    g = GetGValue(colour);
+    b = GetBValue(colour);
+
+    GdiFlush();
+    for (y = 0; y < height; ++y)
+    {
+        DWORD *row = bits + (SIZE_T)y * width;
+
+        for (x = 0; x < width; ++x)
+        {
+            DWORD p = row[x];
+            unsigned int inv = 255 - (p >> 24), pr, pg, pb;
+
+            if (!inv)
+                continue;
+            pr = ((p >> 16) & 0xff) + (r * inv + 127) / 255;
+            pg = ((p >> 8) & 0xff) + (g * inv + 127) / 255;
+            pb = (p & 0xff) + (b * inv + 127) / 255;
+            row[x] = 0xff000000 | (min(pr, 255) << 16) | (min(pg, 255) << 8) | min(pb, 255);
+        }
+    }
+}
+
 static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
         struct wined3d_context *context, const RECT *src_rect, const RECT *dst_rect)
 {
@@ -1903,6 +1973,17 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
             }
             if (dcomp_window)
                 swapchain_compose_window_layers(swapchain, dcomp_window, dst_w, dst_h);
+
+            /* The window's own content below the tree, where the lowest
+             * layer of the window has an alpha channel to say so. */
+            if (swapchain->dcomp_target && swapchain->comp_bits)
+            {
+                const struct wined3d_swapchain *lowest = dcomp_window && dcomp_window->layer[0]
+                        ? dcomp_window->layer[0] : swapchain;
+
+                if (lowest->state.desc.flags & WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA)
+                    swapchain_composite_window_background(swapchain, swapchain->comp_bits, dst_w, dst_h);
+            }
         }
 
         /* Child visuals: only update comp buffer, skip window blit.
