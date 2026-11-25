@@ -409,15 +409,20 @@ This is the recommended branch. What it changes, by subsystem:
   swapchains replaced each other on the window, and the transparent parts of the topmost
   one arrived as black: the editor of oeksound soothe3 1.0.6, which draws its spectrum into
   a topmost target 60 times a second and its JUCE interface into the other one, stayed
-  black in REAPER (giang17/wine issue 33, reported and analysed by kn9ff). For a child
-  window -- a plug-in editor in its host -- wined3d now puts both layers into every frame
-  it presents. Measured against Windows 10 with two swapchains on one window (opaque blue
-  below, transparent with a red and a half transparent green square on top): Windows shows
-  blue, red and green over blue (0,128,127) in all six orders of creation and presents,
-  the fork showed one layer or the other and now gives the same values, also with both
-  layers presenting from two threads. Still different from Windows: a top-level window
-  (GL present), the window's own content below a target that stands alone, and the error
-  for a second target of the same kind. soothe3 itself was not run here
+  black in REAPER (giang17/wine issue 33, reported and analysed by kn9ff). wined3d now
+  puts both layers into every frame it presents; a top-level window, which presents
+  through GL while it has one target, takes the GDI present while it has both. Measured
+  against Windows 10 with two swapchains on one window (opaque blue below, transparent
+  with a red and a half transparent green square on top): Windows shows blue, red and
+  green over blue (0,128,127) in all six orders of creation and presents, with both layers
+  presenting from two threads, and when the second target is created after the first has
+  presented; the fork showed one layer or the other -- on a top-level window always that
+  of the target created first -- and now gives the same values on a child and on a
+  top-level window. Still different from Windows: the window's own content below a target
+  that stands alone (Windows shows the class background and what the window draws on
+  `WM_PAINT` where the tree is transparent, the fork black), leaves below the topmost
+  root while the window has both targets, and the error for a second target of the same
+  kind. soothe3 itself was not run here
 - **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
   only the version 1 classes, so an application that creates the version 2 pair while
   bringing up its Direct Composition engine fails there. Applications built on the CCL
