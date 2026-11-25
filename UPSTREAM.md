@@ -43,6 +43,7 @@ there, or, where it does not or upstream changed the functions involved since
 | evr | The presenter loses its allocator notification when the output type is renegotiated; video stops while audio continues | `94ff059321a` | - |
 | mf | The video renderer (EVR) never reports a completed scrub; Studio Pro 8 does not start playback after a position jump | `529d0045dab` | - |
 | msvcp | Move construction and assignment of the standard stream classes are missing; Ableton Live's indexer aborts without a native VC runtime | `85ea78fad61` | - |
+| msvcp | `msvcp100` to `msvcp140` do not export the `locale::id` objects of the money facets; the PACE wrapper of oeksound soothe3 stops with "Could not find imported function in specified DLL" | `a2204f1c70a` | - |
 | ntdll | `RtlWakeAddressSingle()` loses its wake-up when the waiter it goes to has been terminated; a released critical section stays unowned for 5 s (Studio Pro 8 at exit) | `4940adccac5` | - |
 | ntdll | The first-fit walk in `find_free_block()` is linear; Dorico 6: 399 steps per call, 9.9 with the fix | `e55692cfad7` | - |
 | iphlpapi | `GetAdaptersInfo()` reports an estimated buffer size; Nuendo 15's ADR API network setup fails | `ef6039d796a` | - |
