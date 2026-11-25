@@ -8706,8 +8706,31 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
     }
 
     /* And into the process-wide list, which is how a target on a child window
-     * finds the one on its ancestor whatever device either was created on. */
+     * finds the one on its ancestor whatever device either was created on.
+     *
+     * Windows allows one target of each kind per window and fails the call
+     * with DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED while the window has a
+     * live target created with the same topmost.  Here the new target takes
+     * the window over as the successor of the first, which is what the hook
+     * handling below was written for (issue 98, issue 101).  No application
+     * is known to reach this; the message is there to see one that does
+     * before the call starts to fail (issue 653). */
     EnterCriticalSection(&dcomp_all_targets_cs);
+    {
+        struct dcomp_target *other;
+
+        LIST_FOR_EACH_ENTRY(other, &dcomp_all_targets, struct dcomp_target, all_entry)
+        {
+            if (other->hwnd == hwnd && other->topmost == object->topmost
+                    && !other->foreign && other->refcount > 0)
+            {
+                FIXME("Window %p already has target %p created with topmost %d: Windows returns "
+                        "DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED, target %p takes the window over.\n",
+                        hwnd, other, other->topmost, object);
+                break;
+            }
+        }
+    }
     list_add_tail(&dcomp_all_targets, &object->all_entry);
     LeaveCriticalSection(&dcomp_all_targets_cs);
 
