@@ -404,6 +404,20 @@ This is the recommended branch. What it changes, by subsystem:
   with six orders of hooking and releasing: three ended in the ring before, one of them
   without return, and a fourth lost the third party's procedure once the target above it
   was released; all six pass, 64- and 32-bit. soothe3 itself was not run here
+- **Two DComp targets on one window**: Windows lets a window carry one target created with
+  `topmost` set and one without and composes the topmost tree over the other. Here the two
+  swapchains replaced each other on the window, and the transparent parts of the topmost
+  one arrived as black: the editor of oeksound soothe3 1.0.6, which draws its spectrum into
+  a topmost target 60 times a second and its JUCE interface into the other one, stayed
+  black in REAPER (giang17/wine issue 33, reported and analysed by kn9ff). For a child
+  window -- a plug-in editor in its host -- wined3d now puts both layers into every frame
+  it presents. Measured against Windows 10 with two swapchains on one window (opaque blue
+  below, transparent with a red and a half transparent green square on top): Windows shows
+  blue, red and green over blue (0,128,127) in all six orders of creation and presents,
+  the fork showed one layer or the other and now gives the same values, also with both
+  layers presenting from two threads. Still different from Windows: a top-level window
+  (GL present), the window's own content below a target that stands alone, and the error
+  for a second target of the same kind. soothe3 itself was not run here
 - **UIAnimation**: `UIAnimationManager2` and `UIAnimationTransitionLibrary2`. Wine ships
   only the version 1 classes, so an application that creates the version 2 pair while
   bringing up its Direct Composition engine fails there. Applications built on the CCL
