@@ -2745,6 +2745,20 @@ This is the recommended branch. What it changes, by subsystem:
   Ableton Live's indexer did, on startup in a fresh prefix, so Live restarted it in a loop
   and its browser stayed empty. Implemented for msvcp110, msvcp120, msvcp140 and msvcp_win;
   Live no longer needs a native VC runtime in the prefix
+- **msvcp (money facet ids)**: `msvcp100`, `msvcp110`, `msvcp120` and `msvcp140` did not
+  export the `std::locale::id` objects of `money_get`, `money_put` and `moneypunct` — twelve
+  per DLL, comments in the spec files, upstream as well; `msvcp_win` exported them as stubs.
+  Since msvcp100 these ids and `intl` are all the DLL holds of the money facets, the code of
+  the classes is in the application. Wine's loader sets an import without implementation to a
+  stub, so a module with an ordinary import directory loads anyway (`Kontakt 8.vst3` imports
+  eight of the ids from `MSVCP140.dll`). The PACE wrapper of oeksound soothe3 1.0.6 resolves
+  the imports of the protected module itself and stopped after the iLok activation with
+  "soothe3 could not be loaded … Could not find imported function in specified DLL" — in a
+  message box without owner, which lay below REAPER's windows, so that the host looked hung.
+  Of the 844 functions in the module's original import table the eight money ids were the
+  only ones without an export. The twelve objects are defined and exported now (forwarded
+  from `msvcp_win`); soothe3 loads in REAPER 7.82 and draws its editor on the test display,
+  Kontakt 8 loads and shows its editor as before (issue 654)
 - **ucrtbase (complex math)**: `cabs`, `cabsf`, `conj`, `conjf`, `cexpf`, `csqrtf`, `cpow`
   and the MSVC multiplication helpers `_Cmulcc`, `_Cmulcr`, `_FCmulcc` and `_FCmulcr` were
   stubs, upstream as well. Nuendo 15's plug-in set imports all ten, and opening its
