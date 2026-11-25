@@ -196,9 +196,9 @@ static struct wined3d_dcomp_window *swapchain_dcomp_window_enter(struct wined3d_
 /* The root swapchain of a composition target on a top-level window presents
  * through GL (WINED3D_SWAPCHAIN_PREFER_GL_PRESENT): no readback, no copies.
  * The two layers of one window cannot be composed that way.  They belong to
- * two devices, each with a GL context of its own on the window, and the
- * window showed the frames of the target that was created first and none of
- * the other.
+ * two devices, each with a GL context of its own on the window, and one of
+ * them alone reached the screen: with single presents the layer of the
+ * target created first, whatever was presented last.
  *
  * So a GL present registers the swapchain as a layer of its window like a
  * GDI present does, and while the window has a layer of the other kind both
