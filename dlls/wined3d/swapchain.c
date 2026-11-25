@@ -95,10 +95,10 @@ static BOOL set_window_present_rect(HWND hwnd, UINT x, UINT y, UINT width, UINT 
  * layers are gone.  A second swapchain of the same kind (the successor an
  * application creates on a resize) takes the slot of the first.
  *
- * Only the GDI present comes through here, the one a child window gets -- a
- * plug-in editor in its host.  A top-level window presents through GL
- * (WINED3D_SWAPCHAIN_PREFER_GL_PRESENT) and its two layers still replace
- * each other. */
+ * The frame of both is made in the GDI present, the one a child window gets
+ * -- a plug-in editor in its host.  A top-level window presents through GL
+ * (WINED3D_SWAPCHAIN_PREFER_GL_PRESENT) while it has one layer and through
+ * GDI while it has both, see swapchain_dcomp_window_update_layered(). */
 #define WINED3D_DCOMP_WINDOW_SLOTS 64
 
 struct wined3d_dcomp_window
@@ -191,6 +191,45 @@ static struct wined3d_dcomp_window *swapchain_dcomp_window_enter(struct wined3d_
     if (entry)
         AcquireSRWLockExclusive(&entry->lock);
     return entry;
+}
+
+/* The root swapchain of a composition target on a top-level window presents
+ * through GL (WINED3D_SWAPCHAIN_PREFER_GL_PRESENT): no readback, no copies.
+ * The two layers of one window cannot be composed that way.  They belong to
+ * two devices, each with a GL context of its own on the window, and the
+ * window showed the frames of the target that was created first and none of
+ * the other.
+ *
+ * So a GL present registers the swapchain as a layer of its window like a
+ * GDI present does, and while the window has a layer of the other kind both
+ * take the GDI present, where swapchain_compose_window_layers() makes the
+ * frame of both.  dcomp_layered says so to the present and, through
+ * wined3d_swapchain_gdi_present_forced(), to the context: it leaves the
+ * window's DC for the backup DC, as for any swapchain that presents by GDI
+ * blit.  When the other layer is gone the swapchain presents through GL
+ * again.
+ *
+ * Called on the command stream thread at the start of every present. */
+static void swapchain_dcomp_window_update_layered(struct wined3d_swapchain *swapchain)
+{
+    unsigned int role = !!(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_DCOMP_TOPMOST);
+    struct wined3d_dcomp_window *entry;
+    BOOL layered = FALSE;
+
+    /* A swapchain that presents through GDI anyway registers there. */
+    if (swapchain->dcomp_target
+            && (swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
+            && !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+            && (entry = swapchain_dcomp_window_enter(swapchain)))
+    {
+        layered = !!entry->layer[!role];
+        ReleaseSRWLockExclusive(&entry->lock);
+    }
+
+    if (layered != swapchain->dcomp_layered)
+        TRACE("swapchain %p, window %p: %s.\n", swapchain, swapchain->win_handle,
+                layered ? "a second layer, presenting through GDI" : "the only layer, presenting through GL");
+    swapchain->dcomp_layered = layered;
 }
 
 void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
@@ -534,6 +573,7 @@ void CDECL wined3d_swapchain_set_dcomp_topmost(struct wined3d_swapchain *swapcha
         swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_DCOMP_TOPMOST;
     else
         swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_DCOMP_TOPMOST;
+    swapchain->dcomp_target = TRUE;
 }
 
 void CDECL wined3d_swapchain_set_dirty_rects(struct wined3d_swapchain *swapchain,
@@ -1420,6 +1460,12 @@ static void swapchain_compose_window_layers(struct wined3d_swapchain *swapchain,
     memcpy(swapchain->own_bits, swapchain->comp_bits, (SIZE_T)width * height * sizeof(DWORD));
     swapchain->own_valid = TRUE;
 
+    /* No frame of the other layer yet: on a top-level window it has presented
+     * through GL so far, and that frame is in the window and out of reach
+     * here.  The layer takes the GDI present with its next frame; dxgi's
+     * re-present timer on the target window brings one within 200 ms for the
+     * swapchain that was bound first when the application presents it from
+     * the window's thread. */
     if (!peer_bits)
         return;
 
@@ -2302,6 +2348,10 @@ bool wined3d_swapchain_gdi_present_forced(const struct wined3d_swapchain *swapch
 
     if (desc->flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
         return true;
+    /* One of the two composition layers of a top-level window, see
+     * swapchain_dcomp_window_update_layered(). */
+    if (swapchain->dcomp_layered)
+        return true;
     if (desc->flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
         return false;
     if (desc->swap_effect != WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
@@ -2414,6 +2464,9 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     struct wined3d_context_gl *context_gl;
     struct wined3d_context *context;
 
+    /* Before the context is acquired: it is bound by what this finds. */
+    swapchain_dcomp_window_update_layered(swapchain);
+
     /* Before the context is acquired, see the comment on the function. */
     swapchain_gl_prepare_layer_texture(swapchain);
 
@@ -2437,6 +2490,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
      * the GDI present path requires (~5-10ms per frame). */
     if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
             && !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+            && !swapchain->dcomp_layered
             && context_gl->dc != wined3d_device_gl(swapchain->device)->backup_dc)
     {
         static unsigned int gl_present_count;
