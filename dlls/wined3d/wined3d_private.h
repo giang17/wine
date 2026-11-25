@@ -4103,6 +4103,8 @@ struct wined3d_swapchain_ops
     void (*swapchain_frontbuffer_updated)(struct wined3d_swapchain *swapchain);
 };
 
+struct wined3d_dcomp_window;
+
 struct wined3d_swapchain
 {
     LONG ref;
@@ -4187,6 +4189,17 @@ struct wined3d_swapchain
     /* The 8-bit sRGB copy the GDI blit reads when the back buffer has no DDI
      * format (a floating-point swapchain), see swapchain_update_gdi_texture(). */
     struct wined3d_texture *gdi_texture;
+
+    /* Two composition layers on one window (issue 653), see
+     * swapchain_dcomp_window_enter().  dcomp_window is the window's entry this
+     * swapchain is registered in; own_bits is what this layer alone looks
+     * like, kept for the presents of the other layer while there is one.  All
+     * of it is valid only under the entry's lock. */
+    struct wined3d_dcomp_window *dcomp_window;
+    DWORD *own_bits;
+    unsigned int own_width;
+    unsigned int own_height;
+    BOOL own_valid;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);

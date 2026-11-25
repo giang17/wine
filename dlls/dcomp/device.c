@@ -2606,6 +2606,7 @@ struct dcomp_visual
     struct dcomp_visual *foreign_proxy;
     BOOL is_foreign_proxy;
     HWND target_hwnd;
+    BOOL target_topmost;                   /* root of a target created with topmost set */
     /* Visual tree */
     float offset_x;
     float offset_y;
@@ -3591,8 +3592,10 @@ static void dcomp_visual_try_reparent(struct dcomp_visual *visual)
     /* Tell dxgi to switch the swapchain's rendering target to target_hwnd.
      * This avoids SetParent which destroys the X11 window and breaks GL rendering.
      * The wndproc in dxgi/factory.c handles this message by calling
-     * wined3d_swapchain_set_window, which triggers lazy GL context rebinding. */
-    SendMessageW(comp_wnd, WM_WINE_DCOMP_SET_TARGET, 0, (LPARAM)visual->target_hwnd);
+     * wined3d_swapchain_set_window, which triggers lazy GL context rebinding.
+     * wparam says whether the target is the window's topmost one, which
+     * wined3d composes over the swapchain of the other (issue 653). */
+    SendMessageW(comp_wnd, WM_WINE_DCOMP_SET_TARGET, visual->target_topmost, (LPARAM)visual->target_hwnd);
 
     /* DWM composes swapchain content into the target's background — always
      * below child windows. Our comp window is a real child window and would
@@ -3680,6 +3683,9 @@ static CRITICAL_SECTION_DEBUG dcomp_all_targets_cs_debug =
 };
 static CRITICAL_SECTION dcomp_all_targets_cs = { &dcomp_all_targets_cs_debug, -1, 0, 0, 0, 0 };
 
+static struct dcomp_target *dcomp_window_other_target(HWND hwnd, const struct dcomp_target *target);
+static BOOL dcomp_window_has_base_target(HWND hwnd);
+
 /* What the WINE_DCOMP_HUD overlay of one target shows (issue 399). */
 enum dcomp_hud_kind
 {
@@ -3733,6 +3739,7 @@ struct dcomp_target
     IDCompositionTarget IDCompositionTarget_iface;
     LONG refcount;
     HWND hwnd;
+    BOOL topmost;                         /* CreateTargetForHwnd(): composed over the window's other target */
     struct dcomp_visual *root_visual;
     struct dcomp_device *device;          /* back-pointer for target list management */
     struct dcomp_target *next_target;     /* singly-linked list in dcomp_device */
@@ -3947,6 +3954,26 @@ static ULONG STDMETHODCALLTYPE dcomp_target_Release(IDCompositionTarget *iface)
         {
             BOOL ours = (struct dcomp_target *)GetPropW(target->hwnd, dcomp_target_prop) == target;
 
+            /* The window may carry a second target, one of the two created
+             * with topmost set (issue 653).  It takes the window over with
+             * the hook and the procedure below it, the way a successor does
+             * on creation. */
+            if (ours)
+            {
+                struct dcomp_target *other;
+
+                EnterCriticalSection(&dcomp_all_targets_cs);
+                if ((other = dcomp_window_other_target(target->hwnd, target)))
+                {
+                    if (!other->orig_wndproc)
+                        other->orig_wndproc = target->orig_wndproc;
+                    target->orig_wndproc = NULL;
+                    SetPropW(target->hwnd, dcomp_target_prop, (HANDLE)other);
+                    ours = FALSE;
+                }
+                LeaveCriticalSection(&dcomp_all_targets_cs);
+            }
+
             if (ours && target->orig_wndproc
                     && (WNDPROC)GetWindowLongPtrW(target->hwnd, GWLP_WNDPROC) == dcomp_target_wndproc)
             {
@@ -4089,7 +4116,10 @@ static HRESULT STDMETHODCALLTYPE dcomp_target_SetRoot(IDCompositionTarget *iface
     EnterCriticalSection(&target->device->cs);
     old = target->root_visual;
     if (visual_impl)
+    {
         visual_impl->target_hwnd = target->hwnd;
+        visual_impl->target_topmost = target->topmost;
+    }
     target->root_visual = visual_impl;
     LeaveCriticalSection(&target->device->cs);
     if (old)
@@ -4452,6 +4482,41 @@ static enum dcomp_commit_note dcomp_commit_note_set(HWND hwnd, enum dcomp_commit
     return DCOMP_NOTE_NONE;
 }
 
+/* Another live in-process target on the same window.  Windows allows two per
+ * window, one created with topmost set and one without, and composes the
+ * topmost tree over the other (issue 653).  A target in its last Release()
+ * has no references left and is not handed out.  Caller holds
+ * dcomp_all_targets_cs. */
+static struct dcomp_target *dcomp_window_other_target(HWND hwnd, const struct dcomp_target *target)
+{
+    struct dcomp_target *other;
+
+    LIST_FOR_EACH_ENTRY(other, &dcomp_all_targets, struct dcomp_target, all_entry)
+    {
+        if (other != target && other->hwnd == hwnd && !other->foreign && other->refcount > 0)
+            return other;
+    }
+    return NULL;
+}
+
+static BOOL dcomp_window_has_base_target(HWND hwnd)
+{
+    struct dcomp_target *other;
+    BOOL ret = FALSE;
+
+    EnterCriticalSection(&dcomp_all_targets_cs);
+    LIST_FOR_EACH_ENTRY(other, &dcomp_all_targets, struct dcomp_target, all_entry)
+    {
+        if (other->hwnd == hwnd && !other->topmost && !other->foreign && other->refcount > 0)
+        {
+            ret = TRUE;
+            break;
+        }
+    }
+    LeaveCriticalSection(&dcomp_all_targets_cs);
+    return ret;
+}
+
 static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root)
 {
     struct dcomp_leaf_stats stats = {0};
@@ -4460,6 +4525,24 @@ static void dcomp_commit_visual_tree(HWND target_hwnd, struct dcomp_visual *root
     ULONG_PTR gen;
     /* Read before the walk: a change that lands during it stays stale. */
     LONG tree_gen = InterlockedCompareExchange(&dcomp_tree_generation, 0, 0);
+
+    /* The leaf properties on a window describe one tree, and with two targets
+     * on the window they are those of the one created without topmost: wined3d
+     * draws them into that layer and puts the swapchain of the topmost target
+     * over the result (issue 653).  A commit of the topmost tree must not
+     * replace them, least of all with the empty set of a root that has only
+     * content.  Leaves below a topmost root are not composed while the window
+     * has both targets. */
+    if (root && root->target_topmost && target_hwnd && dcomp_window_has_base_target(target_hwnd))
+    {
+        static unsigned int skip_count;
+
+        if (root->children && (++skip_count <= 3 || !(skip_count % 1000)))
+            FIXME("Target window %p has a second target: the leaves below the topmost root %p "
+                    "are not composed #%u.\n", target_hwnd, root, skip_count);
+        root->serialized_gen = tree_gen;
+        return;
+    }
 
     if (!root || !root->children || !target_hwnd)
     {
@@ -8607,6 +8690,7 @@ static HRESULT STDMETHODCALLTYPE dcomp_device_CreateTargetForHwnd(IDCompositionD
     object->IDCompositionTarget_iface.lpVtbl = &dcomp_target_vtbl;
     object->refcount = 1;
     object->hwnd = hwnd;
+    object->topmost = !!topmost;
 
     /* Link target into device's list for Commit iteration (under the device lock,
      * since Commit may be iterating the list from another thread). */
