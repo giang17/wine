@@ -416,9 +416,9 @@ This is the recommended branch. What it changes, by subsystem:
   with a red and a half transparent green square on top): Windows shows blue, red and
   green over blue (0,128,127) in all six orders of creation and presents, with both layers
   presenting from two threads, and when the second target is created after the first has
-  presented; the fork showed one layer or the other -- on a top-level window always that
-  of the target created first -- and now gives the same values on a child and on a
-  top-level window. Still different from Windows: the window's own content below a target
+  presented; the fork showed one layer or the other -- on a top-level window, with single
+  presents, that of the target created first whatever was presented last -- and now gives
+  the same values on a child and on a top-level window. Still different from Windows: the window's own content below a target
   that stands alone (Windows shows the class background and what the window draws on
   `WM_PAINT` where the tree is transparent, the fork black), leaves below the topmost
   root while the window has both targets, and the error for a second target of the same
