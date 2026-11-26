@@ -491,7 +491,14 @@ This is the recommended branch. What it changes, by subsystem:
   DComp target window presents only on the thread that presents the swapchain — JUCE
   does so on the window thread and needs the timer's present, Qt Quick presents from a
   render thread, and a second presenting thread left one of the two asleep in wined3d's
-  frame latency wait (Dorico 5 froze when an entry of its VST instrument menu was picked)
+  frame latency wait (Dorico 5 froze when an entry of its VST instrument menu was picked).
+  `IDXGIDevice2::EnqueueSetEvent()` sets the event once the commands queued before the call
+  have completed, from a thread pool callback, and returns at once, as on Windows (S_OK, and
+  E_INVALIDARG for a NULL or invalid handle, measured on Windows 10). It was a stub, upstream
+  as well; Chromium calls it after the first present of every swap chain it composes, and on
+  failure skipped its wait for the GPU and wrote a dump of about 112 MiB into the Crashpad
+  folder of the host instead — eleven had collected in the main prefix, ten of WebView2 hosts
+  and one of Native Access (issue 659)
 - **D3D11**: ID3D11Fence with CPU timeline semantics. `DiscardResource()` and
   `DiscardView()` are implemented, backported from Wine 11.18 (five upstream commits,
   including the fixes for buffers without a structure byte stride, the sub-resource index
