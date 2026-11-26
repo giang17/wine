@@ -578,6 +578,7 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetDesc(IDXGISwapChain4 *iface,
 {
     struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
     struct wined3d_swapchain_desc wined3d_desc;
+    static int once;
 
     TRACE("iface %p, desc %p.\n", iface, desc);
 
@@ -591,7 +592,8 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetDesc(IDXGISwapChain4 *iface,
     wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &wined3d_desc);
     wined3d_mutex_unlock();
 
-    FIXME("Ignoring ScanlineOrdering and Scaling.\n");
+    if (!once++)
+        FIXME("Ignoring ScanlineOrdering and Scaling.\n");
 
     desc->BufferDesc.Width = wined3d_desc.backbuffer_width;
     desc->BufferDesc.Height = wined3d_desc.backbuffer_height;

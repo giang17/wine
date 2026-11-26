@@ -4083,7 +4083,10 @@ static void STDMETHODCALLTYPE d3d11_multithread_Leave(ID3D11Multithread *iface)
 static BOOL STDMETHODCALLTYPE d3d11_multithread_SetMultithreadProtected(
         ID3D11Multithread *iface, BOOL enable)
 {
-    FIXME("iface %p, enable %#x stub!\n", iface, enable);
+    static int once;
+
+    if (!once++)
+        FIXME("iface %p, enable %#x stub!\n", iface, enable);
 
     return TRUE;
 }
@@ -8012,7 +8015,10 @@ static void STDMETHODCALLTYPE d3d10_multithread_Leave(ID3D10Multithread *iface)
 
 static BOOL STDMETHODCALLTYPE d3d10_multithread_SetMultithreadProtected(ID3D10Multithread *iface, BOOL enable)
 {
-    FIXME("iface %p, enable %#x stub!\n", iface, enable);
+    static int once;
+
+    if (!once++)
+        FIXME("iface %p, enable %#x stub!\n", iface, enable);
 
     return TRUE;
 }
