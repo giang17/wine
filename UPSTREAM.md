@@ -39,6 +39,7 @@ there, or, where it does not or upstream changed the functions involved since
 | d2d1 | `PushAxisAlignedClip()` repeats its FIXME on every call (HALion Sonic 7) | `0f635c87cc0` | - |
 | dwrite | The glyph cache dies with its font face, and text layout creates a font face per run; resizing a SynthEdit window for 25 s: 111064 bitmap misses, 209 with the fix | `ad0a071cb29` | - |
 | dwrite | The shared factory keeps only a weak reference to the system font collection, so every fetch rebuilds it (Pianoteq 9 through JUCE) | `924dbe3fdf7` | [56717](https://bugs.winehq.org/show_bug.cgi?id=56717) |
+| dxgi | `IDXGIDevice2::EnqueueSetEvent()` is a stub; Chromium skips its wait for the GPU after the first present of a swap chain and writes a dump of about 112 MiB into the Crashpad folder of a WebView2 host | `8cc735e8869` | - |
 | dwmapi | `DwmGetCompositionTimingInfo()` reports the last vblank instead of the upcoming one; Ableton Live 12 rejects every timing sample | `32f39163e25` | - |
 | evr | The presenter loses its allocator notification when the output type is renegotiated; video stops while audio continues | `94ff059321a` | - |
 | mf | The video renderer (EVR) never reports a completed scrub; Studio Pro 8 does not start playback after a position jump | `529d0045dab` | - |
