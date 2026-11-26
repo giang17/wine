@@ -498,7 +498,17 @@ This is the recommended branch. What it changes, by subsystem:
   as well; Chromium calls it after the first present of every swap chain it composes, and on
   failure skipped its wait for the GPU and wrote a dump of about 112 MiB into the Crashpad
   folder of the host instead — eleven had collected in the main prefix, ten of WebView2 hosts
-  and one of Native Access (issue 659)
+  and one of Native Access (issue 659). `IDXGIOutput::WaitForVBlank()` waits for the next
+  boundary of the output's refresh period, taken from its current display mode, instead of
+  a fixed 16 ms (from Berny23, giang17/wine pull request 35). JUCE 8 dispatches its repaints
+  once per call, so a window that repaints on every vertical blank was paced at 62 Hz
+  whatever the monitor's rate: at 144 Hz it drew 62 frames per second, now 145 (Xvfb); at
+  60 Hz 59 to 61 either way (X11, NVIDIA). The call returns only once the boundary has passed; returning just
+  before it gave a second vertical blank within the same period in 7 of 7200 calls. Upstream
+  returns E_NOTIMPL, JUCE 8 then never refreshes its window (WineHQ 56799), and its VBlank
+  thread checks its exit flag only after a successful call, so destroying the window waits
+  forever. The per-frame FIXMEs of `IDXGISurface1::GetDC()`, `IDXGISwapChain::GetDesc()` and
+  `SetMultithreadProtected()` of d3d10 and d3d11 are printed once (same pull request)
 - **D3D11**: ID3D11Fence with CPU timeline semantics. `DiscardResource()` and
   `DiscardView()` are implemented, backported from Wine 11.18 (five upstream commits,
   including the fixes for buffers without a structure byte stride, the sub-resource index
