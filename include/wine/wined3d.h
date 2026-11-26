@@ -920,10 +920,6 @@ enum wined3d_memory_segment_group
 #define WINED3D_SWAPCHAIN_NO_WINDOW_CHANGES                     0x00040000u
 #define WINED3D_SWAPCHAIN_RESTORE_WINDOW_STATE                  0x00080000u
 #define WINED3D_SWAPCHAIN_REGISTER_TOPMOST_TIMER                0x00100000u
-#define WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT                     0x00200000u
-#define WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA                   0x00400000u
-#define WINED3D_SWAPCHAIN_PREFER_GL_PRESENT                     0x00800000u
-#define WINED3D_SWAPCHAIN_DCOMP_TOPMOST                         0x01000000u
 
 #define WINED3DDP_MAXTEXCOORD                                   8
 

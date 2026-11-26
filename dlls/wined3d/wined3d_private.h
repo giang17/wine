@@ -4207,6 +4207,20 @@ struct wined3d_swapchain
      * swapchain_dcomp_window_update_layered(). */
     BOOL dcomp_target;
     BOOL dcomp_layered;
+
+    /* How the swapchain presents, set by dxgi when it binds a composition
+     * swapchain to its target window (wined3d_swapchain_set_*()) and, for
+     * prefer_gl_present, by wined3d_swapchain_init() for a top-level window.
+     * Kept here and not in state.desc.flags, which holds what the
+     * application asked for and is replaced with it.
+     * force_gdi_present: always the GDI blit.  prefer_gl_present: the GL
+     * swap, whatever the swap effect.  premultiplied_alpha: the back buffer
+     * is blended as premultiplied.  dcomp_topmost: the layer of a target
+     * created with topmost set, see swapchain_dcomp_window_enter(). */
+    BOOL force_gdi_present;
+    BOOL prefer_gl_present;
+    BOOL premultiplied_alpha;
+    BOOL dcomp_topmost;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);

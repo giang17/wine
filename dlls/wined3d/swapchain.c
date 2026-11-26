@@ -97,7 +97,7 @@ static BOOL set_window_present_rect(HWND hwnd, UINT x, UINT y, UINT width, UINT 
  *
  * The frame of both is made in the GDI present, the one a child window gets
  * -- a plug-in editor in its host.  A top-level window presents through GL
- * (WINED3D_SWAPCHAIN_PREFER_GL_PRESENT) while it has one layer and through
+ * (prefer_gl_present) while it has one layer and through
  * GDI while it has both, see swapchain_dcomp_window_update_layered(). */
 #define WINED3D_DCOMP_WINDOW_SLOTS 64
 
@@ -140,7 +140,7 @@ static void swapchain_dcomp_window_leave(struct wined3d_swapchain *swapchain)
  * table is full; the present then goes out the way it did before. */
 static struct wined3d_dcomp_window *swapchain_dcomp_window_enter(struct wined3d_swapchain *swapchain)
 {
-    unsigned int role = !!(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_DCOMP_TOPMOST);
+    unsigned int role = !!swapchain->dcomp_topmost;
     struct wined3d_dcomp_window *entry = swapchain->dcomp_window, *unused = NULL;
     unsigned int i;
 
@@ -194,7 +194,7 @@ static struct wined3d_dcomp_window *swapchain_dcomp_window_enter(struct wined3d_
 }
 
 /* The root swapchain of a composition target on a top-level window presents
- * through GL (WINED3D_SWAPCHAIN_PREFER_GL_PRESENT): no readback, no copies.
+ * through GL (prefer_gl_present): no readback, no copies.
  * The two layers of one window cannot be composed that way.  They belong to
  * two devices, each with a GL context of its own on the window, and one of
  * them alone reached the screen: with single presents the layer of the
@@ -212,14 +212,14 @@ static struct wined3d_dcomp_window *swapchain_dcomp_window_enter(struct wined3d_
  * Called on the command stream thread at the start of every present. */
 static void swapchain_dcomp_window_update_layered(struct wined3d_swapchain *swapchain)
 {
-    unsigned int role = !!(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_DCOMP_TOPMOST);
+    unsigned int role = !!swapchain->dcomp_topmost;
     struct wined3d_dcomp_window *entry;
     BOOL layered = FALSE;
 
     /* A swapchain that presents through GDI anyway registers there. */
     if (swapchain->dcomp_target
-            && (swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
-            && !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+            && swapchain->prefer_gl_present
+            && !swapchain->force_gdi_present
             && (entry = swapchain_dcomp_window_enter(swapchain)))
     {
         layered = !!entry->layer[!role];
@@ -526,39 +526,37 @@ void CDECL wined3d_swapchain_set_device_window(struct wined3d_swapchain *swapcha
  * the present path (swapchain_blit_gdi) reads.  present_dirty_rects[] is thus
  * touched only on the app thread, cs_present_dirty_rects[] only on the CS thread.
  *
- * set_force_gdi_present() / set_premultiplied_alpha() write state.desc.flags
- * bits that are also read on the CS-thread present path, but these are
- * configured once at swapchain/target creation (see dlls/dxgi/factory.c) before
- * any Present, never per frame, so they are not raced in practice and do not
- * need the per-frame handoff. */
+ * set_force_gdi_present() / set_prefer_gl_present() / set_premultiplied_alpha()
+ * / set_dcomp_topmost() write fields that are also read on the CS-thread
+ * present path, but these are configured once at swapchain/target creation
+ * (see dlls/dxgi/factory.c) before any Present, never per frame, so they are
+ * not raced in practice and do not need the per-frame handoff.
+ *
+ * They are fields of the swapchain and not flags of its description: the
+ * description is the application's, and what replaces its flags with the
+ * ones of a later call (wined3d_device_reset(), upstream since Wine 11.14
+ * wined3d_swapchain_resize_buffers()) would clear them.  A d3d9 device with
+ * D3DSWAPEFFECT_FLIP on a top-level window presented through GL until its
+ * first Reset() and through the GDI blit after it. */
 void CDECL wined3d_swapchain_set_force_gdi_present(struct wined3d_swapchain *swapchain, BOOL force)
 {
     TRACE("swapchain %p, force %d.\n", swapchain, force);
 
-    if (force)
-        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT;
-    else
-        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT;
+    swapchain->force_gdi_present = !!force;
 }
 
 void CDECL wined3d_swapchain_set_prefer_gl_present(struct wined3d_swapchain *swapchain, BOOL prefer)
 {
     TRACE("swapchain %p, prefer %d.\n", swapchain, prefer);
 
-    if (prefer)
-        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
-    else
-        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
+    swapchain->prefer_gl_present = !!prefer;
 }
 
 void CDECL wined3d_swapchain_set_premultiplied_alpha(struct wined3d_swapchain *swapchain, BOOL premultiplied)
 {
     TRACE("swapchain %p, premultiplied %d.\n", swapchain, premultiplied);
 
-    if (premultiplied)
-        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA;
-    else
-        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA;
+    swapchain->premultiplied_alpha = !!premultiplied;
 }
 
 /* The swapchain is the root content of a composition target created with
@@ -569,10 +567,7 @@ void CDECL wined3d_swapchain_set_dcomp_topmost(struct wined3d_swapchain *swapcha
 {
     TRACE("swapchain %p, topmost %d.\n", swapchain, topmost);
 
-    if (topmost)
-        swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_DCOMP_TOPMOST;
-    else
-        swapchain->state.desc.flags &= ~WINED3D_SWAPCHAIN_DCOMP_TOPMOST;
+    swapchain->dcomp_topmost = !!topmost;
     swapchain->dcomp_target = TRUE;
 }
 
@@ -1422,7 +1417,7 @@ static struct wined3d_texture *swapchain_update_gdi_texture(struct wined3d_swapc
 static void swapchain_compose_window_layers(struct wined3d_swapchain *swapchain,
         struct wined3d_dcomp_window *entry, unsigned int width, unsigned int height)
 {
-    unsigned int role = !!(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_DCOMP_TOPMOST);
+    unsigned int role = !!swapchain->dcomp_topmost;
     struct wined3d_swapchain *peer = entry->layer[!role];
     unsigned int peer_width = 0, peer_height = 0, y, w, h;
     const DWORD *peer_bits = NULL;
@@ -1478,7 +1473,7 @@ static void swapchain_compose_window_layers(struct wined3d_swapchain *swapchain,
                     peer_width, peer_height, peer, compose_count);
     }
 
-    top_blends = !!((role ? swapchain : peer)->state.desc.flags & WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA);
+    top_blends = !!(role ? swapchain : peer)->premultiplied_alpha;
     w = min(width, peer_width);
     h = min(height, peer_height);
 
@@ -1656,7 +1651,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
 
     TRACE("Created source DC %p, bitmap %p for backbuffer %p.\n", src_dc, bitmap, back_buffer);
 
-    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA)
+    if (swapchain->premultiplied_alpha
             || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
             || swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_SEQUENTIAL)
     {
@@ -1915,7 +1910,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
              * This is the composition-swapchain equivalent of a
              * full-window present. */
             BOOL use_alpha_merge = (swapchain->state.desc.swap_effect == WINED3D_SWAP_EFFECT_SEQUENTIAL)
-                    && !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA)
+                    && !swapchain->premultiplied_alpha
                     && swapchain->comp_bits && swapchain->surface_bits
                     && src_w == dst_w && src_h == dst_h
                     && format->byte_count == 4;
@@ -1955,7 +1950,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
             /* The leaves and the leaf layer published on the window belong to
              * its other tree while there is one; a topmost layer above it
              * must not draw them a second time. */
-            BOOL owns_leaves = !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_DCOMP_TOPMOST)
+            BOOL owns_leaves = !swapchain->dcomp_topmost
                     || !dcomp_window || !dcomp_window->layer[0];
 
             if (swapchain->surface_valid && swapchain->surface_bits && swapchain->comp_bits)
@@ -1981,7 +1976,7 @@ static void swapchain_blit_gdi(struct wined3d_swapchain *swapchain,
                 const struct wined3d_swapchain *lowest = dcomp_window && dcomp_window->layer[0]
                         ? dcomp_window->layer[0] : swapchain;
 
-                if (lowest->state.desc.flags & WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA)
+                if (lowest->premultiplied_alpha)
                     swapchain_composite_window_background(swapchain, swapchain->comp_bits, dst_w, dst_h);
             }
         }
@@ -2427,13 +2422,13 @@ bool wined3d_swapchain_gdi_present_forced(const struct wined3d_swapchain *swapch
     const struct wined3d_swapchain_desc *desc = &swapchain->state.desc;
     const struct wined3d_format *format;
 
-    if (desc->flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+    if (swapchain->force_gdi_present)
         return true;
     /* One of the two composition layers of a top-level window, see
      * swapchain_dcomp_window_update_layered(). */
     if (swapchain->dcomp_layered)
         return true;
-    if (desc->flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
+    if (swapchain->prefer_gl_present)
         return false;
     if (desc->swap_effect != WINED3D_SWAP_EFFECT_FLIP_SEQUENTIAL
             && desc->swap_effect != WINED3D_SWAP_EFFECT_SEQUENTIAL)
@@ -2564,13 +2559,13 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
 
     pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format - 1];
 
-    /* PREFER_GL_PRESENT overrides FLIP_SEQUENTIAL/SEQUENTIAL/partial checks
+    /* prefer_gl_present overrides FLIP_SEQUENTIAL/SEQUENTIAL/partial checks
      * for top-level popup windows with a GL-capable X11 drawable.  The GL
-     * context must have successfully bound (not backup_dc) and FORCE_GDI
-     * must not be set.  This eliminates the GPU readback + CPU copies that
-     * the GDI present path requires (~5-10ms per frame). */
-    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_PREFER_GL_PRESENT)
-            && !(swapchain->state.desc.flags & WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT)
+     * context must have successfully bound (not backup_dc) and
+     * force_gdi_present must not be set.  This eliminates the GPU readback
+     * + CPU copies that the GDI present path requires (~5-10ms per frame). */
+    if (swapchain->prefer_gl_present
+            && !swapchain->force_gdi_present
             && !swapchain->dcomp_layered
             && context_gl->dc != wined3d_device_gl(swapchain->device)->backup_dc)
     {
@@ -3559,9 +3554,9 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
     /* WS_CHILD and WS_POPUP swapchains keep the GDI path: dcomp composition
      * windows depend on it, and WS_POPUP windows (settings dialogs, context
      * menus) paint black on the GL path until first interaction (empirical,
-     * shibco patch 0055). A swapchain that dxgi later marks FORCE_GDI_PRESENT
+     * shibco patch 0055). A swapchain that dxgi later marks force_gdi_present
      * still takes the GDI branch at present time — swapchain_gl_present()
-     * checks that flag first. Swapchains are routinely created before the
+     * checks that field first. Swapchains are routinely created before the
      * first ShowWindow(), so visibility is not part of the test.
      *
      * ID2D1HwndRenderTarget top-level windows stay on the GDI path too: on
@@ -3578,7 +3573,7 @@ static HRESULT wined3d_swapchain_init(struct wined3d_swapchain *swapchain, struc
         if (!(style & (WS_CHILD | WS_POPUP))
                 && !GetPropW(window, L"__wine_d3d_hwnd_target"))
         {
-            swapchain->state.desc.flags |= WINED3D_SWAPCHAIN_PREFER_GL_PRESENT;
+            swapchain->prefer_gl_present = TRUE;
             TRACE("Preferring GL present for top-level window %p (style %#lx).\n", window, style);
         }
     }
