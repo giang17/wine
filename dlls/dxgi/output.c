@@ -367,7 +367,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_WaitForVBlank(IDXGIOutput6 *iface)
     struct wined3d_display_mode mode;
     static LARGE_INTEGER freq;
     unsigned int refresh_rate = 60;
-    LONGLONG period, remaining;
+    LONGLONG period, boundary;
     LARGE_INTEGER now;
     static BOOL once;
 
@@ -387,8 +387,15 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_WaitForVBlank(IDXGIOutput6 *iface)
         QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&now);
     period = freq.QuadPart / refresh_rate;
-    remaining = period - now.QuadPart % period;
-    Sleep(max(1, (DWORD)((remaining * 1000 + freq.QuadPart - 1) / freq.QuadPart)));
+    boundary = (now.QuadPart / period + 1) * period;
+    /* Sleep() can return just before the boundary. Returning then would let
+     * the next call wait for the same boundary and return a second time
+     * within one period. */
+    do
+    {
+        Sleep(max(1, (DWORD)(((boundary - now.QuadPart) * 1000 + freq.QuadPart - 1) / freq.QuadPart)));
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart < boundary);
 
     return S_OK;
 }
