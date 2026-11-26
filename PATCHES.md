@@ -2600,6 +2600,26 @@ This is the recommended branch. What it changes, by subsystem:
   after the drag went through the held DC at the old origin; with the fresh DC the image
   follows the frame and nothing is left behind. The held DC stays as it is, a GL context
   that is not forced to GDI is bound to it
+- **wined3d**: what the fork adds to the way a swapchain presents — always the GDI blit,
+  the GL swap whatever the swap effect, premultiplied alpha, the topmost of the two
+  composition layers of a window — is kept in fields of the swapchain and no longer in
+  flags of its description. The description is the application's, and its flags are
+  replaced with those of a later call. `wined3d_device_reset()` does that, which cleared
+  the preference for the GL swap a top-level window gets: a Direct3D 9 device with
+  `D3DSWAPEFFECT_FLIP` presented through GL until its first `Reset()` and through the GDI
+  blit, which reads the frame back, after it. Of three presents before and three after a
+  `Reset()` with unchanged parameters 0 and 3 took the GDI blit, now 0 and 0
+  (`D3DSWAPEFFECT_DISCARD` and `D3DSWAPEFFECT_COPY`: 0 and 0 before and after). On the
+  rolling branch upstream's `wined3d_swapchain_resize_buffers()` replaces the flags as
+  well since Wine 11.14, and a composition swapchain lost all four with its first
+  `ResizeBuffers()`: oeksound soothe3 kept the frame its editor opened with there (issue
+  656). Each new upstream swapchain flag also took the bit of one of the fork's at a
+  rebase. The functions dxgi calls are unchanged. The tests of two composition targets on
+  one window and of a third-party subclass on a target window give the same lines as
+  before (39 of 52 as Windows 10; six scenarios pass, 64- and 32-bit). Minimal Audio Current, Serum 2, Trinity, Hotline and EPROM - Memory Rites in
+  REAPER 7.82 create their nine targets on nine windows; the first four draw their
+  editors, and a screenshot of EPROM's editor is the same pixel for pixel as before
+  (issue 657)
 - **wined3d (Vulkan renderer)**: the SPIR-V vertex and fragment pipes carry `state_nop`
   entries for the 13 fixed-function render states that the stateblock turns into
   replacement shaders (`LIGHTING`, `FOGENABLE`, `SPECULARENABLE`, `COLORKEYENABLE`,
