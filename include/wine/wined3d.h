@@ -925,10 +925,6 @@ enum wined3d_memory_segment_group
 #define WINED3D_SWAPCHAIN_ALLOW_MS_LOCKABLE_BACKBUFFER          0x00200000u
 #define WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT         0x00400000u
 #define WINED3D_SWAPCHAIN_REPORT_OCCLUSION                      0x00800000u
-#define WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT                     0x01000000u
-#define WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA                   0x02000000u
-#define WINED3D_SWAPCHAIN_PREFER_GL_PRESENT                     0x04000000u
-#define WINED3D_SWAPCHAIN_DCOMP_TOPMOST                         0x08000000u
 
 #define WINED3DDP_MAXTEXCOORD                                   8
 
