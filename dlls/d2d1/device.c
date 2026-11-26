@@ -15457,7 +15457,12 @@ static HRESULT d2d_device_create_device_context(struct d2d_device *device,
     /* ENABLE_MULTITHREADED_OPTIMIZATIONS is a hint; rendering is not spread
      * over threads here, so there is nothing for it to switch on. */
     if (options & ~D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS)
-        FIXME("Options are ignored %#x.\n", options);
+    {
+        static int once;
+
+        if (!once++)
+            FIXME("Options are ignored %#x.\n", options);
+    }
 
     if (!(object = calloc(1, sizeof(*object))))
         return E_OUTOFMEMORY;

@@ -216,9 +216,13 @@ static HRESULT STDMETHODCALLTYPE dxgi_surface_Unmap(IDXGISurface2 *iface)
 static HRESULT STDMETHODCALLTYPE dxgi_surface_GetDC(IDXGISurface2 *iface, BOOL discard, HDC *hdc)
 {
     struct dxgi_resource *resource = impl_from_IDXGISurface2(iface);
+    static int once;
     HRESULT hr;
 
-    FIXME("iface %p, discard %d, hdc %p semi-stub!\n", iface, discard, hdc);
+    if (!once++)
+        FIXME("iface %p, discard %d, hdc %p semi-stub!\n", iface, discard, hdc);
+    else
+        TRACE("iface %p, discard %d, hdc %p.\n", iface, discard, hdc);
 
     if (!hdc)
         return E_INVALIDARG;

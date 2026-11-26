@@ -363,12 +363,33 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_FindClosestMatchingMode(IDXGIOutput
 
 static HRESULT STDMETHODCALLTYPE dxgi_output_WaitForVBlank(IDXGIOutput6 *iface)
 {
-    static BOOL once = FALSE;
+    struct dxgi_output *output = impl_from_IDXGIOutput6(iface);
+    struct wined3d_display_mode mode;
+    static LARGE_INTEGER freq;
+    unsigned int refresh_rate = 60;
+    LONGLONG period, remaining;
+    LARGE_INTEGER now;
+    static BOOL once;
 
     if (!once++)
-        FIXME("iface %p semi-stub, sleeping 16ms.\n", iface);
+        FIXME("iface %p semi-stub, emulating vertical blank from the refresh rate.\n", iface);
+    else
+        TRACE("iface %p.\n", iface);
 
-    Sleep(16);
+    /* No vblank events; wait for the next refresh period boundary. */
+    wined3d_mutex_lock();
+    if (SUCCEEDED(wined3d_output_get_display_mode(output->wined3d_output, &mode, NULL))
+            && mode.refresh_rate)
+        refresh_rate = mode.refresh_rate;
+    wined3d_mutex_unlock();
+
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    period = freq.QuadPart / refresh_rate;
+    remaining = period - now.QuadPart % period;
+    Sleep(max(1, (DWORD)((remaining * 1000 + freq.QuadPart - 1) / freq.QuadPart)));
+
     return S_OK;
 }
 
