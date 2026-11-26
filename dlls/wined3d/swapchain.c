@@ -4128,9 +4128,24 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
 
     if (flags)
     {
+        /* The caller makes the flags from what the application passed to
+         * ResizeBuffers().  These four are not the application's: dxgi sets
+         * them when it binds a composition swapchain to its target window,
+         * wined3d_swapchain_init() for a top-level window, and they say how
+         * the swapchain presents.  A composition swapchain that lost them
+         * with its first resize left the GDI present unless its swap effect
+         * alone selects it (wined3d_swapchain_gdi_present_forced()), and was
+         * no longer the topmost of the two layers of its window: with a
+         * FLIP_DISCARD overlay on a child window the window kept the frame
+         * from before the resize, with FLIP_SEQUENTIAL the layer below
+         * disappeared. */
+        static const unsigned int present_flags = WINED3D_SWAPCHAIN_FORCE_GDI_PRESENT
+                | WINED3D_SWAPCHAIN_PREMULTIPLIED_ALPHA | WINED3D_SWAPCHAIN_PREFER_GL_PRESENT
+                | WINED3D_SWAPCHAIN_DCOMP_TOPMOST;
+
         if ((desc->flags ^ flags) & WINED3D_SWAPCHAIN_GDI_COMPATIBLE)
             recreate = true;
-        desc->flags = flags;
+        desc->flags = (flags & ~present_flags) | (desc->flags & present_flags);
     }
 
     if (recreate)
