@@ -924,6 +924,23 @@ This is the recommended branch. What it changes, by subsystem:
   seconds keeps the old creation time, is not emulated. `test_file_creation_time` in
   `kernel32/tests/file.c` covers the rest; `ntdll:file` and `kernel32:file` pass on both
   architectures with 0 failures
+- **ntdll (exceptions through Unix frames)**: an exception that has to pass a frame of
+  Unix code on the Windows stack — the C++ code of a Winelib program such as yabridge's
+  `yabridge-host.exe.so` — ended in a stack overflow of that thread instead of reaching a
+  handler. Two defects, both on the way through such a frame: the DWARF decoder did not
+  read the operand of `DW_CFA_GNU_args_size`, which GCC emits at calls with stack
+  arguments, decoded the rest of the frame's unwind information as nonsense and faulted;
+  and the dispatcher called the frame's C++ personality routine from libstdc++ as an
+  exception handler, which it is not, and faulted on its answer. Each fault was dispatched
+  again on the same thread. Waves Flow Motion in Bitwig through yabridge: inside the
+  plug-in's `IPlugView::attached()` the GUI thread ran 608 times through yabridge's frame
+  and overflowed its stack, and the editor never opened; in REAPER for Windows under Wine
+  the same `attached()` stops with an access violation (WineHQ bug 60350 describes the
+  first defect). The decoder now reads the operands of the GNU and `DW_CFA_val_offset`
+  opcodes and stops at an unknown one, and a personality routine outside every module is
+  no longer called. A Winelib test program whose C++ frame calls a function that raises an
+  exception overflowed its stack and now reaches the unhandled exception filter;
+  `ntdll:exception` gives the same results before and after
 - **Per-pixel alpha for GPU-painted layered windows**: `DwmExtendFrameIntoClientArea`
   with `margins = -1` asks for full glass, which on Windows makes the client area
   per-pixel alpha capable. Wine stubbed it, so a plugin dragging a bitmap around — Serum
