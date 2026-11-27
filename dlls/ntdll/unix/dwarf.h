@@ -55,6 +55,9 @@
 #define DW_CFA_val_offset 0x14
 #define DW_CFA_val_offset_sf 0x15
 #define DW_CFA_val_expression 0x16
+#define DW_CFA_GNU_window_save 0x2d
+#define DW_CFA_GNU_args_size 0x2e
+#define DW_CFA_GNU_negative_offset_extended 0x2f
 
 #define DW_OP_addr                 0x03
 #define DW_OP_deref                0x06
@@ -376,7 +379,8 @@ enum reg_rule
     RULE_CFA_OFFSET,     /* stored at cfa offset */
     RULE_OTHER_REG,      /* stored in other register */
     RULE_EXPRESSION,     /* address specified by expression */
-    RULE_VAL_EXPRESSION  /* value specified by expression */
+    RULE_VAL_EXPRESSION, /* value specified by expression */
+    RULE_VAL_CFA_OFFSET  /* value is cfa + offset */
 };
 
 #ifdef __x86_64__
@@ -628,9 +632,43 @@ static void execute_cfa_instructions( const unsigned char *ptr, const unsigned c
             ptr += len;
             break;
         }
-        default:
-            FIXME( "%lx: unknown CFA opcode %02x\n", info->ip, op );
+        case DW_CFA_val_offset:
+        case DW_CFA_val_offset_sf:
+        {
+            ULONG_PTR reg = dwarf_get_uleb128( &ptr );
+            LONG_PTR offset = (op == DW_CFA_val_offset) ? dwarf_get_uleb128( &ptr ) * info->data_align
+                                                        : dwarf_get_sleb128( &ptr ) * info->data_align;
+            if (!valid_reg( reg )) break;
+            TRACE( "%lx: DW_CFA_val_offset %s, %ld\n", info->ip, dwarf_reg_names[reg], offset );
+            info->state.regs[reg]  = offset;
+            info->state.rules[reg] = RULE_VAL_CFA_OFFSET;
             break;
+        }
+        case DW_CFA_GNU_args_size:
+        {
+            /* only needed to adjust the stack pointer for a landing pad */
+            ULONG_PTR size = dwarf_get_uleb128( &ptr );
+            TRACE( "%lx: DW_CFA_GNU_args_size %lu\n", info->ip, size );
+            break;
+        }
+        case DW_CFA_GNU_negative_offset_extended:
+        {
+            ULONG_PTR reg = dwarf_get_uleb128( &ptr );
+            LONG_PTR offset = -(LONG_PTR)dwarf_get_uleb128( &ptr ) * info->data_align;
+            if (!valid_reg( reg )) break;
+            TRACE( "%lx: DW_CFA_GNU_negative_offset_extended %s, %ld\n", info->ip, dwarf_reg_names[reg], offset );
+            info->state.regs[reg]  = offset;
+            info->state.rules[reg] = RULE_CFA_OFFSET;
+            break;
+        }
+        case DW_CFA_GNU_window_save:
+            /* SPARC register windows, or AArch64 return address signing; no operands */
+            FIXME( "%lx: DW_CFA_GNU_window_save not supported\n", info->ip );
+            break;
+        default:
+            /* the length of the operands is unknown, the rest cannot be decoded */
+            FIXME( "%lx: unknown CFA opcode %02x\n", info->ip, op );
+            return;
         }
     }
 }
@@ -1006,6 +1044,10 @@ static void apply_frame_state( CONTEXT *context, struct frame_state *state,
             break;
         case RULE_VAL_EXPRESSION:
             value = eval_expression( (const unsigned char *)state->regs[i], context, bases );
+            set_context_reg( &new_context, i, &value );
+            break;
+        case RULE_VAL_CFA_OFFSET:
+            value = cfa + state->regs[i];
             set_context_reg( &new_context, i, &value );
             break;
         }
