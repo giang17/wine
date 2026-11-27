@@ -48,6 +48,8 @@ there, or, where it does not or upstream changed the functions involved since
 | msvcp | `msvcp100` to `msvcp140` do not export the `locale::id` objects of the money facets; the PACE wrapper of oeksound soothe3 stops with "Could not find imported function in specified DLL" | `a2204f1c70a` | - |
 | ntdll | `RtlWakeAddressSingle()` loses its wake-up when the waiter it goes to has been terminated; a released critical section stays unowned for 5 s (Studio Pro 8 at exit) | `4940adccac5` | - |
 | ntdll | The first-fit walk in `find_free_block()` is linear; Dorico 6: 399 steps per call, 9.9 with the fix | `e55692cfad7` | - |
+| ntdll | The DWARF decoder does not read the operand of `DW_CFA_GNU_args_size` and decodes the rest of the frame as nonsense; an exception through a C++ frame of a Winelib program (yabridge) overflows the stack | `8d2e41a959d` | [60350](https://bugs.winehq.org/show_bug.cgi?id=60350) |
+| ntdll | The personality routine of a C++ frame in a Winelib module (`__gxx_personality_v0`) is called as an exception handler, and the dispatcher faults on its answer | `dc37c197a28` | - |
 | iphlpapi | `GetAdaptersInfo()` reports an estimated buffer size; Nuendo 15's ADR API network setup fails | `ef6039d796a` | - |
 | include | On i386, `IP_ADAPTER_INFO` is 648 bytes instead of 640 since `time_t` became 64-bit in Wine 11.19 | `028829b7497` | - |
 | server | The pointer stays invisible after `ShowCursor(TRUE)` when a null cursor was set while it was hidden (WebView2 sliders) | `bd76fa41cc6` | - |
