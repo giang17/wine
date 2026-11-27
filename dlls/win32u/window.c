@@ -5357,8 +5357,13 @@ BOOL WINAPI NtUserShowWindowAsync( HWND hwnd, INT cmd )
         return FALSE;
     }
 
+    /* the return value tells whether the request was started, not whether
+     * the window was visible before */
     if ((full_handle = is_current_thread_window( hwnd )))
-        return show_window( full_handle, cmd );
+    {
+        show_window( full_handle, cmd );
+        return TRUE;
+    }
 
     return NtUserMessageCall( hwnd, WM_WINE_SHOWWINDOW, cmd, 0, 0,
                               NtUserSendNotifyMessage, FALSE );
