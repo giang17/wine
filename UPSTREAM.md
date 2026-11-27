@@ -60,6 +60,7 @@ there, or, where it does not or upstream changed the functions involved since
 | win32u | A DC fetched between setting a pixel format and the server update draws into a surface that is clipped away; nothing it paints appears (SynthEdit) | `f23204942c5`, `33d23685e49`, `f2ef136f6ab` | - |
 | win32u | Window-manager geometry that arrives together with a maximize is dropped; drawing and hit testing are offset | `c4868e373a1` | - |
 | win32u | `WM_UAHMEASUREMENUITEM` and `WM_UAHDRAWMENU*` are never sent; the Ableton Live 12 main window grows | `c06e05bad30`, `9b800ea262f` | [57955](https://bugs.winehq.org/show_bug.cgi?id=57955) |
+| win32u | `ShowWindowAsync()` returns the previous visibility for a window of the calling thread, FALSE for a hidden one that it shows; Waves Flow Motion takes it for a failure and crashes its host when its editor opens | `ad805c66719` | - |
 | wined3d | A present rotates the back buffers without copying the frame back; an application that draws incrementally gets an older frame (Studio Pro 8 alternates between two frames) | `7070fef6397` | - |
 | winex11 | The opaque black X background shows while a client window leaves the screen (Ableton Live 12, Learn View) | `aa3b2b8cf5d` | - |
 | winex11 | A `_NET_WM_STATE` request the window manager ignores blocks every later state and configuration update (KWin, Ableton Live 12 leaving fullscreen) | `b377aff406b` | - |
