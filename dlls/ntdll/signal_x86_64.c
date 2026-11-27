@@ -100,7 +100,7 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
  */
 static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEXT *context )
 {
-    LDR_DATA_TABLE_ENTRY *module;
+    LDR_DATA_TABLE_ENTRY *module = NULL, *handler_module;
     NTSTATUS status;
 
     dispatch->ImageBase = 0;
@@ -116,9 +116,17 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEX
         struct unwind_builtin_dll_params params = { type, dispatch, context };
 
         status = WINE_UNIX_CALL( unix_unwind_builtin_dll, &params );
-        if (!status && dispatch->LanguageHandler && !module)
+        /* A personality routine outside every module belongs to a Unix library (libstdc++,
+         * libgcc) and does not take the arguments of an exception handler; this is also the
+         * case for the frames of a Winelib module built from C++. */
+        if (!status && dispatch->LanguageHandler &&
+            LdrFindEntryForAddress( dispatch->LanguageHandler, &handler_module ))
         {
-            FIXME( "calling personality routine in system library not supported yet\n" );
+            static int once;
+            if (!once++)
+                FIXME( "calling personality routine %p of a system library not supported, frame %p in %s\n",
+                       dispatch->LanguageHandler, (void *)dispatch->ControlPc,
+                       module ? debugstr_w( module->BaseDllName.Buffer ) : "a system library" );
             dispatch->LanguageHandler = NULL;
         }
         if (status != STATUS_UNSUCCESSFUL) return status;
