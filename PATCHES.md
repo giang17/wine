@@ -647,6 +647,27 @@ This is the recommended branch. What it changes, by subsystem:
   found (`ERROR_RESOURCE_LANG_NOT_FOUND`), now it is; opening the `ROOT` system store ended one
   `close()` with `EBADF`, the second one on `/etc/ssl/certs/ca-certificates.crt` (strace), now
   none; both probes give the same results on the Wine 11.22 build
+- **Backports from Wine 11.23** (seven upstream commits by Nikolay Sivov, cherry-picked with
+  their origin): a rounded rectangle that is a member of a geometry group is streamed into the
+  group's path at its own place — its arcs carried a rotation of 90 degrees and four of the
+  eight points had the radius applied with the wrong sign (d2d1); the arc-to-Bézier conversion
+  maps the centre of the ellipse with the off-diagonal matrix elements in the right order,
+  which moved the arcs of a rotated ellipse (d2d1); a geometry group that is streamed through
+  a transformed geometry keeps the transform (d2d1); a contextual lookup reads its sequence
+  lookup records as pairs of sequence index and lookup index, where every record after the
+  first was read from the wrong offset (dwrite); a character map of format 10 is read with
+  its 32-bit header fields (dwrite); a text layout that cannot allocate its cluster arrays
+  clears the pointers it freed (dwrite); and an EUDC collection releases the font file stream
+  when the family data cannot be created (dwrite). Measured with a test program through
+  `ID2D1Geometry::GetBounds()`: a group holding the rounded rectangle (10,20)-(110,70) with
+  radii 10 and 5 gave (-0.15,7.19)-(110.15,77.81), now (10,20)-(110,70); a group holding a
+  transformed geometry (translation 100,50) of a group with the rectangle (0,0)-(10,10) gave
+  (0,0)-(10,10), now (100,50)-(110,60); a path with one large clockwise arc from (100,100) to
+  (200,150) of an ellipse with radii 80 and 40 rotated by 30 degrees gave
+  (46.18,49.29)-(200.00,150.74), now (86.14,44.20)-(230.37,150.00), against
+  (86.14,44.22)-(230.37,150.00) from the centre parametrisation of the arc. The Wine 11.23
+  build gives the same three results. The d2d1 tests give the same counts before and after
+  on both architectures
 - **dwrite text layout, backport of the layout rework from Wine 11.1/11.2 and of `HitTestPoint()`
   from 11.21** (21 upstream commits by Nikolay Sivov, 14 for the code and 7 for the tests,
   cherry-picked with their origin; `dlls/dwrite/layout.c` is now identical to upstream master
