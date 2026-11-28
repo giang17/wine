@@ -997,7 +997,17 @@ This is the recommended branch. What it changes, by subsystem:
   UTILITY — this fixes sticky, wrongly decorated and always-on-top plugin menus on KDE;
   the opaque black X expose background is suppressed while a GL/D3D client window is taken
   off the screen for offscreen rendering, so the client area no longer flashes black for a
-  frame (visible in Ableton Live 12 when toggling the Learn View panel); a window hidden
+  frame (visible in Ableton Live 12 when toggling the Learn View panel); windows that are
+  neither DirectComposition swapchain windows nor layered no longer have an X background
+  at all (backport of `73f7ca409a9` from Wine 11.23, which reverts `9339e6cc854`, together
+  with `b591edd78a7`, which clears the padding of a window under display mode emulation
+  instead): the X server filled a newly revealed area black until the application painted
+  it, now it leaves there what was on screen. A test window that paints 400 ms after
+  `WM_PAINT` and grows in six steps showed black for 2300 ms in sum when it resized itself
+  and for 2381 ms when the window manager resized it (NVIDIA, kwin_x11, 60 fps capture),
+  and the previous screen content for that time afterwards, with no black frame; shown
+  again after being hidden, four times, 813 ms and none. The suppression above has no
+  background left to suppress; a window hidden
   while its map was still unacknowledged no longer stays mapped and unpainted for the
   session (upstream fix for Wine bug 59932, cherry-picked; FL Studio's Browser panel at
   startup); a per-pixel-alpha layered window on a 32-bit visual no longer gets a bounding
