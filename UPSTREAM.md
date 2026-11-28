@@ -5,7 +5,7 @@ matching WineHQ bug report where one exists and the state of upstream Wine.
 The list covers fixes that were checked against upstream; it is not complete.
 PATCHES.md describes every change of the fork.
 
-As of 2026-11-28: branch `d2d1-dcomp-11.0` at `cdb81b297c8`, upstream master
+As of 2026-11-28: branch `d2d1-dcomp-11.0` at `20978dc39c8`, upstream master
 at `wine-11.23`.
 
 None of the fork's own fixes is submitted to WineHQ: Wine's Clean-Room
@@ -22,6 +22,7 @@ information for users of the fork, not a request to take the code upstream.
 | ntdll | A debugger's break-in thread in a WoW64 process starts at a truncated 64-bit address | `aa300232981` (backport of `a9dd4878b14`, replaces the fork's own fix) | [59803](https://bugs.winehq.org/show_bug.cgi?id=59803) | Wine 11.22, `a9dd4878b14` |
 | mf | The audio renderer never reports a completed scrub | `1cd7e8c5883` (backport of `324a7da836e`) | - | Wine 11.5, `324a7da836e` |
 | d2d1 | Rounded rectangle `Simplify()` places the corner arcs wrongly | `a6976602e20` | - | Wine 11.23, `7de470a0b98` |
+| winex11 | The opaque black X background shows while a client window leaves the screen (Ableton Live 12, Learn View) | `aa3b2b8cf5d`; the background itself is gone since `20978dc39c8` (backport of `73f7ca409a9`, with `04348d30122`, backport of `b591edd78a7`) | - | Wine 11.23, `73f7ca409a9` removes the background pixel |
 
 ## Open upstream
 
@@ -62,7 +63,6 @@ there, or, where it does not or upstream changed the functions involved since
 | win32u | `WM_UAHMEASUREMENUITEM` and `WM_UAHDRAWMENU*` are never sent; the Ableton Live 12 main window grows | `c06e05bad30`, `9b800ea262f` | [57955](https://bugs.winehq.org/show_bug.cgi?id=57955) |
 | win32u | `ShowWindowAsync()` returns the previous visibility for a window of the calling thread, FALSE for a hidden one that it shows; Waves Flow Motion takes it for a failure and crashes its host when its editor opens | `ad805c66719` | - |
 | wined3d | A present rotates the back buffers without copying the frame back; an application that draws incrementally gets an older frame (Studio Pro 8 alternates between two frames) | `7070fef6397` | - |
-| winex11 | The opaque black X background shows while a client window leaves the screen (Ableton Live 12, Learn View) | `aa3b2b8cf5d` | - |
 | winex11 | A `_NET_WM_STATE` request the window manager ignores blocks every later state and configuration update (KWin, Ableton Live 12 leaving fullscreen) | `b377aff406b` | - |
 | winex11 | A fullscreen position the window manager has already applied is not taken over; drawing and hit testing are offset (Ableton Live 12 menu bar) | `f8c735f42dd` | - |
 | winex11 | A process starting while the virtual desktop is created ends up outside of it | `0cafb0c7120` | - |
