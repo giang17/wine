@@ -53,6 +53,7 @@
 #include FT_SFNT_NAMES_H
 #include FT_TRUETYPE_IDS_H
 #include FT_OUTLINE_H
+#include FT_ADVANCES_H
 #include FT_TRIGONOMETRY_H
 #include FT_MODULE_H
 #include FT_WINFONTS_H
@@ -89,6 +90,7 @@ static void *ft_handle = NULL;
 
 #define MAKE_FUNCPTR(f) static typeof(f) * p##f = NULL
 MAKE_FUNCPTR(FT_Done_Face);
+MAKE_FUNCPTR(FT_Get_Advance);
 MAKE_FUNCPTR(FT_Get_Char_Index);
 MAKE_FUNCPTR(FT_Get_First_Char);
 MAKE_FUNCPTR(FT_Get_Next_Char);
@@ -1467,6 +1469,7 @@ static BOOL init_freetype(void)
 #define LOAD_FUNCPTR(f) if((p##f = dlsym(ft_handle, #f)) == NULL){WARN("Can't find symbol %s\n", #f); goto sym_not_found;}
 
     LOAD_FUNCPTR(FT_Done_Face)
+    LOAD_FUNCPTR(FT_Get_Advance)
     LOAD_FUNCPTR(FT_Get_Char_Index)
     LOAD_FUNCPTR(FT_Get_First_Char)
     LOAD_FUNCPTR(FT_Get_Next_Char)
@@ -3091,6 +3094,38 @@ static FT_Int get_load_flags( UINT format )
     return load_flags;
 }
 
+/* Whether a request takes the embedded bitmap strike of a face that has one at the current ppem.
+ * Measured on Windows 10 19045 with Terminus (TTF) Bold 4.39, whose 14 and 18 ppem strikes are one
+ * pixel wider than the hinted outline (wine-dev issue 514, vatSys strip fields): GetGlyphOutline()
+ * with GGO_METRICS, GetCharABCWidths() and DrawText(DT_CALCRECT) report the strike's advance under
+ * every lfQuality and every font smoothing setting, NONANTIALIASED, DEFAULT and CLEARTYPE quality
+ * draw the strike's pixels, and only ANTIALIASED quality and the GGO_GRAY*_BITMAP formats rasterise
+ * the outline. Wine's own Tahoma and Tahoma Bold carry strikes at 8 to 16 ppem that Microsoft's
+ * Tahoma does not have, with advances that differ from Windows (11 ppem: 'i' 2 px against 3, 'g' 6
+ * against 7), so a face from the Wine data directory keeps its strike for the mono rasterisation
+ * only, as before. A font selected with ANTIALIASED_QUALITY asks for the outline rasterisation and
+ * keeps the outline's metrics too: the reporter's Windows reports 9 px and ABC 0/8/1 for it where
+ * DEFAULT and CLEARTYPE quality report the strike's 10 px (Windows 10 reports the strike for
+ * DrawText() and the outline for GetTextExtentPoint32() under every quality), and gdiplus, which
+ * rasterises the outline through GGO_GRAY8_BITMAP, selects its fonts with that quality so that its
+ * measurements match what it draws and what GDI+ on Windows measures (wine-dev issue 515, vatSys
+ * "Disconnect" button wrapping after nine characters). */
+static BOOL format_uses_strike( const struct gdi_font *font, UINT format )
+{
+    switch (format)
+    {
+    case GGO_BITMAP:
+        return TRUE;
+    case GGO_METRICS:
+    case WINE_GGO_HRGB_BITMAP:
+    case WINE_GGO_HBGR_BITMAP:
+    case WINE_GGO_VRGB_BITMAP:
+    case WINE_GGO_VBGR_BITMAP:
+        return !font->wine_font && font->lf.lfQuality != ANTIALIASED_QUALITY;
+    }
+    return FALSE;
+}
+
 /*************************************************************
  * freetype_get_glyph_outline
  */
@@ -3119,10 +3154,17 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
 
     vertical_metrics = (tategaki && FT_HAS_VERTICAL(ft_face));
 
-    if (matrices || format != GGO_BITMAP) load_flags |= FT_LOAD_NO_BITMAP;
+    if (matrices || !format_uses_strike( font, format )) load_flags |= FT_LOAD_NO_BITMAP;
     if (vertical_metrics) load_flags |= FT_LOAD_VERTICAL_LAYOUT;
 
     err = pFT_Load_Glyph(ft_face, glyph, load_flags & FT_LOAD_NO_HINTING ? load_flags : load_flags | FT_LOAD_PEDANTIC);
+    /* The bitmap getters below expand 1 bpp strikes only; a deeper strike falls back to the outline. */
+    if (!err && ft_face->glyph->format == FT_GLYPH_FORMAT_BITMAP && !(load_flags & FT_LOAD_NO_BITMAP)
+        && ft_face->glyph->bitmap.pixel_mode != FT_PIXEL_MODE_MONO && FT_IS_SCALABLE( ft_face ))
+    {
+        load_flags |= FT_LOAD_NO_BITMAP;
+        err = pFT_Load_Glyph(ft_face, glyph, load_flags & FT_LOAD_NO_HINTING ? load_flags : load_flags | FT_LOAD_PEDANTIC);
+    }
     if (err && !(load_flags & FT_LOAD_NO_HINTING))
     {
         WARN("Failed to load glyph %#x, retrying without hinting. Error %#x.\n", glyph, err);
@@ -3130,9 +3172,25 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT 
         err = pFT_Load_Glyph(ft_face, glyph, load_flags);
     }
 
-    if(err) {
-        WARN("Failed to load glyph %#x, error %#x.\n", glyph, err);
-        return GDI_ERROR;
+    if (err)
+    {
+        /* FreeType refuses the glyph itself. TerminusTTF-Bold 4.39, shipped with vatSys, has a .notdef whose
+         * instruction count exceeds maxp.maxSizeOfInstructions (FT_Err_Too_Many_Hints), and every control
+         * character maps to it. Windows draws nothing for the outline and advances by the hmtx width (a tab
+         * is 8 px wide at 16 px, measured on Windows 10). Without this the callers read whatever ABC widths
+         * the stack held: a WinForms menu measured its shortcut tab 32 475 217 px wide and opened across the
+         * screen. Load the space glyph as the empty stand-in and give it the advance of the glyph asked for. */
+        FT_UInt space = pFT_Get_Char_Index( ft_face, ' ' );
+        FT_Fixed advance;
+
+        if (!space || space == glyph || pFT_Load_Glyph( ft_face, space, load_flags ))
+        {
+            WARN("Failed to load glyph %#x, error %#x.\n", glyph, err);
+            return GDI_ERROR;
+        }
+        WARN("Failed to load glyph %#x, error %#x; drawing it empty with its advance.\n", glyph, err);
+        if (!pFT_Get_Advance( ft_face, glyph, load_flags | FT_LOAD_NO_HINTING, &advance ))
+            ft_face->glyph->metrics.horiAdvance = (load_flags & FT_LOAD_NO_SCALE) ? advance : advance >> 10;
     }
 
     metrics = ft_face->glyph->metrics;

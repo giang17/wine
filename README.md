@@ -1,168 +1,206 @@
-## INTRODUCTION
+```text
++============================================================================+
+|                                                                            |
+|                            #   # ### #   # ####                            |
+|                            #   #  #  ##  # #                               |
+|                            # # #  #  # # # ###                             |
+|                            ## ##  #  #  ## #                               |
+|                            #   # ### #   # ####                            |
+|                                                                            |
+|         ####  ####  ####   #      # ####   ####  ###  #   # ####           |
+|         #   #     # #   # ##     #  #   # #     #   # ## ## #   #          |
+|         #   #  ###  #   #  #    #   #   # #     #   # # # # ####           |
+|         #   # #     #   #  #   #    #   # #     #   # #   # #              |
+|         ####  ##### ####  ### #     ####   ####  ###  #   # #              |
+|                                                                            |
+|                  Wine with DirectComposition and Direct2D                  |
+|                                                                            |
+|       Modern Windows software on Linux: built for DAWs and plugins,        |
+|                running .NET and WebView2 applications too.                 |
+|                                                                            |
++============================================================================+
 
-Wine is a program which allows running Microsoft Windows programs
-(including DOS, Windows 3.x, Win32, and Win64 executables) on Unix.
-It consists of a program loader which loads and executes a Microsoft
-Windows binary, and a library (called Winelib) that implements Windows
-API calls using their Unix, X11 or Mac equivalents.  The library may also
-be used for porting Windows code into native Unix executables.
++--[ release info ]----------------------------------------------------------+
+|  repository ...... github.com/giang17/wine                                 |
+|  stable .......... d2d1-dcomp-11.0 on Wine 11.0, default branch            |
+|  rolling ......... d2d1-dcomp-11.<N> on the newest WineHQ devel tag        |
+|  release builds .. x86_64 Linux, glibc 2.35+, both PE architectures        |
+|  license ......... GNU LGPL, the same as Wine                              |
++----------------------------------------------------------------------------+
 
-Wine is free software, released under the GNU LGPL; see the file
-LICENSE for the details.
++--[ about ]-----------------------------------------------------------------+
+|  Current Windows audio software draws its windows with DirectComposition,  |
+|  Direct2D, DirectWrite and DXGI: JUCE 8 and VSTGUI plugins,                |
+|  WebView2-based editors and the DAWs that host them. Stock Wine            |
+|  implements little of that stack, so these windows open black, flicker,    |
+|  lose their artwork, or the application stops before its first window.     |
+|  This fork implements the stack, fixes the Wine code around it from the    |
+|  X11 driver to the installers, and is in daily use for music production.   |
+|                                                                            |
+|  The same work carries applications outside audio: vatSys, an              |
+|  air-traffic-control radar client drawn with Direct2D; NinjaTrader, a WPF  |
+|  trading platform with a WebView2 chat; and, on the rolling branch, Power  |
+|  BI Desktop.                                                               |
+|                                                                            |
+|  PATCHES.md documents each change with its reason and measurements.        |
++----------------------------------------------------------------------------+
 
++--[ install ]---------------------------------------------------------------+
+|  RELEASE BUILDS                                                            |
+|  The Releases page carries a portable build of d2d1-dcomp-11.0 for x86_64  |
+|  Linux with both PE architectures. Unpack it into any directory and run    |
+|  it from there; the distribution's Wine stays untouched.                   |
+|                                                                            |
+|    $ sudo tar -C /opt -xf wine-d2d1-dcomp-<version>-x86_64.tar.xz          |
+|    $ WINEPREFIX=~/.wine-d2d1 \                                             |
+|        /opt/wine-d2d1-dcomp-<version>/bin/wine winecfg                     |
+|                                                                            |
+|  A build needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, current       |
+|  Fedora and Arch) and the libraries the distribution's own Wine package    |
+|  depends on, so installing that package is the simplest way to get them.   |
+|  On Arch the audio and media libraries are only optional dependencies of   |
+|  wine:                                                                     |
+|                                                                            |
+|    $ sudo pacman -S --needed wine alsa-lib libpulse \                      |
+|        gst-plugins-base-libs opencl-icd-loader libgphoto2 \                |
+|        vulkan-icd-loader                                                   |
+|                                                                            |
+|  Release builds have no FFmpeg support, so media decoding goes through     |
+|  GStreamer. They contain Wine only: no applications, plugins or            |
+|  installers.                                                               |
+|                                                                            |
+|  PACKAGES BY OTHERS                                                        |
+|    * Fedora 44 and 45: the COPR repository patrickl/wine-staging-dev       |
+|      builds the rolling branch with the wine-staging patchsets applied on  |
+|      top. A report from this package should say so.                        |
+|    * Arch Linux and CachyOS: mklnln/wine-d2d1-dcomp installs to            |
+|      /opt/wine-d2d1. Its source package builds the current                 |
+|      d2d1-dcomp-11.0, its binary package a fixed release build; compare    |
+|      its date before relying on it.                                        |
+|  Both are maintained by their authors, independently of this repository.   |
+|                                                                            |
+|  FROM SOURCE                                                               |
+|    $ git clone https://github.com/giang17/wine.git && cd wine              |
+|    $ git checkout d2d1-dcomp-11.23                                         |
+|    $ ./configure --prefix=/opt/wine-d2d1 --enable-archs=i386,x86_64        |
+|    $ make -j$(nproc)                                                       |
+|    $ sudo make install                                                     |
+|                                                                            |
+|  Build both architectures, with the i686-w64-mingw32 and                   |
+|  x86_64-w64-mingw32 cross compilers: 32-bit hosts and plugins load d2d1,   |
+|  dcomp and dxgi directly.                                                  |
++----------------------------------------------------------------------------+
 
-## QUICK START
++--[ before the first run ]--------------------------------------------------+
+|    * wine.inf belongs to the install. It carries the fork's registry       |
+|      defaults, among them the HideWineVersion entries that keep JUCE       |
+|      8.0.13+ plugins on Direct2D instead of their GDI fallback. make       |
+|      install and the release builds include it; DLLs copied by hand        |
+|      without it fail silently.                                             |
+|    * Leave DXVK out of the prefix. It replaces dxgi.dll and d3d11.dll,     |
+|      where the fork's composition swapchains live. PATCHES.md describes    |
+|      the per-application switch for a machine that needs DXVK elsewhere.   |
+|    * On Wayland, keep Wine on Xwayland, the default while DISPLAY is set.  |
+|      The fork's display-driver changes are in winex11.drv;                 |
+|      winewayland.drv is unmodified.                                        |
++----------------------------------------------------------------------------+
 
-From the top-level directory of the Wine source (which contains this file),
-run:
++--[ which branch ]----------------------------------------------------------+
+|  d2d1-dcomp-11.0      base wine-11.0                                       |
+|                       Most users. Stable, maintained, the default branch   |
+|                       and the source of the release builds.                |
+|                                                                            |
+|  d2d1-dcomp-11.<N>    base newest WineHQ devel tag                         |
+|                       Rolling-release setups. Rebased onto each devel tag  |
+|                       about every two weeks; always take the highest       |
+|                       number.                                              |
++----------------------------------------------------------------------------+
 
++--[ verify ]----------------------------------------------------------------+
+|  A release build: the checksum, and the attestation that the archive was   |
+|  built by .github/workflows/release.yml from the commit the release        |
+|  names.                                                                    |
+|                                                                            |
+|    $ sha256sum -c --ignore-missing wine-d2d1-dcomp-<version>.sha256        |
+|    $ gh attestation verify \                                               |
+|        wine-d2d1-dcomp-<version>-x86_64.tar.xz -R giang17/wine             |
+|                                                                            |
+|  The source: the branch descends from the upstream release tag, and the    |
+|  diff against that tag is the whole fork. Fetching the tag from upstream   |
+|  fails if the one in this repository differs.                              |
+|                                                                            |
+|    $ git fetch https://github.com/wine-mirror/wine.git tag wine-11.0       |
+|    $ git merge-base --is-ancestor wine-11.0 d2d1-dcomp-11.0 \              |
+|        && echo "descends from wine-11.0"                                   |
+|    $ git diff --stat wine-11.0 d2d1-dcomp-11.0                             |
+|    $ git diff wine-11.0 d2d1-dcomp-11.0 -- configure.ac .github            |
+|                                                                            |
+|  The last command shows the files most worth reading in full: the build    |
+|  configuration, where a fork could add something that runs before any      |
+|  Wine code does, and the workflows that make the release builds. A         |
+|  rolling branch is checked the same way against its own base tag.          |
++----------------------------------------------------------------------------+
+
++--[ what it changes ]-------------------------------------------------------+
+|    * Direct2D: geometry, clipping, layers, effects and the bitmap paths    |
+|      plugin GUIs use.                                                      |
+|    * DirectComposition: devices, visual trees, surfaces and composition    |
+|      swapchains, composited inside the process.                            |
+|    * DirectWrite: rendering modes, font fallback, glyph caching and        |
+|      subpixel text.                                                        |
+|    * DXGI, Direct3D 11, WineD3D: composition swapchains, fences, GL        |
+|      resource reuse.                                                       |
+|    * Windows and input: layered and composited windows, popups and         |
+|      window-manager interaction in winex11.drv, win32u and wineserver.     |
+|    * Installers and runtime: msi, signed PowerShell scripts, shell links,  |
+|      crash dumps and the other pieces applications need to install and     |
+|      start.                                                                |
+|                                                                            |
+|  The applications tested on this fork, with what each one needs:           |
+|  PATCHES.md, section Tested Applications.                                  |
++----------------------------------------------------------------------------+
+
++--[ reporting problems ]----------------------------------------------------+
+|  Open an issue with the application and plugin framework, the output of    |
+|  wine --version, and whether Wine came from a release build, a package or  |
+|  an own build. A plugin GUI that stays black or looks like GDI is most     |
+|  often a host without its HideWineVersion entry; PATCHES.md explains the   |
+|  switch.                                                                   |
++----------------------------------------------------------------------------+
+
++--[ upstream ]--------------------------------------------------------------+
+|  This is a fork of wine-mirror/wine, not a replacement for it, and a       |
+|  private project without affiliation to the Wine project, WineHQ,          |
+|  CodeWeavers or any software vendor. Wine's Clean-Room Guidelines do not   |
+|  accept LLM-generated code; the fork is developed with LLM assistance, so  |
+|  no merge requests go to WineHQ while that rule stands. Several earlier    |
+|  fixes from the fork are part of upstream Wine. UPSTREAM.md lists defects  |
+|  in upstream Wine that the fork fixes and their state upstream.            |
+|  Upstream's own README is kept as README.wine.                             |
++----------------------------------------------------------------------------+
+
++--[ credits ]---------------------------------------------------------------+
+|    * Subpixel text rendering: Cade (@shibco), shibco/ableton-linux pull    |
+|      request 155, reviewed there by @ClickSentinel                         |
+|    * --enable-archs packaging form for Bottles: @jibeape                   |
++----------------------------------------------------------------------------+
+
++--[ links ]-----------------------------------------------------------------+
+|  * releases                                                                |
+|      https://github.com/giang17/wine/releases                              |
+|  * patches                                                                 |
+|      https://github.com/giang17/wine/blob/d2d1-dcomp-11.0/PATCHES.md       |
+|  * upstream status                                                         |
+|      https://github.com/giang17/wine/blob/d2d1-dcomp-11.0/UPSTREAM.md      |
+|  * issues                                                                  |
+|      https://github.com/giang17/wine/issues                                |
+|  * fedora copr                                                             |
+|      https://copr.fedorainfracloud.org/coprs/patrickl/wine-staging-dev/    |
+|  * arch pkgbuilds                                                          |
+|      https://github.com/mklnln/wine-d2d1-dcomp                             |
+|  * clean room                                                              |
+|      https://gitlab.winehq.org/wine/wine/-/wikis/Clean-Room-Guidelines     |
++----------------------------------------------------------------------------+
+
+                      -----  giang17/wine  |  GNU LGPL  |  2026  -----
 ```
-./configure
-make
-```
-
-Then either install Wine:
-
-```
-make install
-```
-
-Or run Wine directly from the build directory:
-
-```
-./wine notepad
-```
-
-Run programs as `wine program`. For more information and problem
-resolution, read the rest of this file, the Wine man page, and
-especially the wealth of information found at https://www.winehq.org.
-
-
-## REQUIREMENTS
-
-To compile and run Wine, you must have one of the following:
-
-- Linux version 2.6.22 or later
-- FreeBSD 12.4 or later
-- Solaris x86 9 or later
-- NetBSD-current
-- macOS 10.15 or later (for x86_64), or macOS 27 (for ARM64)
-
-As Wine requires kernel-level thread support to run, only the operating
-systems mentioned above are supported.  Other operating systems which
-support kernel threads may be supported in the future.
-
-**FreeBSD info**:
-  See https://wiki.freebsd.org/Wine for more information.
-
-**Solaris info**:
-  You will most likely need to build Wine with the GNU toolchain
-  (gcc, gas, etc.). Warning : installing gas does *not* ensure that it
-  will be used by gcc. Recompiling gcc after installing gas or
-  symlinking cc, as and ld to the gnu tools is said to be necessary.
-
-**NetBSD info**:
-  Make sure you have the USER_LDT, SYSVSHM, SYSVSEM, and SYSVMSG options
-  turned on in your kernel.
-
-**macOS info**:
-  You need Xcode/Xcode Command Line Tools or Apple cctools.
-
-**Supported file systems**:
-  Wine should run on most file systems. A few compatibility problems
-  have also been reported using files accessed through Samba. Also,
-  NTFS does not provide all the file system features needed by some
-  applications.  Using a native Unix file system is recommended.
-
-**Basic requirements**:
-  You need to have the X11 development include files installed
-  (called xorg-dev in Debian and libX11-devel in Red Hat).
-  Of course you also need make (most likely GNU make).
-  You also need flex version 2.5.33 or later and bison.
-
-**Optional support libraries**:
-  Configure will display notices when optional libraries are not found
-  on your system. See https://gitlab.winehq.org/wine/wine/-/wikis/Building-Wine
-  for hints about the packages you should install. On 64-bit
-  platforms, you have to make sure to install the 32-bit versions of
-  these libraries.
-
-
-## COMPILATION
-
-To build Wine, do:
-
-```
-./configure
-make
-```
-
-This will build the program "wine" and numerous support libraries/binaries.
-The program "wine" will load and run Windows executables.
-The library "libwine" ("Winelib") can be used to compile and link
-Windows source code under Unix.
-
-To see compile configuration options, do `./configure --help`.
-
-For more information, see https://gitlab.winehq.org/wine/wine/-/wikis/Building-Wine
-
-
-## SETUP
-
-Once Wine has been built correctly, you can do `make install`; this
-will install the wine executable and libraries, the Wine man page, and
-other needed files.
-
-Don't forget to uninstall any conflicting previous Wine installation
-first.  Try either `dpkg -r wine` or `rpm -e wine` or `make uninstall`
-before installing.
-
-Once installed, you can run the `winecfg` configuration tool. See the
-Support area at https://www.winehq.org/ for configuration hints.
-
-
-## RUNNING PROGRAMS
-
-When invoking Wine, you may specify the entire path to the executable,
-or a filename only.
-
-For example, to run Notepad:
-
-```
-wine notepad            (using the search Path as specified in
-wine notepad.exe         the registry to locate the file)
-
-wine c:\\windows\\notepad.exe      (using DOS filename syntax)
-
-wine ~/.wine/drive_c/windows/notepad.exe  (using Unix filename syntax)
-
-wine notepad.exe readme.txt          (calling program with parameters)
-```
-
-Wine is not perfect, so some programs may crash. If that happens you
-will get a crash log that you should attach to your report when filing
-a bug.
-
-
-## GETTING MORE INFORMATION
-
-- **WWW**: A great deal of information about Wine is available from WineHQ at
-	https://www.winehq.org/ : various Wine Guides, application database,
-	bug tracking. This is probably the best starting point.
-
-- **FAQ**: The Wine FAQ is located at https://gitlab.winehq.org/wine/wine/-/wikis/FAQ
-
-- **Wiki**: The Wine Wiki is located at https://gitlab.winehq.org/wine/wine/-/wikis/
-
-- **Gitlab**: Wine development is hosted at https://gitlab.winehq.org
-
-- **Mailing lists**:
-	There are several mailing lists for Wine users and developers; see
-	https://gitlab.winehq.org/wine/wine/-/wikis/Forums for more
-	information.
-
-- **Bugs**: Report bugs to Wine Bugzilla at https://bugs.winehq.org
-	Please search the bugzilla database to check whether your
-	problem is already known or fixed before posting a bug report.
-
-- **IRC**: Online help is available at channel `#WineHQ` on irc.libera.chat.

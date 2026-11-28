@@ -1165,12 +1165,12 @@ UINT MSI_GetFeatureCost( MSIPACKAGE *package, MSIFEATURE *feature, MSICOSTTREE t
     {
     case MSICOSTTREE_CHILDREN:
     {
-        MSIFEATURE *child;
+        FeatureList *fl;
 
-        LIST_FOR_EACH_ENTRY( child, &feature->Children, MSIFEATURE, entry )
+        LIST_FOR_EACH_ENTRY( fl, &feature->Children, FeatureList, entry )
         {
-            if (child->ActionRequest == state)
-                *cost += feature_cost( child );
+            if (fl->feature->ActionRequest == state)
+                *cost += feature_cost( fl->feature );
         }
         break;
     }

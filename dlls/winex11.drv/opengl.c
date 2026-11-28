@@ -498,20 +498,134 @@ BOOL visual_from_pixel_format( int format, XVisualInfo *visual )
     }
 }
 
+/* issue-250: let the ARGB visual's configs be used for window drawing.
+ * On by default since 26.08.2026; WINE_ARGB_PIXFMT=0 restores the old behaviour. */
+static BOOL argb_pixfmt_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "WINE_ARGB_PIXFMT" );
+        /* on by default; WINE_ARGB_PIXFMT=0 turns it off without a rebuild */
+        enabled = (e && !atoi( e )) ? 0 : 1;
+    }
+    return enabled;
+}
+
 static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_format *pf )
 {
     XVisualInfo visual;
 
     if (!p_egl_describe_pixel_format( format, pf )) return FALSE;
-    if (!visual_from_pixel_format( format, &visual ) || visual.depth != default_visual.depth)
+    if (!visual_from_pixel_format( format, &visual ))
+        pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
+    else if (visual.depth != default_visual.depth)
     {
         /* Forbid drawing to windows with formats whose depth does not match the screen depth
          * so that we can copy child windows on-screen using XCopyArea().
          * See x11drv_init_pixel_formats() for the same logic with GLX. */
-        pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
+        if (argb_pixfmt_enabled() && argb_visual.visualid && pf->pfd.cAlphaBits
+            && visual.depth == argb_visual.depth && visual.class == TrueColor)
+        {
+            /* Visuals that can carry an alpha channel are the one exception: a glass
+             * window's GL child needs one, and such a window is composited by the X
+             * server rather than copied with XCopyArea().  Match on the properties
+             * rather than on argb_visual's id - drivers differ in whether they hand
+             * out that very visual.  Mesa reports it for its ARGB configs, while the
+             * NVIDIA driver gives every config a visual of its own and reports
+             * argb_visual only for a config that has no alpha bits at all.  Flag it
+             * via WGL_TRANSPARENT_ARB, which is what argb_twin_format() matches on when a
+             * per-pixel alpha window's GL child is created. */
+            pf->transparent = 1;
+            TRACE( "format %d keeps PFD_DRAW_TO_WINDOW, visual 0x%lx depth %d.\n",
+                   format, visual.visualid, visual.depth );
+        }
+        else pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
     }
 
     return TRUE;
+}
+
+/* issue-250: find the ARGB-visual twin
+ * of a pixel format.  The EGL formats are laid out as
+ * (flags variant) * config_count + (config index) - see egldrv_describe_pixel_format()
+ * in win32u - so the twin keeps the flags variant and only moves to a config whose
+ * visual can carry an alpha channel.  Returns 0 when there is none. */
+static int argb_twin_format( int format )
+{
+    struct wgl_pixel_format want, cfg;
+    unsigned int variant, base, i;
+
+    if (!egl || !egl->config_count || format < 1) return 0;
+    if (!x11drv_egl_describe_pixel_format( format, &want )) return 0;
+    if (want.transparent) return format;
+
+    variant = (format - 1) / egl->config_count;
+    base = variant * egl->config_count;
+
+    for (i = 0; i < egl->config_count; ++i)
+    {
+        int candidate = base + i + 1;
+
+        if (candidate == format) continue;
+        if (!x11drv_egl_describe_pixel_format( candidate, &cfg )) continue;
+        if (!cfg.transparent) continue;
+        if (!(cfg.pfd.dwFlags & PFD_DRAW_TO_WINDOW)) continue;
+        if ((cfg.pfd.dwFlags & PFD_DOUBLEBUFFER) != (want.pfd.dwFlags & PFD_DOUBLEBUFFER)) continue;
+        if (cfg.pfd.cColorBits != want.pfd.cColorBits) continue;
+        if (cfg.pfd.cDepthBits != want.pfd.cDepthBits) continue;
+        if (cfg.pfd.cStencilBits != want.pfd.cStencilBits) continue;
+        return candidate;
+    }
+    return 0;
+}
+
+/* issue-250: does this window's top level carry per-pixel alpha?  The
+ * bit is maintained in the window data (update_window_argb_visual), so the GL
+ * child ends up on an alpha capable visual exactly when its parent is on one. */
+static BOOL window_wants_argb( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+    BOOL ret = FALSE;
+    HWND root;
+
+    if (!argb_pixfmt_enabled()) return FALSE;
+    if (!(root = NtUserGetAncestor( hwnd, GA_ROOT ))) return FALSE;
+    if ((data = get_win_data( root )))
+    {
+        ret = data->wants_argb && !data->embedded;
+        release_win_data( data );
+    }
+    return ret;
+}
+
+/* issue-250: the format whose visual the GL child of a per-pixel alpha window has
+ * to be created on.  Called from X11DRV_CreateClientSurface(), where the X window
+ * and its visual are chosen; the EGL config follows in x11drv_egl_surface_create()
+ * through the surface's visual_format.  Only the X window and the EGL config move
+ * to the ARGB twin - the client surface and the drawable keep the format that was
+ * ASKED for.
+ *
+ * That distinction is the whole point.  get_unused_client_surface() and
+ * get_window_unused_drawable() reuse a cached surface/drawable only while its
+ * format equals the requested format.  Registering the substituted format there
+ * makes that comparison fail on every single call, so the cached drawable is
+ * dropped and a new client window is built each time: measured 53 requests and
+ * 53 new windows during a 20 s drag, which is what the flicker was.
+ * Returns format itself when nothing needs to change (also for format 0). */
+int x11drv_argb_visual_format( HWND hwnd, int format )
+{
+    int twin;
+
+    if (!format) return format;
+    if (window_wants_argb( hwnd ) && (twin = argb_twin_format( format )) && twin != format)
+    {
+        TRACE( "hwnd %p: per-pixel alpha window, using ARGB visual of format %d for %d.\n",
+               hwnd, twin, format );
+        return twin;
+    }
+    return format;
 }
 
 static BOOL x11drv_egl_surface_create( struct client_surface *client, int format, struct opengl_drawable **drawable )
@@ -537,7 +651,13 @@ static BOOL x11drv_egl_surface_create( struct client_surface *client, int format
     opengl_drawable_map_buffer( &gl->base, GL_FRONT_AND_BACK, GL_BACK );
     if (gl->base.stereo) opengl_drawable_map_buffer( &gl->base, GL_FRONT_RIGHT, GL_BACK_RIGHT );
 
-    if (!(gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, egl_config_for_format( format ),
+    /* issue-250: the client window of a per-pixel alpha window sits on the ARGB
+     * twin's visual (see X11DRV_CreateClientSurface), so the EGL surface has to use
+     * that config too.  The drawable keeps the format that was asked for. */
+    if (surface->visual_format && surface->visual_format != format)
+        TRACE( "using ARGB visual of format %d for %d.\n", surface->visual_format, format );
+
+    if (!(gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, egl_config_for_format( surface->visual_format ? surface->visual_format : format ),
                                                               (void *)surface->window, NULL )))
     {
         opengl_drawable_release( &gl->base );
@@ -896,6 +1016,44 @@ static void x11drv_surface_destroy( struct opengl_drawable *base )
     if (gl->drawable) pglXDestroyWindow( gdi_display, gl->drawable );
 }
 
+/* Catching the X error of a GLX call.
+ *
+ * X11DRV_expect_error() keeps the display locked with XLockDisplay() until
+ * X11DRV_check_error(), so that no other thread sends a request in between.
+ * A GLX call must not be made under that lock. The GL library takes a lock
+ * of its own and then sends its request, and another thread that is inside
+ * the library at that moment waits for the display lock with the library's
+ * lock held:
+ *
+ *   - Mesa sends through xcb. A thread in glXCreateWindow() that has just
+ *     asked Xlib to hand back the socket waits in Xlib for the display
+ *     lock, and the thread that holds it waits in
+ *     glXCreateContextAttribsARB() for the socket to finish moving. The
+ *     d2d1 tests, which create devices on twenty threads, hung in 2 of 70
+ *     runs on Xvfb.
+ *   - With the NVIDIA driver glXMakeContextCurrent() waits for the display
+ *     lock while glXSwapIntervalEXT() under that lock waits for the lock
+ *     glXMakeContextCurrent() holds. Two threads that each create a window
+ *     and a context and clear once hung after a handful of rounds.
+ *
+ * The display lock is therefore released for the call. The error callback
+ * stays installed and the mutex of X11DRV_expect_error() stays held, so
+ * the calls made this way still follow one another; an error of another
+ * thread's request is taken for the expected one only if it is a GLX error
+ * (GLXErrorHandler()). wine-dev issue 617. */
+static void glx_expect_error(void)
+{
+    X11DRV_expect_error( gdi_display, GLXErrorHandler, NULL );
+    XUnlockDisplay( gdi_display );
+}
+
+static int glx_check_error(void)
+{
+    XSync( gdi_display, False );
+    XLockDisplay( gdi_display );
+    return X11DRV_check_error();
+}
+
 static BOOL set_swap_interval( struct gl_drawable *gl, int interval )
 {
     BOOL ret = TRUE;
@@ -905,10 +1063,9 @@ static BOOL set_swap_interval( struct gl_drawable *gl, int interval )
     switch (swap_control_method)
     {
     case GLX_SWAP_CONTROL_EXT:
-        X11DRV_expect_error(gdi_display, GLXErrorHandler, NULL);
+        glx_expect_error();
         pglXSwapIntervalEXT( gdi_display, gl->drawable, interval );
-        XSync(gdi_display, False);
-        ret = !X11DRV_check_error();
+        ret = !glx_check_error();
         break;
 
     case GLX_SWAP_CONTROL_MESA:
@@ -1272,10 +1429,9 @@ static struct opengl_context *x11drv_context_create( const struct opengl_context
     if (x11drv_driver_funcs.context_format && !(fmt = glx_pixel_format_from_format( attrs->format ))) return NULL;
     if (!(context = calloc( 1, sizeof(*context) ))) return NULL;
 
-    X11DRV_expect_error(gdi_display, GLXErrorHandler, NULL);
+    glx_expect_error();
     context->host_context = pglXCreateContextAttribsARB( gdi_display, fmt ? fmt->fbconfig : NULL, host_share, TRUE, attribs );
-    XSync(gdi_display, False);
-    if ((err = X11DRV_check_error()) || !context->host_context)
+    if ((err = glx_check_error()) || !context->host_context)
     {
         /* In the future we should convert the GLX error to a win32 one here if needed */
         WARN("Context creation failed (error %#x).\n", err);
@@ -1493,7 +1649,21 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
     funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
 
     if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
+    {
+        /* An offscreen drawable is presented by blitting its client window, and the
+         * blit below reads the window straight after the swap.  eglSwapBuffers()
+         * returns before the swap has landed in the composite-redirected window on
+         * NVIDIA - measured with a fence sync right here, the wait takes 3 ms on
+         * average - and the blit then copies what the window held before it, which
+         * after a move offscreen is undefined.  Nothing presents again until the
+         * application draws: the Studio Assistant popup of issue 308 came up black
+         * in half of its openings, healed by hovering a control.
+         *
+         * Wait for the swap, the way the GLX path does with glXWaitForSbcOML(), and
+         * the way the flush path above already does with glFinish(). */
+        funcs->p_eglWaitClient();
         XFlush( gdi_display );
+    }
 
     client_surface_present( base->client );
     return TRUE;

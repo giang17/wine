@@ -527,6 +527,30 @@ static BOOL get_glyph_transform(unsigned int simulations, const MATRIX_2X2 *m, F
     return TRUE;
 }
 
+/* A ClearType texture holds three coverage samples per pixel, and only an
+ * outline can supply three different ones: an embedded bitmap strike has a
+ * single sample per pixel, which glyphrunanalysis_render() then expands into
+ * three identical subpixels, so the texture keeps the shape of ClearType and
+ * loses its horizontal resolution. Wine's own Tahoma - the face MS Shell Dlg
+ * resolves to, and so the default user interface font - carries strikes for
+ * 8 to 16 ppem, which covers most interface text.
+ *
+ * Ask for the outline when the caller wants a ClearType texture. A face that
+ * has no outline for this glyph keeps its strike, so the worst case is the
+ * result we would have had anyway. Both the bounding box and the rasteriser
+ * go through here, so the two cannot disagree about which form was used. */
+static FT_Error freetype_load_glyph(FT_Face face, unsigned int glyph, FT_Int32 flags, BOOL want_outline)
+{
+    if (!want_outline || (flags & FT_LOAD_NO_BITMAP))
+        return pFT_Load_Glyph(face, glyph, flags);
+
+    if (!pFT_Load_Glyph(face, glyph, flags | FT_LOAD_NO_BITMAP)
+            && face->glyph->format == FT_GLYPH_FORMAT_OUTLINE)
+        return 0;
+
+    return pFT_Load_Glyph(face, glyph, flags);
+}
+
 static NTSTATUS get_glyph_bbox(void *args)
 {
     struct get_glyph_bbox_params *params = args;
@@ -544,7 +568,8 @@ static NTSTATUS get_glyph_bbox(void *args)
 
     needs_transform = FT_IS_SCALABLE(face) && get_glyph_transform(params->simulations, &params->m, &m);
 
-    if (pFT_Load_Glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0))
+    if (freetype_load_glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0,
+            params->lcd || params->no_bitmap))
     {
         WARN("Failed to load glyph %u.\n", params->glyph);
         pFT_Done_Size(size);
@@ -617,6 +642,99 @@ static NTSTATUS freetype_get_aliased_glyph_bitmap(struct get_glyph_bitmap_params
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS freetype_get_aa_glyph_bitmap(struct get_glyph_bitmap_params *params, FT_Glyph glyph);
+
+/* Coverage is sampled three times per pixel horizontally, once per subpixel,
+ * then filtered along the row. Without the filter a stem lands on one colour
+ * channel and the glyph fringes; the five-tap FIR below is the same one
+ * FreeType applies for FT_RENDER_MODE_LCD, spreading each sample over its
+ * neighbours so the fringing averages back to grey at normal viewing
+ * distance. The outline is scaled rather than rendered through
+ * FT_Render_Glyph because the caller supplies the destination bitmap and its
+ * exact bounds. */
+static BOOL lcd_filter_row(BYTE *row, int width)
+{
+    static const unsigned int coeffs[5] = { 0x08, 0x4d, 0x56, 0x4d, 0x08 };
+    BYTE tmp[3 * 256];
+    BYTE *src = tmp;
+    int i, j;
+
+    if (width > ARRAY_SIZE(tmp))
+    {
+        if (!(src = malloc(width)))
+            return FALSE;
+    }
+    memcpy(src, row, width);
+
+    for (i = 0; i < width; i++)
+    {
+        unsigned int sum = 0;
+
+        for (j = 0; j < 5; j++)
+        {
+            int k = i + j - 2;
+
+            if (k >= 0 && k < width)
+                sum += src[k] * coeffs[j];
+        }
+        row[i] = min(sum >> 8, 255);
+    }
+
+    if (src != tmp)
+        free(src);
+    return TRUE;
+}
+
+static NTSTATUS freetype_get_lcd_glyph_bitmap(struct get_glyph_bitmap_params *params, FT_Glyph glyph)
+{
+    const RECT *bbox = &params->bbox;
+    int width = (bbox->right - bbox->left) * 3;
+    int height = bbox->bottom - bbox->top;
+    int y;
+
+    *params->is_1bpp = 0;
+
+    if (glyph->format != FT_GLYPH_FORMAT_OUTLINE)
+        return freetype_get_aa_glyph_bitmap(params, glyph);
+
+    {
+        FT_OutlineGlyph outline = (FT_OutlineGlyph)glyph;
+        const FT_Outline *src = &outline->outline;
+        FT_Matrix scale = { 3 << 16, 0, 0, 1 << 16 };
+        FT_Bitmap ft_bitmap;
+        FT_Outline copy;
+
+        ft_bitmap.width = width;
+        ft_bitmap.rows = height;
+        ft_bitmap.pitch = params->pitch;
+        ft_bitmap.pixel_mode = FT_PIXEL_MODE_GRAY;
+        ft_bitmap.buffer = params->bitmap;
+
+        if (pFT_Outline_New(library, src->n_points, src->n_contours, &copy) != 0)
+            return STATUS_UNSUCCESSFUL;
+
+        if (pFT_Outline_Copy(src, &copy))
+        {
+            pFT_Outline_Done(library, &copy);
+            return STATUS_UNSUCCESSFUL;
+        }
+        pFT_Outline_Transform(&copy, &scale);
+        pFT_Outline_Translate(&copy, -(bbox->left * 3) << 6, bbox->bottom << 6);
+        if (pFT_Outline_Get_Bitmap(library, &copy, &ft_bitmap))
+        {
+            pFT_Outline_Done(library, &copy);
+            return STATUS_UNSUCCESSFUL;
+        }
+        pFT_Outline_Done(library, &copy);
+    }
+
+    for (y = 0; y < height; y++)
+        if (!lcd_filter_row(params->bitmap + y * params->pitch, width))
+            return STATUS_NO_MEMORY;
+
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS freetype_get_aa_glyph_bitmap(struct get_glyph_bitmap_params *params, FT_Glyph glyph)
 {
     const RECT *bbox = &params->bbox;
@@ -685,7 +803,8 @@ static NTSTATUS get_glyph_bitmap(void *args)
 
     needs_transform = FT_IS_SCALABLE(face) && get_glyph_transform(params->simulations, &params->m, &m);
 
-    if (!pFT_Load_Glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0))
+    if (!freetype_load_glyph(face, params->glyph, needs_transform ? FT_LOAD_NO_BITMAP : 0,
+            (params->lcd || params->no_bitmap) && params->mode != DWRITE_RENDERING_MODE1_ALIASED))
     {
         pFT_Get_Glyph(face->glyph, &glyph);
 
@@ -700,6 +819,8 @@ static NTSTATUS get_glyph_bitmap(void *args)
 
         if (params->mode == DWRITE_RENDERING_MODE1_ALIASED)
             ret = freetype_get_aliased_glyph_bitmap(params, glyph);
+        else if (params->lcd)
+            ret = freetype_get_lcd_glyph_bitmap(params, glyph);
         else
             ret = freetype_get_aa_glyph_bitmap(params, glyph);
 
@@ -950,6 +1071,8 @@ static NTSTATUS wow64_get_glyph_bbox(void *args)
         UINT64 object;
         ULONG simulations;
         ULONG glyph;
+        ULONG lcd;
+        ULONG no_bitmap;
         float emsize;
         MATRIX_2X2 m;
         PTR32 bbox;
@@ -959,6 +1082,8 @@ static NTSTATUS wow64_get_glyph_bbox(void *args)
         params32->object,
         params32->simulations,
         params32->glyph,
+        params32->lcd,
+        params32->no_bitmap,
         params32->emsize,
         params32->m,
         ULongToPtr(params32->bbox),
@@ -975,6 +1100,8 @@ static NTSTATUS wow64_get_glyph_bitmap(void *args)
         ULONG simulations;
         ULONG glyph;
         ULONG mode;
+        ULONG lcd;
+        ULONG no_bitmap;
         float emsize;
         MATRIX_2X2 m;
         RECT bbox;
@@ -988,6 +1115,8 @@ static NTSTATUS wow64_get_glyph_bitmap(void *args)
         params32->simulations,
         params32->glyph,
         params32->mode,
+        params32->lcd,
+        params32->no_bitmap,
         params32->emsize,
         params32->m,
         params32->bbox,

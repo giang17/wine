@@ -1,0 +1,332 @@
+# release.yml -- portable release build of giang17/wine (d2d1-dcomp-11.0).
+#
+# Builds one commit of d2d1-dcomp-11.0 for x86_64 Linux with both PE architectures (new
+# WoW64), packs it as a relocatable tarball, smoke-tests the unpacked copy and, only when
+# asked, publishes it as a GitHub release with a build provenance attestation. It runs only
+# on request (workflow_dispatch): a release is a decision, not a side effect of a push.
+# Nothing in a release is uploaded by hand.
+#
+# Actions are pinned to full commit SHAs, the release in the comment (latest releases,
+# checked 14.11.2026). To update: gh api repos/<action>/releases/latest, then
+# gh api repos/<action>/commits/<tag> --jq .sha.
+
+name: Release build
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Commit of d2d1-dcomp-11.0 to build (empty = branch head)
+        required: false
+        default: ''
+      publish:
+        description: Publish as a GitHub release (otherwise build and test only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A container job runs its steps with sh unless told otherwise.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-build
+  cancel-in-progress: false
+
+env:
+  BRANCH: d2d1-dcomp-11.0
+  # Same PE flags as the development build (CLAUDE.md rule 8b): GCC 14+ makes these errors.
+  PE_CFLAGS: -g -O2 -Werror=incompatible-pointer-types -Werror=int-conversion -Werror=implicit-function-declaration -Werror=implicit-int
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Oldest base still in support: the binaries need the glibc of the build system or newer.
+    # Ubuntu 22.04 = glibc 2.35 (runs on Ubuntu 22.04+, Debian 12+, Fedora 36+, Arch).
+    container: ubuntu:22.04
+    timeout-minutes: 240
+    outputs:
+      sha: ${{ steps.ver.outputs.sha }}
+      version: ${{ steps.ver.outputs.version }}
+      name: ${{ steps.ver.outputs.name }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -q
+          # Unix libraries: the set the development build on the desktop finds (build-host,
+          # 14.11.2026), without FFmpeg (see configure). mingw-w64 brings i686 and x86_64.
+          apt-get install -y -q --no-install-recommends \
+            git ca-certificates build-essential flex bison gettext pkg-config \
+            gcc-mingw-w64 binutils xz-utils zstd xvfb xauth \
+            libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev \
+            libxcomposite-dev libxfixes-dev libxrender-dev libxxf86vm-dev libxdamage-dev \
+            libfreetype-dev libfontconfig-dev libgnutls28-dev \
+            libgl-dev libegl-dev libvulkan-dev libwayland-dev libxkbcommon-dev libxkbregistry-dev \
+            libasound2-dev libpulse-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libdbus-1-dev libudev-dev libusb-1.0-0-dev libsdl2-dev libkrb5-dev libgphoto2-dev \
+            libunwind-dev ocl-icd-opencl-dev
+          # sed reads to the end: head would close the pipe early, and the SIGPIPE of the
+          # writer fails the step under pipefail (exit 141).
+          x86_64-w64-mingw32-gcc --version | sed -n 1p
+          ldd --version | sed -n 1p
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0                    # git describe needs the path back to wine-11.0
+          filter: blob:none
+
+      - name: Resolve commit and version
+        id: ver
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+        run: |
+          set -eu
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sha=$(git rev-parse --verify "${INPUT_COMMIT:-origin/$BRANCH}^{commit}")
+          git merge-base --is-ancestor "$sha" "origin/$BRANCH" \
+            || { echo "::error::$sha is not on $BRANCH"; exit 1; }
+          git checkout -q --detach "$sha"
+          # Release tags must not match wine-*: describe would take them as the base.
+          version=$(git describe --tags --match 'wine-*' "$sha")
+          case "$version" in wine-11.0-*) ;; *) echo "::error::unexpected base: $version"; exit 1;; esac
+          name="wine-d2d1-dcomp-${version#wine-}"
+          { echo "sha=$sha"; echo "version=$version"; echo "name=$name"; } >> "$GITHUB_OUTPUT"
+          echo "$name ($sha)"
+
+      # A lost runner takes the whole log of the job with it, that of completed steps too;
+      # what remains is the list of steps with their start and end times. The build is
+      # therefore split into steps whose times show how far it got, and each step prints
+      # what the runner had before and after, for a build that is slow but finishes.
+      - name: Runner resources
+        run: |
+          set -eu
+          cat > "$RUNNER_TEMP/make-step" <<'EOF'
+          #!/bin/bash
+          # make-step <ERE>: make, in build/ on all cores, those prerequisites of the target
+          # 'all' that match the regular expression, with a line on load, memory and disk
+          # before and after. make-step --all: the whole default goal. make-step --resources:
+          # only the line. The prerequisites of 'all' and not the directory targets: those
+          # build more than 'all' does (dlls/wineandroid.drv/all also builds the Android
+          # package, with tools a Linux build system does not have).
+          set -u
+          res() {
+            awk -v t="$(date -u +%H:%M:%SZ)" -v n="$(nproc)" \
+                -v l="$(cut -d' ' -f1-3 /proc/loadavg)" \
+                -v d="$(df -h --output=avail . | tail -1 | tr -d ' ')" '
+              /^MemTotal:/ {mt = $2} /^MemAvailable:/ {ma = $2}
+              /^SwapTotal:/ {st = $2} /^SwapFree:/ {sf = $2}
+              END {printf "%s  %d cores, load %s, memory %d of %d MiB available, swap used %d MiB, disk %s free\n",
+                   t, n, l, ma / 1024, mt / 1024, (st - sf) / 1024, d}' /proc/meminfo
+          }
+          case "${1-}" in
+            --resources) res; exit 0 ;;
+            --all) targets=() ;;
+            ?*)
+              mapfile -t targets < <(awk '/^all: / {f = 1} f {print; if (!/\\$/) exit}' build/Makefile \
+                | tr ' \\' '\n\n' | grep -E "$1" || true)
+              # An empty list would make the default goal, the whole build, in this step.
+              if [ ${#targets[@]} -eq 0 ]; then echo "::warning::no make targets match $1"; exit 0; fi
+              echo "${#targets[@]} make target(s) matching $1" ;;
+            *) echo "usage: make-step <ERE> | --all | --resources" >&2; exit 2 ;;
+          esac
+          res
+          start=$SECONDS
+          make -C build -j"$(nproc)" "${targets[@]}" >/dev/null
+          rc=$?
+          res
+          echo "make: $((SECONDS - start)) s, exit $rc"
+          exit $rc
+          EOF
+          chmod +x "$RUNNER_TEMP/make-step"
+          "$RUNNER_TEMP/make-step" --resources
+
+      - name: Configure
+        run: |
+          set -eu
+          mkdir build && cd build
+          # --without-ffmpeg: winedmo.so links libavcodec/libavformat with versioned sonames
+          # (.58 on 22.04, .60 on 24.04, .61 later), so a build from one distribution does not
+          # load on the next. --disable-tests: the release does not ship them.
+          ../configure --prefix=/opt/wine-d2d1-dcomp --enable-archs=i386,x86_64 \
+            --disable-tests --without-ffmpeg \
+            "i386_CFLAGS=$PE_CFLAGS" "x86_64_CFLAGS=$PE_CFLAGS" 2>&1 | tee ../configure.out
+          echo "--- configure notices (optional libraries not found)"
+          grep -E '^configure: ' ../configure.out | grep -v -E 'creating|Finished' || true
+
+      # Every file the Makefile builds carries its full dependencies (tools, generated headers,
+      # import libraries), so each part builds on its own; the last step makes whatever is
+      # left, so a target missed here is still built.
+      - name: Build tools
+        run: |
+          "$RUNNER_TEMP/make-step" '^tools/'
+
+      - name: Build dlls a-d
+        run: |
+          "$RUNNER_TEMP/make-step" '^dlls/[a-d]'
+
+      - name: Build dlls e-m
+        run: |
+          "$RUNNER_TEMP/make-step" '^dlls/[e-m]'
+
+      - name: Build dlls n-v
+        run: |
+          "$RUNNER_TEMP/make-step" '^dlls/[n-v]'
+
+      - name: Build dlls w-z
+        run: |
+          "$RUNNER_TEMP/make-step" '^dlls/[w-z]'
+
+      - name: Build programs
+        run: |
+          "$RUNNER_TEMP/make-step" '^programs/'
+
+      - name: Build the rest
+        run: |
+          "$RUNNER_TEMP/make-step" --all
+
+      - name: Install and pack
+        env:
+          NAME: ${{ steps.ver.outputs.name }}
+          SHA: ${{ steps.ver.outputs.sha }}
+        run: |
+          set -eu
+          make -C build install DESTDIR="$PWD/stage" >/dev/null
+          mkdir dist
+          mv stage/opt/wine-d2d1-dcomp "dist/$NAME"
+          # Debug information only; the "Wine builtin DLL" header of the PE files stays.
+          find "dist/$NAME/lib/wine/x86_64-unix" -name '*.so' -exec strip --strip-debug {} +
+          find "dist/$NAME/lib/wine/x86_64-windows" -type f -exec x86_64-w64-mingw32-strip --strip-debug {} + 2>/dev/null || true
+          find "dist/$NAME/lib/wine/i386-windows" -type f -exec i686-w64-mingw32-strip --strip-debug {} + 2>/dev/null || true
+          strip --strip-debug "dist/$NAME/bin/wine" "dist/$NAME/bin/wineserver" "dist/$NAME/bin/wine-preloader" 2>/dev/null || true
+          printf '%s\n' "$SHA" > "dist/$NAME/COMMIT"
+          cp COPYING.LIB LICENSE "dist/$NAME/"
+          tar -C dist -cJf "$NAME-x86_64.tar.xz" "$NAME"
+          # Corresponding source (LGPL): exactly this commit.
+          git archive --format=tar --prefix="$NAME-source/" "$SHA" | xz -T0 > "$NAME-source.tar.xz"
+          sha256sum "$NAME-x86_64.tar.xz" "$NAME-source.tar.xz" > "$NAME.sha256"
+          ls -la "$NAME"*
+
+      - name: Smoke test the unpacked tarball
+        env:
+          NAME: ${{ steps.ver.outputs.name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eu
+          # Unpack somewhere else than the build prefix: proves the build is relocatable.
+          mkdir -p t && tar -C t -xf "$NAME-x86_64.tar.xz"
+          R="$PWD/t/$NAME"; W="$R/bin/wine"
+          test "$("$W" --version)" = "$VERSION"
+          for a in i386 x86_64; do
+            for d in d2d1 dcomp dxgi d3d11 wined3d dwrite; do test -f "$R/lib/wine/$a-windows/$d.dll"; done
+          done
+          for s in ntdll win32u winex11 winealsa winepulse; do test -f "$R/lib/wine/x86_64-unix/$s.so"; done
+          grep -q 'HideWineVersion' "$R/share/wine/wine.inf"
+          # The job runs as root in a workspace owned by the runner user, and Wine refuses to
+          # create a prefix in a directory not owned by the caller.
+          export WINEPREFIX=/tmp/wineprefix WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml="
+          xvfb-run -a sh -c '"$1" wineboot -u && "$1" cmd /c ver && "$2" -w' sh "$W" "$R/bin/wineserver"
+          # The registry default the fork ships in wine.inf reached the new prefix:
+          grep -q 'AppDefaults\\\\reaper.exe' "$WINEPREFIX/user.reg"
+          # What a target system has to provide: direct NEEDED entries and the glibc level.
+          for f in "$R"/lib/wine/x86_64-unix/*.so "$R"/bin/wine "$R"/bin/wineserver; do
+            objdump -p "$f" | awk '/NEEDED/ {print $2}'
+          # libc/libm are everywhere, ntdll.so and win32u.so are Wine's own.
+          done | { grep -v -x -E 'libc\.so\.6|libm\.so\.6|ntdll\.so|win32u\.so' || true; } | sort -u > "$NAME.needed"
+          if grep -E '^lib(av|sw)' "$NAME.needed"; then echo "::error::versioned FFmpeg sonames"; exit 1; fi
+          objdump -T "$R"/lib/wine/x86_64-unix/*.so "$R"/bin/wine "$R"/bin/wineserver \
+            | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 > "$NAME.glibc"
+          cat "$NAME.needed" "$NAME.glibc"
+
+      - name: Release notes
+        env:
+          NAME: ${{ steps.ver.outputs.name }}
+          SHA: ${{ steps.ver.outputs.sha }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          glibc=$(cat "$NAME.glibc")
+          {
+            echo "Built by the public workflow \`.github/workflows/release.yml\` from commit \`$SHA\` of \`$BRANCH\`."
+            echo "\`wine --version\` reports \`$VERSION\`. Nothing in this release is uploaded by hand."
+            echo
+            echo "**Verify**"
+            echo '```'
+            echo "sha256sum -c --ignore-missing $NAME.sha256"
+            echo "gh attestation verify $NAME-x86_64.tar.xz -R $REPO"
+            echo '```'
+            echo
+            echo "**Install** (any directory works; the build is relocatable)"
+            echo '```'
+            echo "sudo tar -C /opt -xf $NAME-x86_64.tar.xz"
+            echo "WINEPREFIX=~/.wine-d2d1 /opt/$NAME/bin/wine winecfg"
+            echo '```'
+            echo
+            echo "Needs x86_64 Linux with $glibc or newer, and the libraries your distribution's own"
+            echo "Wine package depends on (installing that package is the simplest way to get them)."
+            echo "On Arch the audio and media libraries are optional dependencies of \`wine\`:"
+            echo "\`pacman -S --needed wine alsa-lib libpulse gst-plugins-base-libs opencl-icd-loader libgphoto2 vulkan-icd-loader\`."
+            echo "Directly linked: $(tr '\n' ' ' < "$NAME.needed")"
+            echo
+            echo "Built without FFmpeg; media decoding goes through GStreamer. Keep DXVK out of the"
+            echo "prefix and Wine on Xwayland, see \"before the first run\" in the README. A report from this"
+            echo "build should include the output of \`wine --version\` and say that it is a release build."
+          } > "$NAME.notes.md"
+
+      # Also after a failed smoke test, so the tarball can be examined locally; the release
+      # job needs a successful build job and never sees a failed one.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: release
+          compression-level: 0              # the archives are xz already
+          path: |
+            ${{ steps.ver.outputs.name }}-x86_64.tar.xz
+            ${{ steps.ver.outputs.name }}-source.tar.xz
+            ${{ steps.ver.outputs.name }}.sha256
+            ${{ steps.ver.outputs.name }}.needed
+            ${{ steps.ver.outputs.name }}.notes.md
+          retention-days: 14
+
+  release:
+    needs: build
+    # Only from the workflow on d2d1-dcomp-11.0 (the rolling branches carry a copy of this
+    # file through the snapshot apply), only when asked, only in the public repository
+    # (artifact attestations need a public repository on GitHub's plans without Enterprise).
+    if: >-
+      inputs.publish &&
+      github.ref == 'refs/heads/d2d1-dcomp-11.0' &&
+      github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8   # v4.2.2
+        with:
+          subject-path: dist/*.tar.xz
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ needs.build.outputs.name }}
+          SHA: ${{ needs.build.outputs.sha }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -eu
+          # build-11.0-<n>-g<sha>: never wine-*, so git describe keeps using the upstream tag.
+          tag="build-${VERSION#wine-}"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SHA" \
+            --title "$NAME" --notes-file "dist/$NAME.notes.md" \
+            "dist/$NAME-x86_64.tar.xz" "dist/$NAME-source.tar.xz" "dist/$NAME.sha256"

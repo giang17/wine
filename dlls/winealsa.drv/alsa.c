@@ -26,6 +26,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <sched.h>
+#include <errno.h>
+#include <stdlib.h>
 
 #include <alsa/asoundlib.h>
 
@@ -709,6 +712,17 @@ static DWORD get_channel_mask(unsigned int channels)
 static HRESULT map_channels(EDataFlow flow, const WAVEFORMATEX *fmt, int *alsa_channels, int *map)
 {
     BOOL need_remap;
+
+    if(fmt->nChannels > 32){
+        WARN("Channel count %u exceeds map size (32); not remapping.\n", fmt->nChannels);
+        *alsa_channels = 2;
+        map[0] = 0;
+        map[1] = 1;
+        /* Return S_FALSE (consistent with stream-creation's >32 rejection) so the
+         * caller leaves need_remapping FALSE and remap_channels() — which indexes
+         * the fixed alsa_channel_map[32] up to fmt->nChannels — is never reached. */
+        return S_FALSE;
+    }
 
     if(flow != eCapture && (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE || fmt->nChannels > 2) ){
         WAVEFORMATEXTENSIBLE *fmtex = (void*)fmt;
@@ -1515,12 +1529,33 @@ static int alsa_rewind_best_effort(struct alsa_stream *stream)
     return len;
 }
 
+/* The timer thread is the last stage before the device.  On wine-11.0 mmdevapi
+ * owns this thread and registers it with MMCSS ("Pro Audio" at
+ * AVRT_PRIORITY_CRITICAL); since 4c3dd4e1d0e it is a unix thread, so the same
+ * policy is applied here directly: SCHED_FIFO at the level avrt gives an
+ * application's critical audio threads (5; WINE_AVRT_RTPRIO overrides it,
+ * 0 disables). */
+static void set_timer_thread_priority(void)
+{
+    static int warned;
+    struct sched_param sp = {0};
+    const char *env = getenv("WINE_AVRT_RTPRIO");
+    int prio = env ? atoi(env) : 5, max = sched_get_priority_max(SCHED_FIFO);
+
+    if (prio <= 0) return;
+    if (max > 0 && prio > max) prio = max;
+    sp.sched_priority = prio;
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) && !warned++)
+        WARN("cannot raise the timer thread to SCHED_FIFO %d (errno %d)\n", prio, errno);
+}
+
 static void alsa_timer_loop(void *args)
 {
     struct alsa_stream *stream = args;
     LARGE_INTEGER delay, next;
     int adjust;
 
+    set_timer_thread_priority();
     alsa_lock(stream);
 
     delay.QuadPart = -stream->mmdev_period_rt;
@@ -1571,8 +1606,26 @@ static NTSTATUS alsa_start(void *args)
     }else{
         snd_pcm_sframes_t avail, written;
         snd_pcm_uframes_t offs;
+        int err;
 
         avail = snd_pcm_avail_update(stream->pcm_handle);
+
+        /* The device runs dry while the stream is stopped, and the timer
+         * recovers from that only on its next period. A negative avail must
+         * not reach alsa_write_buffer_wrap() as a frame count. */
+        if(avail < 0 || snd_pcm_state(stream->pcm_handle) == SND_PCM_STATE_XRUN){
+            TRACE("XRun state or error %ld, recovering\n", avail);
+
+            if((err = snd_pcm_recover(stream->pcm_handle, avail < 0 ? avail : -EPIPE, 1)) < 0)
+                WARN("snd_pcm_recover failed: %d (%s)\n", err, snd_strerror(err));
+
+            avail = snd_pcm_avail_update(stream->pcm_handle);
+            if(avail < 0){
+                WARN("snd_pcm_avail_update failed: %ld (%s)\n", avail, snd_strerror(avail));
+                avail = 0;
+            }
+        }
+
         avail = min(avail, stream->held_frames);
 
         if(stream->wri_offs_frames < stream->held_frames)
@@ -1910,6 +1963,11 @@ static NTSTATUS alsa_is_format_supported(void *args)
         params->result = S_FALSE;
     else if(params->fmt_in->nChannels < min)
         params->result = S_FALSE;
+    else if(params->fmt_in->nChannels > 32){
+        WARN("Channel count %u exceeds supported limit.\n", params->fmt_in->nChannels);
+        params->result = S_FALSE;
+        goto exit;
+    }
 
     map_channels(params->flow, params->fmt_in, &alsa_channels, alsa_channel_map);
 

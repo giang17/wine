@@ -310,7 +310,7 @@ static void test_getmenubarinfo(void)
     ok(ret, "GetWindowRect failed.\n");
     ret = GetMenuItemRect(hwnd, hmenu, 0, &rci);
     ok(ret, "GetMenuItemRect failed.\n");
-    todo_wine ok(mbi.rcBar.left == rci.left && mbi.rcBar.top == rci.top &&
+    ok(mbi.rcBar.left == rci.left && mbi.rcBar.top == rci.top &&
             mbi.rcBar.bottom == rci.bottom && mbi.rcBar.right == rcw.right - rci.left + rcw.left,
             "rcBar: Got %s instead of (%ld,%ld)-(%ld,%ld)\n", wine_dbgstr_rect(&mbi.rcBar),
             rci.left, rci.top, rcw.right - rci.left + rcw.left, rci.bottom);
@@ -3705,6 +3705,337 @@ static void test_menu_cancelmode(void)
     DestroyWindow( hwnd);
 }
 
+/* mouse messages and capture of the owner while a popup menu opened by a right click is up */
+enum owner_input_mode
+{
+    OWNER_INPUT_RUP,         /* right button up, then a left click outside */
+    OWNER_INPUT_RCLICK,      /* right button up, then a right click outside */
+    OWNER_INPUT_LHELD,       /* left button down on an item, right button up, left button up */
+};
+
+struct owner_input_msg
+{
+    HWND hwnd;
+    UINT message;
+    WPARAM wparam;
+    LPARAM lparam;
+    BOOL in_menu;
+};
+
+static struct
+{
+    enum owner_input_mode mode;
+    UINT flags;
+    BOOL capture;
+    HWND hwnd, owner;
+    HMENU menu;
+    POINT pt, outside;
+    int state;  /* 0: before the menu, 1: tracking, 2: input sent, 3: done */
+    BOOL timeout, nested_ret;
+    DWORD nested_error;
+    UINT ret;
+    HWND capture_in_menu;
+    GUITHREADINFO info;
+    unsigned int count;
+    struct owner_input_msg msgs[32];
+} owner_input;
+
+static void send_mouse_button( DWORD flags )
+{
+    INPUT input;
+
+    memset( &input, 0, sizeof(input) );
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = flags;
+    SendInput( 1, &input, sizeof(input) );
+}
+
+static LRESULT WINAPI owner_input_wnd_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+{
+    switch (msg)
+    {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_CONTEXTMENU:
+    case WM_CAPTURECHANGED:
+        /* the right button down that opens the menu is not recorded */
+        if (owner_input.state && owner_input.count < ARRAY_SIZE(owner_input.msgs))
+        {
+            struct owner_input_msg *m = &owner_input.msgs[owner_input.count++];
+            m->hwnd = hwnd;
+            m->message = msg;
+            m->wparam = wparam;
+            m->lparam = lparam;
+            m->in_menu = owner_input.state == 1 || owner_input.state == 2;
+        }
+        break;
+    }
+
+    switch (msg)
+    {
+    case WM_RBUTTONDOWN:
+        if (hwnd != owner_input.hwnd || owner_input.state) break;
+        owner_input.state = 1;
+        if (owner_input.capture) SetCapture( hwnd );
+        owner_input.ret = TrackPopupMenu( owner_input.menu, owner_input.flags, owner_input.pt.x,
+                                          owner_input.pt.y, 0, owner_input.owner ? owner_input.owner : hwnd, NULL );
+        owner_input.state = 3;
+        return 0;
+
+    case WM_ENTERIDLE:
+    {
+        RECT rect;
+
+        if (owner_input.state != 1) break;
+        owner_input.state = 2;
+        owner_input.capture_in_menu = GetCapture();
+        owner_input.info.cbSize = sizeof(owner_input.info);
+        GetGUIThreadInfo( GetCurrentThreadId(), &owner_input.info );
+        SetTimer( hwnd, 1, 3000, NULL );
+
+        switch (owner_input.mode)
+        {
+        case OWNER_INPUT_RUP:
+            send_mouse_button( MOUSEEVENTF_RIGHTUP );
+            SetCursorPos( owner_input.outside.x, owner_input.outside.y );
+            send_mouse_button( MOUSEEVENTF_LEFTDOWN );
+            send_mouse_button( MOUSEEVENTF_LEFTUP );
+            break;
+        case OWNER_INPUT_RCLICK:
+            send_mouse_button( MOUSEEVENTF_RIGHTUP );
+            SetCursorPos( owner_input.outside.x, owner_input.outside.y );
+            send_mouse_button( MOUSEEVENTF_RIGHTDOWN );
+            send_mouse_button( MOUSEEVENTF_RIGHTUP );
+            break;
+        case OWNER_INPUT_LHELD:
+            GetMenuItemRect( NULL, owner_input.menu, 0, &rect );
+            SetCursorPos( (rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2 );
+            send_mouse_button( MOUSEEVENTF_LEFTDOWN );
+            send_mouse_button( MOUSEEVENTF_RIGHTUP );
+            send_mouse_button( MOUSEEVENTF_LEFTUP );
+            break;
+        }
+        break;
+    }
+
+    case WM_CONTEXTMENU:
+        if (owner_input.state == 2)
+        {
+            HMENU nested = CreatePopupMenu();
+
+            AppendMenuA( nested, MF_STRING, 10, "nested" );
+            SetLastError( 0xdeadbeef );
+            owner_input.nested_ret = TrackPopupMenu( nested, TPM_RETURNCMD, owner_input.outside.x,
+                                                     owner_input.outside.y, 0, hwnd, NULL );
+            owner_input.nested_error = GetLastError();
+            DestroyMenu( nested );
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wparam != 1) break;
+        KillTimer( hwnd, 1 );
+        owner_input.timeout = TRUE;
+        EndMenu();
+        return 0;
+    }
+    return DefWindowProcA( hwnd, msg, wparam, lparam );
+}
+
+static const struct owner_input_msg *find_owner_input_msg( HWND hwnd, UINT message, BOOL in_menu,
+                                                           unsigned int *start )
+{
+    unsigned int i;
+
+    for (i = start ? *start : 0; i < owner_input.count; i++)
+    {
+        if (owner_input.msgs[i].hwnd != hwnd || owner_input.msgs[i].message != message) continue;
+        if (owner_input.msgs[i].in_menu != in_menu) continue;
+        if (start) *start = i + 1;
+        return &owner_input.msgs[i];
+    }
+    return NULL;
+}
+
+static void flush_owner_input_events( DWORD timeout, BOOL until_done )
+{
+    DWORD end = GetTickCount() + timeout;
+    MSG msg;
+
+    while ((int)(end - GetTickCount()) > 0)
+    {
+        if (MsgWaitForMultipleObjects( 0, NULL, FALSE, 50, QS_ALLINPUT ) == WAIT_TIMEOUT &&
+            (!until_done || owner_input.state == 3)) break;
+        while (PeekMessageA( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageA( &msg );
+    }
+}
+
+static void test_menu_owner_input(void)
+{
+    static const struct
+    {
+        enum owner_input_mode mode;
+        UINT flags;
+        BOOL owner, capture;
+    }
+    tests[] =
+    {
+        { OWNER_INPUT_RUP, 0 },
+        { OWNER_INPUT_RUP, 0, FALSE, TRUE },
+        { OWNER_INPUT_RUP, 0, TRUE, TRUE },
+        { OWNER_INPUT_RCLICK, 0 },
+        { OWNER_INPUT_LHELD, TPM_RETURNCMD },
+        { OWNER_INPUT_RUP, TPM_RIGHTBUTTON },
+    };
+    const struct owner_input_msg *m;
+    HWND hwnd, owner, target;
+    POINT orig_pos, origin;
+    WNDCLASSA cls = {0};
+    unsigned int i, start;
+    HMENU menu;
+
+    cls.lpfnWndProc = owner_input_wnd_proc;
+    cls.hInstance = GetModuleHandleA( NULL );
+    cls.hCursor = LoadCursorA( 0, (LPCSTR)IDC_ARROW );
+    cls.lpszClassName = "MenuOwnerInputClass";
+    RegisterClassA( &cls );
+
+    hwnd = CreateWindowExA( 0, cls.lpszClassName, "menu owner input", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                            100, 100, 400, 300, NULL, NULL, NULL, NULL );
+    ok( hwnd != NULL, "CreateWindowEx failed with error %ld\n", GetLastError() );
+    owner = CreateWindowExA( 0, cls.lpszClassName, "owner", WS_POPUP, 0, 0, 0, 0, NULL, NULL, NULL, NULL );
+    ok( owner != NULL, "CreateWindowEx failed with error %ld\n", GetLastError() );
+    menu = CreatePopupMenu();
+    AppendMenuA( menu, MF_STRING, 1, "one" );
+    AppendMenuA( menu, MF_STRING, 2, "two" );
+    AppendMenuA( menu, MF_STRING, 3, "three" );
+
+    GetCursorPos( &orig_pos );
+    SetForegroundWindow( hwnd );
+    flush_owner_input_events( 200, FALSE );
+    if (GetForegroundWindow() != hwnd)
+    {
+        skip( "the window is not in the foreground\n" );
+        goto done;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        winetest_push_context( "test %u", i );
+
+        memset( &owner_input, 0, sizeof(owner_input) );
+        owner_input.mode = tests[i].mode;
+        owner_input.flags = tests[i].flags;
+        owner_input.capture = tests[i].capture;
+        owner_input.hwnd = hwnd;
+        owner_input.owner = tests[i].owner ? owner : NULL;
+        owner_input.menu = menu;
+        owner_input.pt.x = 200;
+        owner_input.pt.y = 150;
+        ClientToScreen( hwnd, &owner_input.pt );
+        owner_input.outside.x = 20;
+        owner_input.outside.y = 20;
+        ClientToScreen( hwnd, &owner_input.outside );
+        target = tests[i].owner ? owner : hwnd;
+
+        SetCursorPos( owner_input.pt.x, owner_input.pt.y );
+        flush_owner_input_events( 100, FALSE );
+        send_mouse_button( MOUSEEVENTF_RIGHTDOWN );
+        flush_owner_input_events( 5000, TRUE );
+        KillTimer( target, 1 );
+
+        if (owner_input.state != 3)
+        {
+            skip( "the menu was not opened\n" );
+            send_mouse_button( MOUSEEVENTF_RIGHTUP );
+            flush_owner_input_events( 100, FALSE );
+            winetest_pop_context();
+            continue;
+        }
+        ok( !owner_input.timeout, "the menu did not end\n" );
+
+        ok( owner_input.capture_in_menu == target, "got capture %p, expected %p\n",
+            owner_input.capture_in_menu, target );
+        ok( owner_input.info.hwndCapture == target, "got hwndCapture %p, expected %p\n",
+            owner_input.info.hwndCapture, target );
+        ok( owner_input.info.hwndMenuOwner == target, "got hwndMenuOwner %p, expected %p\n",
+            owner_input.info.hwndMenuOwner, target );
+        ok( owner_input.info.flags & GUI_INMENUMODE, "got flags %#lx\n", owner_input.info.flags );
+        todo_wine ok( owner_input.info.flags & GUI_POPUPMENUMODE, "got flags %#lx\n", owner_input.info.flags );
+
+        /* the capture moves to the owner when the menu starts, and is released when it ends */
+        start = 0;
+        if (tests[i].capture)
+        {
+            m = find_owner_input_msg( hwnd, WM_CAPTURECHANGED, TRUE, &start );
+            ok( m && (HWND)m->lparam == target, "got WM_CAPTURECHANGED %p, expected %p\n",
+                m ? (HWND)m->lparam : (HWND)-1, target );
+        }
+        if (target != hwnd) start = 0;
+        m = find_owner_input_msg( target, WM_CAPTURECHANGED, TRUE, &start );
+        ok( m && !m->lparam, "got WM_CAPTURECHANGED %p at the end of the menu\n",
+            m ? (HWND)m->lparam : (HWND)-1 );
+
+        if (owner_input.mode == OWNER_INPUT_LHELD || (owner_input.flags & TPM_RIGHTBUTTON))
+        {
+            /* the menu eats the button up */
+            ok( !find_owner_input_msg( target, WM_RBUTTONUP, TRUE, NULL ), "got WM_RBUTTONUP\n" );
+            ok( !find_owner_input_msg( target, WM_CONTEXTMENU, TRUE, NULL ), "got WM_CONTEXTMENU\n" );
+            if (owner_input.mode == OWNER_INPUT_LHELD)
+                ok( owner_input.ret == 1, "TrackPopupMenu returned %u\n", owner_input.ret );
+            else
+                ok( find_owner_input_msg( hwnd, WM_LBUTTONDOWN, FALSE, NULL ) != NULL, "no WM_LBUTTONDOWN\n" );
+            winetest_pop_context();
+            continue;
+        }
+
+        /* the owner gets the button up in screen coordinates, DefWindowProc maps them once more */
+        m = find_owner_input_msg( target, WM_RBUTTONUP, TRUE, NULL );
+        ok( m != NULL, "no WM_RBUTTONUP\n" );
+        if (m) ok( m->lparam == MAKELPARAM( owner_input.pt.x, owner_input.pt.y ), "got lparam %#Ix\n", m->lparam );
+        m = find_owner_input_msg( target, WM_CONTEXTMENU, TRUE, NULL );
+        ok( m != NULL, "no WM_CONTEXTMENU\n" );
+        if (m)
+        {
+            origin.x = origin.y = 0;
+            ClientToScreen( target, &origin );
+            ok( m->wparam == (WPARAM)target, "got wparam %#Ix\n", m->wparam );
+            ok( m->lparam == MAKELPARAM( owner_input.pt.x + origin.x, owner_input.pt.y + origin.y ),
+                "got lparam %#Ix\n", m->lparam );
+            ok( !owner_input.nested_ret, "nested TrackPopupMenu succeeded\n" );
+            ok( owner_input.nested_error == ERROR_POPUP_ALREADY_ACTIVE, "got error %lu\n", owner_input.nested_error );
+        }
+
+        /* the click outside ends the menu and reaches the window afterwards */
+        origin = owner_input.outside;
+        ScreenToClient( hwnd, &origin );
+        if (owner_input.mode == OWNER_INPUT_RCLICK)
+        {
+            m = find_owner_input_msg( hwnd, WM_RBUTTONDOWN, FALSE, NULL );
+            ok( m != NULL, "no WM_RBUTTONDOWN after the menu\n" );
+            if (m) ok( m->lparam == MAKELPARAM( origin.x, origin.y ), "got lparam %#Ix\n", m->lparam );
+            ok( find_owner_input_msg( hwnd, WM_RBUTTONUP, FALSE, NULL ) != NULL, "no WM_RBUTTONUP after the menu\n" );
+        }
+        else
+        {
+            m = find_owner_input_msg( hwnd, WM_LBUTTONDOWN, FALSE, NULL );
+            ok( m != NULL, "no WM_LBUTTONDOWN after the menu\n" );
+            if (m) ok( m->lparam == MAKELPARAM( origin.x, origin.y ), "got lparam %#Ix\n", m->lparam );
+        }
+
+        winetest_pop_context();
+    }
+
+done:
+    SetCursorPos( orig_pos.x, orig_pos.y );
+    DestroyMenu( menu );
+    DestroyWindow( owner );
+    DestroyWindow( hwnd );
+    UnregisterClassA( cls.lpszClassName, cls.hInstance );
+}
+
 /* show menu trees have a maximum depth */
 static void test_menu_maxdepth(void)
 {
@@ -4436,6 +4767,7 @@ START_TEST(menu)
     test_menu_trackpopupmenu();
     test_menu_trackagain();
     test_menu_cancelmode();
+    test_menu_owner_input();
     test_menu_maxdepth();
     test_menu_circref();
     test_emptypopup();

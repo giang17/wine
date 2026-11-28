@@ -1,5 +1,6 @@
 MODULE    = nsi.dll
 IMPORTLIB = nsi
+IMPORTS   = uuid
 
 SOURCES = \
 	nsi.c

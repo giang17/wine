@@ -52,27 +52,27 @@
 @ cdecl -arch=arm ??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAA@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z(ptr ptr) msvcp140.??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAA@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z
 @ thiscall -arch=i386 ??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAE@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z(ptr ptr) msvcp140.??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAE@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z
 @ cdecl -arch=win64 ??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z(ptr ptr) msvcp140.??0?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z
-@ stub -arch=arm ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z
 @ thiscall -arch=i386 ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z
 @ cdecl -arch=win64 ??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@@Z
-@ stub -arch=arm ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@QAA@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@GU?$char_traits@G@std@@@std@@QAA@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@@Z
 @ thiscall -arch=i386 ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@QAE@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@GU?$char_traits@G@std@@@std@@QAE@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@@Z
 @ cdecl -arch=win64 ??0?$basic_iostream@GU?$char_traits@G@std@@@std@@QEAA@PEAV?$basic_streambuf@GU?$char_traits@G@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@GU?$char_traits@G@std@@@std@@QEAA@PEAV?$basic_streambuf@GU?$char_traits@G@std@@@1@@Z
-@ stub -arch=arm ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QAA@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QAA@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z
 @ thiscall -arch=i386 ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QAE@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QAE@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z
 @ cdecl -arch=win64 ??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z(ptr ptr long) msvcp140.??0?$basic_iostream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@@Z
-@ stub -arch=arm ??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_istream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_istream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N1@Z
 @ thiscall -arch=i386 ??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N1@Z
 @ cdecl -arch=win64 ??0?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N1@Z
@@ -82,9 +82,9 @@
 @ cdecl -arch=arm ??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAA@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAA@W4_Uninitialized@1@@Z
 @ thiscall -arch=i386 ??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAE@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@QAE@W4_Uninitialized@1@@Z
 @ cdecl -arch=win64 ??0?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@DU?$char_traits@D@std@@@std@@QEAA@W4_Uninitialized@1@@Z
-@ stub -arch=arm ??0?$basic_istream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_istream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_istream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_istream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_istream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_istream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_istream@GU?$char_traits@G@std@@@std@@QAA@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@QAA@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N1@Z
 @ thiscall -arch=i386 ??0?$basic_istream@GU?$char_traits@G@std@@@std@@QAE@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@QAE@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N1@Z
 @ cdecl -arch=win64 ??0?$basic_istream@GU?$char_traits@G@std@@@std@@QEAA@PEAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@QEAA@PEAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N1@Z
@@ -94,9 +94,9 @@
 @ cdecl -arch=arm ??0?$basic_istream@GU?$char_traits@G@std@@@std@@QAA@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@QAA@W4_Uninitialized@1@@Z
 @ thiscall -arch=i386 ??0?$basic_istream@GU?$char_traits@G@std@@@std@@QAE@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@QAE@W4_Uninitialized@1@@Z
 @ cdecl -arch=win64 ??0?$basic_istream@GU?$char_traits@G@std@@@std@@QEAA@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@GU?$char_traits@G@std@@@std@@QEAA@W4_Uninitialized@1@@Z
-@ stub -arch=arm ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QAA@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QAA@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N1@Z
 @ thiscall -arch=i386 ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QAE@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QAE@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N1@Z
 @ cdecl -arch=win64 ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N1@Z(ptr ptr long long long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N1@Z
@@ -106,27 +106,27 @@
 @ cdecl -arch=arm ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QAA@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QAA@W4_Uninitialized@1@@Z
 @ thiscall -arch=i386 ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QAE@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QAE@W4_Uninitialized@1@@Z
 @ cdecl -arch=win64 ??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QEAA@W4_Uninitialized@1@@Z(ptr long long) msvcp140.??0?$basic_istream@_WU?$char_traits@_W@std@@@std@@QEAA@W4_Uninitialized@1@@Z
-@ stub -arch=arm ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAA@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z
 @ thiscall -arch=i386 ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAE@PAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z
 @ cdecl -arch=win64 ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA@PEAV?$basic_streambuf@DU?$char_traits@D@std@@@1@_N@Z
 @ cdecl -arch=arm ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAA@W4_Uninitialized@1@_N@Z(ptr long long long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAA@W4_Uninitialized@1@_N@Z
 @ thiscall -arch=i386 ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAE@W4_Uninitialized@1@_N@Z(ptr long long long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QAE@W4_Uninitialized@1@_N@Z
 @ cdecl -arch=win64 ??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA@W4_Uninitialized@1@_N@Z(ptr long long long) msvcp140.??0?$basic_ostream@DU?$char_traits@D@std@@@std@@QEAA@W4_Uninitialized@1@_N@Z
-@ stub -arch=arm ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QAA@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QAA@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N@Z
 @ thiscall -arch=i386 ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QAE@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QAE@PAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N@Z
 @ cdecl -arch=win64 ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QEAA@PEAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QEAA@PEAV?$basic_streambuf@GU?$char_traits@G@std@@@1@_N@Z
 @ cdecl -arch=arm ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QAA@W4_Uninitialized@1@_N@Z(ptr long long long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QAA@W4_Uninitialized@1@_N@Z
 @ thiscall -arch=i386 ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QAE@W4_Uninitialized@1@_N@Z(ptr long long long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QAE@W4_Uninitialized@1@_N@Z
 @ cdecl -arch=win64 ??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QEAA@W4_Uninitialized@1@_N@Z(ptr long long long) msvcp140.??0?$basic_ostream@GU?$char_traits@G@std@@@std@@QEAA@W4_Uninitialized@1@_N@Z
-@ stub -arch=arm ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z
-@ stub -arch=i386 ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z
-@ stub -arch=win64 ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z
+@ cdecl -arch=arm ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAA@$$QAV01@@Z
+@ thiscall -arch=i386 ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAE@$$QAV01@@Z
+@ cdecl -arch=win64 ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z(ptr ptr long) msvcp140.??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IEAA@$$QEAV01@@Z
 @ cdecl -arch=arm ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QAA@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QAA@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N@Z
 @ thiscall -arch=i386 ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QAE@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QAE@PAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N@Z
 @ cdecl -arch=win64 ??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N@Z(ptr ptr long long) msvcp140.??0?$basic_ostream@_WU?$char_traits@_W@std@@@std@@QEAA@PEAV?$basic_streambuf@_WU?$char_traits@_W@std@@@1@_N@Z
@@ -544,33 +544,33 @@
 @ cdecl -arch=arm ??4?$_Yarn@_W@std@@QAAAAV01@PB_W@Z(ptr wstr) msvcp140.??4?$_Yarn@_W@std@@QAAAAV01@PB_W@Z
 @ thiscall -arch=i386 ??4?$_Yarn@_W@std@@QAEAAV01@PB_W@Z(ptr wstr) msvcp140.??4?$_Yarn@_W@std@@QAEAAV01@PB_W@Z
 @ cdecl -arch=win64 ??4?$_Yarn@_W@std@@QEAAAEAV01@PEB_W@Z(ptr wstr) msvcp140.??4?$_Yarn@_W@std@@QEAAAEAV01@PEB_W@Z
-@ stub -arch=arm ??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
-@ stub -arch=arm ??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
-@ stub -arch=arm ??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
-@ stub -arch=arm ??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_istream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
-@ stub -arch=arm ??4?$basic_istream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_istream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_istream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
-@ stub -arch=arm ??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
-@ stub -arch=arm ??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
-@ stub -arch=arm ??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
-@ stub -arch=arm ??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z
-@ stub -arch=i386 ??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z
-@ stub -arch=win64 ??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_iostream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_istream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_istream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_istream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_istream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_istream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@DU?$char_traits@D@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@GU?$char_traits@G@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
+@ cdecl -arch=arm ??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAAAAV01@$$QAV01@@Z
+@ thiscall -arch=i386 ??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IAEAAV01@$$QAV01@@Z
+@ cdecl -arch=win64 ??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z(ptr ptr) msvcp140.??4?$basic_ostream@_WU?$char_traits@_W@std@@@std@@IEAAAEAV01@$$QEAV01@@Z
 @ stub -arch=arm ??4?$basic_streambuf@DU?$char_traits@D@std@@@std@@IAAAAV01@ABV01@@Z
 @ stub -arch=i386 ??4?$basic_streambuf@DU?$char_traits@D@std@@@std@@IAEAAV01@ABV01@@Z
 @ stub -arch=win64 ??4?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAAEAV01@AEBV01@@Z
@@ -2606,18 +2606,18 @@
 @ stub ?id@?$messages@D@std@@2V0locale@2@A
 @ stub ?id@?$messages@G@std@@2V0locale@2@A
 @ stub ?id@?$messages@_W@std@@2V0locale@2@A
-@ stub ?id@?$money_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A
-@ stub ?id@?$money_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A
-@ stub ?id@?$money_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A
-@ stub ?id@?$money_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A
-@ stub ?id@?$money_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A
-@ stub ?id@?$money_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A
-@ stub ?id@?$moneypunct@D$00@std@@2V0locale@2@A
-@ stub ?id@?$moneypunct@D$0A@@std@@2V0locale@2@A
-@ stub ?id@?$moneypunct@G$00@std@@2V0locale@2@A
-@ stub ?id@?$moneypunct@G$0A@@std@@2V0locale@2@A
-@ stub ?id@?$moneypunct@_W$00@std@@2V0locale@2@A
-@ stub ?id@?$moneypunct@_W$0A@@std@@2V0locale@2@A
+@ extern ?id@?$money_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$money_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A
+@ extern ?id@?$money_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$money_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A
+@ extern ?id@?$money_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$money_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A
+@ extern ?id@?$money_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$money_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A
+@ extern ?id@?$money_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$money_put@GV?$ostreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A
+@ extern ?id@?$money_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$money_put@_WV?$ostreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A
+@ extern ?id@?$moneypunct@D$00@std@@2V0locale@2@A msvcp140.?id@?$moneypunct@D$00@std@@2V0locale@2@A
+@ extern ?id@?$moneypunct@D$0A@@std@@2V0locale@2@A msvcp140.?id@?$moneypunct@D$0A@@std@@2V0locale@2@A
+@ extern ?id@?$moneypunct@G$00@std@@2V0locale@2@A msvcp140.?id@?$moneypunct@G$00@std@@2V0locale@2@A
+@ extern ?id@?$moneypunct@G$0A@@std@@2V0locale@2@A msvcp140.?id@?$moneypunct@G$0A@@std@@2V0locale@2@A
+@ extern ?id@?$moneypunct@_W$00@std@@2V0locale@2@A msvcp140.?id@?$moneypunct@_W$00@std@@2V0locale@2@A
+@ extern ?id@?$moneypunct@_W$0A@@std@@2V0locale@2@A msvcp140.?id@?$moneypunct@_W$0A@@std@@2V0locale@2@A
 @ extern ?id@?$num_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$num_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@2V0locale@2@A
 @ extern ?id@?$num_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$num_get@GV?$istreambuf_iterator@GU?$char_traits@G@std@@@std@@@std@@2V0locale@2@A
 @ extern ?id@?$num_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A msvcp140.?id@?$num_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@2V0locale@2@A
@@ -2759,24 +2759,24 @@
 @ cdecl -arch=arm ?max_length@codecvt_base@std@@QBAHXZ(ptr) msvcp140.?max_length@codecvt_base@std@@QBAHXZ
 @ thiscall -arch=i386 ?max_length@codecvt_base@std@@QBEHXZ(ptr) msvcp140.?max_length@codecvt_base@std@@QBEHXZ
 @ cdecl -arch=win64 ?max_length@codecvt_base@std@@QEBAHXZ(ptr) msvcp140.?max_length@codecvt_base@std@@QEBAHXZ
-@ stub -arch=arm ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAAX$$QAV12@@Z
-@ stub -arch=i386 ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEX$$QAV12@@Z
-@ stub -arch=win64 ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAX$$QEAV12@@Z
-@ stub -arch=arm ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAAXAAV12@@Z
-@ stub -arch=i386 ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEXAAV12@@Z
-@ stub -arch=win64 ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAXAEAV12@@Z
-@ stub -arch=arm ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAAX$$QAV12@@Z
-@ stub -arch=i386 ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEX$$QAV12@@Z
-@ stub -arch=win64 ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QEAAX$$QEAV12@@Z
-@ stub -arch=arm ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAAXAAV12@@Z
-@ stub -arch=i386 ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEXAAV12@@Z
-@ stub -arch=win64 ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QEAAXAEAV12@@Z
-@ stub -arch=arm ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAAX$$QAV12@@Z
-@ stub -arch=i386 ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAEX$$QAV12@@Z
-@ stub -arch=win64 ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAX$$QEAV12@@Z
-@ stub -arch=arm ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAAXAAV12@@Z
-@ stub -arch=i386 ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAEXAAV12@@Z
-@ stub -arch=win64 ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAXAEAV12@@Z
+@ cdecl -arch=arm ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAAX$$QAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAAX$$QAV12@@Z
+@ thiscall -arch=i386 ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEX$$QAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEX$$QAV12@@Z
+@ cdecl -arch=win64 ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAX$$QEAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAX$$QEAV12@@Z
+@ cdecl -arch=arm ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAAXAAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAAXAAV12@@Z
+@ thiscall -arch=i386 ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEXAAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QAEXAAV12@@Z
+@ cdecl -arch=win64 ?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAXAEAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@DU?$char_traits@D@std@@@std@@QEAAXAEAV12@@Z
+@ cdecl -arch=arm ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAAX$$QAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAAX$$QAV12@@Z
+@ thiscall -arch=i386 ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEX$$QAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEX$$QAV12@@Z
+@ cdecl -arch=win64 ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QEAAX$$QEAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QEAAX$$QEAV12@@Z
+@ cdecl -arch=arm ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAAXAAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAAXAAV12@@Z
+@ thiscall -arch=i386 ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEXAAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEXAAV12@@Z
+@ cdecl -arch=win64 ?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QEAAXAEAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@GU?$char_traits@G@std@@@std@@QEAAXAEAV12@@Z
+@ cdecl -arch=arm ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAAX$$QAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAAX$$QAV12@@Z
+@ thiscall -arch=i386 ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAEX$$QAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAEX$$QAV12@@Z
+@ cdecl -arch=win64 ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAX$$QEAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAX$$QEAV12@@Z
+@ cdecl -arch=arm ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAAXAAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAAXAAV12@@Z
+@ thiscall -arch=i386 ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAEXAAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QAEXAAV12@@Z
+@ cdecl -arch=win64 ?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAXAEAV12@@Z(ptr ptr) msvcp140.?move@?$basic_ios@_WU?$char_traits@_W@std@@@std@@QEAAXAEAV12@@Z
 @ cdecl -arch=arm ?narrow@?$basic_ios@DU?$char_traits@D@std@@@std@@QBADDD@Z(ptr long long) msvcp140.?narrow@?$basic_ios@DU?$char_traits@D@std@@@std@@QBADDD@Z
 @ thiscall -arch=i386 ?narrow@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEDDD@Z(ptr long long) msvcp140.?narrow@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEDDD@Z
 @ cdecl -arch=win64 ?narrow@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBADDD@Z(ptr long long) msvcp140.?narrow@?$basic_ios@DU?$char_traits@D@std@@@std@@QEBADDD@Z

@@ -21,12 +21,34 @@
 
 #include "uiribbon.h"
 
+struct ribbon_property
+{
+    PROPERTYKEY key;
+    PROPVARIANT value;
+};
+
+/* A property store that is part of another object and shares its reference count. */
+struct ribbon_store
+{
+    IPropertyStore IPropertyStore_iface;
+    IUnknown *outer;
+    struct ribbon_property *properties;
+    unsigned int count;
+};
+
 typedef struct {
     IUIFramework IUIFramework_iface;
+    IUIRibbon IUIRibbon_iface;
+    struct ribbon_store framework_store;
+    struct ribbon_store view_store;
     LONG ref;
+    HWND frame;
+    IUIApplication *application;
+    BOOL view_created;
 } UIRibbonFrameworkImpl;
 
 HRESULT UIRibbonFrameworkImpl_Create(IUnknown *pUnkOuter, void **ppObj);
+HRESULT UIRibbonImageFromBitmapFactory_Create(IUnknown *pUnkOuter, void **ppObj);
 
 
 #endif /* __UIRIBBON_PRIVATE_INCLUDED__ */

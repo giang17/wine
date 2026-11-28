@@ -22,6 +22,7 @@
 #define __NTDLL_UNIXLIB_H
 
 #include "wine/unixlib.h"
+#include "wine/list.h"
 
 struct _DISPATCHER_CONTEXT;
 
@@ -79,5 +80,34 @@ enum ntdll_unix_funcs
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;
+
+/* Queue entry of a thread blocked in RtlWaitOnAddress. While the thread sleeps
+ * the PE side publishes it in TEB->ReservedForPerf, so that the Unix side can
+ * deal with it when the thread is terminated from outside: a wake-up spent on
+ * a dead waiter is lost, and with critical sections the released lock then
+ * sits unowned until the next waiter's timeout. The server signals the thread
+ * handle before the thread has run its SIGQUIT handler, so the entry may
+ * already have been picked by a waker by then; the wake-up is then handed on
+ * to the next waiter on the same address. */
+struct wait_on_address_entry
+{
+    struct list  entry;
+    const void  *addr;       /* cleared by the waker that unlinked the entry */
+    DWORD        tid;
+    const void  *wait_addr;  /* address waited on, kept for handing the wake-up on */
+    struct list *queue;      /* queue the entry is linked into */
+    LONG        *lock;       /* spinlock of that queue */
+};
+
+/* the same entry as written by 32-bit ntdll into the 32-bit TEB of a WoW64 thread */
+struct wait_on_address_entry32
+{
+    ULONG next, prev;        /* struct list */
+    ULONG addr;
+    DWORD tid;
+    ULONG wait_addr;
+    ULONG queue;
+    ULONG lock;
+};
 
 #endif /* __NTDLL_UNIXLIB_H */

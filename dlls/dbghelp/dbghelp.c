@@ -71,6 +71,8 @@ BOOL       dbghelp_opt_extension_api = FALSE;
 BOOL       dbghelp_opt_real_path = FALSE;
 BOOL       dbghelp_opt_source_actual_path = FALSE;
 SYSTEM_INFO sysinfo;
+const char *(CDECL *pwine_get_build_id)(void);
+void (CDECL *pwine_get_host_version)(const char **sysname, const char **release);
 
 static struct process* process_first /* = NULL */;
 
@@ -79,9 +81,14 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
+    {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         GetSystemInfo(&sysinfo);
+        pwine_get_build_id = (void *)GetProcAddress(ntdll, "wine_get_build_id");
+        pwine_get_host_version = (void *)GetProcAddress(ntdll, "wine_get_host_version");
         DisableThreadLibraryCalls(instance);
         break;
+    }
     }
     return TRUE;
 }

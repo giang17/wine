@@ -60,6 +60,7 @@ struct object_creation_info
 static const struct object_creation_info object_creation[] =
 {
     { &CLSID_UIRibbonFramework, UIRibbonFrameworkImpl_Create },
+    { &CLSID_UIRibbonImageFromBitmapFactory, UIRibbonImageFromBitmapFactory_Create },
 };
 
 static HRESULT WINAPI XFCF_QueryInterface(LPCLASSFACTORY iface,REFIID riid, void **ppobj)

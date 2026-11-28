@@ -112,11 +112,10 @@ typedef struct MMDevice {
     struct list entry;
 } MMDevice;
 
-static inline void wine_unix_call(const unsigned int code, void *args)
-{
-    const NTSTATUS status = __wine_unix_call(drvs.module_unixlib, code, args);
-    assert(!status);
-}
+/* Every driver entry point is expected to return STATUS_SUCCESS.  The wrapper
+ * keeps the assert but logs the call code and status first, so that a rare
+ * non-zero status can be attributed when it happens. */
+extern void wine_unix_call(unsigned int code, void *args);
 
 extern HRESULT AudioClient_Create(GUID *guid, IMMDevice *device, IAudioClient **out);
 extern HRESULT AudioEndpointVolume_Create(MMDevice *parent, IAudioEndpointVolumeEx **ppv);

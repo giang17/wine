@@ -328,6 +328,9 @@ struct constructor;
     XIID(IWineMSHTMLCrypto) \
     XIID(IWineMSHTMLSubtleCrypto) \
     XIID(IWineMSHTMLMediaQueryList) \
+    XIID(IWineHTMLCanvasPrivate) \
+    XIID(IWineMSHTMLCanvasRenderingContext2D) \
+    XIID(IWineMSHTMLTextMetrics) \
     XIID(IWineMSHTMLMutationObserver)
 
 typedef enum {
@@ -447,6 +450,7 @@ typedef struct {
     X(CSSStyleDeclaration)                 \
     X(CSSStyleRule)                        \
     X(CSSStyleSheet)                       \
+    X(CanvasRenderingContext2D)            \
     X(CharacterData)                       \
     X(ClientRect)                          \
     X(ClientRectList)                      \
@@ -466,6 +470,7 @@ typedef struct {
     X(HTMLAreaElement)                     \
     X(HTMLBodyElement)                     \
     X(HTMLButtonElement)                   \
+    X(HTMLCanvasElement)                   \
     X(HTMLCollection)                      \
     X(HTMLDocument)                        \
     X(HTMLElement)                         \
@@ -532,6 +537,7 @@ typedef struct {
     X(StyleSheetList)                      \
     X(SubtleCrypto)                        \
     X(Text)                                \
+    X(TextMetrics)                         \
     X(TextRange)                           \
     X(UIEvent)                             \
     X(Window)                              \
@@ -1403,6 +1409,7 @@ HRESULT HTMLElement_Create(HTMLDocumentNode*,nsIDOMNode*,BOOL,HTMLElement**);
 HRESULT HTMLCommentElement_Create(HTMLDocumentNode*,nsIDOMNode*,HTMLElement**);
 HRESULT HTMLAnchorElement_Create(HTMLDocumentNode*,nsIDOMElement*,HTMLElement**);
 HRESULT HTMLAreaElement_Create(HTMLDocumentNode*,nsIDOMElement*,HTMLElement**);
+HRESULT HTMLCanvasElement_Create(HTMLDocumentNode*,nsIDOMElement*,HTMLElement**);
 HRESULT HTMLBodyElement_Create(HTMLDocumentNode*,nsIDOMElement*,HTMLElement**);
 HRESULT HTMLButtonElement_Create(HTMLDocumentNode*,nsIDOMElement*,HTMLElement**);
 HRESULT HTMLEmbedElement_Create(HTMLDocumentNode*,nsIDOMElement*,HTMLElement**);

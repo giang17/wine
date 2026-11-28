@@ -1192,10 +1192,16 @@ failed:
     return STATUS_UNSUCCESSFUL;
 }
 
+/* SDL is initialized without its video subsystem, and without it SDL_WaitEventTimeout() does
+ * not block: it polls the event queue and sleeps 1 ms between polls until the timeout. With no
+ * device on the bus only hotplug events can arrive, so poll once and sleep for longer instead. */
+#define SDL_IDLE_POLL_INTERVAL_US 20000
+
 NTSTATUS sdl_bus_wait(void *args)
 {
     struct bus_event *result = args;
     SDL_Event event;
+    BOOL idle;
 
     /* cleanup previously returned event */
     bus_event_cleanup(result);
@@ -1203,7 +1209,17 @@ NTSTATUS sdl_bus_wait(void *args)
     do
     {
         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
-        if (pSDL_WaitEventTimeout(&event, 10) != 0) process_device_event(&event);
+
+        pthread_mutex_lock(&sdl_cs);
+        idle = list_empty(&device_list);
+        pthread_mutex_unlock(&sdl_cs);
+
+        if (idle)
+        {
+            if (pSDL_WaitEventTimeout(&event, 0) != 0) process_device_event(&event);
+            else usleep(SDL_IDLE_POLL_INTERVAL_US);
+        }
+        else if (pSDL_WaitEventTimeout(&event, 10) != 0) process_device_event(&event);
         else check_all_devices_effects_state();
     } while (event.type != quit_event);
 

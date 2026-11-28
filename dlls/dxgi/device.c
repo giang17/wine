@@ -316,11 +316,104 @@ static HRESULT STDMETHODCALLTYPE dxgi_device_ReclaimResources(IWineDXGIDevice *i
     return E_NOTIMPL;
 }
 
+/* EnqueueSetEvent() sets the event once the commands submitted before the call have completed. An event query
+ * issued on the immediate context marks that point; while it is pending, a thread pool callback polls it. The
+ * callback holds a reference on the device, so the query cannot outlive the wined3d device, and its own
+ * duplicate of the event, so the caller may close its handle before the event is set. */
+struct dxgi_device_set_event
+{
+    struct dxgi_device *device;
+    struct wined3d_query *query;
+    HANDLE event;
+};
+
+static void dxgi_device_set_event_complete(struct dxgi_device_set_event *set_event)
+{
+    HANDLE event = set_event->event;
+
+    /* The references go before the event is set: a caller that releases the device once the event is set
+     * holds the last reference, as on Windows. */
+    wined3d_mutex_lock();
+    wined3d_query_decref(set_event->query);
+    wined3d_mutex_unlock();
+    IWineDXGIDevice_Release(&set_event->device->IWineDXGIDevice_iface);
+    free(set_event);
+
+    TRACE("Setting event %p.\n", event);
+    SetEvent(event);
+    CloseHandle(event);
+}
+
+static void CALLBACK dxgi_device_set_event_wait(TP_CALLBACK_INSTANCE *instance, void *context)
+{
+    struct dxgi_device_set_event *set_event = context;
+    HRESULT hr;
+
+    TRACE("Waiting for query %p, event %p.\n", set_event->query, set_event->event);
+
+    for (;;)
+    {
+        wined3d_mutex_lock();
+        hr = wined3d_query_get_data(set_event->query, NULL, 0, WINED3DGETDATA_FLUSH);
+        wined3d_mutex_unlock();
+        if (hr != S_FALSE)
+            break;
+        Sleep(1);
+    }
+    if (FAILED(hr))
+        WARN("Failed to get query data, hr %#lx.\n", hr);
+
+    dxgi_device_set_event_complete(set_event);
+}
+
 static HRESULT STDMETHODCALLTYPE dxgi_device_EnqueueSetEvent(IWineDXGIDevice *iface, HANDLE event)
 {
-    FIXME("iface %p, event %p stub!\n", iface, event);
+    struct dxgi_device *device = impl_from_IWineDXGIDevice(iface);
+    struct dxgi_device_set_event *set_event;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, event %p.\n", iface, event);
+
+    if (!(set_event = calloc(1, sizeof(*set_event))))
+        return E_OUTOFMEMORY;
+
+    if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &set_event->event,
+            0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        WARN("Failed to duplicate event %p, error %lu.\n", event, GetLastError());
+        free(set_event);
+        return E_INVALIDARG;
+    }
+
+    wined3d_mutex_lock();
+    if (FAILED(hr = wined3d_query_create(device->wined3d_device, WINED3D_QUERY_TYPE_EVENT,
+            NULL, &dxgi_null_wined3d_parent_ops, &set_event->query)))
+    {
+        wined3d_mutex_unlock();
+        WARN("Failed to create event query, hr %#lx.\n", hr);
+        CloseHandle(set_event->event);
+        free(set_event);
+        return hr;
+    }
+    wined3d_query_issue(set_event->query, WINED3DISSUE_END);
+    hr = wined3d_query_get_data(set_event->query, NULL, 0, WINED3DGETDATA_FLUSH);
+    wined3d_mutex_unlock();
+
+    set_event->device = device;
+    IWineDXGIDevice_AddRef(iface);
+
+    if (hr != S_FALSE)
+    {
+        TRACE("Commands already completed, setting event %p.\n", event);
+        dxgi_device_set_event_complete(set_event);
+    }
+    else if (!TrySubmitThreadpoolCallback(dxgi_device_set_event_wait, set_event, NULL))
+    {
+        WARN("Failed to submit thread pool callback, error %lu; waiting here.\n", GetLastError());
+        dxgi_device_set_event_wait(NULL, set_event);
+    }
+
+    return S_OK;
 }
 
 static void STDMETHODCALLTYPE dxgi_device_Trim(IWineDXGIDevice *iface)
@@ -468,6 +561,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_swapchain_factory_create_swapchain(IWineDX
         free(object);
         return hr;
     }
+
+    object->alpha_mode = desc->AlphaMode;
 
     TRACE("Created swapchain %p.\n", object);
 

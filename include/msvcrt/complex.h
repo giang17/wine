@@ -29,8 +29,14 @@ typedef _C_double_complex _Dcomplex;
 typedef _C_float_complex _Fcomplex;
 
 _ACRTIMP _Dcomplex __cdecl _Cbuild(double, double);
+_ACRTIMP _Dcomplex __cdecl _Cmulcc(_Dcomplex, _Dcomplex);
+_ACRTIMP _Dcomplex __cdecl _Cmulcr(_Dcomplex, double);
 _ACRTIMP _Dcomplex __cdecl cexp(_Dcomplex);
+_ACRTIMP _Dcomplex __cdecl clog(_Dcomplex);
+_ACRTIMP _Dcomplex __cdecl conj(_Dcomplex);
+_ACRTIMP _Dcomplex __cdecl cpow(_Dcomplex, _Dcomplex);
 
+_ACRTIMP double __cdecl cabs(_Dcomplex);
 _ACRTIMP double __cdecl carg(_Dcomplex);
 _ACRTIMP double __cdecl cimag(_Dcomplex);
 _ACRTIMP double __cdecl creal(_Dcomplex);
@@ -55,6 +61,13 @@ static inline _Fcomplex __cdecl __wine__FCbuild(float r, float i)
 _ACRTIMP _Fcomplex __cdecl _FCbuild(float, float);
 #endif
 
+_ACRTIMP _Fcomplex __cdecl _FCmulcc(_Fcomplex, _Fcomplex);
+_ACRTIMP _Fcomplex __cdecl _FCmulcr(_Fcomplex, float);
+_ACRTIMP _Fcomplex __cdecl cexpf(_Fcomplex);
+_ACRTIMP _Fcomplex __cdecl conjf(_Fcomplex);
+_ACRTIMP _Fcomplex __cdecl csqrtf(_Fcomplex);
+
+_ACRTIMP float __cdecl cabsf(_Fcomplex);
 _ACRTIMP float __cdecl cargf(_Fcomplex);
 _ACRTIMP float __cdecl cimagf(_Fcomplex);
 _ACRTIMP float __cdecl crealf(_Fcomplex);

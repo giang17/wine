@@ -1704,8 +1704,8 @@
 @ cdecl bsearch(ptr ptr long long ptr) msvcr120.bsearch
 @ cdecl bsearch_s(ptr ptr long long ptr ptr) msvcr120.bsearch_s
 @ cdecl btowc(long) msvcr120.btowc
-@ stub cabs
-@ stub cabsf
+@ cdecl cabs(int128) msvcr120.cabs
+@ cdecl cabsf(int64) msvcr120.cabsf
 @ stub cabsl
 @ stub cacos
 @ stub cacosf
@@ -1741,7 +1741,7 @@
 @ cdecl ceil(double) msvcr120.ceil
 @ cdecl -arch=!i386 ceilf(float) msvcr120.ceilf
 @ cdecl -norelay cexp(int128) msvcr120.cexp
-@ stub cexpf
+@ cdecl -norelay cexpf(int64) msvcr120.cexpf
 @ stub cexpl
 @ cdecl cimag(int128) msvcr120.cimag
 @ cdecl cimagf(int64) msvcr120.cimagf
@@ -1755,8 +1755,8 @@
 @ stub clog10l
 @ stub clogf
 @ stub clogl
-@ stub conj
-@ stub conjf
+@ cdecl -norelay conj(int128) msvcr120.conj
+@ cdecl -norelay conjf(int64) msvcr120.conjf
 @ stub conjl
 @ cdecl copysign(double double) msvcr120.copysign
 @ cdecl copysignf(float float) msvcr120.copysignf
@@ -1765,7 +1765,7 @@
 @ cdecl -arch=!i386 cosf(float) msvcr120.cosf
 @ cdecl cosh(double) msvcr120.cosh
 @ cdecl -arch=!i386 coshf(float) msvcr120.coshf
-@ stub cpow
+@ cdecl -norelay cpow(int128 int128) msvcr120.cpow
 @ stub cpowf
 @ stub cpowl
 @ stub cproj
@@ -1781,7 +1781,7 @@
 @ stub csinhl
 @ stub csinl
 @ stub csqrt
-@ stub csqrtf
+@ cdecl -norelay csqrtf(int64) msvcr120.csqrtf
 @ stub csqrtl
 @ stub ctan
 @ stub ctanf

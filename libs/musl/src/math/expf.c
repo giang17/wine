@@ -30,7 +30,7 @@ static inline uint32_t top12(float x)
 	return asuint(x) >> 20;
 }
 
-float __cdecl expf(float x)
+float __cdecl __expf(float x, matherr_t matherr)
 {
 	uint32_t abstop;
 	uint64_t ki, t;
@@ -45,9 +45,9 @@ float __cdecl expf(float x)
 		if (abstop >= top12(INFINITY))
 			return x + x;
 		if (x > 0x1.62e42ep6f) /* x > log(0x1p128) ~= 88.72 */
-			return math_error(_OVERFLOW, "expf", x, 0, x * FLT_MAX);
+			return matherr(_OVERFLOW, "expf", x, 0, x * FLT_MAX);
 		if (x < -0x1.9fe368p6f) /* x < log(0x1p-150) ~= -103.97 */
-			return math_error(_UNDERFLOW, "expf", x, 0, fp_barrierf(FLT_MIN) * FLT_MIN);
+			return matherr(_UNDERFLOW, "expf", x, 0, fp_barrierf(FLT_MIN) * FLT_MIN);
 	}
 
 	/* x*N/Ln2 = k + r with r in [-1/2, 1/2] and int k.  */
@@ -70,4 +70,9 @@ float __cdecl expf(float x)
 	y = z * r2 + y;
 	y = y * s;
 	return eval_as_float(y);
+}
+
+float __cdecl expf(float x)
+{
+    return __expf(x, math_error);
 }

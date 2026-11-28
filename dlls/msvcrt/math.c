@@ -3003,4 +3003,52 @@ float CDECL cimagf(_Fcomplex z)
     return z._Val[1];
 }
 
+#if _MSVCR_VER>=140
+
+/*********************************************************************
+ *      _Cmulcc (UCRTBASE.@)
+ */
+_Dcomplex CDECL _Cmulcc(_Dcomplex x, _Dcomplex y)
+{
+    _Dcomplex ret;
+    ret._Val[0] = x._Val[0] * y._Val[0] - x._Val[1] * y._Val[1];
+    ret._Val[1] = x._Val[0] * y._Val[1] + x._Val[1] * y._Val[0];
+    return ret;
+}
+
+/*********************************************************************
+ *      _Cmulcr (UCRTBASE.@)
+ */
+_Dcomplex CDECL _Cmulcr(_Dcomplex x, double y)
+{
+    _Dcomplex ret;
+    ret._Val[0] = x._Val[0] * y;
+    ret._Val[1] = x._Val[1] * y;
+    return ret;
+}
+
+/*********************************************************************
+ *      _FCmulcc (UCRTBASE.@)
+ */
+_Fcomplex CDECL _FCmulcc(_Fcomplex x, _Fcomplex y)
+{
+    _Fcomplex ret;
+    ret._Val[0] = x._Val[0] * y._Val[0] - x._Val[1] * y._Val[1];
+    ret._Val[1] = x._Val[0] * y._Val[1] + x._Val[1] * y._Val[0];
+    return ret;
+}
+
+/*********************************************************************
+ *      _FCmulcr (UCRTBASE.@)
+ */
+_Fcomplex CDECL _FCmulcr(_Fcomplex x, float y)
+{
+    _Fcomplex ret;
+    ret._Val[0] = x._Val[0] * y;
+    ret._Val[1] = x._Val[1] * y;
+    return ret;
+}
+
+#endif /* _MSVCR_VER>=140 */
+
 #endif /* _MSVCR_VER>=120 */

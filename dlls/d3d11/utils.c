@@ -43,6 +43,187 @@ const char *debug_d3d10_primitive_topology(D3D10_PRIMITIVE_TOPOLOGY topology)
     }
 }
 
+unsigned int dxgi_format_properties(DXGI_FORMAT format)
+{
+    unsigned int props = 0;
+
+    switch (format)
+    {
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        case DXGI_FORMAT_R32G32B32_TYPELESS:
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        case DXGI_FORMAT_R32G32_TYPELESS:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_R16G16_TYPELESS:
+        case DXGI_FORMAT_R32_TYPELESS:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R8G8_TYPELESS:
+        case DXGI_FORMAT_R16_TYPELESS:
+        case DXGI_FORMAT_R8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+            props |= D3D11_FORMAT_PROP_TYPELESS;
+            break;
+
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC5_TYPELESS:
+        case DXGI_FORMAT_BC6H_TYPELESS:
+        case DXGI_FORMAT_BC7_TYPELESS:
+            props |= D3D11_FORMAT_PROP_TYPELESS | D3D11_FORMAT_PROP_COMPRESSED;
+            break;
+
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC2_UNORM:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC4_UNORM:
+        case DXGI_FORMAT_BC4_SNORM:
+        case DXGI_FORMAT_BC5_UNORM:
+        case DXGI_FORMAT_BC5_SNORM:
+        case DXGI_FORMAT_BC6H_UF16:
+        case DXGI_FORMAT_BC6H_SF16:
+        case DXGI_FORMAT_BC7_UNORM:
+            props |= D3D11_FORMAT_PROP_COMPRESSED;
+            break;
+
+        case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC2_UNORM_SRGB:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:
+        case DXGI_FORMAT_BC7_UNORM_SRGB:
+            props |= D3D11_FORMAT_PROP_COMPRESSED | D3D11_FORMAT_PROP_SRGB;
+            break;
+
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32A32_SINT:
+        case DXGI_FORMAT_R32G32B32_UINT:
+        case DXGI_FORMAT_R32G32B32_SINT:
+        case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R16G16B16A16_SINT:
+        case DXGI_FORMAT_R32G32_UINT:
+        case DXGI_FORMAT_R32G32_SINT:
+        case DXGI_FORMAT_R10G10B10A2_UINT:
+        case DXGI_FORMAT_R8G8B8A8_UINT:
+        case DXGI_FORMAT_R8G8B8A8_SINT:
+        case DXGI_FORMAT_R16G16_UINT:
+        case DXGI_FORMAT_R16G16_SINT:
+        case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R32_SINT:
+        case DXGI_FORMAT_R8G8_UINT:
+        case DXGI_FORMAT_R8G8_SINT:
+        case DXGI_FORMAT_R16_UINT:
+        case DXGI_FORMAT_R16_SINT:
+        case DXGI_FORMAT_R8_UINT:
+        case DXGI_FORMAT_R8_SINT:
+            props |= D3D11_FORMAT_PROP_INTEGER;
+            break;
+
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D16_UNORM:
+            props |= D3D11_FORMAT_PROP_DEPTH;
+            break;
+
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+            props |= D3D11_FORMAT_PROP_DEPTH_VIEW | D3D11_FORMAT_PROP_DEPTH_READ;
+            break;
+
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+            props |= D3D11_FORMAT_PROP_DEPTH_VIEW | D3D11_FORMAT_PROP_INTEGER;
+            break;
+
+        case DXGI_FORMAT_R32_FLOAT:
+        case DXGI_FORMAT_R16_UNORM:
+            props |= D3D11_FORMAT_PROP_DEPTH_READ;
+            break;
+
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+            props |= D3D11_FORMAT_PROP_SRGB;
+            break;
+
+        case DXGI_FORMAT_AYUV:
+        case DXGI_FORMAT_Y410:
+        case DXGI_FORMAT_Y416:
+        case DXGI_FORMAT_NV12:
+        case DXGI_FORMAT_P010:
+        case DXGI_FORMAT_P016:
+        case DXGI_FORMAT_420_OPAQUE:
+        case DXGI_FORMAT_YUY2:
+        case DXGI_FORMAT_Y210:
+        case DXGI_FORMAT_Y216:
+        case DXGI_FORMAT_NV11:
+        case DXGI_FORMAT_AI44:
+        case DXGI_FORMAT_IA44:
+        case DXGI_FORMAT_P8:
+        case DXGI_FORMAT_A8P8:
+        case DXGI_FORMAT_P208:
+        case DXGI_FORMAT_V208:
+        case DXGI_FORMAT_V408:
+            props |= D3D11_FORMAT_PROP_VIDEO;
+            break;
+
+        default:
+            break;
+    }
+
+    /* Every format from R32G32B32A32_TYPELESS to R8_SINT and from BC1_TYPELESS
+     * to BC7_UNORM_SRGB has a typeless parent, except R11G11B10_FLOAT and the
+     * five single formats between R8_SINT and B8G8R8A8_UNORM; the B8G8R8 ones
+     * have theirs after them. */
+    if ((format >= DXGI_FORMAT_R32G32B32A32_TYPELESS && format <= DXGI_FORMAT_R8_SINT
+                && format != DXGI_FORMAT_R11G11B10_FLOAT)
+            || (format >= DXGI_FORMAT_BC1_TYPELESS && format <= DXGI_FORMAT_BC5_SNORM)
+            || (format >= DXGI_FORMAT_B8G8R8A8_UNORM && format <= DXGI_FORMAT_BC7_UNORM_SRGB))
+        props |= D3D11_FORMAT_PROP_CASTABLE;
+
+    switch (format)
+    {
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32A32_SINT:
+        case DXGI_FORMAT_R32G32B32_FLOAT:
+        case DXGI_FORMAT_R32G32B32_UINT:
+        case DXGI_FORMAT_R32G32B32_SINT:
+        case DXGI_FORMAT_R32G32_FLOAT:
+        case DXGI_FORMAT_R32G32_UINT:
+        case DXGI_FORMAT_R32G32_SINT:
+        case DXGI_FORMAT_R32_FLOAT:
+        case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R32_SINT:
+            props |= D3D11_FORMAT_PROP_STREAM_OUTPUT;
+            break;
+
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            props |= D3D11_FORMAT_PROP_DISPLAY | D3D11_FORMAT_PROP_BACK_BUFFER_CAST;
+            break;
+
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
+            props |= D3D11_FORMAT_PROP_DISPLAY | D3D11_FORMAT_PROP_DISPLAY_FL10 | D3D11_FORMAT_PROP_BACK_BUFFER_CAST;
+            break;
+
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            props |= D3D11_FORMAT_PROP_DISPLAY | D3D11_FORMAT_PROP_DISPLAY_FL10;
+            break;
+
+        default:
+            break;
+    }
+
+    return props;
+}
+
 const char *debug_dxgi_format(DXGI_FORMAT format)
 {
     switch(format)

@@ -20487,7 +20487,7 @@ static LRESULT WINAPI cancel_popup_proc(HWND hwnd, UINT message, WPARAM wParam, 
 
     switch (message) {
     case WM_ENTERIDLE:
-        todo_wine ok(GetCapture() == hwnd, "expected %p, got %p\n", hwnd, GetCapture());
+        ok(GetCapture() == hwnd, "expected %p, got %p\n", hwnd, GetCapture());
         EndMenu();
         break;
     case WM_INITMENU:
@@ -20496,7 +20496,7 @@ static LRESULT WINAPI cancel_popup_proc(HWND hwnd, UINT message, WPARAM wParam, 
         ok((HMENU)wParam == hpopupmenu, "expected %p, got %Ix\n", hpopupmenu, wParam);
         break;
     case WM_CAPTURECHANGED:
-        todo_wine ok(!lParam || (HWND)lParam == hwnd, "lost capture to %Ix\n", lParam);
+        ok(!lParam || (HWND)lParam == hwnd, "lost capture to %Ix\n", lParam);
         break;
     }
 

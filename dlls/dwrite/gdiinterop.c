@@ -806,7 +806,15 @@ static HRESULT WINAPI gdiinterop_CreateFontFaceFromHdc(IDWriteGdiInterop1 *iface
     }
 
     if (*fileinfo->path)
-        hr = IDWriteFactory7_CreateFontFileReference(interop->factory, fileinfo->path, &fileinfo->writetime, &file);
+    {
+        const WCHAR *path = fileinfo->path;
+
+        /* win32u keeps the NT form of the path; the system collection was built from the
+         * DOS form, and local file references compare by path. */
+        if (!wcsncmp(path, L"\\??\\", 4) && path[4] && path[5] == ':')
+            path += 4;
+        hr = IDWriteFactory7_CreateFontFileReference(interop->factory, path, &fileinfo->writetime, &file);
+    }
     else
         hr = IDWriteFactory7_CreateCustomFontFileReference(interop->factory, &info.instance_id,
                 sizeof(info.instance_id), &interop->IDWriteFontFileLoader_iface, &file);

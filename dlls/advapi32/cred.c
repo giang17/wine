@@ -42,6 +42,25 @@ WINE_DEFAULT_DEBUG_CHANNEL(cred);
 /* the size of the ARC4 key used to encrypt the password data */
 #define KEY_SIZE 8
 
+/* Credential attributes are kept in one REG_BINARY value, "Attributes": per
+ * attribute a struct attribute_record, the keyword (WCHARs including the
+ * terminating null) and the value. */
+struct attribute_record
+{
+    DWORD flags;
+    DWORD keyword_size;  /* in bytes, including the terminating null */
+    DWORD value_size;
+};
+
+/* The attribute array returned to the caller holds pointers, so it is placed
+ * at a pointer-aligned offset; sizes computed in advance reserve the padding. */
+#define ATTRIBUTE_ALIGN_SLACK (sizeof(void *) - 1)
+
+static char *align_attributes(char *ptr)
+{
+    return (char *)(((UINT_PTR)ptr + sizeof(void *) - 1) & ~(UINT_PTR)(sizeof(void *) - 1));
+}
+
 static DWORD read_credential_blob(HKEY hkey, const BYTE key_data[KEY_SIZE],
                                   LPBYTE credential_blob,
                                   DWORD *credential_blob_size)
@@ -75,6 +94,97 @@ static DWORD read_credential_blob(HKEY hkey, const BYTE key_data[KEY_SIZE],
         SystemFunction032(&data, &key);
     }
     return ERROR_SUCCESS;
+}
+
+static DWORD registry_read_attributes(HKEY hkey, PCREDENTIALW credential, char **buffer, DWORD *len)
+{
+    struct attribute_record record;
+    CREDENTIAL_ATTRIBUTEW *attributes;
+    DWORD type, size, offset, count = 0, i;
+    BYTE *data;
+    char *ptr;
+    DWORD ret;
+
+    ret = RegQueryValueExW(hkey, L"Attributes", NULL, &type, NULL, &size);
+    if (ret == ERROR_FILE_NOT_FOUND || (ret == ERROR_SUCCESS && !size))
+    {
+        if (credential)
+        {
+            credential->AttributeCount = 0;
+            credential->Attributes = NULL;
+        }
+        return ERROR_SUCCESS;
+    }
+    if (ret != ERROR_SUCCESS) return ret;
+    if (type != REG_BINARY) return ERROR_REGISTRY_CORRUPT;
+
+    if (!(data = malloc(size))) return ERROR_OUTOFMEMORY;
+    ret = RegQueryValueExW(hkey, L"Attributes", NULL, &type, data, &size);
+    if (ret != ERROR_SUCCESS)
+    {
+        free(data);
+        return ret;
+    }
+
+    for (offset = 0; offset < size; count++)
+    {
+        WCHAR last;
+
+        if (size - offset < sizeof(record)) goto corrupt;
+        memcpy(&record, data + offset, sizeof(record));
+        offset += sizeof(record);
+        if (record.keyword_size < sizeof(WCHAR) || record.keyword_size % sizeof(WCHAR) ||
+            record.keyword_size > size - offset) goto corrupt;
+        memcpy(&last, data + offset + record.keyword_size - sizeof(WCHAR), sizeof(WCHAR));
+        if (last) goto corrupt;
+        offset += record.keyword_size;
+        if (record.value_size > size - offset) goto corrupt;
+        offset += record.value_size;
+    }
+
+    if (!credential)
+    {
+        /* the records' headers are not copied, but they cover the keywords and values */
+        *len += ATTRIBUTE_ALIGN_SLACK + count * sizeof(CREDENTIAL_ATTRIBUTEW) + size;
+        free(data);
+        return ERROR_SUCCESS;
+    }
+
+    attributes = (CREDENTIAL_ATTRIBUTEW *)align_attributes(*buffer);
+    ptr = (char *)(attributes + count);
+
+    /* keywords first, then the values, so that every keyword stays WCHAR aligned */
+    for (i = 0, offset = 0; i < count; i++)
+    {
+        memcpy(&record, data + offset, sizeof(record));
+        offset += sizeof(record);
+        attributes[i].Keyword = (WCHAR *)ptr;
+        attributes[i].Flags = record.flags;
+        attributes[i].ValueSize = record.value_size;
+        memcpy(ptr, data + offset, record.keyword_size);
+        ptr += record.keyword_size;
+        offset += record.keyword_size + record.value_size;
+    }
+    for (i = 0, offset = 0; i < count; i++)
+    {
+        memcpy(&record, data + offset, sizeof(record));
+        offset += sizeof(record) + record.keyword_size;
+        attributes[i].Value = record.value_size ? (BYTE *)ptr : NULL;
+        memcpy(ptr, data + offset, record.value_size);
+        ptr += record.value_size;
+        offset += record.value_size;
+    }
+
+    credential->AttributeCount = count;
+    credential->Attributes = attributes;
+    *len += ptr - *buffer;
+    *buffer = ptr;
+    free(data);
+    return ERROR_SUCCESS;
+
+corrupt:
+    free(data);
+    return ERROR_REGISTRY_CORRUPT;
 }
 
 static DWORD registry_read_credential(HKEY hkey, PCREDENTIALW credential,
@@ -176,14 +286,12 @@ static DWORD registry_read_credential(HKEY hkey, PCREDENTIALW credential,
         else if (ret != ERROR_SUCCESS)
             return ret;
         credential->CredentialBlobSize = count;
+        buffer += count;
     }
 
-    /* FIXME: Attributes */
-    if (credential)
-    {
-        credential->AttributeCount = 0;
-        credential->Attributes = NULL;
-    }
+    ret = registry_read_attributes(hkey, credential, &buffer, len);
+    if (ret != ERROR_SUCCESS)
+        return ret;
 
     if (!credential) return ERROR_SUCCESS;
 
@@ -243,6 +351,44 @@ static DWORD write_credential_blob(HKEY hkey, LPCWSTR target_name, DWORD type,
     return ret;
 }
 
+static DWORD registry_write_attributes(HKEY hkey, const CREDENTIALW *credential)
+{
+    struct attribute_record record;
+    DWORD size = 0, i, ret;
+    BYTE *data, *ptr;
+
+    if (!credential->AttributeCount)
+    {
+        /* a rewritten credential replaces the old one, attributes included */
+        ret = RegDeleteValueW(hkey, L"Attributes");
+        return ret == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : ret;
+    }
+
+    for (i = 0; i < credential->AttributeCount; i++)
+        size += sizeof(record) + (lstrlenW(credential->Attributes[i].Keyword) + 1) * sizeof(WCHAR) +
+                credential->Attributes[i].ValueSize;
+
+    if (!(data = malloc(size))) return ERROR_OUTOFMEMORY;
+    for (i = 0, ptr = data; i < credential->AttributeCount; i++)
+    {
+        const CREDENTIAL_ATTRIBUTEW *attribute = &credential->Attributes[i];
+
+        record.flags = attribute->Flags;
+        record.keyword_size = (lstrlenW(attribute->Keyword) + 1) * sizeof(WCHAR);
+        record.value_size = attribute->ValueSize;
+        memcpy(ptr, &record, sizeof(record));
+        ptr += sizeof(record);
+        memcpy(ptr, attribute->Keyword, record.keyword_size);
+        ptr += record.keyword_size;
+        if (record.value_size) memcpy(ptr, attribute->Value, record.value_size);
+        ptr += record.value_size;
+    }
+
+    ret = RegSetValueExW(hkey, L"Attributes", 0, REG_BINARY, data, size);
+    free(data);
+    return ret;
+}
+
 static DWORD registry_write_credential(HKEY hkey, const CREDENTIALW *credential,
                                        const BYTE key_data[KEY_SIZE], BOOL preserve_blob)
 {
@@ -272,7 +418,8 @@ static DWORD registry_write_credential(HKEY hkey, const CREDENTIALW *credential,
     ret = RegSetValueExW(hkey, L"Persist", 0, REG_DWORD, (const BYTE*)&credential->Persist,
                          sizeof(credential->Persist));
     if (ret != ERROR_SUCCESS) return ret;
-    /* FIXME: Attributes */
+    ret = registry_write_attributes(hkey, credential);
+    if (ret != ERROR_SUCCESS) return ret;
     if (credential->TargetAlias)
     {
         ret = RegSetValueExW(hkey, L"TargetAlias", 0, REG_SZ, (LPVOID)credential->TargetAlias,
@@ -555,6 +702,15 @@ static INT convert_PCREDENTIALW_to_PCREDENTIALA(const CREDENTIALW *CredentialW, 
             needed += WideCharToMultiByte(CP_ACP, 0, CredentialW->TargetAlias, -1, NULL, 0, NULL, NULL);
         if (CredentialW->UserName)
             needed += WideCharToMultiByte(CP_ACP, 0, CredentialW->UserName, -1, NULL, 0, NULL, NULL);
+        if (CredentialW->AttributeCount)
+        {
+            DWORD i;
+
+            needed += ATTRIBUTE_ALIGN_SLACK + CredentialW->AttributeCount * sizeof(CREDENTIAL_ATTRIBUTEA);
+            for (i = 0; i < CredentialW->AttributeCount; i++)
+                needed += WideCharToMultiByte(CP_ACP, 0, CredentialW->Attributes[i].Keyword, -1, NULL, 0, NULL, NULL) +
+                          CredentialW->Attributes[i].ValueSize;
+        }
 
         return needed;
     }
@@ -599,8 +755,38 @@ static INT convert_PCREDENTIALW_to_PCREDENTIALA(const CREDENTIALW *CredentialW, 
     else
         CredentialA->CredentialBlob = NULL;
     CredentialA->Persist = CredentialW->Persist;
-    CredentialA->AttributeCount = 0;
-    CredentialA->Attributes = NULL; /* FIXME */
+    if (CredentialW->AttributeCount)
+    {
+        CREDENTIAL_ATTRIBUTEA *attributes = (CREDENTIAL_ATTRIBUTEA *)align_attributes(buffer);
+        char *ptr = (char *)(attributes + CredentialW->AttributeCount);
+        DWORD i;
+
+        for (i = 0; i < CredentialW->AttributeCount; i++)
+        {
+            attributes[i].Keyword = ptr;
+            attributes[i].Flags = CredentialW->Attributes[i].Flags;
+            attributes[i].ValueSize = CredentialW->Attributes[i].ValueSize;
+            ptr += WideCharToMultiByte(CP_ACP, 0, CredentialW->Attributes[i].Keyword, -1, ptr,
+                                       len - (ptr - buffer), NULL, NULL);
+        }
+        for (i = 0; i < CredentialW->AttributeCount; i++)
+        {
+            attributes[i].Value = attributes[i].ValueSize ? (BYTE *)ptr : NULL;
+            if (attributes[i].ValueSize)
+                memcpy(ptr, CredentialW->Attributes[i].Value, attributes[i].ValueSize);
+            ptr += attributes[i].ValueSize;
+        }
+        CredentialA->AttributeCount = CredentialW->AttributeCount;
+        CredentialA->Attributes = attributes;
+        needed += ptr - buffer;
+        len -= ptr - buffer;
+        buffer = ptr;
+    }
+    else
+    {
+        CredentialA->AttributeCount = 0;
+        CredentialA->Attributes = NULL;
+    }
     if (CredentialW->TargetAlias)
     {
         CredentialA->TargetAlias = buffer;
@@ -646,6 +832,15 @@ static INT convert_PCREDENTIALA_to_PCREDENTIALW(const CREDENTIALA *CredentialA, 
             needed += sizeof(WCHAR) * MultiByteToWideChar(CP_ACP, 0, CredentialA->TargetAlias, -1, NULL, 0);
         if (CredentialA->UserName)
             needed += sizeof(WCHAR) * MultiByteToWideChar(CP_ACP, 0, CredentialA->UserName, -1, NULL, 0);
+        if (CredentialA->AttributeCount)
+        {
+            DWORD i;
+
+            needed += ATTRIBUTE_ALIGN_SLACK + CredentialA->AttributeCount * sizeof(CREDENTIAL_ATTRIBUTEW);
+            for (i = 0; i < CredentialA->AttributeCount; i++)
+                needed += sizeof(WCHAR) * MultiByteToWideChar(CP_ACP, 0, CredentialA->Attributes[i].Keyword, -1, NULL, 0) +
+                          CredentialA->Attributes[i].ValueSize;
+        }
 
         return needed;
     }
@@ -688,8 +883,6 @@ static INT convert_PCREDENTIALA_to_PCREDENTIALW(const CREDENTIALA *CredentialA, 
     else
         CredentialW->CredentialBlob = NULL;
     CredentialW->Persist = CredentialA->Persist;
-    CredentialW->AttributeCount = 0;
-    CredentialW->Attributes = NULL; /* FIXME */
     if (CredentialA->TargetAlias)
     {
         CredentialW->TargetAlias = (LPWSTR)buffer;
@@ -704,10 +897,43 @@ static INT convert_PCREDENTIALA_to_PCREDENTIALW(const CREDENTIALA *CredentialA, 
     {
         CredentialW->UserName = (LPWSTR)buffer;
         string_len = MultiByteToWideChar(CP_ACP, 0, CredentialA->UserName, -1, CredentialW->UserName, len / sizeof(WCHAR));
+        buffer += sizeof(WCHAR) * string_len;
         needed += sizeof(WCHAR) * string_len;
+        len -= sizeof(WCHAR) * string_len;
     }
     else
         CredentialW->UserName = NULL;
+    /* last, so that no value of odd size moves the strings above off WCHAR alignment */
+    if (CredentialA->AttributeCount)
+    {
+        CREDENTIAL_ATTRIBUTEW *attributes = (CREDENTIAL_ATTRIBUTEW *)align_attributes(buffer);
+        char *ptr = (char *)(attributes + CredentialA->AttributeCount);
+        DWORD i;
+
+        for (i = 0; i < CredentialA->AttributeCount; i++)
+        {
+            attributes[i].Keyword = (WCHAR *)ptr;
+            attributes[i].Flags = CredentialA->Attributes[i].Flags;
+            attributes[i].ValueSize = CredentialA->Attributes[i].ValueSize;
+            ptr += sizeof(WCHAR) * MultiByteToWideChar(CP_ACP, 0, CredentialA->Attributes[i].Keyword, -1,
+                                                       attributes[i].Keyword, (len - (ptr - buffer)) / sizeof(WCHAR));
+        }
+        for (i = 0; i < CredentialA->AttributeCount; i++)
+        {
+            attributes[i].Value = attributes[i].ValueSize ? (BYTE *)ptr : NULL;
+            if (attributes[i].ValueSize)
+                memcpy(ptr, CredentialA->Attributes[i].Value, attributes[i].ValueSize);
+            ptr += attributes[i].ValueSize;
+        }
+        CredentialW->AttributeCount = CredentialA->AttributeCount;
+        CredentialW->Attributes = attributes;
+        needed += ptr - buffer;
+    }
+    else
+    {
+        CredentialW->AttributeCount = 0;
+        CredentialW->Attributes = NULL;
+    }
 
     return needed;
 }
@@ -1518,6 +1744,26 @@ BOOL WINAPI CredWriteA(PCREDENTIALA Credential, DWORD Flags)
         return FALSE;
     }
 
+    if (Credential->AttributeCount)
+    {
+        DWORD i;
+
+        if (!Credential->Attributes)
+        {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        for (i = 0; i < Credential->AttributeCount; i++)
+        {
+            if (!Credential->Attributes[i].Keyword ||
+                (Credential->Attributes[i].ValueSize && !Credential->Attributes[i].Value))
+            {
+                SetLastError(ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        }
+    }
+
     len = convert_PCREDENTIALA_to_PCREDENTIALW(Credential, NULL, 0);
     CredentialW = malloc(len);
     if (!CredentialW)
@@ -1566,6 +1812,26 @@ BOOL WINAPI CredWriteW(PCREDENTIALW Credential, DWORD Flags)
         FIXME("unhandled type %ld\n", Credential->Type);
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
+    }
+
+    if (Credential->AttributeCount)
+    {
+        DWORD i;
+
+        if (!Credential->Attributes)
+        {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        for (i = 0; i < Credential->AttributeCount; i++)
+        {
+            if (!Credential->Attributes[i].Keyword ||
+                (Credential->Attributes[i].ValueSize && !Credential->Attributes[i].Value))
+            {
+                SetLastError(ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+        }
     }
 
     TRACE("Credential->Flags = 0x%08lx\n", Credential->Flags);

@@ -789,6 +789,10 @@ static void nulldrv_GetDC( HDC hdc, HWND hwnd, HWND top_win, const RECT *win_rec
 {
 }
 
+static void nulldrv_FlushDisplay( void )
+{
+}
+
 static BOOL nulldrv_ProcessEvents( DWORD mask )
 {
     return FALSE;
@@ -943,6 +947,10 @@ static UINT nulldrv_OpenGLInit( UINT version, const struct opengl_funcs *opengl_
 }
 
 static void nulldrv_ThreadDetach( void )
+{
+}
+
+static void nulldrv_SetRawKeyboardSink( BOOL enable )
 {
 }
 
@@ -1267,6 +1275,11 @@ static UINT loaderdrv_OpenGLInit( UINT version, const struct opengl_funcs *openg
     return load_driver()->pOpenGLInit( version, opengl_funcs, driver_funcs );
 }
 
+static void loaderdrv_SetRawKeyboardSink( BOOL enable )
+{
+    load_driver()->pSetRawKeyboardSink( enable );
+}
+
 static const struct user_driver_funcs lazy_load_driver =
 {
     { NULL },
@@ -1311,6 +1324,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_DestroyWindow,
     loaderdrv_FlashWindowEx,
     loaderdrv_GetDC,
+    nulldrv_FlushDisplay,
     nulldrv_ProcessEvents,
     nulldrv_ReleaseDC,
     nulldrv_ScrollDC,
@@ -1344,6 +1358,8 @@ static const struct user_driver_funcs lazy_load_driver =
     loaderdrv_OpenGLInit,
     /* thread management */
     nulldrv_ThreadDetach,
+    /* raw input */
+    loaderdrv_SetRawKeyboardSink,
 };
 
 const struct user_driver_funcs *user_driver = &lazy_load_driver;
@@ -1411,6 +1427,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(DestroyWindow);
     SET_USER_FUNC(FlashWindowEx);
     SET_USER_FUNC(GetDC);
+    SET_USER_FUNC(FlushDisplay);
     SET_USER_FUNC(ProcessEvents);
     SET_USER_FUNC(ReleaseDC);
     SET_USER_FUNC(ScrollDC);
@@ -1439,6 +1456,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(VulkanInit);
     SET_USER_FUNC(OpenGLInit);
     SET_USER_FUNC(ThreadDetach);
+    SET_USER_FUNC(SetRawKeyboardSink);
 #undef SET_USER_FUNC
 
     prev = InterlockedCompareExchangePointer( (void **)&user_driver, driver, (void *)&lazy_load_driver );

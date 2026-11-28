@@ -582,7 +582,7 @@ typedef struct _TEB
     ULONG                        GdiBatchCount;                     /* f70/1740 */
     ULONG                        IdealProcessorValue;               /* f74/1744 */
     ULONG                        GuaranteedStackBytes;              /* f78/1748 */
-    PVOID                        ReservedForPerf;                   /* f7c/1750 */
+    PVOID                        ReservedForPerf;                   /* f7c/1750 used for the RtlWaitOnAddress entry in Wine */
     PVOID                        ReservedForOle;                    /* f80/1758 */
     ULONG                        WaitingOnLoaderLock;               /* f84/1760 */
     PVOID                        SavedPriorityState;                /* f88/1768 */

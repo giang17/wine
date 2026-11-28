@@ -70,6 +70,8 @@ static BOOL fetch_process_info(struct dump_context* dc)
                     dc->threads[dc->num_threads].tid        = HandleToULong(spi->ti[i].ClientId.UniqueThread);
                     dc->threads[dc->num_threads].prio_class = spi->ti[i].dwBasePriority; /* FIXME */
                     dc->threads[dc->num_threads].curr_prio  = spi->ti[i].dwCurrentPriority;
+                    dc->threads[dc->num_threads].stack_start = 0;
+                    dc->threads[dc->num_threads].stack_size = 0;
                     dc->num_threads++;
                 }
                 HeapFree(GetProcessHeap(), 0, pcs_buffer);
@@ -197,6 +199,7 @@ static BOOL add_module(struct dump_context* dc, const WCHAR* name,
     dc->modules[dc->num_modules].timestamp = timestamp;
     dc->modules[dc->num_modules].checksum = checksum;
     dc->modules[dc->num_modules].is_elf = is_elf;
+    dc->modules[dc->num_modules].referenced_by_memory = FALSE;
     dc->num_modules++;
 
     return TRUE;
@@ -317,6 +320,37 @@ static void fetch_module_versioninfo(LPCWSTR filename, VS_FIXEDFILEINFO* ffi)
 }
 
 /******************************************************************
+ *		fetch_module_versioninfo_mapped
+ *
+ * The VS_FIXEDFILEINFO of a module mapped in this process, read from the image's
+ * version resource. GetFileVersionInfoW() loads the file as a data file through
+ * the loader and takes the loader lock, which a crash handler dumping its own
+ * process must not do: one of the threads it suspended may hold that lock.
+ */
+static BOOL fetch_module_versioninfo_mapped(DWORD64 base, VS_FIXEDFILEINFO* ffi)
+{
+    HMODULE     module = (HMODULE)(ULONG_PTR)base;
+    HRSRC       rsrc;
+    HGLOBAL     res;
+    const BYTE* data;
+    DWORD       size, i;
+
+    if (!(rsrc = FindResourceW(module, MAKEINTRESOURCEW(VS_VERSION_INFO), (LPCWSTR)RT_VERSION))) return FALSE;
+    if (!(size = SizeofResource(module, rsrc)) || !(res = LoadResource(module, rsrc)) ||
+        !(data = LockResource(res))) return FALSE;
+    /* VS_VERSIONINFO: the VS_FIXEDFILEINFO follows the key, at the first 32-bit aligned offset */
+    for (i = 0; i + sizeof(*ffi) <= size; i += sizeof(DWORD))
+    {
+        if (*(const DWORD*)(data + i) == VS_FFI_SIGNATURE)
+        {
+            memcpy(ffi, data + i, sizeof(*ffi));
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/******************************************************************
  *		minidump_add_memory_block
  *
  * Add a memory block to be dumped in a minidump
@@ -421,6 +455,55 @@ static  unsigned        dump_exception_info(struct dump_context* dc)
 }
 
 /******************************************************************
+ *		scan_memory_for_modules
+ *
+ * MiniDumpScanMemory: look through the thread stacks written to the dump for
+ * pointer-sized values inside a module, and flag those modules.  The module
+ * callback is then told about them with ModuleReferencedByMemory, which is
+ * what callbacks keeping "only the modules referenced by memory" rely on.
+ */
+static void scan_memory_for_modules(struct dump_context* dc)
+{
+    const unsigned      word_size = dbghelp_current_cpu->word_size;
+    ULONG64             lo = ~(ULONG64)0, hi = 0, addr;
+    unsigned            i, j, pos, len, off;
+    char                tmp[1024];
+
+    for (i = 0; i < dc->num_modules; i++)
+    {
+        lo = min(lo, dc->modules[i].base);
+        hi = max(hi, dc->modules[i].base + dc->modules[i].size);
+    }
+    if (lo >= hi) return;
+
+    for (i = 0; i < dc->num_threads; i++)
+    {
+        for (pos = 0; pos < dc->threads[i].stack_size; pos += sizeof(tmp))
+        {
+            len = min(dc->threads[i].stack_size - pos, sizeof(tmp));
+            if (!read_process_memory(dc->process, dc->threads[i].stack_start + pos, tmp, len)) break;
+            for (off = 0; off + word_size <= len; off += word_size)
+            {
+                if (word_size == sizeof(ULONG64)) memcpy(&addr, tmp + off, sizeof(ULONG64));
+                else
+                {
+                    ULONG addr32;
+                    memcpy(&addr32, tmp + off, sizeof(addr32));
+                    addr = addr32;
+                }
+                if (addr < lo || addr >= hi) continue;
+                for (j = 0; j < dc->num_modules; j++)
+                {
+                    if (!dc->modules[j].referenced_by_memory &&
+                        addr - dc->modules[j].base < dc->modules[j].size)
+                        dc->modules[j].referenced_by_memory = TRUE;
+                }
+            }
+        }
+    }
+}
+
+/******************************************************************
  *		dump_modules
  *
  * Write in File the modules from pcs
@@ -463,6 +546,8 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
             continue;
 
         flags_out = ModuleWriteModule | ModuleWriteMiscRecord | ModuleWriteCvRecord;
+        if (dc->modules[i].referenced_by_memory)
+            flags_out |= ModuleReferencedByMemory;
         if (dc->type & MiniDumpWithDataSegs)
             flags_out |= ModuleWriteDataSeg;
         if (dc->type & MiniDumpWithProcessThreadData)
@@ -511,8 +596,15 @@ static  unsigned        dump_modules(struct dump_context* dc, BOOL dump_elf)
             mdModule.ModuleNameRva = dc->rva;
             ms->Length -= sizeof(WCHAR);
             append(dc, ms, sizeof(ULONG) + ms->Length + sizeof(WCHAR));
-            if (!dump_elf) fetch_module_versioninfo(ms->Buffer, &mdModule.VersionInfo);
-            else memset(&mdModule.VersionInfo, 0, sizeof(mdModule.VersionInfo));
+            memset(&mdModule.VersionInfo, 0, sizeof(mdModule.VersionInfo));
+            if (!dump_elf)
+            {
+                if (dc->pid == GetCurrentProcessId())
+                    /* the image is mapped here: no file access, no loader lock */
+                    fetch_module_versioninfo_mapped(dc->modules[i].base, &mdModule.VersionInfo);
+                else
+                    fetch_module_versioninfo(ms->Buffer, &mdModule.VersionInfo);
+            }
             mdModule.CvRecord.DataSize = 0; /* FIXME */
             mdModule.CvRecord.Rva = 0; /* FIXME */
             mdModule.MiscRecord.DataSize = 0; /* FIXME */
@@ -546,8 +638,6 @@ static  unsigned        dump_system_info(struct dump_context* dc)
     ULONG                       slen;
     DWORD                       wine_extra = 0;
 
-    const char *(CDECL *wine_get_build_id)(void);
-    void (CDECL *wine_get_host_version)(const char **sysname, const char **release);
     const char* build_id = NULL;
     const char* sys_name = NULL;
     const char* release_name = NULL;
@@ -556,14 +646,12 @@ static  unsigned        dump_system_info(struct dump_context* dc)
     osInfo.dwOSVersionInfoSize = sizeof(osInfo);
     RtlGetVersion(&osInfo);
 
-    wine_get_build_id = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_build_id");
-    wine_get_host_version = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_host_version");
-    if (wine_get_build_id && wine_get_host_version)
+    if (pwine_get_build_id && pwine_get_host_version)
     {
         /* cheat minidump system information by adding specific wine information */
         wine_extra = 4 + 4 * sizeof(slen);
-        build_id = wine_get_build_id();
-        wine_get_host_version(&sys_name, &release_name);
+        build_id = pwine_get_build_id();
+        pwine_get_host_version(&sys_name, &release_name);
         wine_extra += strlen(build_id) + 1 + strlen(sys_name) + 1 + strlen(release_name) + 1;
     }
 
@@ -701,6 +789,8 @@ static  unsigned        dump_threads(struct dump_context* dc)
             }
             if (mdThd.Stack.Memory.DataSize && (flags_out & ThreadWriteStack))
             {
+                dc->threads[i].stack_start = mdThd.Stack.StartOfMemoryRange;
+                dc->threads[i].stack_size = mdThd.Stack.Memory.DataSize;
                 minidump_add_memory_block(dc, mdThd.Stack.StartOfMemoryRange,
                                           mdThd.Stack.Memory.DataSize,
                                           rva_base + sizeof(mdThdList.NumberOfThreads) +
@@ -940,6 +1030,10 @@ static BOOL write_minidump(struct dump_context *dc)
     if ((mdDir.Location.DataSize = dump_threads_names(dc)))
         writeat(dc, mdHead.StreamDirectoryRva + idx_stream++ * sizeof(mdDir),
                 &mdDir, sizeof(mdDir));
+
+    /* the thread stacks are known now: find the modules they point into */
+    if ((dc->type & MiniDumpScanMemory) && dc->cb)
+        scan_memory_for_modules(dc);
 
     mdDir.StreamType = ModuleListStream;
     mdDir.Location.Rva = dc->rva;

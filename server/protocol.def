@@ -2687,7 +2687,7 @@ enum message_type
     user_handle_t  owner;       /* owner window */
     atom_t         atom;        /* class atom */
     mod_handle_t   class_instance; /* class module instance */
-    unsigned int   dpi_context; /* thread DPI context */
+    unsigned int   dpi_context; /* thread DPI context, NTUSER_DPI_CONTEXT_FLAG_PROCESS: process awareness still unset */
     unsigned int   ansi;        /* window created as ansi */
     unsigned int   dpi;         /* initial monitor DPI */
     struct ratio   scale;       /* initial monitor scale ratio */
@@ -4382,4 +4382,10 @@ struct fd_desc
     VARARG(obj_attr,object_attributes); /* object attributes */
 @REPLY
     obj_handle_t        handle;         /* handle to the ALPC port */
+@END
+
+
+/* Set the process DPI awareness context: windows created while it was unset take it */
+@REQ(set_process_dpi_awareness)
+    unsigned int   dpi_context; /* process DPI awareness context */
 @END

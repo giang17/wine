@@ -363,14 +363,41 @@ static HRESULT STDMETHODCALLTYPE dxgi_output_FindClosestMatchingMode(IDXGIOutput
 
 static HRESULT STDMETHODCALLTYPE dxgi_output_WaitForVBlank(IDXGIOutput6 *iface)
 {
-    static BOOL once = FALSE;
+    struct dxgi_output *output = impl_from_IDXGIOutput6(iface);
+    struct wined3d_display_mode mode;
+    static LARGE_INTEGER freq;
+    unsigned int refresh_rate = 60;
+    LONGLONG period, boundary;
+    LARGE_INTEGER now;
+    static BOOL once;
 
     if (!once++)
-        FIXME("iface %p stub!\n", iface);
+        FIXME("iface %p semi-stub, emulating vertical blank from the refresh rate.\n", iface);
     else
-        TRACE("iface %p stub!\n", iface);
+        TRACE("iface %p.\n", iface);
 
-    return E_NOTIMPL;
+    /* No vblank events; wait for the next refresh period boundary. */
+    wined3d_mutex_lock();
+    if (SUCCEEDED(wined3d_output_get_display_mode(output->wined3d_output, &mode, NULL))
+            && mode.refresh_rate)
+        refresh_rate = mode.refresh_rate;
+    wined3d_mutex_unlock();
+
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    period = freq.QuadPart / refresh_rate;
+    boundary = (now.QuadPart / period + 1) * period;
+    /* Sleep() can return just before the boundary. Returning then would let
+     * the next call wait for the same boundary and return a second time
+     * within one period. */
+    do
+    {
+        Sleep(max(1, (DWORD)(((boundary - now.QuadPart) * 1000 + freq.QuadPart - 1) / freq.QuadPart)));
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart < boundary);
+
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE dxgi_output_TakeOwnership(IDXGIOutput6 *iface, IUnknown *device, BOOL exclusive)

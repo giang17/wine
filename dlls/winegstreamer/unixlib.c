@@ -260,8 +260,7 @@ NTSTATUS wg_init_gstreamer(void *arg)
 {
     struct wg_init_gstreamer_params *params = arg;
     char arg0[] = "wine";
-    char arg1[] = "--gst-disable-registry-fork";
-    char *args[] = {arg0, arg1, NULL};
+    char *args[] = {arg0, NULL};
     int argc = ARRAY_SIZE(args) - 1;
     char **argv = args;
     GError *err;

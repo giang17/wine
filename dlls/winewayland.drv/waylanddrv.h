@@ -71,6 +71,7 @@ enum wayland_window_message
     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
     WM_WAYLAND_CONFIGURE,
     WM_WAYLAND_SET_FOREGROUND,
+    WM_WAYLAND_UPDATE_XDG_PARENTS,
 };
 
 enum wayland_surface_config_state
@@ -392,6 +393,8 @@ struct wayland_win_data
     BOOL resizeable;
     BOOL managed;
     BOOL layered_attribs_set;
+    /* window whose toplevel the compositor has as the parent of this one's */
+    HWND xdg_parent;
 };
 
 struct wayland_win_data *wayland_win_data_get(HWND hwnd);

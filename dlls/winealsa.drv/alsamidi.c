@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <time.h>
 #include <alsa/asoundlib.h>
@@ -53,6 +54,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(midi);
 struct midi_dest
 {
     BOOL                bEnabled;
+    BOOL                present;    /* the ALSA port currently exists */
+    unsigned int        scan_gen;   /* last device scan that saw the port */
     MIDIOPENDESC        midiDesc;
     BYTE                runningStatus;
     WORD                wFlags;
@@ -65,6 +68,8 @@ struct midi_dest
 struct midi_src
 {
     int                 state; /* -1 disabled, 0 is no recording started, 1 in recording, bit 2 set if in sys exclusive recording */
+    BOOL                present;    /* the ALSA port currently exists */
+    unsigned int        scan_gen;   /* last device scan that saw the port */
     MIDIOPENDESC        midiDesc;
     WORD                wFlags;
     MIDIHDR            *lpQueueHdr;
@@ -73,20 +78,45 @@ struct midi_src
     snd_seq_t          *seq;
     snd_seq_addr_t      addr;
     int                 port_in;
+    /* System exclusive input that arrived while no buffer was queued.  It is
+     * handed to the next buffer the application adds instead of being lost;
+     * see handle_sysex_event(). */
+    BYTE               *pending;
+    UINT                pending_len;
+    UINT                pending_size;
+    BOOL                buffers_used;   /* a buffer was added since the device was opened */
 };
+
+/* An application that stops adding buffers must not make us hold an unbounded
+ * amount of data. */
+#define MAX_PENDING_SYSEX (256 * 1024)
 
 static pthread_mutex_t seq_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t in_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t devices_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* The device tables never move: winmm hands out their indices as device
+ * ids, the record thread walks them without holding the sequencer lock,
+ * and a device that appears after start-up is appended in place.  Windows
+ * keeps ids stable the same way, so a fixed capacity is the simplest
+ * thing that is also correct. */
+#define MAX_MIDI_DEVICES 256
 static unsigned int num_dests, num_srcs;
 static struct midi_dest *dests;
 static struct midi_src *srcs;
 static snd_seq_t *midi_seq;
 static unsigned int seq_refs;
 static int port_in = -1;
+static int port_announce = -1;
 
-static unsigned int num_midi_in_started;
+static BOOL devices_dirty;          /* an announce event arrived since the last scan */
+static unsigned int scan_generation;
+static uint64_t last_scan_time;
+#define SCAN_INTERVAL_MS 2000       /* poll fallback should an announce event get lost */
+
+static BOOL rec_thread_running;
 static int rec_cancel_pipe[2];
+static int rec_wake_pipe[2] = {-1, -1};   /* midi_in_add_buffer() -> record thread: deliver pending sysex */
 static pthread_t rec_thread_id;
 
 static pthread_mutex_t notify_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -115,6 +145,16 @@ static void in_buffer_lock(void)
 static void in_buffer_unlock(void)
 {
     pthread_mutex_unlock(&in_buffer_mutex);
+}
+
+static void devices_lock(void)
+{
+    pthread_mutex_lock(&devices_mutex);
+}
+
+static void devices_unlock(void)
+{
+    pthread_mutex_unlock(&devices_mutex);
 }
 
 static uint64_t get_time_msec(void)
@@ -249,6 +289,11 @@ static void seq_close(void)
             snd_seq_delete_simple_port(midi_seq, port_in);
             port_in = -1;
         }
+        if (port_announce >= 0)
+        {
+            snd_seq_delete_simple_port(midi_seq, port_announce);
+            port_announce = -1;
+        }
         snd_seq_close(midi_seq);
         midi_seq = NULL;
     }
@@ -282,6 +327,25 @@ static int alsa_to_win_device_type(unsigned int type)
     return MOD_FMSYNTH;
 }
 
+/* Build the name winmm shows for a sequencer port: "client - port", or the
+ * port name alone if that would not fit.  Hotplug matching relies on this
+ * name staying the same when a device is replugged under a new address. */
+static unsigned int port_display_name(snd_seq_client_info_t *cinfo, snd_seq_port_info_t *pinfo,
+                                      char name[MAXPNAMELEN])
+{
+    unsigned int len = strlen(snd_seq_port_info_get_name(pinfo));
+
+    if ((strlen(snd_seq_client_info_get_name(cinfo)) + len + 3) < MAXPNAMELEN) {
+        sprintf(name, "%s - %s", snd_seq_client_info_get_name(cinfo), snd_seq_port_info_get_name(pinfo));
+        len = strlen(name);
+    } else {
+        len = min(len, MAXPNAMELEN - 1);
+        memcpy(name, snd_seq_port_info_get_name(pinfo), len);
+        name[len] = '\0';
+    }
+    return len;
+}
+
 static void port_add(snd_seq_client_info_t* cinfo, snd_seq_port_info_t* pinfo, unsigned int cap, unsigned int type)
 {
     char name[MAXPNAMELEN];
@@ -300,10 +364,16 @@ static void port_add(snd_seq_client_info_t* cinfo, snd_seq_port_info_t* pinfo, u
         if (!type)
             return;
 
-        dests = realloc( dests, (num_dests + 1) * sizeof(*dests) );
+        if (num_dests >= MAX_MIDI_DEVICES)
+        {
+            WARN("Too many MIDI output devices, ignoring %s\n", snd_seq_port_info_get_name(pinfo));
+            return;
+        }
         dest = dests + num_dests;
         memset( dest, 0, sizeof(*dest) );
         dest->addr = *snd_seq_port_info_get_addr(pinfo);
+        dest->present = TRUE;
+        dest->scan_gen = scan_generation;
 
         /* Manufac ID. We do not have access to this with soundcard.h
          * Does not seem to be a problem, because in mmsystem.h only
@@ -322,15 +392,7 @@ static void port_add(snd_seq_client_info_t* cinfo, snd_seq_port_info_t* pinfo, u
         /* Try to use both client and port names, if this is too long take the port name only.
            In the second case the port name should be explicit enough due to its big size.
         */
-        len = strlen(snd_seq_port_info_get_name(pinfo));
-        if ( (strlen(snd_seq_client_info_get_name(cinfo)) + len + 3) < sizeof(name) ) {
-            sprintf(name, "%s - %s", snd_seq_client_info_get_name(cinfo), snd_seq_port_info_get_name(pinfo));
-            len = strlen(name);
-        } else {
-            len = min(len, sizeof(name) - 1);
-            memcpy(name, snd_seq_port_info_get_name(pinfo), len);
-            name[len] = '\0';
-        }
+        len = port_display_name(cinfo, pinfo, name);
         ntdll_umbstowcs( name, len + 1, dest->caps.szPname, ARRAY_SIZE(dest->caps.szPname));
 
         dest->caps.wTechnology = alsa_to_win_device_type(type);
@@ -362,7 +424,7 @@ static void port_add(snd_seq_client_info_t* cinfo, snd_seq_port_info_t* pinfo, u
               dest->caps.wChannelMask, (unsigned)dest->caps.dwSupport,
               type);
 
-        num_dests++;
+        __atomic_store_n(&num_dests, num_dests + 1, __ATOMIC_RELEASE);
     }
     if (cap & SND_SEQ_PORT_CAP_READ) {
         TRACE("IN  (%d:%s:%s:%d:%s:%x)\n",snd_seq_client_info_get_client(cinfo),
@@ -375,10 +437,16 @@ static void port_add(snd_seq_client_info_t* cinfo, snd_seq_port_info_t* pinfo, u
         if (!type)
             return;
 
-        srcs = realloc( srcs, (num_srcs + 1) * sizeof(*srcs) );
+        if (num_srcs >= MAX_MIDI_DEVICES)
+        {
+            WARN("Too many MIDI input devices, ignoring %s\n", snd_seq_port_info_get_name(pinfo));
+            return;
+        }
         src = srcs + num_srcs;
         memset( src, 0, sizeof(*src) );
         src->addr = *snd_seq_port_info_get_addr(pinfo);
+        src->present = TRUE;
+        src->scan_gen = scan_generation;
 
         /* Manufac ID. We do not have access to this with soundcard.h
          * Does not seem to be a problem, because in mmsystem.h only
@@ -393,15 +461,7 @@ static void port_add(snd_seq_client_info_t* cinfo, snd_seq_port_info_t* pinfo, u
         /* Try to use both client and port names, if this is too long take the port name only.
            In the second case the port name should be explicit enough due to its big size.
         */
-        len = strlen(snd_seq_port_info_get_name(pinfo));
-        if ( (strlen(snd_seq_client_info_get_name(cinfo)) + len + 3) < sizeof(name) ) {
-            sprintf(name, "%s - %s", snd_seq_client_info_get_name(cinfo), snd_seq_port_info_get_name(pinfo));
-            len = strlen(name);
-        } else {
-            len = min(len, sizeof(name) - 1);
-            memcpy(name, snd_seq_port_info_get_name(pinfo), len);
-            name[len] = '\0';
-        }
+        len = port_display_name(cinfo, pinfo, name);
         ntdll_umbstowcs( name, len + 1, src->caps.szPname, ARRAY_SIZE(src->caps.szPname));
         src->state = 0;
 
@@ -409,15 +469,210 @@ static void port_add(snd_seq_client_info_t* cinfo, snd_seq_port_info_t* pinfo, u
               "\tALSA info: midi dev-type=%x, capa=0\n",
               num_srcs, wine_dbgstr_w(src->caps.szPname), (unsigned)src->caps.dwSupport, type);
 
-        num_srcs++;
+        __atomic_store_n(&num_srcs, num_srcs + 1, __ATOMIC_RELEASE);
     }
 }
+
+/* A scan found a port.  Match it against the tables: same address and name
+ * is the device we already know; a known name whose port went away and now
+ * shows up under a new address is the same device replugged (subscriptions
+ * die silently with the old port, so re-subscribe anything that is open);
+ * anything else is a new device and gets appended.  Called with the
+ * sequencer and device locks held. */
+static void port_match(snd_seq_client_info_t *cinfo, snd_seq_port_info_t *pinfo, unsigned int cap, unsigned int type)
+{
+    const snd_seq_addr_t *addr = snd_seq_port_info_get_addr(pinfo);
+    char name[MAXPNAMELEN];
+    WCHAR nameW[MAXPNAMELEN];
+    unsigned int len, i, add_cap = 0;
+    int ret;
+
+    if (!type) return;
+
+    len = port_display_name(cinfo, pinfo, name);
+    ntdll_umbstowcs(name, len + 1, nameW, ARRAY_SIZE(nameW));
+
+    if (cap & SND_SEQ_PORT_CAP_WRITE)
+    {
+        struct midi_dest *dest = NULL;
+
+        for (i = 0; i < num_dests; i++)
+            if (dests[i].scan_gen != scan_generation && dests[i].addr.client == addr->client &&
+                dests[i].addr.port == addr->port && !wcscmp(dests[i].caps.szPname, nameW))
+            {
+                dest = &dests[i];
+                break;
+            }
+        if (!dest)
+            for (i = 0; i < num_dests; i++)
+                if (dests[i].scan_gen != scan_generation && !dests[i].present &&
+                    !wcscmp(dests[i].caps.szPname, nameW))
+                {
+                    dest = &dests[i];
+                    TRACE("MidiOut[%u] '%s' is back as %d:%d\n", i, name, addr->client, addr->port);
+                    dest->addr = *addr;
+                    if (dest->midiDesc.hMidi && dest->seq && dest->port_out >= 0)
+                    {
+                        ret = snd_seq_connect_to(dest->seq, dest->port_out, addr->client, addr->port);
+                        if (ret < 0)
+                            WARN("Could not re-subscribe MidiOut '%s' to %d:%d: %s\n",
+                                 name, addr->client, addr->port, snd_strerror(ret));
+                    }
+                    break;
+                }
+        if (dest)
+        {
+            dest->present = TRUE;
+            dest->scan_gen = scan_generation;
+        }
+        else add_cap |= SND_SEQ_PORT_CAP_WRITE;
+    }
+    if (cap & SND_SEQ_PORT_CAP_READ)
+    {
+        struct midi_src *src = NULL;
+
+        for (i = 0; i < num_srcs; i++)
+            if (srcs[i].scan_gen != scan_generation && srcs[i].addr.client == addr->client &&
+                srcs[i].addr.port == addr->port && !wcscmp(srcs[i].caps.szPname, nameW))
+            {
+                src = &srcs[i];
+                break;
+            }
+        if (!src)
+            for (i = 0; i < num_srcs; i++)
+                if (srcs[i].scan_gen != scan_generation && !srcs[i].present &&
+                    !wcscmp(srcs[i].caps.szPname, nameW))
+                {
+                    src = &srcs[i];
+                    TRACE("MidiIn [%u] '%s' is back as %d:%d\n", i, name, addr->client, addr->port);
+                    src->addr = *addr;
+                    if (src->midiDesc.hMidi && src->seq)
+                    {
+                        ret = snd_seq_connect_from(src->seq, src->port_in, addr->client, addr->port);
+                        if (ret < 0)
+                            WARN("Could not re-subscribe MidiIn '%s' to %d:%d: %s\n",
+                                 name, addr->client, addr->port, snd_strerror(ret));
+                    }
+                    break;
+                }
+        if (src)
+        {
+            src->present = TRUE;
+            src->scan_gen = scan_generation;
+        }
+        else add_cap |= SND_SEQ_PORT_CAP_READ;
+    }
+    if (add_cap) port_add(cinfo, pinfo, add_cap, type);
+}
+
+/* Walk the sequencer's ports (internal devices first, then external ones,
+ * as the original enumeration did) and bring the device tables up to date.
+ * Called with the sequencer lock held. */
+static void scan_devices(void)
+{
+    snd_seq_client_info_t *cinfo;
+    snd_seq_port_info_t *pinfo;
+    int own_client = snd_seq_client_id(midi_seq);
+    unsigned int i, pass;
+
+    cinfo = calloc( 1, snd_seq_client_info_sizeof() );
+    pinfo = calloc( 1, snd_seq_port_info_sizeof() );
+
+    devices_lock();
+    scan_generation++;
+    devices_dirty = FALSE;
+
+    for (pass = 0; pass < 2; pass++)
+    {
+        snd_seq_client_info_set_client(cinfo, -1);
+        while (snd_seq_query_next_client(midi_seq, cinfo) >= 0) {
+            if (snd_seq_client_info_get_client(cinfo) == own_client) continue;
+            snd_seq_port_info_set_client(pinfo, snd_seq_client_info_get_client(cinfo));
+            snd_seq_port_info_set_port(pinfo, -1);
+            while (snd_seq_query_next_port(midi_seq, pinfo) >= 0) {
+                unsigned int cap = snd_seq_port_info_get_capability(pinfo);
+                unsigned int type = snd_seq_port_info_get_type(pinfo);
+                if (!(type & SND_SEQ_PORT_TYPE_PORT) == !pass)
+                    port_match(cinfo, pinfo, cap, type);
+            }
+        }
+    }
+
+    for (i = 0; i < num_dests; i++)
+        if (dests[i].scan_gen != scan_generation && dests[i].present)
+        {
+            TRACE("MidiOut[%u] '%s' (%d:%d) is gone\n", i, wine_dbgstr_w(dests[i].caps.szPname),
+                  dests[i].addr.client, dests[i].addr.port);
+            dests[i].present = FALSE;
+        }
+    for (i = 0; i < num_srcs; i++)
+        if (srcs[i].scan_gen != scan_generation && srcs[i].present)
+        {
+            TRACE("MidiIn [%u] '%s' (%d:%d) is gone\n", i, wine_dbgstr_w(srcs[i].caps.szPname),
+                  srcs[i].addr.client, srcs[i].addr.port);
+            srcs[i].present = FALSE;
+        }
+
+    last_scan_time = get_time_msec();
+    devices_unlock();
+
+    free( cinfo );
+    free( pinfo );
+}
+
+/* Re-scan on a GETNUMDEVS request when the announce port reported a change,
+ * or, as a fallback, when the last scan is older than SCAN_INTERVAL_MS.
+ * Windows re-enumerates on every midiIn/OutGetNumDevs() call; applications
+ * that poll do so every few hundred milliseconds, hence the throttle. */
+/* Number of devices to report to winmm: up to and including the last one
+ * whose port exists.  A device that went away keeps its slot, so that an
+ * open handle stays valid and the port lands on the same id when it comes
+ * back -- but a trailing run of absent devices is dropped from the count,
+ * as Windows drops an unplugged device from the enumeration.  Absent
+ * devices below a present one stay visible and fail GETDEVCAPS. */
+static UINT num_visible_dests(void)
+{
+    unsigned int n;
+
+    devices_lock();
+    n = num_dests;
+    while (n && !dests[n - 1].present) n--;
+    devices_unlock();
+    return n;
+}
+
+static UINT num_visible_srcs(void)
+{
+    unsigned int n;
+
+    devices_lock();
+    n = num_srcs;
+    while (n && !srcs[n - 1].present) n--;
+    devices_unlock();
+    return n;
+}
+
+static void rescan_devices(void)
+{
+    BOOL do_scan;
+
+    if (!midi_seq) return;
+
+    devices_lock();
+    do_scan = devices_dirty || get_time_msec() - last_scan_time >= SCAN_INTERVAL_MS;
+    devices_unlock();
+    if (!do_scan) return;
+
+    seq_lock();
+    if (midi_seq) scan_devices();
+    seq_unlock();
+}
+
+static void *rec_thread_proc(void *arg);
 
 static UINT alsa_midi_init(void)
 {
     static BOOL init_done;
-    snd_seq_client_info_t *cinfo;
-    snd_seq_port_info_t *pinfo;
     snd_seq_t *seq;
 
     if (init_done)
@@ -426,41 +681,52 @@ static UINT alsa_midi_init(void)
     TRACE("Initializing the MIDI variables.\n");
     init_done = TRUE;
 
-    /* try to open device */
+    if (!(dests = calloc( MAX_MIDI_DEVICES, sizeof(*dests) )) ||
+        !(srcs = calloc( MAX_MIDI_DEVICES, sizeof(*srcs) )))
+        return ERROR_OUTOFMEMORY;
+
+    /* The sequencer stays open for the life of the driver: the record
+     * thread listens on the system announce port for devices that come and
+     * go, and a scan on GETNUMDEVS picks them up. */
     if (!(seq = seq_open(NULL)))
         return ERROR_OPEN_FAILED;
 
-    cinfo = calloc( 1, snd_seq_client_info_sizeof() );
-    pinfo = calloc( 1, snd_seq_port_info_sizeof() );
+    seq_lock();
+    /* The announce subscription needs a writable port of our own.  Give it
+     * no type so that neither this nor any other Wine process lists it as
+     * a MIDI device, and no export so nobody else can subscribe to it. */
+    port_announce = snd_seq_create_simple_port(seq, "WINE announce",
+                                               SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_NO_EXPORT, 0);
+    if (port_announce < 0)
+        WARN("Unable to create the announce port: %s\n", snd_strerror(port_announce));
+    else if (snd_seq_connect_from(seq, port_announce, SND_SEQ_CLIENT_SYSTEM, SND_SEQ_PORT_SYSTEM_ANNOUNCE) < 0)
+        WARN("Could not subscribe to the system announce port\n");
 
-    /* First, search for all internal midi devices */
-    snd_seq_client_info_set_client(cinfo, -1);
-    while (snd_seq_query_next_client(seq, cinfo) >= 0) {
-        snd_seq_port_info_set_client(pinfo, snd_seq_client_info_get_client(cinfo));
-        snd_seq_port_info_set_port(pinfo, -1);
-        while (snd_seq_query_next_port(seq, pinfo) >= 0) {
-            unsigned int cap = snd_seq_port_info_get_capability(pinfo);
-            unsigned int type = snd_seq_port_info_get_type(pinfo);
-            if (!(type & SND_SEQ_PORT_TYPE_PORT))
-                port_add(cinfo, pinfo, cap, type);
-        }
+    scan_devices();
+    seq_unlock();
+
+    /* Without the wake-up pipe pending sysex input still goes out with the
+     * next event that arrives, only later. */
+    if (pipe(rec_wake_pipe) < 0)
+    {
+        WARN("Couldn't create the wake-up pipe for midi-in\n");
+        rec_wake_pipe[0] = rec_wake_pipe[1] = -1;
+    }
+    else
+    {
+        fcntl(rec_wake_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(rec_wake_pipe[1], F_SETFL, O_NONBLOCK);
     }
 
-    /* Second, search for all external ports */
-    snd_seq_client_info_set_client(cinfo, -1);
-    while (snd_seq_query_next_client(seq, cinfo) >= 0) {
-        snd_seq_port_info_set_client(pinfo, snd_seq_client_info_get_client(cinfo));
-        snd_seq_port_info_set_port(pinfo, -1);
-        while (snd_seq_query_next_port(seq, pinfo) >= 0) {
-            unsigned int cap = snd_seq_port_info_get_capability(pinfo);
-            unsigned int type = snd_seq_port_info_get_type(pinfo);
-            if (type & SND_SEQ_PORT_TYPE_PORT)
-                port_add(cinfo, pinfo, cap, type);
-        }
+    if (pipe(rec_cancel_pipe) < 0)
+        WARN("Couldn't create the cancel pipe for midi-in\n");
+    else if (pthread_create(&rec_thread_id, NULL, rec_thread_proc, seq))
+    {
+        close(rec_cancel_pipe[0]);
+        close(rec_cancel_pipe[1]);
+        WARN("Couldn't create thread for midi-in\n");
     }
-    seq_close();
-    free( cinfo );
-    free( pinfo );
+    else rec_thread_running = TRUE;
 
     TRACE("End\n");
 
@@ -469,6 +735,24 @@ static UINT alsa_midi_init(void)
 
 NTSTATUS alsa_midi_release(void *args)
 {
+    if (rec_thread_running)
+    {
+        TRACE("Stopping thread for midi-in\n");
+        write(rec_cancel_pipe[1], "x", 1);
+        pthread_join(rec_thread_id, NULL);
+        close(rec_cancel_pipe[0]);
+        close(rec_cancel_pipe[1]);
+        rec_thread_running = FALSE;
+        TRACE("Stopped thread for midi-in\n");
+    }
+    if (rec_wake_pipe[0] != -1)
+    {
+        close(rec_wake_pipe[0]);
+        close(rec_wake_pipe[1]);
+        rec_wake_pipe[0] = rec_wake_pipe[1] = -1;
+    }
+    if (midi_seq) seq_close();
+
     /* stop the notify_wait thread */
     notify_post(NULL);
 
@@ -511,9 +795,9 @@ static UINT midi_out_open(WORD dev_id, MIDIOPENDESC *midi_desc, UINT flags, stru
         WARN("device already open !\n");
         return MMSYSERR_ALLOCATED;
     }
-    if (!dest->bEnabled)
+    if (!dest->bEnabled || !dest->present)
     {
-        WARN("device disabled !\n");
+        WARN("device %s !\n", dest->present ? "disabled" : "not present");
         return MIDIERR_NODEVICE;
     }
     if ((flags & ~CALLBACK_TYPEMASK) != 0)
@@ -916,6 +1200,9 @@ static UINT midi_out_get_devcaps(WORD dev_id, MIDIOUTCAPSW *caps, UINT size)
 
     if (dev_id >= num_dests) return MMSYSERR_BADDEVICEID;
     if (!caps) return MMSYSERR_INVALPARAM;
+    /* the port went away: keep the id, but let the application see that
+     * there is no device behind it any more */
+    if (!dests[dev_id].present) return MMSYSERR_NODRIVER;
 
     memcpy(caps, &dests[dev_id].caps, min(size, sizeof(*caps)));
 
@@ -953,27 +1240,27 @@ static UINT midi_out_reset(WORD dev_id)
     return MMSYSERR_NOERROR;
 }
 
-static void handle_sysex_event(struct midi_src *src, BYTE *data, UINT len)
+/* Copy sysex bytes into the queued buffers and return how many were taken.  A
+ * buffer is returned when it is full or holds the end of a message, so a
+ * message never shares a buffer with the next one.  Called with the in_buffer
+ * lock held. */
+static UINT fill_sysex_buffers(struct midi_src *src, const BYTE *data, UINT len)
 {
     UINT pos = 0, copy_len, current_time = get_time_msec() - src->startTime;
     struct notify_context notify;
+    const BYTE *end;
     MIDIHDR *hdr;
 
-    in_buffer_lock();
-
-    while (len)
+    while (pos < len && (hdr = src->lpQueueHdr))
     {
-        hdr = src->lpQueueHdr;
-        if (!hdr) break;
-
-        copy_len = min(len, hdr->dwBufferLength - hdr->dwBytesRecorded);
+        copy_len = min(len - pos, hdr->dwBufferLength - hdr->dwBytesRecorded);
+        if ((end = memchr(data + pos, 0xF7, copy_len)))
+            copy_len = end - (data + pos) + 1;
         memcpy(hdr->lpData + hdr->dwBytesRecorded, data + pos, copy_len);
         hdr->dwBytesRecorded += copy_len;
-        len -= copy_len;
         pos += copy_len;
 
-        if ((hdr->dwBytesRecorded == hdr->dwBufferLength) ||
-            (*(BYTE*)(hdr->lpData + hdr->dwBytesRecorded - 1) == 0xF7))
+        if (hdr->dwBytesRecorded == hdr->dwBufferLength || end)
         { /* buffer full or end of sysex message */
             src->lpQueueHdr = hdr->lpNext;
             hdr->dwFlags &= ~MHDR_INQUEUE;
@@ -983,6 +1270,88 @@ static void handle_sysex_event(struct midi_src *src, BYTE *data, UINT len)
         }
     }
 
+    return pos;
+}
+
+/* Keep sysex bytes that found no buffer.  Called with the in_buffer lock held. */
+static void keep_pending_sysex(struct midi_src *src, const BYTE *data, UINT len)
+{
+    UINT size;
+    BYTE *new;
+
+    if (src->pending_len + len > MAX_PENDING_SYSEX)
+    {
+        WARN("no buffer queued, %u bytes of system exclusive input lost, %u bytes wait\n",
+             len, src->pending_len);
+        return;
+    }
+    if (src->pending_len + len > src->pending_size)
+    {
+        size = max(max(src->pending_size * 2, 4096), src->pending_len + len);
+        if (!(new = realloc(src->pending, size)))
+        {
+            WARN("out of memory, %u bytes of system exclusive input lost\n", len);
+            return;
+        }
+        src->pending = new;
+        src->pending_size = size;
+    }
+    memcpy(src->pending + src->pending_len, data, len);
+    src->pending_len += len;
+    TRACE("no buffer queued, %u bytes of system exclusive input wait\n", src->pending_len);
+}
+
+/* Hand pending sysex bytes to the queued buffers.  Called with the in_buffer
+ * lock held. */
+static void flush_pending_sysex(struct midi_src *src)
+{
+    UINT taken = fill_sysex_buffers(src, src->pending, src->pending_len);
+
+    src->pending_len -= taken;
+    if (src->pending_len) memmove(src->pending, src->pending + taken, src->pending_len);
+}
+
+static void handle_sysex_event(struct midi_src *src, BYTE *data, UINT len)
+{
+    UINT taken;
+
+    in_buffer_lock();
+
+    /* An application that reads system exclusive input queues a few buffers
+     * and adds each one again from its MIM_LONGDATA callback.  If that callback
+     * is slow, a dump at full MIDI speed can find no buffer queued for a moment;
+     * the data is kept for the next buffer instead of being dropped.  For an
+     * application that never queued a buffer nothing is kept, as before. */
+    if (src->pending_len)
+    {
+        keep_pending_sysex(src, data, len);
+        flush_pending_sysex(src);
+    }
+    else if ((taken = fill_sysex_buffers(src, data, len)) < len)
+    {
+        if (src->buffers_used)
+            keep_pending_sysex(src, data + taken, len - taken);
+        else
+            TRACE("no buffer queued, %u bytes of system exclusive input dropped\n", len - taken);
+    }
+
+    in_buffer_unlock();
+}
+
+/* Called on the record thread when midi_in_add_buffer() has queued a buffer
+ * for a source with pending sysex input. */
+static void flush_all_pending_sysex(void)
+{
+    unsigned int i, num;
+
+    devices_lock();
+    num = __atomic_load_n(&num_srcs, __ATOMIC_ACQUIRE);
+    devices_unlock();
+
+    in_buffer_lock();
+    for (i = 0; i < num; i++)
+        if (srcs[i].state == 1 && srcs[i].pending_len && srcs[i].lpQueueHdr)
+            flush_pending_sysex(srcs + i);
     in_buffer_unlock();
 }
 
@@ -1051,15 +1420,68 @@ static void handle_regular_event(struct midi_src *src, snd_seq_event_t *ev)
     }
 }
 
+/* A port or client appeared or went away.  Remember that the tables are
+ * stale and, once per change, tell the PE side so that it can raise
+ * WM_DEVICECHANGE for applications that re-enumerate on that.
+ * Runs on the record thread, which is a plain pthread without a TEB: no
+ * TRACE/WARN here, like in the rest of the record path. */
+static void handle_announce_event(snd_seq_event_t *ev)
+{
+    struct notify_context notify;
+
+    switch (ev->type)
+    {
+    case SND_SEQ_EVENT_PORT_START:
+    case SND_SEQ_EVENT_PORT_EXIT:
+        break;
+    case SND_SEQ_EVENT_PORT_CHANGE:
+    case SND_SEQ_EVENT_CLIENT_EXIT:
+        /* no port of its own to report, but the tables may be stale */
+        devices_lock();
+        devices_dirty = TRUE;
+        devices_unlock();
+        return;
+    default:
+        return;
+    }
+    if (ev->data.addr.client == snd_seq_client_id(midi_seq)) return;
+
+    devices_lock();
+    devices_dirty = TRUE;
+    devices_unlock();
+
+    /* one notification per port, arrival and removal alike: the PE side
+     * turns it into the interface events an application registered for */
+    memset(&notify, 0, sizeof(notify));
+    notify.send_notify = TRUE;
+    notify.msg = MIDI_NOTIFY_DEVICE_CHANGE;
+    notify.dev_id = ev->type == SND_SEQ_EVENT_PORT_START;
+    notify.param_1 = ev->data.addr.client;
+    notify.param_2 = ev->data.addr.port;
+    notify_post(&notify);
+}
+
 static void midi_handle_event(snd_seq_event_t *ev)
 {
     struct midi_src *src;
+    unsigned int i, num;
+
+    if (ev->source.client == SND_SEQ_CLIENT_SYSTEM && ev->source.port == SND_SEQ_PORT_SYSTEM_ANNOUNCE)
+    {
+        handle_announce_event(ev);
+        return;
+    }
 
     /* Find the target device */
-    for (src = srcs; src < srcs + num_srcs; src++)
-        if ((ev->source.client == src->addr.client) && (ev->source.port == src->addr.port))
+    devices_lock();
+    num = __atomic_load_n(&num_srcs, __ATOMIC_ACQUIRE);
+    for (i = 0; i < num; i++)
+        if ((ev->source.client == srcs[i].addr.client) && (ev->source.port == srcs[i].addr.port))
             break;
-    if ((src == srcs + num_srcs) || (src->state != 1))
+    devices_unlock();
+    if (i == num) return;
+    src = srcs + i;
+    if (src->state != 1)
         return;
 
     if (ev->type == SND_SEQ_EVENT_SYSEX)
@@ -1075,17 +1497,22 @@ static void *rec_thread_proc(void *arg)
     struct pollfd *pollfd;
     int ret;
 
-    /* Add on one for the read end of the cancel pipe */
-    num_fds = snd_seq_poll_descriptors_count(midi_seq, POLLIN) + 1;
+    /* Add on two for the read ends of the cancel and wake-up pipes */
+    num_fds = snd_seq_poll_descriptors_count(midi_seq, POLLIN) + 2;
     pollfd = malloc(num_fds * sizeof(struct pollfd));
 
     while(1)
     {
+        BOOL seq_ready = FALSE;
+        int i;
+
         pollfd[0].fd = rec_cancel_pipe[0];
         pollfd[0].events = POLLIN;
+        pollfd[1].fd = rec_wake_pipe[0];   /* -1 without the pipe, poll() skips it */
+        pollfd[1].events = POLLIN;
 
         seq_lock();
-        snd_seq_poll_descriptors(midi_seq, pollfd + 1, num_fds - 1, POLLIN);
+        snd_seq_poll_descriptors(midi_seq, pollfd + 2, num_fds - 2, POLLIN);
         seq_unlock();
 
         /* Check if an event is present */
@@ -1094,6 +1521,19 @@ static void *rec_thread_proc(void *arg)
 
         if (pollfd[0].revents & POLLIN) /* cancelled */
             break;
+
+        if (pollfd[1].revents & POLLIN) /* a buffer was added for pending sysex input */
+        {
+            char drain[64];
+            while (read(rec_wake_pipe[0], drain, sizeof(drain)) > 0) ;
+            flush_all_pending_sysex();
+        }
+
+        /* The sequencer is in blocking mode: read only when it has input. */
+        for (i = 2; i < num_fds; i++)
+            if (pollfd[i].revents) seq_ready = TRUE;
+        if (!seq_ready)
+            continue;
 
         do
         {
@@ -1142,9 +1582,9 @@ static UINT midi_in_open(WORD dev_id, MIDIOPENDESC *desc, UINT flags, struct not
     }
     src = srcs + dev_id;
 
-    if (src->state == -1)
+    if (src->state == -1 || !src->present)
     {
-        WARN("device disabled\n");
+        WARN("device %s\n", src->present ? "disabled" : "not present");
         return MIDIERR_NODEVICE;
     }
     if (src->midiDesc.hMidi)
@@ -1169,6 +1609,8 @@ static UINT midi_in_open(WORD dev_id, MIDIOPENDESC *desc, UINT flags, struct not
     src->wFlags = HIWORD(flags & CALLBACK_TYPEMASK);
 
     src->lpQueueHdr = NULL;
+    src->pending_len = 0;
+    src->buffers_used = FALSE;
     src->midiDesc = *desc;
     src->state = 0;
     src->startTime = 0;
@@ -1183,20 +1625,6 @@ static UINT midi_in_open(WORD dev_id, MIDIOPENDESC *desc, UINT flags, struct not
         return MMSYSERR_NOTENABLED;
 
     TRACE("Input port :%d connected %d:%d\n", port_in, src->addr.client, src->addr.port);
-
-    if (num_midi_in_started++ == 0)
-    {
-        pipe(rec_cancel_pipe);
-        if (pthread_create(&rec_thread_id, NULL, rec_thread_proc, midi_seq))
-        {
-            close(rec_cancel_pipe[0]);
-            close(rec_cancel_pipe[1]);
-            num_midi_in_started = 0;
-            WARN("Couldn't create thread for midi-in\n");
-            seq_close();
-            return MMSYSERR_ERROR;
-        }
-    }
 
     set_in_notify(notify, src, dev_id, MIM_OPEN, 0, 0);
     return MMSYSERR_NOERROR;
@@ -1227,16 +1655,6 @@ static UINT midi_in_close(WORD dev_id, struct notify_context *notify)
         WARN("ooops !\n");
         return MMSYSERR_ERROR;
     }
-    if (--num_midi_in_started == 0)
-    {
-        TRACE("Stopping thread for midi-in\n");
-        write(rec_cancel_pipe[1], "x", 1);
-        pthread_join(rec_thread_id, NULL);
-        close(rec_cancel_pipe[0]);
-        close(rec_cancel_pipe[1]);
-        TRACE("Stopped thread for midi-in\n");
-    }
-
     seq_lock();
     snd_seq_disconnect_from(src->seq, src->port_in, src->addr.client, src->addr.port);
     seq_unlock();
@@ -1246,6 +1664,13 @@ static UINT midi_in_close(WORD dev_id, struct notify_context *notify)
     src->midiDesc.hMidi = 0;
     src->seq = NULL;
 
+    in_buffer_lock();
+    free(src->pending);
+    src->pending = NULL;
+    src->pending_len = src->pending_size = 0;
+    src->buffers_used = FALSE;
+    in_buffer_unlock();
+
     return MMSYSERR_NOERROR;
 }
 
@@ -1253,6 +1678,7 @@ static UINT midi_in_add_buffer(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
 {
     struct midi_src *src;
     MIDIHDR **next;
+    BOOL wake;
 
     TRACE("(%04X, %p, %d);\n", dev_id, hdr, hdr_size);
 
@@ -1276,7 +1702,17 @@ static UINT midi_in_add_buffer(WORD dev_id, MIDIHDR *hdr, UINT hdr_size)
     while (*next) next = &(*next)->lpNext;
     *next = hdr;
 
+    src->buffers_used = TRUE;
+    /* Pending sysex input is delivered on the record thread, as any other
+     * input: applications add buffers from their MIM_LONGDATA callback, which
+     * runs on the notify thread, and posting notifications from here could
+     * wait for that very thread. */
+    wake = src->pending_len != 0;
+
     in_buffer_unlock();
+
+    if (wake && rec_wake_pipe[1] != -1)
+        write(rec_wake_pipe[1], "w", 1);   /* nonblocking; a full pipe already wakes the thread */
 
     return MMSYSERR_NOERROR;
 }
@@ -1319,6 +1755,9 @@ static UINT midi_in_get_devcaps(WORD dev_id, MIDIINCAPSW *caps, UINT size)
 
     if (dev_id >= num_srcs) return MMSYSERR_BADDEVICEID;
     if (!caps) return MMSYSERR_INVALPARAM;
+    /* the port went away: keep the id, but let the application see that
+     * there is no device behind it any more */
+    if (!srcs[dev_id].present) return MMSYSERR_NODRIVER;
 
     memcpy(caps, &srcs[dev_id].caps, min(size, sizeof(*caps)));
 
@@ -1351,6 +1790,9 @@ static UINT midi_in_stop(WORD dev_id)
     if (src->state == -1) return MIDIERR_NODEVICE;
 
     src->state = 0;
+    in_buffer_lock();
+    src->pending_len = 0;   /* input after the stop is not recorded either */
+    in_buffer_unlock();
     return MMSYSERR_NOERROR;
 }
 
@@ -1369,6 +1811,7 @@ static DWORD midi_in_reset(WORD dev_id, struct notify_context *notify)
 
     in_buffer_lock();
 
+    src->pending_len = 0;
     if (src->lpQueueHdr)
     {
         hdr = src->lpQueueHdr;
@@ -1423,7 +1866,8 @@ NTSTATUS alsa_midi_out_message(void *args)
         *params->err = midi_out_get_devcaps(params->dev_id, (MIDIOUTCAPSW *)params->param_1, params->param_2);
         break;
     case MODM_GETNUMDEVS:
-        *params->err = num_dests;
+        rescan_devices();
+        *params->err = num_visible_dests();
         break;
     case MODM_GETVOLUME:
         *params->err = midi_out_get_volume(params->dev_id, (UINT *)params->param_1);
@@ -1478,7 +1922,8 @@ NTSTATUS alsa_midi_in_message(void *args)
         *params->err = midi_in_get_devcaps(params->dev_id, (MIDIINCAPSW *)params->param_1, params->param_2);
         break;
     case MIDM_GETNUMDEVS:
-        *params->err = num_srcs;
+        rescan_devices();
+        *params->err = num_visible_srcs();
         break;
     case MIDM_START:
         *params->err = midi_in_start(params->dev_id);

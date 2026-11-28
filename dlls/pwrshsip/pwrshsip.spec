@@ -1,0 +1,8 @@
+@ stdcall PsCreateHash(ptr ptr ptr)
+@ stdcall PsGetSignature(ptr ptr long ptr ptr)
+@ stdcall PsIsMyFileType(wstr ptr)
+@ stdcall PsPutSignature(ptr long ptr long ptr)
+@ stdcall PsRemoveSignature(ptr long)
+@ stdcall PsVerifyHash(ptr ptr)
+@ stdcall -private DllRegisterServer()
+@ stdcall -private DllUnregisterServer()
