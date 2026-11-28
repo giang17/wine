@@ -5,8 +5,8 @@ matching WineHQ bug report where one exists and the state of upstream Wine.
 The list covers fixes that were checked against upstream; it is not complete.
 PATCHES.md describes every change of the fork.
 
-As of 2026-11-20: branch `d2d1-dcomp-11.0` at `7c5c7c23446`, upstream master
-at `wine-11.22-107-g76f8e947954`.
+As of 2026-11-28: branch `d2d1-dcomp-11.0` at `cdb81b297c8`, upstream master
+at `wine-11.23`.
 
 None of the fork's own fixes is submitted to WineHQ: Wine's Clean-Room
 Guidelines do not accept LLM-generated code, and this fork is developed with
@@ -21,6 +21,7 @@ information for users of the fork, not a request to take the code upstream.
 | msi | The saved string pool counts unused slots at its end, crosses 65535 entries and switches to 3-byte string references; the Kontakt 8 installer aborts | `89612d2640e` (backport of `fd1a09b8702`, replaces the fork's own fix) | [59056](https://bugs.winehq.org/show_bug.cgi?id=59056) | master after Wine 11.22, `fd1a09b8702` |
 | ntdll | A debugger's break-in thread in a WoW64 process starts at a truncated 64-bit address | `aa300232981` (backport of `a9dd4878b14`, replaces the fork's own fix) | [59803](https://bugs.winehq.org/show_bug.cgi?id=59803) | Wine 11.22, `a9dd4878b14` |
 | mf | The audio renderer never reports a completed scrub | `1cd7e8c5883` (backport of `324a7da836e`) | - | Wine 11.5, `324a7da836e` |
+| d2d1 | Rounded rectangle `Simplify()` places the corner arcs wrongly | `a6976602e20` | - | Wine 11.23, `7de470a0b98` |
 
 ## Open upstream
 
@@ -33,7 +34,6 @@ there, or, where it does not or upstream changed the functions involved since
 | d2d1 | `CombineWithGeometry()` is a stub, and anything drawn through its empty result is clipped away; a JUCE 8 component stops updating until a full repaint | `2e939c3e701`, `77b9f3cadc3`, `74cc53881df` | - |
 | d2d1 | `ID2D1Geometry::Outline()` is a stub; Cubase 15 leaves the corners of its start-up splash transparent | `84bad3dff46` | - |
 | d2d1 | Every cubic Bezier is approximated by a single quadratic; S-shaped curves are drawn as arcs | `0f42192d02e`, `c823f3c363f` | - |
-| d2d1 | Rounded rectangle `Simplify()` places the corner arcs wrongly | `a6976602e20` | - |
 | d2d1 | Bezier overlap resolution never ends for a control triangle with a non-finite area; the process runs out of memory | `2e075d515e1` | - |
 | d2d1 | Triangulation vertices are compared without a total order; one NaN vertex can make the triangulation read from address zero, and Studio Pro 8 crashed at the end of its shutdown | `4331b70158d` | - |
 | d2d1 | `PushAxisAlignedClip()` repeats its FIXME on every call (HALion Sonic 7) | `0f635c87cc0` | - |
